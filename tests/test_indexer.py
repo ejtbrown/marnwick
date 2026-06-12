@@ -35,6 +35,54 @@ def test_background_indexer_refreshes_directory_and_reports_completion(tmp_path:
         indexer.shutdown()
 
 
+def test_background_indexer_discovers_directories_without_indexing_images(tmp_path: Path) -> None:
+    root = tmp_path / "catalog"
+    make_image(root / "set" / "nested" / "one.jpg")
+
+    indexer = BackgroundIndexer(max_workers=1)
+    try:
+        task = indexer.discover_directories(root)
+        task.wait(timeout=5)
+        snapshot = task.snapshot()
+
+        assert snapshot.done
+        assert snapshot.error is None
+        assert snapshot.processed == 3
+        assert snapshot.total == 3
+        with Catalog(root) as catalog:
+            assert catalog.list_known_directories() == ["", "set", "set/nested"]
+            assert catalog.list_images("set/nested") == []
+    finally:
+        indexer.shutdown()
+
+
+def test_background_indexer_prunes_thumbnail_cache(tmp_path: Path) -> None:
+    root = tmp_path / "catalog"
+    make_image(root / "one.jpg")
+    with Catalog(root) as catalog:
+        catalog.refresh()
+        thumb_row = catalog._conn.execute(
+            "SELECT thumb_rel_path FROM images WHERE rel_path = ?",
+            ("one.jpg",),
+        ).fetchone()
+        catalog.thumbnail_abs_path(thumb_row["thumb_rel_path"]).unlink()
+
+    indexer = BackgroundIndexer(max_workers=1, idle_sleep_seconds=0.001)
+    try:
+        task = indexer.prune_thumbnails(root)
+        task.wait(timeout=5)
+        snapshot = task.snapshot()
+
+        assert snapshot.done
+        assert snapshot.error is None
+        assert snapshot.processed == 1
+        assert snapshot.total == 1
+        with Catalog(root) as catalog:
+            assert catalog.get_thumbnail_blob("one.jpg")
+    finally:
+        indexer.shutdown()
+
+
 def test_background_indexer_deduplicates_active_directory_tasks(tmp_path: Path) -> None:
     root = tmp_path / "catalog"
     make_image(root / "set" / "one.jpg")

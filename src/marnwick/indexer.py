@@ -146,6 +146,39 @@ class BackgroundIndexer:
             self._refresh_catalog,
         )
 
+    def discover_directories(self, root: Path, *, interactive: bool = True) -> IndexTask:
+        root = root.expanduser().resolve()
+        label = f"Discovering folders {root.name or root}"
+        key = f"discover:{root}"
+        return self._submit_unique(
+            key,
+            IndexTask(
+                label,
+                root,
+                None,
+                interactive=interactive,
+                idle_sleep_seconds=self._idle_sleep_seconds,
+            ),
+            self._discover_directories,
+        )
+
+    def prune_thumbnails(self, root: Path, *, interactive: bool = False, force: bool = False) -> IndexTask:
+        root = root.expanduser().resolve()
+        label = f"Pruning thumbnails {root.name or root}"
+        key = f"thumbnail-prune-force:{root}" if force else f"thumbnail-prune:{root}"
+        return self._submit_unique(
+            key,
+            IndexTask(
+                label,
+                root,
+                None,
+                interactive=interactive,
+                idle_sleep_seconds=self._idle_sleep_seconds,
+                force_refresh=force,
+            ),
+            self._prune_thumbnails,
+        )
+
     def refresh_directory(
         self,
         root: Path,
@@ -262,6 +295,7 @@ class BackgroundIndexer:
         except IndexTaskCancelled:
             task.mark_canceled()
         except Exception as error:
+            self._log_task_error(task, error)
             task.mark_failed(error)
 
     def _refresh_directory(self, task: IndexTask) -> None:
@@ -277,4 +311,40 @@ class BackgroundIndexer:
         except IndexTaskCancelled:
             task.mark_canceled()
         except Exception as error:
+            self._log_task_error(task, error)
             task.mark_failed(error)
+
+    def _discover_directories(self, task: IndexTask) -> None:
+        try:
+            with Catalog(task.root) as catalog:
+                catalog.discover_directories(
+                    self._progress_callback(task),
+                    task.check_canceled,
+                )
+            task.mark_done()
+        except IndexTaskCancelled:
+            task.mark_canceled()
+        except Exception as error:
+            self._log_task_error(task, error)
+            task.mark_failed(error)
+
+    def _prune_thumbnails(self, task: IndexTask) -> None:
+        try:
+            with Catalog(task.root) as catalog:
+                catalog.prune_thumbnails(
+                    self._progress_callback(task),
+                    task.check_canceled,
+                )
+            task.mark_done()
+        except IndexTaskCancelled:
+            task.mark_canceled()
+        except Exception as error:
+            self._log_task_error(task, error)
+            task.mark_failed(error)
+
+    def _log_task_error(self, task: IndexTask, error: BaseException) -> None:
+        try:
+            with Catalog(task.root) as catalog:
+                catalog.append_log(f"{task.label} failed: {error}", level="ERROR")
+        except Exception:
+            return

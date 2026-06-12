@@ -25,6 +25,7 @@ from marnwick.ui import (  # noqa: E402
     DIR_REL_ROLE,
     DirectoryPropertiesDialog,
     FullscreenViewer,
+    LogsDialog,
     MainWindow,
     TagDialog,
     ThumbnailDelegate,
@@ -1100,7 +1101,46 @@ def test_tools_menu_refresh_catalog_forces_current_catalog_refresh(tmp_path: Pat
         )
         assert tools_menu is not None
         assert any(action.text().replace("&", "") == "Refresh Catalog" for action in tools_menu.actions())
+        assert any(action.text().replace("&", "") == "Logs" for action in tools_menu.actions())
+        assert any(action.text().replace("&", "") == "Prune Thumbnails" for action in tools_menu.actions())
         assert any(action.text().replace("&", "") == "Preferences" for action in tools_menu.actions())
+    finally:
+        window.workspace.close()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_tools_menu_prune_thumbnails_schedules_current_catalog_prune(tmp_path: Path, monkeypatch) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+
+    class FakeIndexer:
+        def __init__(self) -> None:
+            self.calls: list[tuple[Path, bool, bool]] = []
+
+        def prune_thumbnails(self, root: Path, *, interactive: bool = False, force: bool = False):  # type: ignore[no-untyped-def]
+            self.calls.append((root, interactive, force))
+            return object()
+
+        def shutdown(self) -> None:
+            return None
+
+    window = MainWindow()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        window.indexer.shutdown()
+        fake_indexer = FakeIndexer()
+        window.indexer = fake_indexer  # type: ignore[assignment]
+        monkeypatch.setattr(window, "_poll_indexer", lambda: None)
+        catalog = window.workspace.open_catalog(root)
+        window.current_catalog = catalog
+
+        window.prune_current_catalog_thumbnails()
+
+        assert fake_indexer.calls == [(catalog.root, True, True)]
+        assert window._thumbnail_prune_tasks[catalog.root] is not None
     finally:
         window.workspace.close()
         window.close()
@@ -1198,6 +1238,62 @@ def test_progress_label_shows_directory_instead_of_file_name(tmp_path: Path, mon
         qt_app.processEvents()
 
 
+def test_open_catalog_discovers_directory_tree_without_waiting_for_image_index(tmp_path: Path) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    (root / "empty" / "nested").mkdir(parents=True)
+
+    window = MainWindow()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+
+        window.open_catalog(root)
+        task = window._directory_discovery_tasks.get(root.resolve())
+        if task is not None:
+            task.wait(timeout=5)
+        window._poll_indexer()
+
+        root_item = window.tree.topLevelItem(0)
+        assert root_item is not None
+        child = root_item.child(0)
+        assert child is not None
+        assert child.data(0, DIR_REL_ROLE) == "empty"
+        nested = child.child(0)
+        assert nested is not None
+        assert nested.data(0, DIR_REL_ROLE) == "empty/nested"
+    finally:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        window.indexer.shutdown()
+        window.workspace.close()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_logs_dialog_displays_catalog_logs_and_copies_line(tmp_path: Path) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+
+    with Catalog(root) as catalog:
+        catalog.append_log("File edit saved: one.jpg")
+        dialog = LogsDialog([catalog])
+        try:
+            assert dialog.copy_buttons
+
+            dialog.copy_buttons[0].click()
+
+            copied = qt_app.clipboard().text()
+            assert root.name in copied
+            assert "File edit saved: one.jpg" in copied
+        finally:
+            qt_app.clipboard().clear()
+            dialog.close()
+            dialog.deleteLater()
+            qt_app.processEvents()
+
+
 def test_directory_properties_dialog_counts_files_and_copies_path(tmp_path: Path) -> None:
     qt_app = app()
     root = tmp_path / "catalog"
@@ -1231,6 +1327,33 @@ def test_directory_properties_dialog_counts_files_and_copies_path(tmp_path: Path
             assert qt_app.clipboard().text() == str(target.resolve())
         finally:
             qt_app.clipboard().clear()
+            dialog.close()
+            dialog.deleteLater()
+            qt_app.processEvents()
+
+
+def test_directory_properties_dialog_elides_long_scan_paths_without_expanding(tmp_path: Path) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+
+    with Catalog(root) as catalog:
+        dialog = DirectoryPropertiesDialog(catalog, "")
+        try:
+            dialog.timer.stop()
+            dialog.resize(420, 240)
+            qt_app.processEvents()
+
+            baseline_width = dialog.sizeHint().width()
+            long_status = f"Counting {root / ('deep-' + ('x' * 900))}"
+            dialog._set_status_text(long_status)
+            qt_app.processEvents()
+
+            assert dialog.status_label.text() != long_status
+            assert len(dialog.status_label.text()) < len(long_status)
+            assert dialog.status_label.toolTip() == long_status
+            assert dialog.sizeHint().width() <= baseline_width + 20
+        finally:
             dialog.close()
             dialog.deleteLater()
             qt_app.processEvents()
