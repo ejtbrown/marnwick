@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import csv
+from dataclasses import dataclass
+from datetime import datetime
 import errno
 import hashlib
 import io
@@ -13,7 +15,7 @@ import zlib
 from collections.abc import Callable, Iterable, Sequence
 from pathlib import Path
 
-from PIL import Image, ImageOps, UnidentifiedImageError
+from PIL import Image, ImageOps
 
 from .models import CatalogSettings, DirectoryRecord, DirectorySummary, ImageRecord, MoveResult, SQL_SORT_ORDER, SortOrder
 
@@ -36,6 +38,13 @@ CancelCallback = Callable[[], None]
 SCAN_PROGRESS_INTERVAL = 64
 HASH_CHUNK_SIZE = 1024 * 1024
 FIND_POLL_INTERVAL_SECONDS = 0.02
+LOG_FILE_NAME = "marnwick.log"
+MAX_LOG_BYTES = 1024 * 1024
+THUMBNAIL_DIR_NAME = "thumbnails"
+THUMBNAIL_FILE_SUFFIX = ".jpg"
+SQL_LIKE_ESCAPE = "\\"
+SQLITE_VARIABLE_BATCH_SIZE = 500
+PRUNE_BATCH_SIZE = 512
 
 
 def is_image_name(name: str) -> bool:
@@ -65,6 +74,35 @@ def parse_tag_entry(text: str) -> list[str]:
     return names
 
 
+def escape_sql_like(value: str) -> str:
+    return (
+        value.replace(SQL_LIKE_ESCAPE, SQL_LIKE_ESCAPE * 2)
+        .replace("%", f"{SQL_LIKE_ESCAPE}%")
+        .replace("_", f"{SQL_LIKE_ESCAPE}_")
+    )
+
+
+def descendant_like_pattern(rel_path: str) -> str:
+    if not rel_path:
+        return "%"
+    return f"{escape_sql_like(rel_path)}/%"
+
+
+def batched(values: Sequence[str], size: int) -> Iterable[Sequence[str]]:
+    for start in range(0, len(values), size):
+        yield values[start : start + size]
+
+
+@dataclass(frozen=True, slots=True)
+class ThumbnailPruneResult:
+    db_rows_checked: int = 0
+    thumbnails_rebuilt: int = 0
+    stale_db_rows_removed: int = 0
+    orphan_files_removed: int = 0
+    legacy_blobs_migrated: int = 0
+    errors: int = 0
+
+
 class Catalog:
     """SQLite-backed, self-contained state for one photo catalog."""
 
@@ -72,6 +110,8 @@ class Catalog:
         self.root = root.expanduser().resolve()
         self.state_dir = self.root / ".marnwick"
         self.db_path = self.state_dir / "catalog.sqlite3"
+        self.log_path = self.state_dir / LOG_FILE_NAME
+        self.thumbnail_dir = self.state_dir / THUMBNAIL_DIR_NAME
         self.root.mkdir(parents=True, exist_ok=True)
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(self.db_path, isolation_level=None)
@@ -101,6 +141,255 @@ class Catalog:
         if settings.thumbnail_native_size < 64:
             raise ValueError("thumbnail_native_size must be at least 64")
         self._set_setting("thumbnail_native_size", str(settings.thumbnail_native_size))
+
+    def append_log(self, message: str, *, level: str = "INFO") -> None:
+        timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+        safe_level = " ".join(level.upper().split()) or "INFO"
+        safe_message = " ".join(str(message).splitlines())
+        line = f"{timestamp} {safe_level} {safe_message}\n"
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        with self.log_path.open("ab") as handle:
+            handle.write(line.encode("utf-8", errors="replace"))
+        self._trim_log_file()
+
+    def read_log_lines(self) -> list[str]:
+        try:
+            data = self.log_path.read_bytes()
+        except OSError:
+            return []
+        if len(data) > MAX_LOG_BYTES:
+            data = data[-MAX_LOG_BYTES:]
+            first_newline = data.find(b"\n")
+            if first_newline >= 0:
+                data = data[first_newline + 1 :]
+        return data.decode("utf-8", errors="replace").splitlines()
+
+    def _trim_log_file(self) -> None:
+        try:
+            size = self.log_path.stat().st_size
+        except OSError:
+            return
+        if size <= MAX_LOG_BYTES:
+            return
+        with self.log_path.open("rb") as handle:
+            handle.seek(-MAX_LOG_BYTES, os.SEEK_END)
+            data = handle.read()
+        first_newline = data.find(b"\n")
+        if first_newline >= 0:
+            data = data[first_newline + 1 :]
+        self.log_path.write_bytes(data)
+
+    def thumbnail_abs_path(self, thumb_rel_path: str) -> Path:
+        candidate = (self.state_dir / thumb_rel_path).resolve()
+        candidate.relative_to(self.state_dir)
+        return candidate
+
+    def _thumbnail_rel_path(self, cache_key: str, thumbnail_size: int) -> str:
+        safe_key = "".join(character for character in cache_key.lower() if character in "0123456789abcdef")
+        if len(safe_key) < 8:
+            raise ValueError("thumbnail cache key is invalid")
+        return (
+            Path(THUMBNAIL_DIR_NAME)
+            / str(int(thumbnail_size))
+            / safe_key[:2]
+            / safe_key[2:4]
+            / f"{safe_key}{THUMBNAIL_FILE_SUFFIX}"
+        ).as_posix()
+
+    def _write_thumbnail_file(self, cache_key: str, thumbnail_size: int, thumb_blob: bytes) -> str:
+        thumb_rel_path = self._thumbnail_rel_path(cache_key, thumbnail_size)
+        target = self.thumbnail_abs_path(thumb_rel_path)
+        if target.is_file():
+            return thumb_rel_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temp = target.with_name(f"{target.name}.{os.getpid()}.{time.time_ns()}.tmp")
+        try:
+            temp.write_bytes(thumb_blob)
+            temp.rename(target)
+        finally:
+            temp.unlink(missing_ok=True)
+        return thumb_rel_path
+
+    def _read_thumbnail_file(self, thumb_rel_path: str | None) -> bytes | None:
+        if not thumb_rel_path:
+            return None
+        try:
+            return self.thumbnail_abs_path(thumb_rel_path).read_bytes()
+        except (OSError, ValueError):
+            return None
+
+    def _thumbnail_blob_for_row(self, row: sqlite3.Row, rel_path: str) -> bytes | None:
+        thumb_blob = self._read_thumbnail_file(row["thumb_rel_path"])
+        if thumb_blob is not None:
+            return thumb_blob
+        legacy_blob = row["thumb_blob"]
+        if legacy_blob is None:
+            return None
+        try:
+            path = self.abs_path(rel_path)
+            self._ensure_existing_thumbnail_file(rel_path, path, row)
+        except Exception:
+            return bytes(legacy_blob)
+        updated = self._conn.execute(
+            "SELECT thumb_rel_path FROM images WHERE rel_path = ?",
+            (rel_path,),
+        ).fetchone()
+        migrated_blob = self._read_thumbnail_file(
+            updated["thumb_rel_path"] if updated is not None else row["thumb_rel_path"]
+        )
+        return migrated_blob if migrated_blob is not None else bytes(legacy_blob)
+
+    def _ensure_existing_thumbnail_file(self, rel_path: str, path: Path, row: sqlite3.Row) -> bool:
+        thumb_rel_path = row["thumb_rel_path"]
+        thumb_cache_key = row["thumb_cache_key"]
+        thumb_size_px = int(row["thumb_size_px"] or self.settings.thumbnail_native_size)
+        if thumb_cache_key:
+            try:
+                expected_rel_path = self._thumbnail_rel_path(str(thumb_cache_key), thumb_size_px)
+            except ValueError:
+                expected_rel_path = None
+            expected_exists = False
+            if expected_rel_path:
+                try:
+                    expected_exists = self.thumbnail_abs_path(expected_rel_path).is_file()
+                except (OSError, ValueError):
+                    expected_exists = False
+            if expected_rel_path and expected_exists:
+                if str(thumb_rel_path or "") != expected_rel_path or row["thumb_blob"] is not None:
+                    self._conn.execute(
+                        """
+                        UPDATE images
+                        SET thumb_rel_path = ?, thumb_blob = NULL
+                        WHERE rel_path = ?
+                        """,
+                        (expected_rel_path, rel_path),
+                    )
+                return True
+        elif thumb_rel_path:
+            try:
+                if self.thumbnail_abs_path(str(thumb_rel_path)).is_file():
+                    return True
+            except (OSError, ValueError):
+                pass
+        legacy_blob = row["thumb_blob"]
+        if legacy_blob is None:
+            return False
+        image_hash = row["image_hash"]
+        if not thumb_cache_key:
+            image_hash, thumb_cache_key = self._image_file_hashes(path)
+        thumb_rel_path = self._write_thumbnail_file(str(thumb_cache_key), thumb_size_px, bytes(legacy_blob))
+        self._conn.execute(
+            """
+            UPDATE images
+            SET
+                image_hash = COALESCE(image_hash, ?),
+                thumb_cache_key = ?,
+                thumb_rel_path = ?,
+                thumb_blob = NULL
+            WHERE rel_path = ?
+            """,
+            (image_hash, thumb_cache_key, thumb_rel_path, rel_path),
+        )
+        return True
+
+    def _thumbnail_rel_paths_for_records(self, rel_paths: Iterable[str]) -> set[str]:
+        rel_paths = list(rel_paths)
+        if not rel_paths:
+            return set()
+        thumb_rel_paths: set[str] = set()
+        variable_limit = SQLITE_VARIABLE_BATCH_SIZE
+        if hasattr(self._conn, "getlimit"):
+            variable_limit = min(
+                variable_limit,
+                self._conn.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER),
+            )
+        variable_limit = max(1, variable_limit)
+        for chunk in batched(rel_paths, variable_limit):
+            rows = self._conn.execute(
+                f"""
+                SELECT thumb_rel_path
+                FROM images
+                WHERE rel_path IN ({",".join("?" for _ in chunk)})
+                    AND thumb_rel_path IS NOT NULL
+                """,
+                chunk,
+            )
+            thumb_rel_paths.update(str(row["thumb_rel_path"]) for row in rows)
+        return thumb_rel_paths
+
+    def _remove_unreferenced_thumbnail_files(self, thumb_rel_paths: Iterable[str]) -> None:
+        for thumb_rel_path in set(path for path in thumb_rel_paths if path):
+            row = self._conn.execute(
+                "SELECT 1 FROM images WHERE thumb_rel_path = ? LIMIT 1",
+                (thumb_rel_path,),
+            ).fetchone()
+            if row is not None:
+                continue
+            try:
+                path = self.thumbnail_abs_path(thumb_rel_path)
+            except ValueError:
+                continue
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as error:
+                self.append_log(f"Thumbnail cleanup error for {thumb_rel_path}: {error}", level="ERROR")
+                continue
+            self._remove_empty_thumbnail_parents(path.parent)
+
+    def _prune_orphan_thumbnail_files(self) -> int:
+        if not self.thumbnail_dir.exists():
+            return 0
+        removed = 0
+        for path in self.thumbnail_dir.rglob("*"):
+            if not path.is_file():
+                continue
+            try:
+                thumb_rel_path = path.relative_to(self.state_dir).as_posix()
+            except ValueError:
+                continue
+            row = self._conn.execute(
+                "SELECT 1 FROM images WHERE thumb_rel_path = ? LIMIT 1",
+                (thumb_rel_path,),
+            ).fetchone()
+            if row is not None:
+                continue
+            try:
+                path.unlink()
+            except OSError as error:
+                self.append_log(f"Thumbnail prune error for {thumb_rel_path}: {error}", level="ERROR")
+                continue
+            removed += 1
+        for dirpath, _, _ in os.walk(self.thumbnail_dir, topdown=False):
+            path = Path(dirpath)
+            if path == self.thumbnail_dir:
+                continue
+            try:
+                path.rmdir()
+            except OSError:
+                continue
+        return removed
+
+    def _remove_empty_thumbnail_parents(self, directory: Path) -> None:
+        try:
+            thumbnail_root = self.thumbnail_dir.resolve()
+        except OSError:
+            return
+        current = directory
+        while True:
+            try:
+                current_resolved = current.resolve()
+                current_resolved.relative_to(thumbnail_root)
+            except (OSError, ValueError):
+                return
+            if current_resolved == thumbnail_root:
+                return
+            try:
+                current.rmdir()
+            except OSError:
+                return
+            current = current.parent
 
     def catalog_refresh_is_current(self, cancel_check: CancelCallback | None = None) -> bool:
         stored_hash = self.stored_catalog_find_hash()
@@ -313,8 +602,30 @@ class Catalog:
         if not force and self.catalog_refresh_is_current(cancel_check):
             if progress is not None:
                 progress(0, 0, "Catalog up to date")
+            self.append_log("Catalog refresh complete: up to date")
             return False
-        return self._refresh_catalog_tree(progress, cancel_check, force=force)
+        refreshed = self._refresh_catalog_tree(progress, cancel_check, force=force)
+        self.append_log("Catalog refresh complete")
+        return refreshed
+
+    def discover_directories(
+        self,
+        progress: ProgressCallback | None = None,
+        cancel_check: CancelCallback | None = None,
+    ) -> int:
+        if progress is not None:
+            progress(0, None, f"Finding folders in {self.root.name or self.root}")
+        if shutil.which("find") is not None:
+            try:
+                count = self._discover_directories_subprocess(progress, cancel_check)
+            except OSError:
+                count = self._discover_directories_python(progress, cancel_check)
+        else:
+            count = self._discover_directories_python(progress, cancel_check)
+        if progress is not None:
+            progress(count, count, "Folder discovery complete")
+        self.append_log(f"Folder discovery complete: {count} folders")
+        return count
 
     def _refresh_catalog_tree(
         self,
@@ -402,7 +713,12 @@ class Catalog:
         for processed, rel_path in enumerate(image_rel_paths, start=1):
             if cancel_check is not None:
                 cancel_check()
-            self.index_image(rel_path, cancel_check=cancel_check)
+            try:
+                self.index_image(rel_path, cancel_check=cancel_check)
+            except Exception as error:
+                if cancel_check is not None:
+                    cancel_check()
+                self.append_log(f"Indexing error for {rel_path}: {error}", level="ERROR")
             if progress is not None:
                 progress(processed, total, rel_path)
         existing = {
@@ -441,7 +757,12 @@ class Catalog:
         if not path.exists() or not path.is_file() or not is_image_path(path):
             self._delete_db_records([rel_path])
             return None
-        stat = path.stat()
+        try:
+            stat = path.stat()
+        except OSError as error:
+            self.append_log(f"Indexing error for {rel_path}: {error}", level="ERROR")
+            self._delete_db_records([rel_path])
+            return None
         existing = self._conn.execute(
             """
             SELECT
@@ -449,35 +770,61 @@ class Catalog:
                 file_size_bytes,
                 modified_at_ns,
                 image_hash,
+                thumb_cache_key,
+                thumb_rel_path,
                 thumb_size_px,
+                thumb_blob,
                 thumb_blob IS NOT NULL AS has_thumb
             FROM images
             WHERE rel_path = ?
             """,
             (rel_path,),
         ).fetchone()
+        thumbnail_ready = (
+            existing is not None
+            and self._ensure_existing_thumbnail_file(rel_path, path, existing)
+        )
         if (
             existing
+            and int(existing["file_size_bytes"]) == stat.st_size
             and int(existing["modified_at_ns"]) == stat.st_mtime_ns
             and int(existing["thumb_size_px"]) == self.settings.thumbnail_native_size
-            and int(existing["has_thumb"])
+            and thumbnail_ready
         ):
-            if int(existing["file_size_bytes"]) != stat.st_size or existing["image_hash"] is None:
+            if existing["image_hash"] is None or existing["thumb_cache_key"] is None:
                 try:
-                    image_hash = existing["image_hash"] or self._fast_image_hash(path, cancel_check)
+                    image_hash, thumb_cache_key = self._image_file_hashes(path, cancel_check)
                 except OSError:
+                    self.append_log(f"Indexing error for {rel_path}: could not read image file", level="ERROR")
                     self._delete_db_records([rel_path])
                     return None
-                self._update_file_identity(rel_path, stat.st_size, stat.st_mtime_ns, str(image_hash))
+                self._update_file_identity(
+                    rel_path,
+                    stat.st_size,
+                    stat.st_mtime_ns,
+                    str(image_hash),
+                    thumb_cache_key=str(thumb_cache_key),
+                )
             return self.get_image(rel_path, include_blob=False)
 
         try:
             width, height, thumb_blob, thumb_width, thumb_height = self._read_image_metadata_and_thumbnail(path)
-            image_hash = self._fast_image_hash(path, cancel_check)
-        except (UnidentifiedImageError, OSError):
+            image_hash, thumb_cache_key = self._image_file_hashes(path, cancel_check)
+            thumb_rel_path = self._write_thumbnail_file(
+                thumb_cache_key,
+                self.settings.thumbnail_native_size,
+                thumb_blob,
+            )
+        except Exception as error:
+            if cancel_check is not None:
+                cancel_check()
+            self.append_log(f"Indexing error for {rel_path}: {error}", level="ERROR")
             self._delete_db_records([rel_path])
             return None
 
+        old_thumb_rel_paths = set()
+        if existing is not None and existing["thumb_rel_path"] is not None:
+            old_thumb_rel_paths.add(str(existing["thumb_rel_path"]))
         dir_rel = Path(rel_path).parent.as_posix()
         if dir_rel == ".":
             dir_rel = ""
@@ -488,10 +835,10 @@ class Catalog:
             INSERT INTO images (
                 rel_path, dir_rel, filename, size_bytes, file_size_bytes,
                 mtime_ns, modified_at_ns, image_hash, width, height,
-                aspect_ratio, thumb_blob, thumb_width, thumb_height, thumb_size_px,
-                indexed_at_ns
+                aspect_ratio, thumb_blob, thumb_rel_path, thumb_cache_key,
+                thumb_width, thumb_height, thumb_size_px, indexed_at_ns
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(rel_path) DO UPDATE SET
                 dir_rel = excluded.dir_rel,
                 filename = excluded.filename,
@@ -504,6 +851,8 @@ class Catalog:
                 height = excluded.height,
                 aspect_ratio = excluded.aspect_ratio,
                 thumb_blob = excluded.thumb_blob,
+                thumb_rel_path = excluded.thumb_rel_path,
+                thumb_cache_key = excluded.thumb_cache_key,
                 thumb_width = excluded.thumb_width,
                 thumb_height = excluded.thumb_height,
                 thumb_size_px = excluded.thumb_size_px,
@@ -521,13 +870,16 @@ class Catalog:
                 width,
                 height,
                 aspect_ratio,
-                thumb_blob,
+                None,
+                thumb_rel_path,
+                thumb_cache_key,
                 thumb_width,
                 thumb_height,
                 self.settings.thumbnail_native_size,
                 time.time_ns(),
             ),
         )
+        self._remove_unreferenced_thumbnail_files(old_thumb_rel_paths - {thumb_rel_path})
         return self.get_image(rel_path, include_blob=True)
 
     def list_images(
@@ -604,18 +956,24 @@ class Catalog:
         return sorted(records, key=self._directory_sort_key(sort_order), reverse=self._record_sort_reverse(sort_order))
 
     def thumbnail_blobs_under(self, dir_rel: str, *, limit: int = 4) -> list[bytes]:
+        nested_like = descendant_like_pattern(dir_rel)
         rows = self._conn.execute(
             """
-            SELECT thumb_blob
+            SELECT rel_path, thumb_rel_path, thumb_cache_key, thumb_size_px, image_hash, thumb_blob
             FROM images
-            WHERE (dir_rel = ? OR dir_rel LIKE ?)
-                AND thumb_blob IS NOT NULL
+            WHERE (dir_rel = ? OR dir_rel LIKE ? ESCAPE '\\')
+                AND (thumb_rel_path IS NOT NULL OR thumb_blob IS NOT NULL)
             ORDER BY rel_path COLLATE NOCASE ASC
             LIMIT ?
             """,
-            (dir_rel, f"{dir_rel}/%", limit),
+            (dir_rel, nested_like, limit),
         )
-        return [bytes(row["thumb_blob"]) for row in rows if row["thumb_blob"] is not None]
+        blobs: list[bytes] = []
+        for row in rows:
+            blob = self._thumbnail_blob_for_row(row, str(row["rel_path"]))
+            if blob is not None:
+                blobs.append(blob)
+        return blobs
 
     def get_image(self, rel_path: str, *, include_blob: bool = True) -> ImageRecord | None:
         columns = self._image_columns(include_blob)
@@ -634,38 +992,40 @@ class Catalog:
     def get_thumbnail_blob(self, rel_path: str) -> bytes | None:
         row = self._conn.execute(
             """
-            SELECT thumb_blob
+            SELECT rel_path, thumb_rel_path, thumb_cache_key, thumb_size_px, image_hash, thumb_blob
             FROM images
             WHERE rel_path = ?
             """,
             (rel_path,),
         ).fetchone()
-        if row is None or row["thumb_blob"] is None:
+        if row is None:
             return None
-        return bytes(row["thumb_blob"])
+        return self._thumbnail_blob_for_row(row, rel_path)
 
     def indexed_image_sizes_under(self, dir_rel: str) -> dict[str, int]:
         if dir_rel:
+            nested_like = descendant_like_pattern(dir_rel)
             rows = self._conn.execute(
                 """
                 SELECT rel_path, file_size_bytes
                 FROM images
-                WHERE dir_rel = ? OR dir_rel LIKE ?
+                WHERE dir_rel = ? OR dir_rel LIKE ? ESCAPE '\\'
                 """,
-                (dir_rel, f"{dir_rel}/%"),
+                (dir_rel, nested_like),
             )
         else:
             rows = self._conn.execute("SELECT rel_path, file_size_bytes FROM images")
         return {str(row["rel_path"]): int(row["file_size_bytes"]) for row in rows}
 
     def _indexed_image_size_under(self, dir_rel: str) -> int:
+        nested_like = descendant_like_pattern(dir_rel)
         row = self._conn.execute(
             """
             SELECT COALESCE(SUM(file_size_bytes), 0) AS total
             FROM images
-            WHERE dir_rel = ? OR dir_rel LIKE ?
+            WHERE dir_rel = ? OR dir_rel LIKE ? ESCAPE '\\'
             """,
-            (dir_rel, f"{dir_rel}/%"),
+            (dir_rel, nested_like),
         ).fetchone()
         return 0 if row is None else int(row["total"])
 
@@ -880,15 +1240,28 @@ class Catalog:
         if wipe:
             self._wipe_directory_files(directory)
         shutil.rmtree(directory)
-        nested_like = f"{dir_rel}/%"
+        nested_like = descendant_like_pattern(dir_rel)
+        old_thumb_rel_paths = {
+            str(row["thumb_rel_path"])
+            for row in self._conn.execute(
+                """
+                SELECT thumb_rel_path
+                FROM images
+                WHERE (dir_rel = ? OR dir_rel LIKE ? ESCAPE '\\')
+                    AND thumb_rel_path IS NOT NULL
+                """,
+                (dir_rel, nested_like),
+            )
+        }
         self._conn.execute(
-            "DELETE FROM images WHERE dir_rel = ? OR dir_rel LIKE ?",
+            "DELETE FROM images WHERE dir_rel = ? OR dir_rel LIKE ? ESCAPE '\\'",
             (dir_rel, nested_like),
         )
         self._conn.execute(
-            "DELETE FROM directories WHERE dir_rel = ? OR dir_rel LIKE ?",
+            "DELETE FROM directories WHERE dir_rel = ? OR dir_rel LIKE ? ESCAPE '\\'",
             (dir_rel, nested_like),
         )
+        self._remove_unreferenced_thumbnail_files(old_thumb_rel_paths)
         parent_rel = Path(dir_rel).parent.as_posix()
         if parent_rel == ".":
             parent_rel = ""
@@ -959,16 +1332,106 @@ class Catalog:
             other_file_size_bytes=other_file_size_bytes,
         )
 
+    def prune_thumbnails(
+        self,
+        progress: ProgressCallback | None = None,
+        cancel_check: CancelCallback | None = None,
+    ) -> ThumbnailPruneResult:
+        total_row = self._conn.execute("SELECT COUNT(*) AS count FROM images").fetchone()
+        total = 0 if total_row is None else int(total_row["count"])
+        checked = 0
+        rebuilt = 0
+        stale_removed = 0
+        legacy_migrated = 0
+        errors = 0
+        last_id = 0
+
+        if progress is not None:
+            progress(0, total, "Pruning thumbnails")
+        while True:
+            rows = self._conn.execute(
+                """
+                SELECT
+                    id, rel_path, file_size_bytes, modified_at_ns, thumb_rel_path,
+                    thumb_cache_key, thumb_size_px, image_hash, thumb_blob
+                FROM images
+                WHERE id > ?
+                ORDER BY id ASC
+                LIMIT ?
+                """,
+                (last_id, PRUNE_BATCH_SIZE),
+            ).fetchall()
+            if not rows:
+                break
+            last_id = int(rows[-1]["id"])
+            stale_rel_paths: list[str] = []
+            for row in rows:
+                if cancel_check is not None:
+                    cancel_check()
+                checked += 1
+                rel_path = str(row["rel_path"])
+                if progress is not None:
+                    progress(checked, total, rel_path)
+                try:
+                    path = self.abs_path(rel_path)
+                    if not path.is_file() or not is_image_path(path):
+                        stale_rel_paths.append(rel_path)
+                        stale_removed += 1
+                        continue
+                    stat = path.stat()
+                    if (
+                        int(row["file_size_bytes"]) != stat.st_size
+                        or int(row["modified_at_ns"]) != stat.st_mtime_ns
+                        or int(row["thumb_size_px"]) != self.settings.thumbnail_native_size
+                    ):
+                        if self.index_image(rel_path, cancel_check=cancel_check) is not None:
+                            rebuilt += 1
+                        continue
+                    had_legacy_blob = row["thumb_blob"] is not None
+                    if self._ensure_existing_thumbnail_file(rel_path, path, row):
+                        if had_legacy_blob:
+                            legacy_migrated += 1
+                        continue
+                    if self.rebuild_thumbnail(rel_path) is not None:
+                        rebuilt += 1
+                except Exception as error:
+                    if cancel_check is not None:
+                        cancel_check()
+                    errors += 1
+                    self.append_log(f"Thumbnail prune error for {rel_path}: {error}", level="ERROR")
+            self._delete_db_records(stale_rel_paths)
+
+        orphan_removed = self._prune_orphan_thumbnail_files()
+        result = ThumbnailPruneResult(
+            db_rows_checked=checked,
+            thumbnails_rebuilt=rebuilt,
+            stale_db_rows_removed=stale_removed,
+            orphan_files_removed=orphan_removed,
+            legacy_blobs_migrated=legacy_migrated,
+            errors=errors,
+        )
+        self.append_log(
+            "Thumbnail prune complete: "
+            f"{checked} rows checked, {rebuilt} rebuilt, {stale_removed} stale rows removed, "
+            f"{orphan_removed} orphan files removed, {legacy_migrated} legacy blobs migrated, {errors} errors"
+        )
+        if progress is not None:
+            progress(total, total, "Thumbnail prune complete")
+        return result
+
     def rebuild_thumbnail(self, rel_path: str) -> ImageRecord | None:
+        old_thumb_rel_paths = self._thumbnail_rel_paths_for_records([rel_path])
         self._conn.execute(
             """
             UPDATE images
-            SET thumb_blob = NULL, thumb_size_px = 0
+            SET thumb_blob = NULL, thumb_rel_path = NULL, thumb_cache_key = NULL, thumb_size_px = 0
             WHERE rel_path = ?
             """,
             (rel_path,),
         )
-        return self.index_image(rel_path)
+        record = self.index_image(rel_path)
+        self._remove_unreferenced_thumbnail_files(old_thumb_rel_paths)
+        return record
 
     def _configure_connection(self) -> None:
         self._conn.execute("PRAGMA busy_timeout = 100")
@@ -1001,6 +1464,8 @@ class Catalog:
                 height INTEGER NOT NULL,
                 aspect_ratio REAL NOT NULL,
                 thumb_blob BLOB,
+                thumb_rel_path TEXT,
+                thumb_cache_key TEXT,
                 thumb_width INTEGER NOT NULL DEFAULT 0,
                 thumb_height INTEGER NOT NULL DEFAULT 0,
                 thumb_size_px INTEGER NOT NULL DEFAULT 0,
@@ -1059,6 +1524,10 @@ class Catalog:
             self._conn.execute("ALTER TABLE images ADD COLUMN modified_at_ns INTEGER NOT NULL DEFAULT 0")
         if "image_hash" not in columns:
             self._conn.execute("ALTER TABLE images ADD COLUMN image_hash TEXT")
+        if "thumb_rel_path" not in columns:
+            self._conn.execute("ALTER TABLE images ADD COLUMN thumb_rel_path TEXT")
+        if "thumb_cache_key" not in columns:
+            self._conn.execute("ALTER TABLE images ADD COLUMN thumb_cache_key TEXT")
         self._conn.execute(
             """
             UPDATE images
@@ -1089,6 +1558,12 @@ class Catalog:
             """
             CREATE INDEX IF NOT EXISTS idx_images_hash
                 ON images(image_hash)
+            """
+        )
+        self._conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_images_thumb_rel_path
+                ON images(thumb_rel_path)
             """
         )
 
@@ -1144,6 +1619,84 @@ class Catalog:
         if process.returncode not in (0, None):
             raise OSError(f"command failed: {' '.join(command)}")
         return stdout
+
+    def _discover_directories_subprocess(
+        self,
+        progress: ProgressCallback | None,
+        cancel_check: CancelCallback | None = None,
+    ) -> int:
+        process = subprocess.Popen(
+            ["find", ".", "-path", "./.marnwick", "-prune", "-o", "-type", "d", "-print0"],
+            cwd=self.root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        if process.stdout is None:
+            process.kill()
+            raise OSError("find did not provide stdout")
+        count = 0
+        buffer = b""
+        try:
+            while True:
+                if cancel_check is not None:
+                    cancel_check()
+                chunk = process.stdout.read1(64 * 1024)
+                if not chunk:
+                    break
+                buffer += chunk
+                parts = buffer.split(b"\0")
+                buffer = parts.pop()
+                for raw_path in parts:
+                    dir_rel = self._find_display_path_to_dir_rel(raw_path)
+                    if dir_rel is None:
+                        continue
+                    self._remember_directory(dir_rel)
+                    count += 1
+                    if progress is not None and count % SCAN_PROGRESS_INTERVAL == 0:
+                        progress(count, None, dir_rel or self.root.name or str(self.root))
+            if buffer:
+                dir_rel = self._find_display_path_to_dir_rel(buffer)
+                if dir_rel is not None:
+                    self._remember_directory(dir_rel)
+                    count += 1
+            process.stdout.close()
+            return_code = process.wait()
+        except BaseException:
+            process.kill()
+            process.wait()
+            raise
+        if return_code not in (0, None):
+            raise OSError("directory discovery command failed")
+        return count
+
+    def _discover_directories_python(
+        self,
+        progress: ProgressCallback | None,
+        cancel_check: CancelCallback | None = None,
+    ) -> int:
+        count = 0
+        for dirpath, dirnames, _ in os.walk(self.root):
+            if cancel_check is not None:
+                cancel_check()
+            dirnames[:] = [name for name in dirnames if name != ".marnwick"]
+            current = Path(dirpath)
+            dir_rel = "" if current == self.root else self.rel_path(current)
+            self._remember_directory(dir_rel)
+            count += 1
+            if progress is not None and count % SCAN_PROGRESS_INTERVAL == 0:
+                progress(count, None, dir_rel or self.root.name or str(self.root))
+        return count
+
+    def _find_display_path_to_dir_rel(self, display_path: bytes | str) -> str | None:
+        if isinstance(display_path, bytes):
+            display_path = display_path.decode("utf-8", errors="surrogateescape")
+        if display_path in {"", "."}:
+            return ""
+        prefix = "./"
+        rel = display_path[len(prefix) :] if display_path.startswith(prefix) else display_path
+        if rel == ".marnwick" or rel.startswith(".marnwick/"):
+            return None
+        return Path(rel).as_posix()
 
     def _directory_find_hash_subprocess(
         self,
@@ -1345,7 +1898,11 @@ class Catalog:
             return width, height, out.getvalue(), thumb.width, thumb.height
 
     def _fast_image_hash(self, path: Path, cancel_check: CancelCallback | None = None) -> str:
+        return self._image_file_hashes(path, cancel_check)[0]
+
+    def _image_file_hashes(self, path: Path, cancel_check: CancelCallback | None = None) -> tuple[str, str]:
         checksum = 0
+        digest = hashlib.sha256()
         with path.open("rb") as handle:
             while True:
                 if cancel_check is not None:
@@ -1354,7 +1911,8 @@ class Catalog:
                 if not chunk:
                     break
                 checksum = zlib.crc32(chunk, checksum)
-        return f"{checksum & 0xFFFFFFFF:08x}"
+                digest.update(chunk)
+        return f"{checksum & 0xFFFFFFFF:08x}", digest.hexdigest()
 
     def _update_file_identity(
         self,
@@ -1362,26 +1920,35 @@ class Catalog:
         file_size_bytes: int,
         modified_at_ns: int,
         image_hash: str,
+        *,
+        thumb_cache_key: str | None = None,
     ) -> None:
-        self._conn.execute(
-            """
-            UPDATE images
-            SET
+        assignments = """
                 size_bytes = ?,
                 file_size_bytes = ?,
                 mtime_ns = ?,
                 modified_at_ns = ?,
                 image_hash = ?
+        """
+        params: list[object] = [
+            file_size_bytes,
+            file_size_bytes,
+            modified_at_ns,
+            modified_at_ns,
+            image_hash,
+        ]
+        if thumb_cache_key is not None:
+            assignments += ",\n                thumb_cache_key = ?"
+            params.append(thumb_cache_key)
+        params.append(rel_path)
+        self._conn.execute(
+            f"""
+            UPDATE images
+            SET
+{assignments}
             WHERE rel_path = ?
             """,
-            (
-                file_size_bytes,
-                file_size_bytes,
-                modified_at_ns,
-                modified_at_ns,
-                image_hash,
-                rel_path,
-            ),
+            params,
         )
 
     def _image_columns(self, include_blob: bool) -> str:
@@ -1389,7 +1956,7 @@ class Catalog:
         return (
             "id, rel_path, dir_rel, filename, file_size_bytes AS size_bytes, "
             "modified_at_ns AS mtime_ns, width, height, aspect_ratio, thumb_width, "
-            f"thumb_height, image_hash, {thumb_column}"
+            f"thumb_height, image_hash, thumb_rel_path, thumb_cache_key, thumb_size_px, {thumb_column}"
         )
 
     def _row_to_record(self, row: sqlite3.Row, *, include_blob: bool) -> ImageRecord:
@@ -1406,27 +1973,48 @@ class Catalog:
             aspect_ratio=float(row["aspect_ratio"]),
             thumb_width=int(row["thumb_width"]),
             thumb_height=int(row["thumb_height"]),
-            thumb_blob=bytes(row["thumb_blob"]) if include_blob and row["thumb_blob"] is not None else None,
+            thumb_blob=self._thumbnail_blob_for_row(row, str(row["rel_path"])) if include_blob else None,
             image_hash=str(row["image_hash"]) if row["image_hash"] is not None else None,
         )
 
     def _delete_db_records(self, rel_paths: Iterable[str]) -> None:
+        rel_paths = list(rel_paths)
+        old_thumb_rel_paths = self._thumbnail_rel_paths_for_records(rel_paths)
         self._conn.executemany("DELETE FROM images WHERE rel_path = ?", [(rel_path,) for rel_path in rel_paths])
+        self._remove_unreferenced_thumbnail_files(old_thumb_rel_paths)
 
     def _delete_directory_records(self, dir_rel: str) -> None:
-        nested_like = f"{dir_rel}/%" if dir_rel else "%"
+        nested_like = descendant_like_pattern(dir_rel)
         if dir_rel:
+            old_thumb_rel_paths = {
+                str(row["thumb_rel_path"])
+                for row in self._conn.execute(
+                    """
+                    SELECT thumb_rel_path
+                    FROM images
+                    WHERE (dir_rel = ? OR dir_rel LIKE ? ESCAPE '\\')
+                        AND thumb_rel_path IS NOT NULL
+                    """,
+                    (dir_rel, nested_like),
+                )
+            }
             self._conn.execute(
-                "DELETE FROM images WHERE dir_rel = ? OR dir_rel LIKE ?",
+                "DELETE FROM images WHERE dir_rel = ? OR dir_rel LIKE ? ESCAPE '\\'",
                 (dir_rel, nested_like),
             )
             self._conn.execute(
-                "DELETE FROM directories WHERE dir_rel = ? OR dir_rel LIKE ?",
+                "DELETE FROM directories WHERE dir_rel = ? OR dir_rel LIKE ? ESCAPE '\\'",
                 (dir_rel, nested_like),
             )
+            self._remove_unreferenced_thumbnail_files(old_thumb_rel_paths)
             return
+        old_thumb_rel_paths = {
+            str(row["thumb_rel_path"])
+            for row in self._conn.execute("SELECT thumb_rel_path FROM images WHERE thumb_rel_path IS NOT NULL")
+        }
         self._conn.execute("DELETE FROM images")
         self._conn.execute("DELETE FROM directories WHERE dir_rel != ''")
+        self._remove_unreferenced_thumbnail_files(old_thumb_rel_paths)
 
     def _delete_missing_child_directories(self, parent_dir_rel: str, child_dirs: Sequence[str]) -> None:
         known_children = set(self._direct_child_directories(parent_dir_rel))
@@ -1476,18 +2064,19 @@ class Catalog:
 
     def _move_directory_records_in_place(self, source_dir_rel: str, dest_dir_rel: str) -> None:
         self._delete_directory_records(dest_dir_rel)
+        nested_like = descendant_like_pattern(source_dir_rel)
         directory_rows = [
             str(row["dir_rel"])
             for row in self._conn.execute(
-                "SELECT dir_rel FROM directories WHERE dir_rel = ? OR dir_rel LIKE ?",
-                (source_dir_rel, f"{source_dir_rel}/%"),
+                "SELECT dir_rel FROM directories WHERE dir_rel = ? OR dir_rel LIKE ? ESCAPE '\\'",
+                (source_dir_rel, nested_like),
             )
         ]
         image_rows = [
             str(row["rel_path"])
             for row in self._conn.execute(
-                "SELECT rel_path FROM images WHERE rel_path = ? OR rel_path LIKE ?",
-                (source_dir_rel, f"{source_dir_rel}/%"),
+                "SELECT rel_path FROM images WHERE rel_path = ? OR rel_path LIKE ? ESCAPE '\\'",
+                (source_dir_rel, nested_like),
             )
         ]
         for old_dir_rel in sorted(directory_rows, key=len, reverse=True):
@@ -1511,11 +2100,12 @@ class Catalog:
 
     def _transfer_directory_records(self, source_dir_rel: str, dest_dir_rel: str, dest_catalog: "Catalog") -> None:
         dest_catalog._delete_directory_records(dest_dir_rel)
+        nested_like = descendant_like_pattern(source_dir_rel)
         directory_rows = [
             str(row["dir_rel"])
             for row in self._conn.execute(
-                "SELECT dir_rel FROM directories WHERE dir_rel = ? OR dir_rel LIKE ?",
-                (source_dir_rel, f"{source_dir_rel}/%"),
+                "SELECT dir_rel FROM directories WHERE dir_rel = ? OR dir_rel LIKE ? ESCAPE '\\'",
+                (source_dir_rel, nested_like),
             )
         ]
         if source_dir_rel not in directory_rows:
@@ -1524,13 +2114,18 @@ class Catalog:
             new_dir_rel = self._replace_prefix(old_dir_rel, source_dir_rel, dest_dir_rel)
             dest_catalog._remember_directory(new_dir_rel)
         rows = self._conn.execute(
-            "SELECT * FROM images WHERE rel_path = ? OR rel_path LIKE ?",
-            (source_dir_rel, f"{source_dir_rel}/%"),
+            "SELECT * FROM images WHERE rel_path = ? OR rel_path LIKE ? ESCAPE '\\'",
+            (source_dir_rel, nested_like),
         ).fetchall()
         for row in rows:
             old_rel_path = str(row["rel_path"])
             new_rel_path = self._replace_prefix(old_rel_path, source_dir_rel, dest_dir_rel)
-            dest_catalog._insert_transferred_image_row(row, new_rel_path, self.get_image_tags(old_rel_path))
+            dest_catalog._insert_transferred_image_row(
+                row,
+                new_rel_path,
+                self.get_image_tags(old_rel_path),
+                source_catalog=self,
+            )
         self._delete_directory_records(source_dir_rel)
 
     def _transfer_db_record(self, source_rel_path: str, dest_rel_path: str, dest_catalog: "Catalog") -> None:
@@ -1540,7 +2135,7 @@ class Catalog:
             dest_catalog.index_image(dest_rel_path)
             self._delete_db_records([source_rel_path])
             return
-        dest_catalog._insert_transferred_image_row(row, dest_rel_path, tag_names)
+        dest_catalog._insert_transferred_image_row(row, dest_rel_path, tag_names, source_catalog=self)
         self._delete_db_records([source_rel_path])
 
     def _insert_transferred_image_row(
@@ -1548,10 +2143,21 @@ class Catalog:
         row: sqlite3.Row,
         dest_rel_path: str,
         tag_names: Sequence[str],
+        *,
+        source_catalog: "Catalog | None" = None,
     ) -> None:
         dest_path = self.abs_path(dest_rel_path)
         stat = dest_path.stat()
-        image_hash = row["image_hash"] or self._fast_image_hash(dest_path)
+        image_hash = row["image_hash"]
+        thumb_cache_key = row["thumb_cache_key"]
+        if not image_hash or not thumb_cache_key:
+            image_hash, thumb_cache_key = self._image_file_hashes(dest_path)
+        thumb_rel_path, thumb_width, thumb_height, thumb_size_px = self._thumbnail_for_transfer(
+            row,
+            dest_path,
+            source_catalog,
+            str(thumb_cache_key),
+        )
         dir_rel = Path(dest_rel_path).parent.as_posix()
         if dir_rel == ".":
             dir_rel = ""
@@ -1560,10 +2166,10 @@ class Catalog:
             INSERT INTO images (
                 rel_path, dir_rel, filename, size_bytes, file_size_bytes,
                 mtime_ns, modified_at_ns, image_hash, width, height,
-                aspect_ratio, thumb_blob, thumb_width, thumb_height, thumb_size_px,
-                indexed_at_ns
+                aspect_ratio, thumb_blob, thumb_rel_path, thumb_cache_key,
+                thumb_width, thumb_height, thumb_size_px, indexed_at_ns
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(rel_path) DO UPDATE SET
                 dir_rel = excluded.dir_rel,
                 filename = excluded.filename,
@@ -1576,6 +2182,8 @@ class Catalog:
                 height = excluded.height,
                 aspect_ratio = excluded.aspect_ratio,
                 thumb_blob = excluded.thumb_blob,
+                thumb_rel_path = excluded.thumb_rel_path,
+                thumb_cache_key = excluded.thumb_cache_key,
                 thumb_width = excluded.thumb_width,
                 thumb_height = excluded.thumb_height,
                 thumb_size_px = excluded.thumb_size_px,
@@ -1593,15 +2201,45 @@ class Catalog:
                 int(row["width"]),
                 int(row["height"]),
                 float(row["aspect_ratio"]),
-                row["thumb_blob"],
-                int(row["thumb_width"]),
-                int(row["thumb_height"]),
-                int(row["thumb_size_px"]),
+                None,
+                thumb_rel_path,
+                thumb_cache_key,
+                thumb_width,
+                thumb_height,
+                thumb_size_px,
                 time.time_ns(),
             ),
         )
         if tag_names:
             self.set_image_tags(dest_rel_path, tag_names, replace=False)
+
+    def _thumbnail_for_transfer(
+        self,
+        row: sqlite3.Row,
+        dest_path: Path,
+        source_catalog: "Catalog | None",
+        thumb_cache_key: str,
+    ) -> tuple[str, int, int, int]:
+        desired_size = self.settings.thumbnail_native_size
+        source_size = int(row["thumb_size_px"] or desired_size)
+        source_thumb_rel_path = row["thumb_rel_path"]
+        if source_size == desired_size and source_catalog is not None and source_thumb_rel_path:
+            try:
+                source_thumbnail = source_catalog.thumbnail_abs_path(str(source_thumb_rel_path))
+                thumb_rel_path = self._write_thumbnail_file(
+                    thumb_cache_key,
+                    desired_size,
+                    source_thumbnail.read_bytes(),
+                )
+                return thumb_rel_path, int(row["thumb_width"]), int(row["thumb_height"]), desired_size
+            except (OSError, ValueError):
+                pass
+        if source_size == desired_size and row["thumb_blob"] is not None:
+            thumb_rel_path = self._write_thumbnail_file(thumb_cache_key, desired_size, bytes(row["thumb_blob"]))
+            return thumb_rel_path, int(row["thumb_width"]), int(row["thumb_height"]), desired_size
+        _, _, thumb_blob, thumb_width, thumb_height = self._read_image_metadata_and_thumbnail(dest_path)
+        thumb_rel_path = self._write_thumbnail_file(thumb_cache_key, desired_size, thumb_blob)
+        return thumb_rel_path, thumb_width, thumb_height, desired_size
 
     def _replace_prefix(self, value: str, source_prefix: str, dest_prefix: str) -> str:
         if value == source_prefix:
@@ -1612,9 +2250,10 @@ class Catalog:
         return f"{dest_prefix}/{suffix}" if dest_prefix else suffix
 
     def _directory_and_descendants(self, dir_rel: str) -> list[str]:
+        nested_like = descendant_like_pattern(dir_rel)
         rows = self._conn.execute(
-            "SELECT dir_rel FROM directories WHERE dir_rel = ? OR dir_rel LIKE ?",
-            (dir_rel, f"{dir_rel}/%"),
+            "SELECT dir_rel FROM directories WHERE dir_rel = ? OR dir_rel LIKE ? ESCAPE '\\'",
+            (dir_rel, nested_like),
         )
         dirs = {dir_rel}
         dirs.update(str(row["dir_rel"]) for row in rows)

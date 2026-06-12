@@ -7,7 +7,8 @@ from pathlib import Path
 
 from PIL import Image
 
-from marnwick.catalog import Catalog, parse_tag_entry
+import marnwick.catalog as catalog_module
+from marnwick.catalog import MAX_LOG_BYTES, Catalog, parse_tag_entry
 from marnwick.models import CatalogSettings, SortOrder
 
 
@@ -23,6 +24,46 @@ def test_catalog_state_is_created_inside_catalog_root(tmp_path: Path) -> None:
         assert catalog.db_path.exists()
         assert catalog.settings.thumbnail_native_size == 128
         assert catalog.list_directories() == [""]
+
+
+def test_catalog_log_is_stored_inside_state_dir_and_limited(tmp_path: Path) -> None:
+    root = tmp_path / "catalog"
+    with Catalog(root) as catalog:
+        assert catalog.log_path == root / ".marnwick" / "marnwick.log"
+
+        for index in range(1300):
+            catalog.append_log(f"log entry {index:04d} {'x' * 1000}")
+
+        lines = catalog.read_log_lines()
+
+        assert catalog.log_path.stat().st_size <= MAX_LOG_BYTES
+        assert any("log entry 1299" in line for line in lines)
+        assert not any("log entry 0000" in line for line in lines)
+
+
+def test_discover_directories_remembers_tree_without_indexing_images(tmp_path: Path) -> None:
+    root = tmp_path / "catalog"
+    (root / "one" / "two").mkdir(parents=True)
+    make_image(root / "one" / "two" / "image.jpg")
+
+    with Catalog(root) as catalog:
+        count = catalog.discover_directories()
+
+        assert count == 3
+        assert catalog.list_known_directories() == ["", "one", "one/two"]
+        assert catalog.list_images("one/two") == []
+        assert any("Folder discovery complete" in line for line in catalog.read_log_lines())
+
+
+def test_discover_directories_preserves_whitespace_directory_names(tmp_path: Path) -> None:
+    root = tmp_path / "catalog"
+    (root / "space " / "line\nbreak").mkdir(parents=True)
+
+    with Catalog(root) as catalog:
+        catalog.discover_directories()
+
+        assert "space " in catalog.list_known_directories()
+        assert "space /line\nbreak" in catalog.list_known_directories()
 
 
 def test_changing_native_thumbnail_size_rebuilds_thumbnail_on_next_index(tmp_path: Path) -> None:
@@ -60,6 +101,27 @@ def test_refresh_indexes_images_with_relative_paths_and_thumbnails(tmp_path: Pat
         assert records[0].thumb_width <= 96
         assert records[0].thumb_height <= 96
         assert catalog.list_known_directories() == ["", "set-a"]
+
+
+def test_indexing_stores_thumbnail_as_file_not_database_blob(tmp_path: Path) -> None:
+    root = tmp_path / "catalog"
+    make_image(root / "set-a" / "wide.jpg", (640, 320))
+
+    with Catalog(root, CatalogSettings(thumbnail_native_size=96)) as catalog:
+        catalog.refresh()
+        record = catalog.get_image("set-a/wide.jpg")
+        row = catalog._conn.execute(
+            "SELECT thumb_blob, thumb_rel_path, thumb_cache_key FROM images WHERE rel_path = ?",
+            ("set-a/wide.jpg",),
+        ).fetchone()
+
+        assert record is not None
+        assert record.thumb_blob
+        assert row["thumb_blob"] is None
+        assert row["thumb_rel_path"]
+        assert row["thumb_cache_key"]
+        assert catalog.thumbnail_abs_path(row["thumb_rel_path"]).is_file()
+        assert catalog.get_thumbnail_blob("set-a/wide.jpg") == record.thumb_blob
 
 
 def test_metadata_listing_does_not_load_thumbnail_blobs(tmp_path: Path) -> None:
@@ -221,6 +283,57 @@ def test_directory_refresh_reindexes_when_directory_hash_changes(tmp_path: Path)
 
         assert catalog.refresh_directory("set-a", force=False)
         assert catalog.get_image("set-a/new.jpg") is not None
+
+
+def test_rebuild_thumbnail_replaces_unreferenced_thumbnail_file(tmp_path: Path) -> None:
+    root = tmp_path / "catalog"
+    make_image(root / "image.jpg", (120, 80), (10, 20, 30))
+
+    with Catalog(root) as catalog:
+        catalog.refresh()
+        old_row = catalog._conn.execute(
+            "SELECT thumb_rel_path FROM images WHERE rel_path = ?",
+            ("image.jpg",),
+        ).fetchone()
+        old_thumb_path = catalog.thumbnail_abs_path(old_row["thumb_rel_path"])
+        assert old_thumb_path.is_file()
+
+        make_image(root / "image.jpg", (80, 120), (200, 20, 30))
+        after = catalog.rebuild_thumbnail("image.jpg")
+        new_row = catalog._conn.execute(
+            "SELECT thumb_rel_path FROM images WHERE rel_path = ?",
+            ("image.jpg",),
+        ).fetchone()
+
+        assert after is not None
+        assert new_row["thumb_rel_path"] != old_row["thumb_rel_path"]
+        assert catalog.thumbnail_abs_path(new_row["thumb_rel_path"]).is_file()
+        assert not old_thumb_path.exists()
+
+
+def test_refresh_continues_after_single_file_indexing_error(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "catalog"
+    make_image(root / "bad.jpg", (120, 80))
+    make_image(root / "good.jpg", (120, 80))
+
+    with Catalog(root) as catalog:
+        original_index_image = catalog.index_image
+
+        def index_image(rel_path: str, cancel_check=None):  # type: ignore[no-untyped-def]
+            if rel_path == "bad.jpg":
+                raise RuntimeError("decoder failed")
+            return original_index_image(rel_path, cancel_check=cancel_check)
+
+        monkeypatch.setattr(catalog, "index_image", index_image)
+
+        assert catalog.refresh_directory("")
+
+        assert catalog.get_image("good.jpg") is not None
+        assert catalog.get_image("bad.jpg") is None
+        assert any(
+            "ERROR Indexing error for bad.jpg: decoder failed" in line
+            for line in catalog.read_log_lines()
+        )
 
 
 def test_skip_check_refreshes_when_find_hash_changes(tmp_path: Path) -> None:
@@ -386,9 +499,17 @@ def test_same_catalog_move_updates_database_record_without_rebuilding_thumbnail(
         catalog.save_catalog_find_hash()
         before = catalog.get_image("incoming/image.jpg")
         assert before is not None
+        before_row = catalog._conn.execute(
+            "SELECT thumb_rel_path FROM images WHERE rel_path = ?",
+            ("incoming/image.jpg",),
+        ).fetchone()
 
         results = catalog.move_images(["incoming/image.jpg"], catalog, "sorted")
         after = catalog.get_image(results[0].dest_rel_path)
+        after_row = catalog._conn.execute(
+            "SELECT thumb_rel_path FROM images WHERE rel_path = ?",
+            ("sorted/image.jpg",),
+        ).fetchone()
 
         assert results[0].dest_rel_path == "sorted/image.jpg"
         assert not (root / "incoming" / "image.jpg").exists()
@@ -396,6 +517,7 @@ def test_same_catalog_move_updates_database_record_without_rebuilding_thumbnail(
         assert after is not None
         assert after.id == before.id
         assert after.thumb_blob == before.thumb_blob
+        assert after_row["thumb_rel_path"] == before_row["thumb_rel_path"]
         assert catalog.directory_hash_matches("incoming")
         assert catalog.directory_hash_matches("sorted")
         assert catalog.catalog_refresh_is_current()
@@ -415,6 +537,24 @@ def test_move_uses_unique_destination_when_name_exists(tmp_path: Path) -> None:
         assert (root / "dest" / "image (1).jpg").exists()
 
 
+def test_same_catalog_directory_move_treats_like_wildcards_as_literal_names(tmp_path: Path) -> None:
+    root = tmp_path / "catalog"
+    make_image(root / "a_b" / "nested" / "image.jpg", (100, 80), (20, 20, 20))
+    make_image(root / "axb" / "nested" / "image.jpg", (100, 80), (200, 200, 200))
+
+    with Catalog(root) as catalog:
+        catalog.refresh()
+        catalog.set_image_tags("axb/nested/image.jpg", ["Keep"], replace=True)
+
+        results = catalog.move_directories(["a_b"], catalog, "sorted")
+
+        assert results[0].dest_rel_path == "sorted/a_b"
+        assert catalog.get_image("sorted/a_b/nested/image.jpg") is not None
+        assert catalog.get_image("axb/nested/image.jpg") is not None
+        assert catalog.get_image("sorted/axb/nested/image.jpg") is None
+        assert catalog.get_image_tags("axb/nested/image.jpg") == ["Keep"]
+
+
 def test_cross_catalog_move_purges_source_and_preserves_tags_and_thumbnail(tmp_path: Path) -> None:
     source_root = tmp_path / "source"
     dest_root = tmp_path / "dest"
@@ -428,19 +568,59 @@ def test_cross_catalog_move_purges_source_and_preserves_tags_and_thumbnail(tmp_p
         source.set_image_tags("set/image.jpg", ["Keep"], replace=True)
         before = source.get_image("set/image.jpg")
         assert before is not None
+        source_thumb_row = source._conn.execute(
+            "SELECT thumb_rel_path FROM images WHERE rel_path = ?",
+            ("set/image.jpg",),
+        ).fetchone()
+        source_thumb_path = source.thumbnail_abs_path(source_thumb_row["thumb_rel_path"])
 
         results = source.move_images(["set/image.jpg"], dest, "new-set")
         moved = dest.get_image(results[0].dest_rel_path)
+        dest_thumb_row = dest._conn.execute(
+            "SELECT thumb_rel_path FROM images WHERE rel_path = ?",
+            ("new-set/image.jpg",),
+        ).fetchone()
 
         assert source.get_image("set/image.jpg") is None
         assert moved is not None
         assert moved.thumb_blob == before.thumb_blob
+        assert dest.thumbnail_abs_path(dest_thumb_row["thumb_rel_path"]).is_file()
+        assert not source_thumb_path.exists()
         assert dest.get_image_tags("new-set/image.jpg") == ["Keep"]
         assert (dest_root / "new-set" / "image.jpg").exists()
         assert source.directory_hash_matches("set")
         assert dest.directory_hash_matches("new-set")
         assert source.catalog_refresh_is_current()
         assert dest.catalog_refresh_is_current()
+
+
+def test_cross_catalog_move_rebuilds_thumbnail_for_destination_native_size(tmp_path: Path) -> None:
+    source_root = tmp_path / "source"
+    dest_root = tmp_path / "dest"
+    make_image(source_root / "set" / "image.jpg", (640, 480))
+
+    with (
+        Catalog(source_root, CatalogSettings(thumbnail_native_size=96)) as source,
+        Catalog(dest_root, CatalogSettings(thumbnail_native_size=192)) as dest,
+    ):
+        source.refresh()
+        dest.refresh()
+
+        results = source.move_images(["set/image.jpg"], dest, "new-set")
+        row = dest._conn.execute(
+            """
+            SELECT thumb_rel_path, thumb_size_px, thumb_width, thumb_height
+            FROM images
+            WHERE rel_path = ?
+            """,
+            (results[0].dest_rel_path,),
+        ).fetchone()
+
+        assert row["thumb_size_px"] == 192
+        assert "/192/" in row["thumb_rel_path"]
+        assert row["thumb_width"] <= 192
+        assert row["thumb_height"] <= 192
+        assert dest.thumbnail_abs_path(row["thumb_rel_path"]).is_file()
 
 
 def test_same_catalog_directory_move_rewrites_nested_database_records(tmp_path: Path) -> None:
@@ -452,9 +632,17 @@ def test_same_catalog_directory_move_rewrites_nested_database_records(tmp_path: 
         catalog.save_catalog_find_hash()
         before = catalog.get_image("set/nested/image.jpg")
         assert before is not None
+        before_row = catalog._conn.execute(
+            "SELECT thumb_rel_path FROM images WHERE rel_path = ?",
+            ("set/nested/image.jpg",),
+        ).fetchone()
 
         results = catalog.move_directories(["set"], catalog, "sorted")
         after = catalog.get_image("sorted/set/nested/image.jpg")
+        after_row = catalog._conn.execute(
+            "SELECT thumb_rel_path FROM images WHERE rel_path = ?",
+            ("sorted/set/nested/image.jpg",),
+        ).fetchone()
 
         assert results[0].dest_rel_path == "sorted/set"
         assert not (root / "set").exists()
@@ -462,6 +650,7 @@ def test_same_catalog_directory_move_rewrites_nested_database_records(tmp_path: 
         assert after is not None
         assert after.id == before.id
         assert after.thumb_blob == before.thumb_blob
+        assert after_row["thumb_rel_path"] == before_row["thumb_rel_path"]
         assert catalog.directory_hash_matches("sorted/set")
         assert catalog.catalog_refresh_is_current()
 
@@ -479,18 +668,58 @@ def test_cross_catalog_directory_move_preserves_nested_tags_and_thumbnails(tmp_p
         source.set_image_tags("set/nested/image.jpg", ["Keep"], replace=True)
         before = source.get_image("set/nested/image.jpg")
         assert before is not None
+        source_thumb_row = source._conn.execute(
+            "SELECT thumb_rel_path FROM images WHERE rel_path = ?",
+            ("set/nested/image.jpg",),
+        ).fetchone()
+        source_thumb_path = source.thumbnail_abs_path(source_thumb_row["thumb_rel_path"])
 
         results = source.move_directories(["set"], dest, "target")
         moved = dest.get_image("target/set/nested/image.jpg")
+        dest_thumb_row = dest._conn.execute(
+            "SELECT thumb_rel_path FROM images WHERE rel_path = ?",
+            ("target/set/nested/image.jpg",),
+        ).fetchone()
 
         assert results[0].dest_rel_path == "target/set"
         assert source.get_image("set/nested/image.jpg") is None
         assert moved is not None
         assert moved.thumb_blob == before.thumb_blob
+        assert dest.thumbnail_abs_path(dest_thumb_row["thumb_rel_path"]).is_file()
+        assert not source_thumb_path.exists()
         assert dest.get_image_tags("target/set/nested/image.jpg") == ["Keep"]
         assert (dest_root / "target" / "set" / "nested" / "image.jpg").exists()
         assert source.catalog_refresh_is_current()
         assert dest.catalog_refresh_is_current()
+
+
+def test_cross_catalog_directory_move_rebuilds_thumbnail_for_destination_native_size(tmp_path: Path) -> None:
+    source_root = tmp_path / "source"
+    dest_root = tmp_path / "dest"
+    make_image(source_root / "set" / "nested" / "image.jpg", (640, 480))
+
+    with (
+        Catalog(source_root, CatalogSettings(thumbnail_native_size=96)) as source,
+        Catalog(dest_root, CatalogSettings(thumbnail_native_size=192)) as dest,
+    ):
+        source.refresh()
+        dest.refresh()
+
+        source.move_directories(["set"], dest, "target")
+        row = dest._conn.execute(
+            """
+            SELECT thumb_rel_path, thumb_size_px, thumb_width, thumb_height
+            FROM images
+            WHERE rel_path = ?
+            """,
+            ("target/set/nested/image.jpg",),
+        ).fetchone()
+
+        assert row["thumb_size_px"] == 192
+        assert "/192/" in row["thumb_rel_path"]
+        assert row["thumb_width"] <= 192
+        assert row["thumb_height"] <= 192
+        assert dest.thumbnail_abs_path(row["thumb_rel_path"]).is_file()
 
 
 def test_cross_filesystem_move_copies_then_wipes_source(tmp_path: Path, monkeypatch) -> None:
@@ -530,9 +759,97 @@ def test_delete_removes_files_and_database_rows(tmp_path: Path) -> None:
 
     with Catalog(root) as catalog:
         catalog.refresh()
+        thumb_row = catalog._conn.execute(
+            "SELECT thumb_rel_path FROM images WHERE rel_path = ?",
+            ("one.jpg",),
+        ).fetchone()
+        one_thumb_path = catalog.thumbnail_abs_path(thumb_row["thumb_rel_path"])
+        assert one_thumb_path.is_file()
+
         assert catalog.delete_images(["one.jpg", "two.jpg"]) == 2
+
         assert not (root / "one.jpg").exists()
+        assert not one_thumb_path.exists()
         assert catalog.list_images("") == []
+
+
+def test_delete_images_chunks_thumbnail_lookup_for_sqlite_variable_limit(tmp_path: Path) -> None:
+    root = tmp_path / "catalog"
+    rel_paths = [f"bulk/{index:03}.jpg" for index in range(60)]
+    for rel_path in rel_paths:
+        make_image(root / rel_path, (32, 24))
+
+    with Catalog(root) as catalog:
+        catalog.refresh()
+        previous_limit = catalog._conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 50)
+        try:
+            assert catalog.delete_images(rel_paths) == len(rel_paths)
+        finally:
+            catalog._conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, previous_limit)
+
+        assert catalog.list_images("bulk") == []
+        assert not any(path.is_file() for path in catalog.thumbnail_dir.rglob("*"))
+
+
+def test_prune_thumbnails_repairs_cache_drift(tmp_path: Path) -> None:
+    root = tmp_path / "catalog"
+    make_image(root / "keep.jpg", (120, 90), (20, 40, 60))
+    make_image(root / "deleted.jpg", (90, 120), (80, 40, 20))
+
+    with Catalog(root, CatalogSettings(thumbnail_native_size=96)) as catalog:
+        catalog.refresh()
+        keep_row = catalog._conn.execute(
+            "SELECT thumb_rel_path FROM images WHERE rel_path = ?",
+            ("keep.jpg",),
+        ).fetchone()
+        keep_thumb_path = catalog.thumbnail_abs_path(keep_row["thumb_rel_path"])
+        keep_thumb_path.unlink()
+        orphan_path = catalog.thumbnail_dir / "96" / "ff" / "ee" / "orphan.jpg"
+        orphan_path.parent.mkdir(parents=True)
+        orphan_path.write_bytes(b"orphan")
+        (root / "deleted.jpg").unlink()
+
+        result = catalog.prune_thumbnails()
+        repaired_row = catalog._conn.execute(
+            "SELECT thumb_rel_path FROM images WHERE rel_path = ?",
+            ("keep.jpg",),
+        ).fetchone()
+
+        assert result.db_rows_checked == 2
+        assert result.thumbnails_rebuilt == 1
+        assert result.stale_db_rows_removed == 1
+        assert result.orphan_files_removed >= 1
+        assert result.errors == 0
+        assert repaired_row is not None
+        assert catalog.thumbnail_abs_path(repaired_row["thumb_rel_path"]).is_file()
+        assert catalog.get_image("deleted.jpg") is None
+        assert not orphan_path.exists()
+        assert any("Thumbnail prune complete" in line for line in catalog.read_log_lines())
+
+
+def test_prune_thumbnails_processes_database_rows_in_batches(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "catalog"
+    for index in range(5):
+        make_image(root / f"image-{index}.jpg", (120, 90), (20 + index, 40, 60))
+
+    monkeypatch.setattr(catalog_module, "PRUNE_BATCH_SIZE", 2)
+    with Catalog(root, CatalogSettings(thumbnail_native_size=96)) as catalog:
+        catalog.refresh()
+        stale_thumb_row = catalog._conn.execute(
+            "SELECT thumb_rel_path FROM images WHERE rel_path = ?",
+            ("image-1.jpg",),
+        ).fetchone()
+        catalog.thumbnail_abs_path(stale_thumb_row["thumb_rel_path"]).unlink()
+        (root / "image-4.jpg").unlink()
+
+        result = catalog.prune_thumbnails()
+
+        assert result.db_rows_checked == 5
+        assert result.thumbnails_rebuilt == 1
+        assert result.stale_db_rows_removed == 1
+        assert catalog.get_image("image-1.jpg") is not None
+        assert catalog.get_thumbnail_blob("image-1.jpg")
+        assert catalog.get_image("image-4.jpg") is None
 
 
 def test_delete_images_can_wipe_files(tmp_path: Path, monkeypatch) -> None:
@@ -585,6 +902,30 @@ def test_create_delete_directory_and_summary(tmp_path: Path) -> None:
         assert not (root / "set").exists()
         assert catalog.get_image("set/one.jpg") is None
         assert "set" not in catalog.list_known_directories()
+
+
+def test_delete_directory_treats_like_wildcards_as_literal_names(tmp_path: Path) -> None:
+    root = tmp_path / "catalog"
+    make_image(root / "a_b" / "image.jpg", (100, 80), (20, 20, 20))
+    make_image(root / "axb" / "image.jpg", (100, 80), (200, 200, 200))
+
+    with Catalog(root) as catalog:
+        catalog.refresh()
+        catalog.set_image_tags("axb/image.jpg", ["Keep"], replace=True)
+        axb_thumb_row = catalog._conn.execute(
+            "SELECT thumb_rel_path FROM images WHERE rel_path = ?",
+            ("axb/image.jpg",),
+        ).fetchone()
+        axb_thumb_path = catalog.thumbnail_abs_path(axb_thumb_row["thumb_rel_path"])
+
+        catalog.delete_directory("a_b")
+
+        assert not (root / "a_b").exists()
+        assert (root / "axb" / "image.jpg").exists()
+        assert catalog.get_image("a_b/image.jpg") is None
+        assert catalog.get_image("axb/image.jpg") is not None
+        assert catalog.get_image_tags("axb/image.jpg") == ["Keep"]
+        assert axb_thumb_path.is_file()
 
 
 def test_list_images_supports_limit_and_offset_for_large_directories(tmp_path: Path) -> None:
