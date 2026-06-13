@@ -73,6 +73,7 @@ class DirectoryRecord:
     size_bytes: int = 0
     aspect_ratio: float = 1.0
     preview_blobs: tuple[bytes, ...] = ()
+    preview_items: tuple[FolderPreviewRecord, ...] = ()
 
     @property
     def absolute_path(self) -> Path:
@@ -92,8 +93,15 @@ PaneRecordKind = Literal["image", "directory"]
 
 
 @dataclass(frozen=True, slots=True)
+class FolderPreviewRecord:
+    kind: Literal["image", "video", "other"]
+    blob: bytes | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class CatalogSettings:
     thumbnail_native_size: int = 512
+    prune_parallelism: int = 4
 
 
 @dataclass(frozen=True, slots=True)

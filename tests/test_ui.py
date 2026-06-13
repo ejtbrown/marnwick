@@ -90,6 +90,49 @@ def test_oriented_pixmap_respects_exif_orientation(tmp_path: Path) -> None:
     assert pixmap.height() == 20
 
 
+def test_fullscreen_viewer_plays_displayed_gif(tmp_path: Path) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    gif_path = root / "animated.gif"
+    frames = [
+        Image.new("RGB", (16, 16), (255, 0, 0)),
+        Image.new("RGB", (16, 16), (0, 0, 255)),
+    ]
+    frames[0].save(gif_path, save_all=True, append_images=[frames[1]], duration=50, loop=0)
+
+    with Catalog(root) as catalog:
+        viewer = FullscreenViewer(catalog, ImageNavigator.sequential(["animated.gif"], "animated.gif"))
+        try:
+            assert viewer.movie is not None
+            assert viewer.movie.isValid()
+            assert viewer.movie.state().name == "Running"
+        finally:
+            viewer.close()
+            viewer.deleteLater()
+            qt_app.processEvents()
+
+
+def test_fullscreen_navigation_exits_at_list_edges(tmp_path: Path) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    Image.new("RGB", (8, 8), (10, 20, 30)).save(root / "first.jpg")
+    Image.new("RGB", (8, 8), (40, 50, 60)).save(root / "second.jpg")
+
+    with Catalog(root) as catalog:
+        viewer = FullscreenViewer(catalog, ImageNavigator.sequential(["first.jpg", "second.jpg"], "second.jpg"))
+        try:
+            viewer.navigate(1)
+
+            assert viewer.result() == QDialog.DialogCode.Accepted
+            assert viewer.last_viewed_rel_path == "second.jpg"
+        finally:
+            viewer.close()
+            viewer.deleteLater()
+            qt_app.processEvents()
+
+
 def test_clone_brush_drag_moves_source_with_target(tmp_path: Path) -> None:
     qt_app = app()
     root = tmp_path / "catalog"
@@ -938,7 +981,8 @@ def test_move_payload_to_directory_moves_selected_images_across_catalogs(tmp_pat
         assert (dest_root / "target" / "image.jpg").exists()
         assert source.get_image("set/image.jpg") is None
         assert dest.get_image("target/image.jpg") is not None
-        assert window._swept_catalog_roots == {source.root, dest.root}
+        assert source.root not in window._swept_catalog_roots
+        assert dest.root not in window._swept_catalog_roots
         assert source.directory_hash_matches("set")
         assert dest.directory_hash_matches("target")
         assert source.catalog_refresh_is_current()
@@ -1044,7 +1088,8 @@ def test_move_payload_to_directory_moves_directories_across_catalogs(tmp_path: P
         assert (dest_root / "target" / "set" / "nested" / "image.jpg").exists()
         assert source.get_image("set/nested/image.jpg") is None
         assert dest.get_image("target/set/nested/image.jpg") is not None
-        assert window._swept_catalog_roots == {source.root, dest.root}
+        assert source.root not in window._swept_catalog_roots
+        assert dest.root not in window._swept_catalog_roots
         assert source.catalog_refresh_is_current()
         assert dest.catalog_refresh_is_current()
     finally:
@@ -1184,17 +1229,17 @@ def test_progress_bar_uses_determinate_range_for_unknown_total(tmp_path: Path, m
         qt_app.processEvents()
 
 
-def test_progress_label_shows_directory_instead_of_file_name(tmp_path: Path, monkeypatch) -> None:
+def test_progress_label_shows_relative_directory_path_instead_of_file_name(tmp_path: Path, monkeypatch) -> None:
     qt_app = app()
     window = MainWindow()
     try:
         snapshot = IndexProgressSnapshot(
-            label="Indexing set",
+            label="Indexing set/nested",
             root=tmp_path,
-            dir_rel="set",
+            dir_rel="set/nested",
             processed=1,
             total=2,
-            current="set/one.jpg",
+            current="set/nested/one.jpg",
             done=False,
             error=None,
             interactive=True,
@@ -1206,16 +1251,16 @@ def test_progress_label_shows_directory_instead_of_file_name(tmp_path: Path, mon
 
         window._poll_indexer()
 
-        assert "set" in window.progress_label.text()
+        assert "set/nested" in window.progress_label.text()
         assert "one.jpg" not in window.progress_label.text()
 
         root_snapshot = IndexProgressSnapshot(
-            label="Refreshing catalog",
+            label=f"Refreshing catalog {tmp_path.name}",
             root=tmp_path,
             dir_rel=None,
             processed=1,
-            total=2,
-            current="one.jpg",
+            total=7,
+            current="set/nested",
             done=False,
             error=None,
             interactive=True,
@@ -1226,8 +1271,62 @@ def test_progress_label_shows_directory_instead_of_file_name(tmp_path: Path, mon
 
         window._poll_indexer()
 
-        assert tmp_path.name in window.progress_label.text()
-        assert "one.jpg" not in window.progress_label.text()
+        assert window.progress_label.text().startswith(f"Refreshing catalog {tmp_path.name} (1/7):")
+        assert "set/nested" in window.progress_label.text()
+    finally:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        window.indexer.shutdown()
+        window.workspace.close()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_idle_catalog_refresh_resumes_after_interactive_directory_index(tmp_path: Path, monkeypatch) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    (root / "set").mkdir(parents=True)
+    window = MainWindow()
+
+    class FakeTask:
+        def __init__(self, *, done: bool) -> None:
+            self.done = done
+
+        def snapshot(self) -> IndexProgressSnapshot:
+            return IndexProgressSnapshot(
+                label="fake",
+                root=root.resolve(),
+                dir_rel=None,
+                processed=0,
+                total=1,
+                current="",
+                done=self.done,
+                error=None,
+                interactive=False,
+                canceled=False,
+                started_at=1.0,
+            )
+
+    scheduled: list[Path] = []
+
+    def refresh_catalog(catalog_root: Path, *, interactive: bool = False, force: bool = False) -> FakeTask:
+        scheduled.append(catalog_root.resolve())
+        return FakeTask(done=False)
+
+    try:
+        catalog = window.workspace.open_catalog(root)
+        window._swept_catalog_roots.add(catalog.root)
+        window._resume_idle_refresh_roots.add(catalog.root)
+        window._directory_index_tasks[(catalog.root, "set")] = FakeTask(done=True)  # type: ignore[assignment]
+        monkeypatch.setattr(window.indexer, "has_active_tasks", lambda: False)
+        monkeypatch.setattr(window.indexer, "refresh_catalog", refresh_catalog)
+
+        window._schedule_idle_indexing()
+
+        assert scheduled == [catalog.root]
+        assert catalog.root not in window._resume_idle_refresh_roots
+        assert catalog.root not in window._swept_catalog_roots
     finally:
         window.progress_timer.stop()
         window.idle_timer.stop()

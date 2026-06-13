@@ -34,10 +34,14 @@ class ImageNavigator:
     def current(self) -> str:
         return self.order[self.index]
 
-    def next(self) -> str:
-        self.index = (self.index + 1) % len(self.order)
+    def next(self) -> str | None:
+        if self.index + 1 >= len(self.order):
+            return None
+        self.index += 1
         return self.current
 
-    def previous(self) -> str:
-        self.index = (self.index - 1) % len(self.order)
+    def previous(self) -> str | None:
+        if self.index <= 0:
+            return None
+        self.index -= 1
         return self.current

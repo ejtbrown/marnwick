@@ -25,5 +25,9 @@ def test_sequential_navigator_uses_display_order() -> None:
 
     assert navigator.current == "b"
     assert navigator.next() == "c"
-    assert navigator.next() == "a"
-    assert navigator.previous() == "c"
+    assert navigator.next() is None
+    assert navigator.current == "c"
+    assert navigator.previous() == "b"
+    assert navigator.previous() == "a"
+    assert navigator.previous() is None
+    assert navigator.current == "a"
