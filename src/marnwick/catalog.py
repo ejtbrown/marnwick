@@ -7,17 +7,29 @@ import errno
 import hashlib
 import io
 import os
+import queue
 import shutil
 import sqlite3
 import subprocess
+import threading
 import time
 import zlib
 from collections.abc import Callable, Iterable, Sequence
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from PIL import Image, ImageOps
 
-from .models import CatalogSettings, DirectoryRecord, DirectorySummary, ImageRecord, MoveResult, SQL_SORT_ORDER, SortOrder
+from .models import (
+    CatalogSettings,
+    DirectoryRecord,
+    DirectorySummary,
+    FolderPreviewRecord,
+    ImageRecord,
+    MoveResult,
+    SQL_SORT_ORDER,
+    SortOrder,
+)
 
 IMAGE_EXTENSIONS = {
     ".avif",
@@ -32,6 +44,17 @@ IMAGE_EXTENSIONS = {
     ".tiff",
     ".webp",
 }
+VIDEO_EXTENSIONS = {
+    ".avi",
+    ".m4v",
+    ".mkv",
+    ".mov",
+    ".mp4",
+    ".mpeg",
+    ".mpg",
+    ".webm",
+    ".wmv",
+}
 
 ProgressCallback = Callable[[int, int | None, str], None]
 CancelCallback = Callable[[], None]
@@ -45,6 +68,10 @@ THUMBNAIL_FILE_SUFFIX = ".jpg"
 SQL_LIKE_ESCAPE = "\\"
 SQLITE_VARIABLE_BATCH_SIZE = 500
 PRUNE_BATCH_SIZE = 512
+INDEX_QUEUE_DEPTH = 20
+INDEX_PIPELINE_MIN_IMAGES = 3
+PIPELINE_SENTINEL = object()
+FOLDER_PREVIEW_SCAN_LIMIT = 256
 
 
 def is_image_name(name: str) -> bool:
@@ -53,6 +80,10 @@ def is_image_name(name: str) -> bool:
 
 def is_image_path(path: Path) -> bool:
     return is_image_name(path.name)
+
+
+def is_video_name(name: str) -> bool:
+    return os.path.splitext(name)[1].lower() in VIDEO_EXTENSIONS
 
 
 def normalize_tag(name: str) -> str:
@@ -103,6 +134,35 @@ class ThumbnailPruneResult:
     errors: int = 0
 
 
+@dataclass(frozen=True, slots=True)
+class ImageReadJob:
+    rel_path: str
+    path: Path
+    stat: os.stat_result
+    data: bytes
+
+
+@dataclass(frozen=True, slots=True)
+class ImageSkipJob:
+    rel_path: str
+
+
+@dataclass(frozen=True, slots=True)
+class ThumbnailWriteJob:
+    rel_path: str
+    thumb_rel_path: str
+    thumb_blob: bytes
+
+
+@dataclass(frozen=True, slots=True)
+class ThumbnailPruneRowResult:
+    rel_path: str
+    rebuilt: int = 0
+    stale_removed: int = 0
+    legacy_migrated: int = 0
+    errors: int = 0
+
+
 class Catalog:
     """SQLite-backed, self-contained state for one photo catalog."""
 
@@ -114,14 +174,17 @@ class Catalog:
         self.thumbnail_dir = self.state_dir / THUMBNAIL_DIR_NAME
         self.root.mkdir(parents=True, exist_ok=True)
         self.state_dir.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(self.db_path, isolation_level=None)
+        self._conn = sqlite3.connect(self.db_path, isolation_level=None, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
+        self._db_lock = threading.RLock()
         self._configure_connection()
         self._init_schema()
         if settings is not None:
             self.set_settings(settings)
         elif self._get_setting("thumbnail_native_size") is None:
             self.set_settings(CatalogSettings())
+        elif self._get_setting("prune_parallelism") is None:
+            self._set_setting("prune_parallelism", str(CatalogSettings().prune_parallelism))
 
     def close(self) -> None:
         self._conn.close()
@@ -134,13 +197,20 @@ class Catalog:
 
     @property
     def settings(self) -> CatalogSettings:
-        value = self._get_setting("thumbnail_native_size")
-        return CatalogSettings(thumbnail_native_size=int(value or 512))
+        thumbnail_size = self._get_setting("thumbnail_native_size")
+        prune_parallelism = self._get_setting("prune_parallelism")
+        return CatalogSettings(
+            thumbnail_native_size=int(thumbnail_size or 512),
+            prune_parallelism=max(1, int(prune_parallelism or 4)),
+        )
 
     def set_settings(self, settings: CatalogSettings) -> None:
         if settings.thumbnail_native_size < 64:
             raise ValueError("thumbnail_native_size must be at least 64")
+        if settings.prune_parallelism < 1:
+            raise ValueError("prune_parallelism must be at least 1")
         self._set_setting("thumbnail_native_size", str(settings.thumbnail_native_size))
+        self._set_setting("prune_parallelism", str(settings.prune_parallelism))
 
     def append_log(self, message: str, *, level: str = "INFO") -> None:
         timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
@@ -198,9 +268,13 @@ class Catalog:
 
     def _write_thumbnail_file(self, cache_key: str, thumbnail_size: int, thumb_blob: bytes) -> str:
         thumb_rel_path = self._thumbnail_rel_path(cache_key, thumbnail_size)
+        self._write_thumbnail_rel_file(thumb_rel_path, thumb_blob)
+        return thumb_rel_path
+
+    def _write_thumbnail_rel_file(self, thumb_rel_path: str, thumb_blob: bytes) -> None:
         target = self.thumbnail_abs_path(thumb_rel_path)
         if target.is_file():
-            return thumb_rel_path
+            return
         target.parent.mkdir(parents=True, exist_ok=True)
         temp = target.with_name(f"{target.name}.{os.getpid()}.{time.time_ns()}.tmp")
         try:
@@ -208,7 +282,6 @@ class Catalog:
             temp.rename(target)
         finally:
             temp.unlink(missing_ok=True)
-        return thumb_rel_path
 
     def _read_thumbnail_file(self, thumb_rel_path: str | None) -> bytes | None:
         if not thumb_rel_path:
@@ -338,9 +411,12 @@ class Catalog:
                 continue
             self._remove_empty_thumbnail_parents(path.parent)
 
-    def _prune_orphan_thumbnail_files(self) -> int:
+    def _prune_orphan_thumbnail_files(self, workers: int = 1) -> int:
         if not self.thumbnail_dir.exists():
             return 0
+        workers = max(1, int(workers))
+        if workers > 1:
+            return self._prune_orphan_thumbnail_files_parallel(workers)
         removed = 0
         for path in self.thumbnail_dir.rglob("*"):
             if not path.is_file():
@@ -361,6 +437,62 @@ class Catalog:
                 self.append_log(f"Thumbnail prune error for {thumb_rel_path}: {error}", level="ERROR")
                 continue
             removed += 1
+        for dirpath, _, _ in os.walk(self.thumbnail_dir, topdown=False):
+            path = Path(dirpath)
+            if path == self.thumbnail_dir:
+                continue
+            try:
+                path.rmdir()
+            except OSError:
+                continue
+        return removed
+
+    def _prune_orphan_thumbnail_files_parallel(self, workers: int) -> int:
+        path_queue: queue.Queue[Path | object] = queue.Queue(maxsize=max(1, workers * 8))
+        removed = 0
+        removed_lock = threading.Lock()
+
+        def worker() -> None:
+            nonlocal removed
+            with Catalog(self.root) as catalog:
+                while True:
+                    item = path_queue.get()
+                    if item is PIPELINE_SENTINEL:
+                        return
+                    assert isinstance(item, Path)
+                    try:
+                        thumb_rel_path = item.relative_to(catalog.state_dir).as_posix()
+                    except ValueError:
+                        continue
+                    row = catalog._conn.execute(
+                        "SELECT 1 FROM images WHERE thumb_rel_path = ? LIMIT 1",
+                        (thumb_rel_path,),
+                    ).fetchone()
+                    if row is not None:
+                        continue
+                    try:
+                        item.unlink()
+                    except OSError as error:
+                        catalog.append_log(f"Thumbnail prune error for {thumb_rel_path}: {error}", level="ERROR")
+                        continue
+                    with removed_lock:
+                        removed += 1
+
+        threads = [
+            threading.Thread(target=worker, name=f"marnwick-prune-orphan-{index}", daemon=True)
+            for index in range(workers)
+        ]
+        for thread in threads:
+            thread.start()
+        try:
+            for path in self.thumbnail_dir.rglob("*"):
+                if path.is_file():
+                    self._force_queue_put(path_queue, path)
+        finally:
+            for _ in threads:
+                self._force_queue_put(path_queue, PIPELINE_SENTINEL)
+            for thread in threads:
+                thread.join()
         for dirpath, _, _ in os.walk(self.thumbnail_dir, topdown=False):
             path = Path(dirpath)
             if path == self.thumbnail_dir:
@@ -493,6 +625,19 @@ class Catalog:
             self.db_path.with_name(f"{self.db_path.name}-shm"),
         ]
         return paths
+
+    def thumbnail_repository_size_bytes(self) -> int:
+        total = 0
+        if not self.thumbnail_dir.exists():
+            return 0
+        for dirpath, _, filenames in os.walk(self.thumbnail_dir):
+            for filename in filenames:
+                path = Path(dirpath) / filename
+                try:
+                    total += path.stat().st_size
+                except OSError:
+                    continue
+        return total
 
     def has_catalog_files_modified_after(
         self,
@@ -635,7 +780,13 @@ class Catalog:
         force: bool,
     ) -> bool:
         refreshed = False
+        known_dirs = set(self.list_known_directories())
+        known_dirs.add("")
+        total_dirs = max(1, len(known_dirs))
+        processed_dirs = 0
         stack: list[tuple[str, bool]] = [("", False)]
+        if progress is not None:
+            progress(0, total_dirs, ".")
         while stack:
             dir_rel, save_hash = stack.pop()
             if cancel_check is not None:
@@ -647,20 +798,32 @@ class Catalog:
                 continue
             if not force and self.directory_hash_matches(dir_rel, cancel_check, require_complete=True):
                 if progress is not None:
-                    progress(0, 0, f"{dir_rel or self.root.name or self.root} up to date")
+                    progress(processed_dirs, total_dirs, dir_rel or ".")
+                processed_dirs += 1
+                if progress is not None:
+                    progress(processed_dirs, total_dirs, dir_rel or ".")
                 continue
+            if progress is not None:
+                progress(processed_dirs, total_dirs, dir_rel or ".")
             child_dirs = self._refresh_directory_contents(
                 dir_rel,
-                progress,
+                None,
                 cancel_check,
                 prune_missing_children=True,
             )
+            for child_dir in child_dirs:
+                if child_dir not in known_dirs:
+                    known_dirs.add(child_dir)
+                    total_dirs += 1
+            processed_dirs += 1
+            if progress is not None:
+                progress(processed_dirs, total_dirs, dir_rel or ".")
             refreshed = True
             stack.append((dir_rel, True))
             for child_dir in reversed(child_dirs):
                 stack.append((child_dir, False))
         if progress is not None:
-            progress(1 if refreshed else 0, 1 if refreshed else 0, "Catalog scan complete")
+            progress(processed_dirs, total_dirs, "Catalog scan complete")
         return refreshed
 
     def _refresh_directory_contents(
@@ -677,7 +840,7 @@ class Catalog:
             return []
         self._remember_directory(dir_rel)
         if progress is not None:
-            progress(0, None, f"Finding images in {dir_rel or self.root.name or self.root}")
+            progress(0, None, f"Finding images in {dir_rel or '.'}")
         image_rel_paths: list[str] = []
         child_dirs: list[str] = []
         scanned = 0
@@ -701,26 +864,29 @@ class Catalog:
                     if rel_path is not None:
                         image_rel_paths.append(rel_path)
                     if progress is not None and scanned % SCAN_PROGRESS_INTERVAL == 0:
-                        progress(len(image_rel_paths), None, dir_rel or self.root.name or str(self.root))
+                        progress(len(image_rel_paths), None, dir_rel or ".")
         except OSError:
             return []
         if prune_missing_children:
             self._delete_missing_child_directories(dir_rel, child_dirs)
         total = len(image_rel_paths)
         if progress is not None:
-            progress(0, total, dir_rel or self.root.name or str(self.root))
+            progress(0, total, dir_rel or ".")
         seen: set[str] = set(image_rel_paths)
-        for processed, rel_path in enumerate(image_rel_paths, start=1):
-            if cancel_check is not None:
-                cancel_check()
-            try:
-                self.index_image(rel_path, cancel_check=cancel_check)
-            except Exception as error:
+        if len(image_rel_paths) >= INDEX_PIPELINE_MIN_IMAGES:
+            self.index_images_pipeline(image_rel_paths, progress, cancel_check)
+        else:
+            for processed, rel_path in enumerate(image_rel_paths, start=1):
                 if cancel_check is not None:
                     cancel_check()
-                self.append_log(f"Indexing error for {rel_path}: {error}", level="ERROR")
-            if progress is not None:
-                progress(processed, total, rel_path)
+                try:
+                    self.index_image(rel_path, cancel_check=cancel_check)
+                except Exception as error:
+                    if cancel_check is not None:
+                        cancel_check()
+                    self.append_log(f"Indexing error for {rel_path}: {error}", level="ERROR")
+                if progress is not None:
+                    progress(processed, total, rel_path)
         existing = {
             row["rel_path"]
             for row in self._conn.execute("SELECT rel_path FROM images WHERE dir_rel = ?", (dir_rel,))
@@ -729,6 +895,241 @@ class Catalog:
         if stale:
             self._delete_db_records(stale)
         return child_dirs
+
+    def index_images_pipeline(
+        self,
+        rel_paths: Sequence[str],
+        progress: ProgressCallback | None = None,
+        cancel_check: CancelCallback | None = None,
+    ) -> None:
+        image_queue: queue.Queue[ImageReadJob | ImageSkipJob | object] = queue.Queue(maxsize=INDEX_QUEUE_DEPTH)
+        thumbnail_queue: queue.Queue[ThumbnailWriteJob | object] = queue.Queue(maxsize=INDEX_QUEUE_DEPTH)
+        total = len(rel_paths)
+        processed = 0
+        processed_lock = threading.Lock()
+        first_error: list[BaseException] = []
+
+        def remember_error(error: BaseException) -> None:
+            if not first_error:
+                first_error.append(error)
+
+        def put_with_cancel(target: queue.Queue[object], item: object) -> None:
+            while True:
+                if cancel_check is not None:
+                    cancel_check()
+                try:
+                    target.put(item, timeout=0.05)
+                    return
+                except queue.Full:
+                    continue
+
+        def put_sentinel(target: queue.Queue[object]) -> None:
+            while True:
+                try:
+                    target.put(PIPELINE_SENTINEL, timeout=0.05)
+                    return
+                except queue.Full:
+                    if first_error:
+                        return
+
+        def reader() -> None:
+            try:
+                for rel_path in rel_paths:
+                    if cancel_check is not None:
+                        cancel_check()
+                    path = self.abs_path(rel_path)
+                    if not path.exists() or not path.is_file() or not is_image_path(path):
+                        with self._db_lock:
+                            self._delete_db_records([rel_path])
+                        put_with_cancel(image_queue, ImageSkipJob(rel_path))
+                        continue
+                    try:
+                        stat = path.stat()
+                        if self._image_row_is_current(rel_path, stat):
+                            put_with_cancel(image_queue, ImageSkipJob(rel_path))
+                            continue
+                        data = path.read_bytes()
+                    except OSError as error:
+                        self.append_log(f"Indexing error for {rel_path}: {error}", level="ERROR")
+                        with self._db_lock:
+                            self._delete_db_records([rel_path])
+                        put_with_cancel(image_queue, ImageSkipJob(rel_path))
+                        continue
+                    put_with_cancel(image_queue, ImageReadJob(rel_path, path, stat, data))
+            except BaseException as error:
+                remember_error(error)
+            finally:
+                put_sentinel(image_queue)
+
+        def processor() -> None:
+            nonlocal processed
+            try:
+                while True:
+                    item = image_queue.get()
+                    if item is PIPELINE_SENTINEL:
+                        return
+                    if isinstance(item, ImageSkipJob):
+                        rel_path = item.rel_path
+                    else:
+                        assert isinstance(item, ImageReadJob)
+                        rel_path = item.rel_path
+                        try:
+                            self._index_read_job(item, thumbnail_queue, put_with_cancel, cancel_check)
+                        except Exception as error:
+                            if cancel_check is not None:
+                                cancel_check()
+                            self.append_log(f"Indexing error for {item.rel_path}: {error}", level="ERROR")
+                            with self._db_lock:
+                                self._delete_db_records([item.rel_path])
+                    with processed_lock:
+                        processed += 1
+                        current_processed = processed
+                    if progress is not None:
+                        progress(current_processed, total, rel_path)
+            except BaseException as error:
+                remember_error(error)
+            finally:
+                put_sentinel(thumbnail_queue)
+
+        def writer() -> None:
+            try:
+                while True:
+                    item = thumbnail_queue.get()
+                    if item is PIPELINE_SENTINEL:
+                        return
+                    assert isinstance(item, ThumbnailWriteJob)
+                    try:
+                        self._write_thumbnail_rel_file(item.thumb_rel_path, item.thumb_blob)
+                    except Exception as error:
+                        self.append_log(f"Thumbnail write error for {item.rel_path}: {error}", level="ERROR")
+            except BaseException as error:
+                remember_error(error)
+
+        threads = [
+            threading.Thread(target=reader, name="marnwick-index-reader", daemon=True),
+            threading.Thread(target=processor, name="marnwick-index-processor", daemon=True),
+            threading.Thread(target=writer, name="marnwick-index-writer", daemon=True),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        if first_error:
+            raise first_error[0]
+
+    def _force_queue_put(self, target: queue.Queue[object], item: object) -> None:
+        while True:
+            try:
+                target.put(item, timeout=0.05)
+                return
+            except queue.Full:
+                continue
+
+    def _image_row_is_current(self, rel_path: str, stat: os.stat_result) -> bool:
+        with self._db_lock:
+            row = self._conn.execute(
+                """
+                SELECT file_size_bytes, modified_at_ns, thumb_rel_path, thumb_cache_key,
+                    thumb_size_px, image_hash
+                FROM images
+                WHERE rel_path = ?
+                """,
+                (rel_path,),
+            ).fetchone()
+        if row is None:
+            return False
+        if (
+            int(row["file_size_bytes"]) != stat.st_size
+            or int(row["modified_at_ns"]) != stat.st_mtime_ns
+            or int(row["thumb_size_px"]) != self.settings.thumbnail_native_size
+            or row["image_hash"] is None
+            or row["thumb_cache_key"] is None
+            or row["thumb_rel_path"] is None
+        ):
+            return False
+        try:
+            return self.thumbnail_abs_path(str(row["thumb_rel_path"])).is_file()
+        except (OSError, ValueError):
+            return False
+
+    def _index_read_job(
+        self,
+        job: ImageReadJob,
+        thumbnail_queue: queue.Queue[ThumbnailWriteJob | object],
+        queue_put: Callable[[queue.Queue[object], object], None],
+        cancel_check: CancelCallback | None,
+    ) -> None:
+        if cancel_check is not None:
+            cancel_check()
+        width, height, thumb_blob, thumb_width, thumb_height = self._read_image_metadata_and_thumbnail_from_bytes(
+            job.data
+        )
+        image_hash, thumb_cache_key = self._image_hashes_for_bytes(job.data)
+        thumb_rel_path = self._thumbnail_rel_path(thumb_cache_key, self.settings.thumbnail_native_size)
+        queue_put(thumbnail_queue, ThumbnailWriteJob(job.rel_path, thumb_rel_path, thumb_blob))
+        old_thumb_rel_paths = set()
+        with self._db_lock:
+            existing = self._conn.execute(
+                "SELECT thumb_rel_path FROM images WHERE rel_path = ?",
+                (job.rel_path,),
+            ).fetchone()
+            if existing is not None and existing["thumb_rel_path"] is not None:
+                old_thumb_rel_paths.add(str(existing["thumb_rel_path"]))
+            dir_rel = Path(job.rel_path).parent.as_posix()
+            if dir_rel == ".":
+                dir_rel = ""
+            self._remember_directory(dir_rel)
+            aspect_ratio = width / height if height else 0.0
+            self._conn.execute(
+                """
+                INSERT INTO images (
+                    rel_path, dir_rel, filename, size_bytes, file_size_bytes,
+                    mtime_ns, modified_at_ns, image_hash, width, height,
+                    aspect_ratio, thumb_blob, thumb_rel_path, thumb_cache_key,
+                    thumb_width, thumb_height, thumb_size_px, indexed_at_ns
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(rel_path) DO UPDATE SET
+                    dir_rel = excluded.dir_rel,
+                    filename = excluded.filename,
+                    size_bytes = excluded.size_bytes,
+                    file_size_bytes = excluded.file_size_bytes,
+                    mtime_ns = excluded.mtime_ns,
+                    modified_at_ns = excluded.modified_at_ns,
+                    image_hash = excluded.image_hash,
+                    width = excluded.width,
+                    height = excluded.height,
+                    aspect_ratio = excluded.aspect_ratio,
+                    thumb_blob = excluded.thumb_blob,
+                    thumb_rel_path = excluded.thumb_rel_path,
+                    thumb_cache_key = excluded.thumb_cache_key,
+                    thumb_width = excluded.thumb_width,
+                    thumb_height = excluded.thumb_height,
+                    thumb_size_px = excluded.thumb_size_px,
+                    indexed_at_ns = excluded.indexed_at_ns
+                """,
+                (
+                    job.rel_path,
+                    dir_rel,
+                    job.path.name,
+                    job.stat.st_size,
+                    job.stat.st_size,
+                    job.stat.st_mtime_ns,
+                    job.stat.st_mtime_ns,
+                    image_hash,
+                    width,
+                    height,
+                    aspect_ratio,
+                    None,
+                    thumb_rel_path,
+                    thumb_cache_key,
+                    thumb_width,
+                    thumb_height,
+                    self.settings.thumbnail_native_size,
+                    time.time_ns(),
+                ),
+            )
+            self._remove_unreferenced_thumbnail_files(old_thumb_rel_paths - {thumb_rel_path})
 
     def refresh_directory(
         self,
@@ -942,6 +1343,7 @@ class Catalog:
                 stat_mtime = 0
             else:
                 stat_mtime = stat.st_mtime_ns
+            preview_items = tuple(self.folder_preview_items_under(child_rel, limit=4))
             records.append(
                 DirectoryRecord(
                     catalog_root=self.root,
@@ -950,10 +1352,55 @@ class Catalog:
                     mtime_ns=stat_mtime,
                     size_bytes=self._indexed_image_size_under(child_rel),
                     aspect_ratio=1.0,
-                    preview_blobs=tuple(self.thumbnail_blobs_under(child_rel, limit=4)),
+                    preview_blobs=tuple(item.blob for item in preview_items if item.kind == "image" and item.blob),
+                    preview_items=preview_items,
                 )
             )
         return sorted(records, key=self._directory_sort_key(sort_order), reverse=self._record_sort_reverse(sort_order))
+
+    def folder_preview_items_under(self, dir_rel: str, *, limit: int = 4) -> list[FolderPreviewRecord]:
+        previews = [
+            FolderPreviewRecord("image", blob)
+            for blob in self.thumbnail_blobs_under(dir_rel, limit=limit)
+        ]
+        if len(previews) >= limit:
+            return previews[:limit]
+        seen_image_paths = {
+            str(row["rel_path"])
+            for row in self._conn.execute(
+                """
+                SELECT rel_path
+                FROM images
+                WHERE dir_rel = ? OR dir_rel LIKE ? ESCAPE '\\'
+                ORDER BY rel_path COLLATE NOCASE ASC
+                LIMIT ?
+                """,
+                (dir_rel, descendant_like_pattern(dir_rel), limit),
+            )
+        }
+        directory = self.abs_path(dir_rel) if dir_rel else self.root
+        for scanned, path in enumerate(self._preview_candidate_files(directory)):
+            if scanned >= FOLDER_PREVIEW_SCAN_LIMIT:
+                break
+            if len(previews) >= limit:
+                break
+            try:
+                rel_path = self.rel_path(path)
+            except ValueError:
+                continue
+            if rel_path in seen_image_paths:
+                continue
+            if is_video_name(path.name):
+                previews.append(FolderPreviewRecord("video"))
+            elif not is_image_name(path.name):
+                previews.append(FolderPreviewRecord("other"))
+        return previews[:limit]
+
+    def _preview_candidate_files(self, directory: Path) -> Iterable[Path]:
+        for dirpath, dirnames, filenames in os.walk(directory):
+            dirnames[:] = sorted(name for name in dirnames if name != ".marnwick")
+            for filename in sorted(filenames, key=str.casefold):
+                yield Path(dirpath) / filename
 
     def thumbnail_blobs_under(self, dir_rel: str, *, limit: int = 4) -> list[bytes]:
         nested_like = descendant_like_pattern(dir_rel)
@@ -1339,69 +1786,83 @@ class Catalog:
     ) -> ThumbnailPruneResult:
         total_row = self._conn.execute("SELECT COUNT(*) AS count FROM images").fetchone()
         total = 0 if total_row is None else int(total_row["count"])
+        workers = max(1, int(self.settings.prune_parallelism))
         checked = 0
         rebuilt = 0
         stale_removed = 0
         legacy_migrated = 0
         errors = 0
         last_id = 0
+        worker_state = threading.local()
+        worker_catalogs: list[Catalog] = []
+        worker_catalogs_lock = threading.Lock()
 
         if progress is not None:
             progress(0, total, "Pruning thumbnails")
-        while True:
-            rows = self._conn.execute(
-                """
-                SELECT
-                    id, rel_path, file_size_bytes, modified_at_ns, thumb_rel_path,
-                    thumb_cache_key, thumb_size_px, image_hash, thumb_blob
-                FROM images
-                WHERE id > ?
-                ORDER BY id ASC
-                LIMIT ?
-                """,
-                (last_id, PRUNE_BATCH_SIZE),
-            ).fetchall()
-            if not rows:
-                break
-            last_id = int(rows[-1]["id"])
-            stale_rel_paths: list[str] = []
-            for row in rows:
-                if cancel_check is not None:
-                    cancel_check()
-                checked += 1
-                rel_path = str(row["rel_path"])
-                if progress is not None:
-                    progress(checked, total, rel_path)
-                try:
-                    path = self.abs_path(rel_path)
-                    if not path.is_file() or not is_image_path(path):
-                        stale_rel_paths.append(rel_path)
-                        stale_removed += 1
-                        continue
-                    stat = path.stat()
-                    if (
-                        int(row["file_size_bytes"]) != stat.st_size
-                        or int(row["modified_at_ns"]) != stat.st_mtime_ns
-                        or int(row["thumb_size_px"]) != self.settings.thumbnail_native_size
-                    ):
-                        if self.index_image(rel_path, cancel_check=cancel_check) is not None:
-                            rebuilt += 1
-                        continue
-                    had_legacy_blob = row["thumb_blob"] is not None
-                    if self._ensure_existing_thumbnail_file(rel_path, path, row):
-                        if had_legacy_blob:
-                            legacy_migrated += 1
-                        continue
-                    if self.rebuild_thumbnail(rel_path) is not None:
-                        rebuilt += 1
-                except Exception as error:
-                    if cancel_check is not None:
-                        cancel_check()
-                    errors += 1
-                    self.append_log(f"Thumbnail prune error for {rel_path}: {error}", level="ERROR")
-            self._delete_db_records(stale_rel_paths)
 
-        orphan_removed = self._prune_orphan_thumbnail_files()
+        def catalog_for_worker() -> Catalog:
+            catalog = getattr(worker_state, "catalog", None)
+            if catalog is None:
+                catalog = Catalog(self.root)
+                with worker_catalogs_lock:
+                    worker_catalogs.append(catalog)
+                worker_state.catalog = catalog
+            return catalog
+
+        def process_row(row_data: dict[str, object]) -> ThumbnailPruneRowResult:
+            return catalog_for_worker()._prune_thumbnail_row(row_data, cancel_check)
+
+        def record_result(result: ThumbnailPruneRowResult) -> None:
+            nonlocal checked, rebuilt, stale_removed, legacy_migrated, errors
+            checked += 1
+            rebuilt += result.rebuilt
+            stale_removed += result.stale_removed
+            legacy_migrated += result.legacy_migrated
+            errors += result.errors
+            if progress is not None:
+                progress(checked, total, result.rel_path)
+
+        pending = set()
+        try:
+            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="marnwick-prune") as executor:
+                while True:
+                    rows = self._conn.execute(
+                        """
+                        SELECT
+                            id, rel_path, file_size_bytes, modified_at_ns, thumb_rel_path,
+                            thumb_cache_key, thumb_size_px, image_hash, thumb_blob
+                        FROM images
+                        WHERE id > ?
+                        ORDER BY id ASC
+                        LIMIT ?
+                        """,
+                        (last_id, PRUNE_BATCH_SIZE),
+                    ).fetchall()
+                    if not rows:
+                        break
+                    last_id = int(rows[-1]["id"])
+                    for row in rows:
+                        if cancel_check is not None:
+                            cancel_check()
+                        row_data = {key: row[key] for key in row.keys()}
+                        pending.add(executor.submit(process_row, row_data))
+                        while len(pending) >= max(1, workers * 4):
+                            future = next(as_completed(pending))
+                            pending.remove(future)
+                            record_result(future.result())
+
+                while pending:
+                    future = next(as_completed(pending))
+                    pending.remove(future)
+                    record_result(future.result())
+        finally:
+            for catalog in worker_catalogs:
+                try:
+                    catalog.close()
+                except Exception:
+                    pass
+
+        orphan_removed = self._prune_orphan_thumbnail_files(workers)
         result = ThumbnailPruneResult(
             db_rows_checked=checked,
             thumbnails_rebuilt=rebuilt,
@@ -1418,6 +1879,39 @@ class Catalog:
         if progress is not None:
             progress(total, total, "Thumbnail prune complete")
         return result
+
+    def _prune_thumbnail_row(
+        self,
+        row: dict[str, object],
+        cancel_check: CancelCallback | None = None,
+    ) -> ThumbnailPruneRowResult:
+        rel_path = str(row["rel_path"])
+        try:
+            if cancel_check is not None:
+                cancel_check()
+            path = self.abs_path(rel_path)
+            if not path.is_file() or not is_image_path(path):
+                self._delete_db_records([rel_path])
+                return ThumbnailPruneRowResult(rel_path, stale_removed=1)
+            stat = path.stat()
+            if (
+                int(row["file_size_bytes"] or 0) != stat.st_size
+                or int(row["modified_at_ns"] or 0) != stat.st_mtime_ns
+                or int(row["thumb_size_px"] or 0) != self.settings.thumbnail_native_size
+            ):
+                rebuilt = 1 if self.index_image(rel_path, cancel_check=cancel_check) is not None else 0
+                return ThumbnailPruneRowResult(rel_path, rebuilt=rebuilt)
+            had_legacy_blob = row["thumb_blob"] is not None
+            if self._ensure_existing_thumbnail_file(rel_path, path, row):  # type: ignore[arg-type]
+                migrated = 1 if had_legacy_blob else 0
+                return ThumbnailPruneRowResult(rel_path, legacy_migrated=migrated)
+            rebuilt = 1 if self.rebuild_thumbnail(rel_path) is not None else 0
+            return ThumbnailPruneRowResult(rel_path, rebuilt=rebuilt)
+        except Exception as error:
+            if cancel_check is not None:
+                cancel_check()
+            self.append_log(f"Thumbnail prune error for {rel_path}: {error}", level="ERROR")
+            return ThumbnailPruneRowResult(rel_path, errors=1)
 
     def rebuild_thumbnail(self, rel_path: str) -> ImageRecord | None:
         old_thumb_rel_paths = self._thumbnail_rel_paths_for_records([rel_path])
@@ -1653,7 +2147,7 @@ class Catalog:
                     self._remember_directory(dir_rel)
                     count += 1
                     if progress is not None and count % SCAN_PROGRESS_INTERVAL == 0:
-                        progress(count, None, dir_rel or self.root.name or str(self.root))
+                        progress(count, None, dir_rel or ".")
             if buffer:
                 dir_rel = self._find_display_path_to_dir_rel(buffer)
                 if dir_rel is not None:
@@ -1684,7 +2178,7 @@ class Catalog:
             self._remember_directory(dir_rel)
             count += 1
             if progress is not None and count % SCAN_PROGRESS_INTERVAL == 0:
-                progress(count, None, dir_rel or self.root.name or str(self.root))
+                progress(count, None, dir_rel or ".")
         return count
 
     def _find_display_path_to_dir_rel(self, display_path: bytes | str) -> str | None:
@@ -1897,6 +2391,28 @@ class Catalog:
             thumb.save(out, format="JPEG", quality=82, optimize=True)
             return width, height, out.getvalue(), thumb.width, thumb.height
 
+    def _read_image_metadata_and_thumbnail_from_bytes(self, data: bytes) -> tuple[int, int, bytes, int, int]:
+        with Image.open(io.BytesIO(data)) as image:
+            image = ImageOps.exif_transpose(image)
+            width, height = image.size
+            thumb = image.copy()
+            thumb.thumbnail(
+                (self.settings.thumbnail_native_size, self.settings.thumbnail_native_size),
+                Image.Resampling.LANCZOS,
+            )
+            if thumb.mode in {"RGBA", "LA"}:
+                background = Image.new("RGB", thumb.size, (255, 255, 255))
+                if thumb.mode == "RGBA":
+                    background.paste(thumb, mask=thumb.getchannel("A"))
+                    thumb = background
+                else:
+                    thumb = thumb.convert("RGB")
+            elif thumb.mode == "L":
+                thumb = thumb.convert("RGB")
+            out = io.BytesIO()
+            thumb.save(out, format="JPEG", quality=82, optimize=True)
+            return width, height, out.getvalue(), thumb.width, thumb.height
+
     def _fast_image_hash(self, path: Path, cancel_check: CancelCallback | None = None) -> str:
         return self._image_file_hashes(path, cancel_check)[0]
 
@@ -1913,6 +2429,9 @@ class Catalog:
                 checksum = zlib.crc32(chunk, checksum)
                 digest.update(chunk)
         return f"{checksum & 0xFFFFFFFF:08x}", digest.hexdigest()
+
+    def _image_hashes_for_bytes(self, data: bytes) -> tuple[str, str]:
+        return f"{zlib.crc32(data) & 0xFFFFFFFF:08x}", hashlib.sha256(data).hexdigest()
 
     def _update_file_identity(
         self,

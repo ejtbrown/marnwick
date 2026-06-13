@@ -21,7 +21,7 @@ from PySide6.QtCore import (
     QTimer,
     QUrl,
 )
-from PySide6.QtGui import QAction, QBrush, QColor, QCursor, QDrag, QIcon, QImage, QImageReader, QKeySequence, QPen, QPixmap, QShortcut
+from PySide6.QtGui import QAction, QBrush, QColor, QCursor, QDrag, QIcon, QImage, QImageReader, QKeySequence, QMovie, QPen, QPixmap, QShortcut
 from PySide6.QtGui import QFont, QFontMetrics, QPainter
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -311,10 +311,12 @@ class ThumbnailModel(QAbstractListModel):
         return pixmap
 
     def folder_tile_pixmap(self, record: DirectoryRecord) -> QPixmap:
-        preview_blobs = list(record.preview_blobs[:4])
-        if len(preview_blobs) < 4 and self.catalog is not None:
-            preview_blobs = self.catalog.thumbnail_blobs_under(record.dir_rel, limit=4)
-        return pixmap_from_pil_image(render_folder_icon(preview_blobs[:4], max(1, self.tile_size)))
+        preview_items = list(record.preview_items[:4])
+        if not preview_items:
+            preview_items = list(record.preview_blobs[:4])
+        if len(preview_items) < 4 and self.catalog is not None:
+            preview_items = self.catalog.folder_preview_items_under(record.dir_rel, limit=4)
+        return pixmap_from_pil_image(render_folder_icon(preview_items[:4], max(1, self.tile_size)))
 
 
 class ThumbnailDelegate(QStyledItemDelegate):
@@ -577,12 +579,16 @@ class ThumbnailView(QListView):
 
     def finish_manual_drag(self, global_pos: QPoint) -> None:
         self.update_manual_drag(global_pos)
+        move_request: tuple["MainWindow", list[dict[str, str]], Path, str] | None = None
         if self.main_window is not None and self._drag_payload is not None and self._drag_destination_item is not None:
             item = self._drag_destination_item
             root = Path(item.data(0, CATALOG_ROOT_ROLE))
             dir_rel = item.data(0, DIR_REL_ROLE)
-            self.main_window.move_payload_to_directory(self._drag_payload, root, dir_rel)
+            move_request = (self.main_window, list(self._drag_payload), root, dir_rel)
         self.cleanup_manual_drag()
+        if move_request is not None:
+            window, payload, root, dir_rel = move_request
+            QTimer.singleShot(0, lambda: window.move_payload_to_directory(payload, root, dir_rel))
 
     def cleanup_manual_drag(self) -> None:
         if self.main_window is not None:
@@ -770,7 +776,9 @@ class MainWindow(QMainWindow):
         self._pruned_catalog_roots: set[Path] = set()
         self._idle_index_tasks: dict[Path, IndexTask] = {}
         self._directory_discovery_tasks: dict[Path, IndexTask] = {}
+        self._directory_index_tasks: dict[tuple[Path, str], IndexTask] = {}
         self._thumbnail_prune_tasks: dict[Path, IndexTask] = {}
+        self._resume_idle_refresh_roots: set[Path] = set()
         self._indexing_was_active = False
 
         self.tree = DirectoryTree(self)
@@ -1152,7 +1160,11 @@ class MainWindow(QMainWindow):
         self._pruned_catalog_roots.discard(resolved)
         self._idle_index_tasks.pop(resolved, None)
         self._directory_discovery_tasks.pop(resolved, None)
+        self._directory_index_tasks = {
+            key: task for key, task in self._directory_index_tasks.items() if key[0] != resolved
+        }
         self._thumbnail_prune_tasks.pop(resolved, None)
+        self._resume_idle_refresh_roots.discard(resolved)
         if self.current_catalog and self.current_catalog.root == resolved:
             self.current_catalog = None
             self.current_dir_rel = ""
@@ -1235,6 +1247,9 @@ class MainWindow(QMainWindow):
         if catalog is None:
             return
         dir_rel = item.data(0, DIR_REL_ROLE)
+        idle_task = self._idle_index_tasks.get(catalog.root)
+        if idle_task is not None and not idle_task.snapshot().done:
+            self._resume_idle_refresh_roots.add(catalog.root)
         self.indexer.cancel_idle_tasks(catalog.root)
         self.indexer.cancel_directory_tasks(catalog.root, keep_dir_rel=dir_rel)
         self.current_catalog = catalog
@@ -1434,13 +1449,15 @@ class MainWindow(QMainWindow):
         for item in payload:
             group = directory_groups if item.get("kind") == "directory" else image_groups
             group[Path(item["catalog_root"]).resolve()].append(item["rel_path"])
+        affected_roots = {dest_catalog.root, *directory_groups.keys(), *image_groups.keys()}
+        for root in affected_roots:
+            self.indexer.cancel_idle_tasks(root)
+            self.indexer.cancel_directory_tasks(root)
         try:
             for source_root, dir_rels in directory_groups.items():
                 source_catalog = self.workspace.catalog_for_root(source_root)
                 if source_catalog is None:
                     continue
-                self.indexer.cancel_idle_tasks(source_catalog.root)
-                self.indexer.cancel_idle_tasks(dest_catalog.root)
                 source_catalog.move_directories(
                     dir_rels,
                     dest_catalog,
@@ -1450,8 +1467,6 @@ class MainWindow(QMainWindow):
             for source_root, rel_paths in image_groups.items():
                 source_catalog = self.workspace.catalog_for_root(source_root)
                 if source_catalog is not None:
-                    self.indexer.cancel_idle_tasks(source_catalog.root)
-                    self.indexer.cancel_idle_tasks(dest_catalog.root)
                     source_catalog.move_images(
                         rel_paths,
                         dest_catalog,
@@ -1462,7 +1477,9 @@ class MainWindow(QMainWindow):
             show_error(self, "Move", str(error))
             return
         for source_root in [*directory_groups.keys(), *image_groups.keys(), dest_catalog.root]:
-            self._pruned_catalog_roots.discard(Path(source_root).resolve())
+            resolved_root = Path(source_root).resolve()
+            self._swept_catalog_roots.discard(resolved_root)
+            self._pruned_catalog_roots.discard(resolved_root)
         self.reload_tree_and_directory()
 
     def select_rel_path(self, rel_path: str) -> None:
@@ -1486,11 +1503,13 @@ class MainWindow(QMainWindow):
         force: bool = False,
         interactive: bool = True,
     ) -> None:
-        self.indexer.refresh_directory(catalog.root, dir_rel, interactive=interactive, force=force)
+        task = self.indexer.refresh_directory(catalog.root, dir_rel, interactive=interactive, force=force)
+        self._directory_index_tasks[(catalog.root, dir_rel)] = task
         self._poll_indexer()
 
     def _schedule_idle_indexing(self) -> None:
         self._settle_directory_discovery_tasks()
+        self._settle_directory_index_tasks()
         self._settle_idle_tasks()
         self._settle_thumbnail_prune_tasks()
         if self.indexer.has_active_tasks():
@@ -1512,6 +1531,7 @@ class MainWindow(QMainWindow):
 
     def _poll_indexer(self) -> None:
         self._settle_directory_discovery_tasks()
+        self._settle_directory_index_tasks()
         self._settle_idle_tasks()
         self._settle_thumbnail_prune_tasks()
         snapshots = self.indexer.active_snapshots()
@@ -1519,6 +1539,7 @@ class MainWindow(QMainWindow):
             if self._indexing_was_active:
                 self._indexing_was_active = False
                 self.reload_tree_and_directory()
+            self._schedule_idle_indexing()
             self.progress_bar.setRange(0, 1)
             self.progress_bar.setValue(0)
             self.progress_label.setText("Ready")
@@ -1545,9 +1566,16 @@ class MainWindow(QMainWindow):
         else:
             self.progress_bar.setRange(0, snapshot.total)
             self.progress_bar.setValue(min(snapshot.processed, snapshot.total))
-            detail = f"{snapshot.label}: {snapshot.processed}/{snapshot.total}"
+            if snapshot.label.startswith("Refreshing catalog"):
+                detail = (
+                    f"{snapshot.label} ({snapshot.processed}/{snapshot.total}): "
+                    f"{self.indexing_progress_path(snapshot)}"
+                )
+            else:
+                detail = f"{snapshot.label}: {snapshot.processed}/{snapshot.total}"
         if snapshot.current and snapshot.total != 0:
-            detail = f"{detail} - {self.indexing_directory_name(snapshot)}"
+            if not snapshot.label.startswith("Refreshing catalog"):
+                detail = f"{detail} - {self.indexing_progress_path(snapshot)}"
             if (
                 self.current_catalog is not None
                 and snapshot.root == self.current_catalog.root
@@ -1556,21 +1584,25 @@ class MainWindow(QMainWindow):
                 self.model.refresh_thumbnail(snapshot.current)
         self.progress_label.setText(detail)
 
-    def indexing_directory_name(self, snapshot: IndexProgressSnapshot) -> str:
+    def indexing_progress_path(self, snapshot: IndexProgressSnapshot) -> str:
         if snapshot.dir_rel is not None:
-            return Path(snapshot.dir_rel).name if snapshot.dir_rel else snapshot.root.name or str(snapshot.root)
+            return snapshot.dir_rel or "."
         if not snapshot.current:
-            return snapshot.root.name or str(snapshot.root)
+            return "."
         current_text = snapshot.current
         if current_text.startswith("Finding images in "):
             current_text = current_text.removeprefix("Finding images in ").strip()
+        if current_text == snapshot.root.name or current_text == str(snapshot.root):
+            return "."
+        if current_text in {"Catalog scan complete", "Directory scan complete", "Folder discovery complete"}:
+            return current_text
         current = Path(current_text)
+        if not current.suffix:
+            return current.as_posix() or "."
         parent = current.parent.as_posix()
         if parent == ".":
-            if current.suffix:
-                return snapshot.root.name or str(snapshot.root)
-            return current.name if current.name else snapshot.root.name or str(snapshot.root)
-        return Path(parent).name
+            return "."
+        return parent
 
     def _settle_idle_tasks(self) -> None:
         for root, task in list(self._idle_index_tasks.items()):
@@ -1580,6 +1612,21 @@ class MainWindow(QMainWindow):
             self._idle_index_tasks.pop(root, None)
             if snapshot.error is None and not snapshot.canceled:
                 self._swept_catalog_roots.add(root)
+
+    def _settle_directory_index_tasks(self) -> None:
+        completed_roots: set[Path] = set()
+        for key, task in list(self._directory_index_tasks.items()):
+            snapshot = task.snapshot()
+            if not snapshot.done:
+                continue
+            self._directory_index_tasks.pop(key, None)
+            completed_roots.add(key[0])
+        for root in completed_roots:
+            if any(key[0] == root for key in self._directory_index_tasks):
+                continue
+            if root in self._resume_idle_refresh_roots:
+                self._resume_idle_refresh_roots.discard(root)
+                self._swept_catalog_roots.discard(root)
 
     def _settle_directory_discovery_tasks(self) -> None:
         should_rebuild = False
@@ -1792,10 +1839,14 @@ class PreferencesDialog(QDialog):
         self.thumbnail_size.setRange(64, 4096)
         self.thumbnail_size.setSingleStep(64)
         self.thumbnail_size.setValue(self._selected_catalog().settings.thumbnail_native_size)
+        self.prune_parallelism = QSpinBox()
+        self.prune_parallelism.setRange(1, 64)
+        self.prune_parallelism.setValue(self._selected_catalog().settings.prune_parallelism)
         self.catalog_combo.currentIndexChanged.connect(self._catalog_changed)
 
         form.addRow("Catalog", self.catalog_combo)
         form.addRow("Saved thumbnail size", self.thumbnail_size)
+        form.addRow("Thumbnail prune threads", self.prune_parallelism)
         layout.addLayout(form)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
@@ -1804,10 +1855,15 @@ class PreferencesDialog(QDialog):
         layout.addWidget(buttons)
 
     def selected_settings(self) -> tuple[Catalog, CatalogSettings]:
-        return self._selected_catalog(), CatalogSettings(thumbnail_native_size=self.thumbnail_size.value())
+        return self._selected_catalog(), CatalogSettings(
+            thumbnail_native_size=self.thumbnail_size.value(),
+            prune_parallelism=self.prune_parallelism.value(),
+        )
 
     def _catalog_changed(self) -> None:
-        self.thumbnail_size.setValue(self._selected_catalog().settings.thumbnail_native_size)
+        settings = self._selected_catalog().settings
+        self.thumbnail_size.setValue(settings.thumbnail_native_size)
+        self.prune_parallelism.setValue(settings.prune_parallelism)
 
     def _selected_catalog(self) -> Catalog:
         root = Path(str(self.catalog_combo.currentData())).resolve()
@@ -1984,12 +2040,14 @@ class DirectoryPropertiesDialog(QDialog):
         self.image_size_label = QLabel("0 B")
         self.other_size_label = QLabel("0 B")
         self.database_size_label = QLabel(format_bytes(catalog.catalog_database_size_bytes()))
+        self.thumbnail_repository_size_label = QLabel(format_bytes(catalog.thumbnail_repository_size_bytes()))
         form.addRow("Images", self.image_count_label)
         form.addRow("Other files", self.other_count_label)
         form.addRow("Image size", self.image_size_label)
         form.addRow("Other file size", self.other_size_label)
         if not dir_rel:
             form.addRow("Database size", self.database_size_label)
+            form.addRow("Thumbnail repository size", self.thumbnail_repository_size_label)
         frame_layout.addLayout(form)
 
         self.status_label = QLabel()
@@ -2334,6 +2392,7 @@ class FullscreenViewer(QDialog):
         self.display_preview_image: Image.Image | None = None
         self.display_preview_size: tuple[int, int] | None = None
         self.base_pixmap = QPixmap()
+        self.movie: QMovie | None = None
         self.zoom_level = 1.0
         self.pan_offset = QPoint(0, 0)
         self.pan_drag_start: QPoint | None = None
@@ -2514,6 +2573,7 @@ class FullscreenViewer(QDialog):
         if not self.confirm_pending_edits():
             event.ignore()
             return
+        self.stop_movie()
         self.cleanup_preview()
         super().closeEvent(event)
 
@@ -2524,10 +2584,10 @@ class FullscreenViewer(QDialog):
     def navigate(self, step: int) -> None:
         if not self.confirm_pending_edits():
             return
-        if step > 0:
-            self.navigator.next()
-        else:
-            self.navigator.previous()
+        next_rel_path = self.navigator.next() if step > 0 else self.navigator.previous()
+        if next_rel_path is None:
+            self.accept()
+            return
         self.load_current()
 
     def delete_current_image(self) -> None:
@@ -2546,6 +2606,7 @@ class FullscreenViewer(QDialog):
         self.load_current()
 
     def load_current(self) -> None:
+        self.stop_movie()
         self.cleanup_preview()
         self.operations.clear()
         self.exit_region_edit()
@@ -2559,9 +2620,32 @@ class FullscreenViewer(QDialog):
         self.display_preview_image = None
         self.display_preview_size = None
         self.base_pixmap = load_oriented_pixmap(self.current_path)
+        if self.current_path.suffix.casefold() == ".gif":
+            self.start_movie()
+            return
         self._fit_pixmap()
 
+    def start_movie(self) -> None:
+        movie = QMovie(str(self.current_path))
+        movie.setCacheMode(QMovie.CacheMode.CacheAll)
+        movie.setScaledSize(self.displayed_image_rect().size())
+        self.label.clear_display_pixmap()
+        self.label.setMovie(movie)
+        movie.start()
+        self.movie = movie
+
+    def stop_movie(self) -> None:
+        if self.movie is None:
+            return
+        self.movie.stop()
+        self.movie.deleteLater()
+        self.movie = None
+        self.label.clear_display_pixmap()
+
     def _fit_pixmap(self) -> None:
+        if self.movie is not None and self.display_preview_image is None:
+            self.movie.setScaledSize(self.displayed_image_rect().size())
+            return
         if self.base_pixmap.isNull():
             self.label.clear_display_pixmap()
             return
@@ -2664,6 +2748,9 @@ class FullscreenViewer(QDialog):
         self.render_preview()
 
     def start_region_edit(self, mode: str) -> None:
+        if self.movie is not None:
+            self.stop_movie()
+            self._fit_pixmap()
         self.edit_mode = mode
         self.drag_origin = None
         self.rubber_band.hide()
@@ -2844,6 +2931,7 @@ class FullscreenViewer(QDialog):
         return widget_device_pixel_ratio(self.label)
 
     def render_preview(self) -> None:
+        self.stop_movie()
         self.cleanup_preview()
         self.preview_image = self.render_operations_to_image(self.operations)
         self.preview_image_current = True

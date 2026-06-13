@@ -4,10 +4,12 @@ import io
 from dataclasses import dataclass
 from functools import lru_cache
 from math import ceil
+from collections.abc import Sequence
 
-from PIL import Image, ImageOps
+from PIL import Image, ImageDraw, ImageOps
 
 from .app_icon import folder_icon_bytes
+from .models import FolderPreviewRecord
 
 FOLDER_ICON_NATIVE_SIZE = (1254, 1254)
 EMPTY_PREVIEW_COLOR = (242, 245, 249, 255)
@@ -37,15 +39,15 @@ class FolderIconTemplate:
     region_masks: dict[str, Image.Image]
 
 
-def render_folder_icon(preview_blobs: list[bytes], size: int) -> Image.Image:
+def render_folder_icon(previews: Sequence[bytes | FolderPreviewRecord], size: int) -> Image.Image:
     target_size = max(1, int(size))
     template_size = min(target_size, FOLDER_ICON_NATIVE_SIZE[0])
     template = folder_icon_template(template_size)
     canvas = Image.new("RGBA", template.overlay.size, (0, 0, 0, 0))
     for region in template.regions:
         canvas.paste(EMPTY_PREVIEW_COLOR, region.bbox[:2], template.region_masks[region.name])
-    for blob, region in zip(preview_blobs, template.regions):
-        thumbnail = _load_preview_image(blob)
+    for preview, region in zip(previews, template.regions):
+        thumbnail = _preview_image(preview, region)
         if thumbnail is None:
             continue
         fitted = _fit_preview_to_region(thumbnail, region)
@@ -68,6 +70,64 @@ def folder_icon_template(size: int | None = None) -> FolderIconTemplate:
     region_masks = {region.name: _green_component_mask(icon, region) for region in regions}
     overlay = _transparent_folder_overlay(icon)
     return FolderIconTemplate(overlay=overlay, regions=regions, region_masks=region_masks)
+
+
+def _preview_image(preview: bytes | FolderPreviewRecord, region: FolderPreviewRegion) -> Image.Image | None:
+    if isinstance(preview, bytes):
+        return _load_preview_image(preview)
+    if preview.kind == "image" and preview.blob is not None:
+        return _load_preview_image(preview.blob)
+    if preview.kind == "video":
+        return _video_placeholder(region)
+    if preview.kind == "other":
+        return _binary_placeholder(region)
+    return None
+
+
+def _placeholder_canvas(region: FolderPreviewRegion) -> Image.Image:
+    left, top, right, bottom = region.bbox
+    return Image.new("RGBA", (right - left, bottom - top), (239, 246, 255, 255))
+
+
+def _video_placeholder(region: FolderPreviewRegion) -> Image.Image:
+    image = _placeholder_canvas(region)
+    draw = ImageDraw.Draw(image)
+    width, height = image.size
+    radius = max(8, min(width, height) // 3)
+    center = (width // 2, height // 2)
+    draw.ellipse(
+        (
+            center[0] - radius,
+            center[1] - radius,
+            center[0] + radius,
+            center[1] + radius,
+        ),
+        fill=(255, 255, 255, 255),
+        outline=(37, 99, 235, 255),
+        width=max(2, radius // 10),
+    )
+    triangle_width = max(8, int(radius * 0.9))
+    triangle_height = max(8, int(radius * 1.1))
+    points = [
+        (center[0] - triangle_width // 3, center[1] - triangle_height // 2),
+        (center[0] - triangle_width // 3, center[1] + triangle_height // 2),
+        (center[0] + triangle_width // 2, center[1]),
+    ]
+    draw.polygon(points, fill=(37, 99, 235, 255))
+    return image
+
+
+def _binary_placeholder(region: FolderPreviewRegion) -> Image.Image:
+    image = _placeholder_canvas(region)
+    draw = ImageDraw.Draw(image)
+    width, height = image.size
+    text_color = (30, 64, 175, 255)
+    step_x = max(18, width // 5)
+    step_y = max(18, height // 5)
+    for y in range(8, height, step_y):
+        for column, x in enumerate(range(8, width, step_x)):
+            draw.text((x, y), "1" if (x + y + column) % 2 else "0", fill=text_color)
+    return image
 
 
 def _scaled_region(region: FolderPreviewRegion, size: int) -> FolderPreviewRegion:

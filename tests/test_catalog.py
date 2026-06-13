@@ -124,6 +124,33 @@ def test_indexing_stores_thumbnail_as_file_not_database_blob(tmp_path: Path) -> 
         assert catalog.get_thumbnail_blob("set-a/wide.jpg") == record.thumb_blob
 
 
+def test_thumbnail_repository_size_counts_thumbnail_files(tmp_path: Path) -> None:
+    root = tmp_path / "catalog"
+    make_image(root / "set-a" / "wide.jpg", (640, 320))
+    make_image(root / "set-a" / "tall.jpg", (320, 640))
+
+    with Catalog(root, CatalogSettings(thumbnail_native_size=96)) as catalog:
+        catalog.refresh()
+        expected = sum(path.stat().st_size for path in catalog.thumbnail_dir.rglob("*") if path.is_file())
+
+        assert expected > 0
+        assert catalog.thumbnail_repository_size_bytes() == expected
+
+
+def test_folder_preview_items_include_video_and_other_file_placeholders(tmp_path: Path) -> None:
+    root = tmp_path / "catalog"
+    folder = root / "mixed"
+    folder.mkdir(parents=True)
+    (folder / "a-video.mp4").write_bytes(b"video")
+    (folder / "b-data.bin").write_bytes(b"data")
+
+    with Catalog(root) as catalog:
+        catalog.discover_directories()
+        previews = catalog.folder_preview_items_under("mixed", limit=4)
+
+        assert [preview.kind for preview in previews] == ["video", "other"]
+
+
 def test_metadata_listing_does_not_load_thumbnail_blobs(tmp_path: Path) -> None:
     root = tmp_path / "catalog"
     make_image(root / "set-a" / "wide.jpg", (640, 320))
@@ -829,8 +856,9 @@ def test_prune_thumbnails_repairs_cache_drift(tmp_path: Path) -> None:
 
 def test_prune_thumbnails_processes_database_rows_in_batches(tmp_path: Path, monkeypatch) -> None:
     root = tmp_path / "catalog"
-    for index in range(5):
-        make_image(root / f"image-{index}.jpg", (120, 90), (20 + index, 40, 60))
+    colors = [(20, 40, 60), (120, 20, 20), (20, 120, 20), (20, 20, 160), (160, 160, 20)]
+    for index, color in enumerate(colors):
+        make_image(root / f"image-{index}.jpg", (120, 90), color)
 
     monkeypatch.setattr(catalog_module, "PRUNE_BATCH_SIZE", 2)
     with Catalog(root, CatalogSettings(thumbnail_native_size=96)) as catalog:
