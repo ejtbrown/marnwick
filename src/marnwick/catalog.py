@@ -737,6 +737,47 @@ class Catalog:
             directories.update(self._directory_and_parents(str(row["dir_rel"])))
         return sorted(directories, key=lambda item: item.casefold())
 
+    def list_filesystem_child_directory_rels(self, dir_rel: str = "") -> list[str]:
+        directory = self.abs_path(dir_rel) if dir_rel else self.root
+        child_dirs: list[str] = []
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    if entry.name == ".marnwick":
+                        continue
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            child_dirs.append(self.rel_path(Path(entry.path)))
+                    except OSError:
+                        continue
+        except OSError:
+            return []
+        return sorted(child_dirs, key=lambda item: item.casefold())
+
+    def list_filesystem_child_directories(
+        self,
+        dir_rel: str = "",
+        sort_order: SortOrder = SortOrder.NAME_ASC,
+    ) -> list[DirectoryRecord]:
+        records: list[DirectoryRecord] = []
+        for child_rel in self.list_filesystem_child_directory_rels(dir_rel):
+            path = self.abs_path(child_rel)
+            try:
+                stat = path.stat()
+            except OSError:
+                stat_mtime = 0
+            else:
+                stat_mtime = stat.st_mtime_ns
+            records.append(
+                DirectoryRecord(
+                    catalog_root=self.root,
+                    dir_rel=child_rel,
+                    name=Path(child_rel).name,
+                    mtime_ns=stat_mtime,
+                )
+            )
+        return sorted(records, key=self._directory_sort_key(sort_order), reverse=self._record_sort_reverse(sort_order))
+
     def refresh(
         self,
         progress: ProgressCallback | None = None,

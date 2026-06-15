@@ -66,6 +66,22 @@ def test_discover_directories_preserves_whitespace_directory_names(tmp_path: Pat
         assert "space /line\nbreak" in catalog.list_known_directories()
 
 
+def test_list_filesystem_child_directory_rels_scans_only_one_level(tmp_path: Path) -> None:
+    root = tmp_path / "catalog"
+    (root / "alpha" / "nested").mkdir(parents=True)
+    (root / "beta").mkdir()
+    (root / ".marnwick" / "ignored").mkdir(parents=True)
+    make_image(root / "alpha" / "nested" / "image.jpg")
+
+    with Catalog(root) as catalog:
+        assert catalog.list_filesystem_child_directory_rels("") == ["alpha", "beta"]
+        assert catalog.list_filesystem_child_directory_rels("alpha") == ["alpha/nested"]
+        records = catalog.list_filesystem_child_directories("", SortOrder.NAME_DESC)
+
+        assert [record.dir_rel for record in records] == ["beta", "alpha"]
+        assert all(record.preview_items == () for record in records)
+
+
 def test_changing_native_thumbnail_size_rebuilds_thumbnail_on_next_index(tmp_path: Path) -> None:
     root = tmp_path / "catalog"
     make_image(root / "wide.jpg", (640, 320))
