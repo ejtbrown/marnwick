@@ -4,6 +4,8 @@ import json
 from math import ceil, hypot
 import os
 from collections import OrderedDict, defaultdict
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from time import monotonic
@@ -87,6 +89,23 @@ from .workspace import Workspace
 
 CATALOG_ROOT_ROLE = Qt.ItemDataRole.UserRole
 DIR_REL_ROLE = Qt.ItemDataRole.UserRole + 1
+TIMINGS_FILE_NAME = "timings.json"
+MAX_TIMING_EVENTS = 1000
+
+
+@dataclass(slots=True)
+class CatalogOpenResult:
+    catalog: Catalog
+    init_duration_ms: float
+
+
+@dataclass(slots=True)
+class CatalogOpenTask:
+    root: Path
+    future: Future[CatalogOpenResult]
+    log_event: bool
+    selected_at: float | None
+    started_at: float
 
 DIALOG_STYLESHEET = """
 QDialog,
@@ -769,6 +788,7 @@ class MainWindow(QMainWindow):
         self.app_config = load_config(self.config_path) if self.config_enabled else AppConfig()
         self.workspace = Workspace()
         self.indexer = BackgroundIndexer()
+        self.catalog_open_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="marnwick-open")
         self.current_catalog: Catalog | None = None
         self.current_dir_rel = ""
         self.current_sort = self.sort_order_from_config(self.app_config.sort_order)
@@ -780,6 +800,7 @@ class MainWindow(QMainWindow):
         self._thumbnail_prune_tasks: dict[Path, IndexTask] = {}
         self._resume_idle_refresh_roots: set[Path] = set()
         self._shallow_tree_roots: set[Path] = set()
+        self._catalog_open_tasks: dict[Future[CatalogOpenResult], CatalogOpenTask] = {}
         self._indexing_was_active = False
 
         self.tree = DirectoryTree(self)
@@ -871,6 +892,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         self.save_window_config()
+        self.catalog_open_executor.shutdown(wait=False, cancel_futures=True)
         self.indexer.shutdown()
         self.workspace.close()
         super().closeEvent(event)
@@ -1015,9 +1037,16 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence("Ctrl+O"), self, activated=self.open_catalog_dialog)
 
     def open_catalog_dialog(self) -> None:
+        dialog_started_at = monotonic()
         directory = QFileDialog.getExistingDirectory(self, "Open catalog")
         if directory:
-            self.open_catalog(Path(directory))
+            selected_at = monotonic()
+            self.defer_open_catalog(
+                Path(directory),
+                log_event=True,
+                selected_at=selected_at,
+                dialog_duration_ms=(selected_at - dialog_started_at) * 1000,
+            )
 
     def refresh_current_catalog(self) -> None:
         if self.current_catalog is None:
@@ -1136,25 +1165,245 @@ class MainWindow(QMainWindow):
         self.queue_directory_index(catalog, self.current_dir_rel if self.current_catalog == catalog else "")
 
     def open_catalog(self, root: Path, *, log_event: bool = True) -> None:
+        operation_started_at = monotonic()
+        init_started_at = monotonic()
         was_open = self.workspace.catalog_for_root(root) is not None
         catalog = self.workspace.open_catalog(root)
+        self._record_timing_phase(
+            catalog.root,
+            "catalog_init_sync",
+            init_started_at,
+            {"was_open": was_open},
+        )
+        self._finish_open_catalog_ui(
+            catalog,
+            was_open=was_open,
+            log_event=log_event,
+            operation_started_at=operation_started_at,
+            mode="sync",
+        )
+
+    def defer_open_catalog(
+        self,
+        root: Path,
+        *,
+        log_event: bool = True,
+        selected_at: float | None = None,
+        dialog_duration_ms: float | None = None,
+    ) -> None:
+        selected_at = selected_at or monotonic()
+        details: dict[str, object] = {}
+        if dialog_duration_ms is not None:
+            details["dialog_duration_ms"] = round(dialog_duration_ms, 3)
+        self._append_timing_event(root, "dialog_selected", 0.0, details)
+        self._show_catalog_open_status(root)
+        QTimer.singleShot(
+            0,
+            lambda: self.open_catalog_async(root, log_event=log_event, selected_at=selected_at),
+        )
+
+    def open_catalog_async(
+        self,
+        root: Path,
+        *,
+        log_event: bool = True,
+        selected_at: float | None = None,
+    ) -> None:
+        operation_started_at = monotonic()
+        if selected_at is not None:
+            self._append_timing_event(
+                root,
+                "deferred_open_start",
+                (operation_started_at - selected_at) * 1000,
+            )
+        existing = self.workspace.catalog_for_root(root)
+        if existing is not None:
+            self._finish_open_catalog_ui(
+                existing,
+                was_open=True,
+                log_event=log_event,
+                operation_started_at=operation_started_at,
+                mode="async_existing",
+            )
+            return
+        if any(task.root.expanduser() == root.expanduser() for task in self._catalog_open_tasks.values()):
+            self._show_catalog_open_status(root)
+            return
+        future = self.catalog_open_executor.submit(self._open_catalog_worker, root)
+        self._catalog_open_tasks[future] = CatalogOpenTask(
+            root=root,
+            future=future,
+            log_event=log_event,
+            selected_at=selected_at,
+            started_at=operation_started_at,
+        )
+        self._show_catalog_open_status(root)
+
+    def _open_catalog_worker(self, root: Path) -> CatalogOpenResult:
+        init_started_at = monotonic()
+        catalog = Catalog(root)
+        return CatalogOpenResult(catalog, (monotonic() - init_started_at) * 1000)
+
+    def _finish_open_catalog_ui(
+        self,
+        catalog: Catalog,
+        *,
+        was_open: bool,
+        log_event: bool,
+        operation_started_at: float,
+        mode: str,
+    ) -> None:
         if log_event and not was_open:
+            phase_started_at = monotonic()
             catalog.append_log("Catalog added to workspace")
+            self._record_timing_phase(catalog.root, "append_open_log", phase_started_at, {"mode": mode})
+        phase_started_at = monotonic()
         self._swept_catalog_roots.discard(catalog.root)
         self._pruned_catalog_roots.discard(catalog.root)
         self._idle_index_tasks.pop(catalog.root, None)
         if not was_open:
             self._shallow_tree_roots.add(catalog.root)
+        self._record_timing_phase(catalog.root, "prepare_open_state", phase_started_at, {"mode": mode})
+
+        phase_started_at = monotonic()
         self._directory_discovery_tasks[catalog.root] = self.indexer.discover_directories(catalog.root)
+        self._record_timing_phase(catalog.root, "start_directory_discovery", phase_started_at, {"mode": mode})
+
         self.current_catalog = catalog
         self.current_dir_rel = ""
+
+        phase_started_at = monotonic()
         self.rebuild_tree()
+        self._record_timing_phase(catalog.root, "rebuild_tree", phase_started_at, {"mode": mode})
+
+        phase_started_at = monotonic()
         self.load_current_directory()
+        self._record_timing_phase(catalog.root, "load_current_directory", phase_started_at, {"mode": mode})
+
+        phase_started_at = monotonic()
         self.queue_directory_index(catalog, "", interactive=False)
+        self._record_timing_phase(catalog.root, "queue_root_directory_index", phase_started_at, {"mode": mode})
+
+        phase_started_at = monotonic()
         self._schedule_idle_indexing()
+        self._record_timing_phase(catalog.root, "schedule_idle_indexing", phase_started_at, {"mode": mode})
+
+        self._append_timing_event(
+            catalog.root,
+            "open_catalog_total",
+            (monotonic() - operation_started_at) * 1000,
+            {"mode": mode, "was_open": was_open},
+        )
+
+    def _show_catalog_open_status(self, root: Path) -> None:
+        self.progress_bar.setRange(0, 0)
+        self.progress_label.setText(f"Opening catalog {root.name or root}")
+
+    def _record_timing_phase(
+        self,
+        root: Path,
+        phase: str,
+        started_at: float,
+        details: dict[str, object] | None = None,
+    ) -> None:
+        self._append_timing_event(root, phase, (monotonic() - started_at) * 1000, details)
+
+    def _append_timing_event(
+        self,
+        root: Path,
+        phase: str,
+        duration_ms: float | None = None,
+        details: dict[str, object] | None = None,
+    ) -> None:
+        try:
+            state_dir = root.expanduser() / ".marnwick"
+            state_dir.mkdir(parents=True, exist_ok=True)
+            timings_path = state_dir / TIMINGS_FILE_NAME
+            try:
+                payload = json.loads(timings_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                payload = {}
+            if not isinstance(payload, dict):
+                payload = {}
+            events = payload.get("events")
+            if not isinstance(events, list):
+                events = []
+            event: dict[str, object] = {
+                "timestamp": datetime.now().astimezone().isoformat(timespec="milliseconds"),
+                "operation": "open_catalog",
+                "phase": phase,
+                "root": str(root.expanduser()),
+            }
+            if duration_ms is not None:
+                event["duration_ms"] = round(float(duration_ms), 3)
+            if details:
+                event["details"] = {
+                    key: str(value) if isinstance(value, Path) else value
+                    for key, value in details.items()
+                }
+            events.append(event)
+            payload["version"] = 1
+            payload["events"] = events[-MAX_TIMING_EVENTS:]
+            timings_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        except (OSError, TypeError, ValueError):
+            return
+
+    def _settle_catalog_open_tasks(self) -> None:
+        for future, task in list(self._catalog_open_tasks.items()):
+            if not future.done():
+                continue
+            self._catalog_open_tasks.pop(future, None)
+            if future.cancelled():
+                self._append_timing_event(task.root, "catalog_init_canceled", None)
+                continue
+            try:
+                result = future.result()
+            except Exception as error:
+                self._append_timing_event(
+                    task.root,
+                    "catalog_init_failed",
+                    (monotonic() - task.started_at) * 1000,
+                    {"error": str(error)},
+                )
+                self.progress_bar.setRange(0, 1)
+                self.progress_bar.setValue(0)
+                self.progress_label.setText("Ready")
+                show_error(self, "Open Catalog", str(error))
+                continue
+            self._append_timing_event(result.catalog.root, "catalog_init", result.init_duration_ms)
+            catalog, was_open = self.workspace.adopt_catalog(result.catalog)
+            self._finish_open_catalog_ui(
+                catalog,
+                was_open=was_open,
+                log_event=task.log_event,
+                operation_started_at=task.started_at,
+                mode="async",
+            )
+
+    def _has_active_catalog_open_tasks(self) -> bool:
+        return bool(self._catalog_open_tasks)
+
+    def _active_catalog_open_task(self) -> CatalogOpenTask | None:
+        tasks = list(self._catalog_open_tasks.values())
+        if not tasks:
+            return None
+        return sorted(tasks, key=lambda task: task.started_at)[0]
+
+    def _cancel_catalog_open_tasks(self, root: Path) -> None:
+        for future, task in list(self._catalog_open_tasks.items()):
+            try:
+                matches_root = task.root.expanduser().resolve() == root.expanduser().resolve()
+            except OSError:
+                matches_root = task.root.expanduser() == root.expanduser()
+            if not matches_root:
+                continue
+            future.cancel()
+            self._catalog_open_tasks.pop(future, None)
+            self._append_timing_event(task.root, "catalog_init_canceled", None)
 
     def close_catalog(self, root: Path) -> None:
         resolved = root.resolve()
+        self._cancel_catalog_open_tasks(resolved)
         catalog = self.workspace.catalog_for_root(root)
         if catalog is not None:
             catalog.append_log("Catalog removed from workspace")
@@ -1523,6 +1772,8 @@ class MainWindow(QMainWindow):
         self._poll_indexer()
 
     def _schedule_idle_indexing(self) -> None:
+        if self._has_active_catalog_open_tasks():
+            return
         self._settle_directory_discovery_tasks()
         self._settle_directory_index_tasks()
         self._settle_idle_tasks()
@@ -1545,6 +1796,11 @@ class MainWindow(QMainWindow):
                 return
 
     def _poll_indexer(self) -> None:
+        self._settle_catalog_open_tasks()
+        active_open_task = self._active_catalog_open_task()
+        if active_open_task is not None:
+            self._show_catalog_open_status(active_open_task.root)
+            return
         self._settle_directory_discovery_tasks()
         self._settle_directory_index_tasks()
         self._settle_idle_tasks()

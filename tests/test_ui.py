@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from time import monotonic
@@ -1364,6 +1365,147 @@ def test_open_catalog_discovers_directory_tree_without_waiting_for_image_index(t
     finally:
         window.progress_timer.stop()
         window.idle_timer.stop()
+        window.indexer.shutdown()
+        window.workspace.close()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_open_catalog_dialog_defers_open_until_next_event_loop_tick(tmp_path: Path, monkeypatch) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    calls: list[tuple[Path, bool, float | None]] = []
+
+    window = MainWindow()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        monkeypatch.setattr("marnwick.ui.QFileDialog.getExistingDirectory", lambda *_: str(root))
+
+        def fake_open_catalog_async(
+            selected_root: Path,
+            *,
+            log_event: bool = True,
+            selected_at: float | None = None,
+        ) -> None:
+            calls.append((selected_root, log_event, selected_at))
+
+        monkeypatch.setattr(window, "open_catalog_async", fake_open_catalog_async)
+
+        window.open_catalog_dialog()
+
+        assert calls == []
+        timings_path = root / ".marnwick" / "timings.json"
+        timings = json.loads(timings_path.read_text(encoding="utf-8"))
+        assert timings["events"][-1]["phase"] == "dialog_selected"
+
+        qt_app.processEvents()
+
+        assert len(calls) == 1
+        assert calls[0][0] == root
+        assert calls[0][1] is True
+        assert calls[0][2] is not None
+    finally:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        window.catalog_open_executor.shutdown(wait=False, cancel_futures=True)
+        window.indexer.shutdown()
+        window.workspace.close()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_async_open_catalog_writes_phase_timings(tmp_path: Path) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    (root / "child").mkdir(parents=True)
+
+    class FakeTask:
+        def __init__(self, label: str, task_root: Path, dir_rel: str | None = None) -> None:
+            self.label = label
+            self.root = task_root.resolve()
+            self.dir_rel = dir_rel
+
+        def snapshot(self) -> IndexProgressSnapshot:
+            return IndexProgressSnapshot(
+                label=self.label,
+                root=self.root,
+                dir_rel=self.dir_rel,
+                processed=0,
+                total=0,
+                current="",
+                done=True,
+                error=None,
+                interactive=True,
+                canceled=False,
+                started_at=1.0,
+            )
+
+    class FakeIndexer:
+        def discover_directories(self, task_root: Path, *, interactive: bool = True) -> FakeTask:
+            return FakeTask(f"Discovering folders {task_root.name}", task_root)
+
+        def refresh_directory(
+            self,
+            task_root: Path,
+            dir_rel: str,
+            *,
+            interactive: bool = True,
+            force: bool = False,
+        ) -> FakeTask:
+            return FakeTask(f"Indexing {dir_rel or task_root.name}", task_root, dir_rel)
+
+        def refresh_catalog(self, task_root: Path, *, interactive: bool = False, force: bool = False) -> FakeTask:
+            return FakeTask(f"Refreshing catalog {task_root.name}", task_root)
+
+        def prune_thumbnails(self, task_root: Path, *, interactive: bool = False, force: bool = False) -> FakeTask:
+            return FakeTask(f"Pruning thumbnails {task_root.name}", task_root)
+
+        def active_snapshots(self) -> list[IndexProgressSnapshot]:
+            return []
+
+        def has_active_tasks(self) -> bool:
+            return False
+
+        def cancel_idle_tasks(self, root: Path | None = None) -> None:
+            return None
+
+        def cancel_directory_tasks(self, root: Path, *, keep_dir_rel: str | None = None) -> None:
+            return None
+
+        def shutdown(self) -> None:
+            return None
+
+    window = MainWindow()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        window.indexer.shutdown()
+        window.indexer = FakeIndexer()  # type: ignore[assignment]
+
+        selected_at = monotonic()
+        window.open_catalog_async(root, selected_at=selected_at)
+        deadline = monotonic() + 5.0
+        while window.workspace.catalog_for_root(root) is None and monotonic() < deadline:
+            qt_app.processEvents()
+            window._poll_indexer()
+
+        assert window.workspace.catalog_for_root(root) is not None
+        timings = json.loads((root / ".marnwick" / "timings.json").read_text(encoding="utf-8"))
+        phases = [event["phase"] for event in timings["events"]]
+
+        assert "deferred_open_start" in phases
+        assert "catalog_init" in phases
+        assert "rebuild_tree" in phases
+        assert "load_current_directory" in phases
+        assert "open_catalog_total" in phases
+    finally:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        window.catalog_open_executor.shutdown(wait=False, cancel_futures=True)
         window.indexer.shutdown()
         window.workspace.close()
         window.close()
