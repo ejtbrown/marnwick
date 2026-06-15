@@ -91,6 +91,8 @@ CATALOG_ROOT_ROLE = Qt.ItemDataRole.UserRole
 DIR_REL_ROLE = Qt.ItemDataRole.UserRole + 1
 TIMINGS_FILE_NAME = "timings.json"
 MAX_TIMING_EVENTS = 1000
+TREE_BUILD_BATCH_SIZE = 400
+TREE_BUILD_BUDGET_SECONDS = 0.008
 
 
 @dataclass(slots=True)
@@ -106,6 +108,18 @@ class CatalogOpenTask:
     log_event: bool
     selected_at: float | None
     started_at: float
+
+
+@dataclass(slots=True)
+class TreeBuildTask:
+    catalog: Catalog
+    directories: list[str]
+    expanded_items: set[tuple[Path, str]]
+    item_by_dir: dict[str, QTreeWidgetItem]
+    index: int
+    selected_item: QTreeWidgetItem | None
+    started_at: float
+    reason: str
 
 DIALOG_STYLESHEET = """
 QDialog,
@@ -801,6 +815,8 @@ class MainWindow(QMainWindow):
         self._resume_idle_refresh_roots: set[Path] = set()
         self._shallow_tree_roots: set[Path] = set()
         self._catalog_open_tasks: dict[Future[CatalogOpenResult], CatalogOpenTask] = {}
+        self._tree_build_task: TreeBuildTask | None = None
+        self._pending_tree_rebuilds: dict[Path, tuple[Catalog, str]] = {}
         self._indexing_was_active = False
 
         self.tree = DirectoryTree(self)
@@ -1418,6 +1434,7 @@ class MainWindow(QMainWindow):
         self._thumbnail_prune_tasks.pop(resolved, None)
         self._resume_idle_refresh_roots.discard(resolved)
         self._shallow_tree_roots.discard(resolved)
+        self._pending_tree_rebuilds.pop(resolved, None)
         if self.current_catalog and self.current_catalog.root == resolved:
             self.current_catalog = None
             self.current_dir_rel = ""
@@ -1426,6 +1443,8 @@ class MainWindow(QMainWindow):
         self.rebuild_tree()
 
     def rebuild_tree(self) -> None:
+        self._tree_build_task = None
+        self._pending_tree_rebuilds.clear()
         expanded_items = self._expanded_tree_items()
         self.tree.clear()
         selected_item: QTreeWidgetItem | None = None
@@ -1463,6 +1482,124 @@ class MainWindow(QMainWindow):
             self.tree.setCurrentItem(selected_item)
             self._expand_tree_item_ancestors(selected_item)
             self.tree.scrollToItem(selected_item)
+
+    def _request_incremental_tree_rebuild(self, catalog: Catalog, *, reason: str) -> None:
+        active_task = self._tree_build_task
+        if active_task is not None:
+            self._pending_tree_rebuilds[catalog.root] = (catalog, reason)
+            self._append_timing_event(
+                catalog.root,
+                "queue_incremental_tree_rebuild",
+                None,
+                {"reason": reason},
+            )
+            return
+        self._start_incremental_tree_rebuild(catalog, reason=reason)
+
+    def _start_incremental_tree_rebuild(self, catalog: Catalog, *, reason: str) -> None:
+        phase_started_at = monotonic()
+        self._pending_tree_rebuilds.pop(catalog.root, None)
+        expanded_items = self._expanded_tree_items()
+        root_item = self._tree_item_for_root(catalog.root)
+        if root_item is None:
+            root_item = QTreeWidgetItem([catalog.root.name or str(catalog.root)])
+            root_item.setIcon(0, self.folder_icon)
+            root_item.setToolTip(0, str(catalog.root))
+            root_item.setData(0, CATALOG_ROOT_ROLE, str(catalog.root))
+            root_item.setData(0, DIR_REL_ROLE, "")
+            self.tree.addTopLevelItem(root_item)
+        else:
+            root_item.takeChildren()
+        root_item.setExpanded(True)
+        directories = [
+            dir_rel
+            for dir_rel in catalog.list_known_directories()
+            if dir_rel
+        ]
+        self._tree_build_task = TreeBuildTask(
+            catalog=catalog,
+            directories=directories,
+            expanded_items=expanded_items,
+            item_by_dir={"": root_item},
+            index=0,
+            selected_item=root_item if self._is_current_tree_item(catalog.root, "") else None,
+            started_at=phase_started_at,
+            reason=reason,
+        )
+        self._record_timing_phase(
+            catalog.root,
+            "start_incremental_tree_rebuild",
+            phase_started_at,
+            {"reason": reason, "directories": len(directories)},
+        )
+        self._continue_incremental_tree_rebuild()
+
+    def _continue_incremental_tree_rebuild(self) -> None:
+        task = self._tree_build_task
+        if task is None:
+            return
+        deadline = monotonic() + TREE_BUILD_BUDGET_SECONDS
+        processed = 0
+        while task.index < len(task.directories):
+            dir_rel = task.directories[task.index]
+            task.index += 1
+            parent_rel = Path(dir_rel).parent.as_posix()
+            if parent_rel == ".":
+                parent_rel = ""
+            parent_item = task.item_by_dir.get(parent_rel, task.item_by_dir[""])
+            item = QTreeWidgetItem([Path(dir_rel).name])
+            item.setIcon(0, self.folder_icon)
+            item.setToolTip(0, str(task.catalog.root / dir_rel))
+            item.setData(0, CATALOG_ROOT_ROLE, str(task.catalog.root))
+            item.setData(0, DIR_REL_ROLE, dir_rel)
+            parent_item.addChild(item)
+            task.item_by_dir[dir_rel] = item
+            if self._is_current_tree_item(task.catalog.root, dir_rel):
+                task.selected_item = item
+            if (task.catalog.root, dir_rel) in task.expanded_items:
+                item.setExpanded(True)
+            processed += 1
+            if processed >= TREE_BUILD_BATCH_SIZE or monotonic() >= deadline:
+                break
+        total = len(task.directories)
+        if task.index < total:
+            self.progress_bar.setRange(0, max(total, 1))
+            self.progress_bar.setValue(task.index)
+            self.progress_label.setText(f"Building folder tree {task.index}/{total}")
+            QTimer.singleShot(0, self._continue_incremental_tree_rebuild)
+            return
+        if task.selected_item is not None:
+            self.tree.setCurrentItem(task.selected_item)
+            self._expand_tree_item_ancestors(task.selected_item)
+            self.tree.scrollToItem(task.selected_item)
+        self._append_timing_event(
+            task.catalog.root,
+            "incremental_tree_rebuild_complete",
+            (monotonic() - task.started_at) * 1000,
+            {"reason": task.reason, "directories": total},
+        )
+        self._tree_build_task = None
+        self._start_next_pending_tree_rebuild()
+
+    def _start_next_pending_tree_rebuild(self) -> None:
+        while self._pending_tree_rebuilds:
+            root, (_, reason) = self._pending_tree_rebuilds.popitem()
+            catalog = self.workspace.catalog_for_root(root)
+            if catalog is None:
+                continue
+            QTimer.singleShot(
+                0,
+                lambda catalog=catalog, reason=reason: self._start_incremental_tree_rebuild(catalog, reason=reason),
+            )
+            return
+
+    def _tree_item_for_root(self, root: Path) -> QTreeWidgetItem | None:
+        resolved = root.resolve()
+        for index in range(self.tree.topLevelItemCount()):
+            item = self.tree.topLevelItem(index)
+            if Path(item.data(0, CATALOG_ROOT_ROLE)).resolve() == resolved:
+                return item
+        return None
 
     def _tree_directory_rels_for_catalog(self, catalog: Catalog) -> list[str]:
         if catalog.root in self._shallow_tree_roots:
@@ -1778,6 +1915,8 @@ class MainWindow(QMainWindow):
         self._settle_directory_index_tasks()
         self._settle_idle_tasks()
         self._settle_thumbnail_prune_tasks()
+        if self._tree_build_task is not None or self._pending_tree_rebuilds:
+            return
         if self.indexer.has_active_tasks():
             return
         for catalog in self.workspace.catalogs:
@@ -1809,8 +1948,11 @@ class MainWindow(QMainWindow):
         if not snapshots:
             if self._indexing_was_active:
                 self._indexing_was_active = False
-                self.reload_tree_and_directory()
+                self.load_current_directory()
             self._schedule_idle_indexing()
+            if self._tree_build_task is not None:
+                self._show_tree_build_status(self._tree_build_task)
+                return
             self.progress_bar.setRange(0, 1)
             self.progress_bar.setValue(0)
             self.progress_label.setText("Ready")
@@ -1855,6 +1997,12 @@ class MainWindow(QMainWindow):
                 self.model.refresh_thumbnail(snapshot.current)
         self.progress_label.setText(detail)
 
+    def _show_tree_build_status(self, task: TreeBuildTask) -> None:
+        total = len(task.directories)
+        self.progress_bar.setRange(0, max(total, 1))
+        self.progress_bar.setValue(task.index)
+        self.progress_label.setText(f"Building folder tree {task.index}/{total}")
+
     def indexing_progress_path(self, snapshot: IndexProgressSnapshot) -> str:
         if snapshot.dir_rel is not None:
             return snapshot.dir_rel or "."
@@ -1883,6 +2031,10 @@ class MainWindow(QMainWindow):
             self._idle_index_tasks.pop(root, None)
             if snapshot.error is None and not snapshot.canceled:
                 self._swept_catalog_roots.add(root)
+                if snapshot.interactive or task.force_refresh:
+                    catalog = self.workspace.catalog_for_root(root)
+                    if catalog is not None:
+                        self._request_incremental_tree_rebuild(catalog, reason="catalog_refresh")
 
     def _settle_directory_index_tasks(self) -> None:
         completed_roots: set[Path] = set()
@@ -1900,7 +2052,6 @@ class MainWindow(QMainWindow):
                 self._swept_catalog_roots.discard(root)
 
     def _settle_directory_discovery_tasks(self) -> None:
-        should_rebuild = False
         for root, task in list(self._directory_discovery_tasks.items()):
             snapshot = task.snapshot()
             if not snapshot.done:
@@ -1908,9 +2059,9 @@ class MainWindow(QMainWindow):
             self._directory_discovery_tasks.pop(root, None)
             self._shallow_tree_roots.discard(root)
             if snapshot.error is None and not snapshot.canceled:
-                should_rebuild = True
-        if should_rebuild:
-            self.rebuild_tree()
+                catalog = self.workspace.catalog_for_root(root)
+                if catalog is not None:
+                    self._request_incremental_tree_rebuild(catalog, reason="directory_discovery")
 
     def _settle_thumbnail_prune_tasks(self) -> None:
         for root, task in list(self._thumbnail_prune_tasks.items()):

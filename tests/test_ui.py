@@ -1815,6 +1815,50 @@ def test_tree_rebuild_preserves_selected_empty_directory_and_expands_ancestors(t
         qt_app.processEvents()
 
 
+def test_incremental_tree_rebuild_yields_between_batches(tmp_path: Path, monkeypatch) -> None:
+    qt_app = app()
+    root = tmp_path / "Pictures"
+    (root / "a" / "b" / "c").mkdir(parents=True)
+    (root / "d").mkdir()
+
+    window = MainWindow()
+    try:
+        monkeypatch.setattr("marnwick.ui.TREE_BUILD_BATCH_SIZE", 1)
+        monkeypatch.setattr("marnwick.ui.TREE_BUILD_BUDGET_SECONDS", 999.0)
+        catalog = window.workspace.open_catalog(root)
+        for dir_rel in ["a", "a/b", "a/b/c", "d"]:
+            catalog.remember_directory(dir_rel)
+        window.current_catalog = catalog
+        window.current_dir_rel = "a/b/c"
+
+        window._start_incremental_tree_rebuild(catalog, reason="test")
+
+        root_item = window.tree.topLevelItem(0)
+        assert root_item is not None
+        assert root_item.childCount() == 1
+        assert root_item.child(0).data(0, DIR_REL_ROLE) == "a"
+        assert window._tree_build_task is not None
+
+        deadline = monotonic() + 1.0
+        while window._tree_build_task is not None and monotonic() < deadline:
+            qt_app.processEvents()
+
+        assert window._tree_build_task is None
+        selected = window.tree.currentItem()
+        assert selected is not None
+        assert selected.data(0, DIR_REL_ROLE) == "a/b/c"
+        assert root_item.childCount() == 2
+        assert root_item.child(0).child(0).child(0).data(0, DIR_REL_ROLE) == "a/b/c"
+    finally:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        window.indexer.shutdown()
+        window.workspace.close()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
 def test_directory_tree_drag_hover_highlights_destination(tmp_path: Path) -> None:
     qt_app = app()
     root = tmp_path / "catalog"
