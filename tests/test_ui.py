@@ -1371,6 +1371,135 @@ def test_open_catalog_discovers_directory_tree_without_waiting_for_image_index(t
         qt_app.processEvents()
 
 
+def test_open_catalog_uses_shallow_tree_until_directory_discovery_finishes(tmp_path: Path) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    (root / "top" / "nested").mkdir(parents=True)
+    with Catalog(root) as catalog:
+        catalog.discover_directories()
+
+    class FakeTask:
+        def __init__(self, label: str, task_root: Path, dir_rel: str | None, *, interactive: bool) -> None:
+            self.label = label
+            self.root = task_root.resolve()
+            self.dir_rel = dir_rel
+            self.interactive = interactive
+            self.done = False
+            self.canceled = False
+
+        def snapshot(self) -> IndexProgressSnapshot:
+            return IndexProgressSnapshot(
+                label=self.label,
+                root=self.root,
+                dir_rel=self.dir_rel,
+                processed=0,
+                total=None,
+                current="",
+                done=self.done,
+                error=None,
+                interactive=self.interactive,
+                canceled=self.canceled,
+                started_at=1.0,
+            )
+
+        def finish(self) -> None:
+            self.done = True
+
+        def cancel(self) -> None:
+            self.done = True
+            self.canceled = True
+
+    class FakeIndexer:
+        def __init__(self) -> None:
+            self.tasks: list[FakeTask] = []
+            self.discovery_task: FakeTask | None = None
+
+        def discover_directories(self, task_root: Path, *, interactive: bool = True) -> FakeTask:
+            task = FakeTask(f"Discovering folders {task_root.name}", task_root, None, interactive=interactive)
+            self.discovery_task = task
+            self.tasks.append(task)
+            return task
+
+        def refresh_directory(
+            self,
+            task_root: Path,
+            dir_rel: str,
+            *,
+            interactive: bool = True,
+            force: bool = False,
+        ) -> FakeTask:
+            task = FakeTask(f"Indexing {dir_rel or task_root.name}", task_root, dir_rel, interactive=interactive)
+            self.tasks.append(task)
+            return task
+
+        def refresh_catalog(self, task_root: Path, *, interactive: bool = False, force: bool = False) -> FakeTask:
+            task = FakeTask(f"Refreshing catalog {task_root.name}", task_root, None, interactive=interactive)
+            self.tasks.append(task)
+            return task
+
+        def prune_thumbnails(self, task_root: Path, *, interactive: bool = False, force: bool = False) -> FakeTask:
+            task = FakeTask(f"Pruning thumbnails {task_root.name}", task_root, None, interactive=interactive)
+            self.tasks.append(task)
+            return task
+
+        def active_snapshots(self) -> list[IndexProgressSnapshot]:
+            return [task.snapshot() for task in self.tasks if not task.done]
+
+        def has_active_tasks(self) -> bool:
+            return any(not task.done for task in self.tasks)
+
+        def cancel_idle_tasks(self, root: Path | None = None) -> None:
+            return None
+
+        def cancel_directory_tasks(self, root: Path, *, keep_dir_rel: str | None = None) -> None:
+            return None
+
+        def shutdown(self) -> None:
+            for task in self.tasks:
+                task.cancel()
+
+    window = MainWindow()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        window.indexer.shutdown()
+        fake_indexer = FakeIndexer()
+        window.indexer = fake_indexer  # type: ignore[assignment]
+
+        window.open_catalog(root)
+
+        root_item = window.tree.topLevelItem(0)
+        assert root_item is not None
+        top_item = root_item.child(0)
+        assert top_item is not None
+        assert top_item.data(0, DIR_REL_ROLE) == "top"
+        assert top_item.childCount() == 0
+        assert root.resolve() in window._shallow_tree_roots
+        assert "Discovering folders" in window.progress_label.text()
+        assert [record.dir_rel for record in window.model.images if isinstance(record, DirectoryRecord)] == ["top"]
+
+        for task in fake_indexer.tasks:
+            task.finish()
+        window._poll_indexer()
+
+        root_item = window.tree.topLevelItem(0)
+        assert root_item is not None
+        top_item = root_item.child(0)
+        assert top_item is not None
+        nested_item = top_item.child(0)
+        assert nested_item is not None
+        assert nested_item.data(0, DIR_REL_ROLE) == "top/nested"
+        assert root.resolve() not in window._shallow_tree_roots
+    finally:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        window.indexer.shutdown()
+        window.workspace.close()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
 def test_logs_dialog_displays_catalog_logs_and_copies_line(tmp_path: Path) -> None:
     qt_app = app()
     root = tmp_path / "catalog"

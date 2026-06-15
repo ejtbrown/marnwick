@@ -779,6 +779,7 @@ class MainWindow(QMainWindow):
         self._directory_index_tasks: dict[tuple[Path, str], IndexTask] = {}
         self._thumbnail_prune_tasks: dict[Path, IndexTask] = {}
         self._resume_idle_refresh_roots: set[Path] = set()
+        self._shallow_tree_roots: set[Path] = set()
         self._indexing_was_active = False
 
         self.tree = DirectoryTree(self)
@@ -1142,10 +1143,12 @@ class MainWindow(QMainWindow):
         self._swept_catalog_roots.discard(catalog.root)
         self._pruned_catalog_roots.discard(catalog.root)
         self._idle_index_tasks.pop(catalog.root, None)
+        if not was_open:
+            self._shallow_tree_roots.add(catalog.root)
         self._directory_discovery_tasks[catalog.root] = self.indexer.discover_directories(catalog.root)
-        self.rebuild_tree()
         self.current_catalog = catalog
         self.current_dir_rel = ""
+        self.rebuild_tree()
         self.load_current_directory()
         self.queue_directory_index(catalog, "", interactive=False)
         self._schedule_idle_indexing()
@@ -1165,6 +1168,7 @@ class MainWindow(QMainWindow):
         }
         self._thumbnail_prune_tasks.pop(resolved, None)
         self._resume_idle_refresh_roots.discard(resolved)
+        self._shallow_tree_roots.discard(resolved)
         if self.current_catalog and self.current_catalog.root == resolved:
             self.current_catalog = None
             self.current_dir_rel = ""
@@ -1186,7 +1190,7 @@ class MainWindow(QMainWindow):
             item_by_dir = {"": root_item}
             if self._is_current_tree_item(catalog.root, ""):
                 selected_item = root_item
-            for dir_rel in catalog.list_known_directories():
+            for dir_rel in self._tree_directory_rels_for_catalog(catalog):
                 if not dir_rel:
                     continue
                 parent_rel = Path(dir_rel).parent.as_posix()
@@ -1210,6 +1214,11 @@ class MainWindow(QMainWindow):
             self.tree.setCurrentItem(selected_item)
             self._expand_tree_item_ancestors(selected_item)
             self.tree.scrollToItem(selected_item)
+
+    def _tree_directory_rels_for_catalog(self, catalog: Catalog) -> list[str]:
+        if catalog.root in self._shallow_tree_roots:
+            return catalog.list_filesystem_child_directory_rels("")
+        return catalog.list_known_directories()
 
     def _expanded_tree_items(self) -> set[tuple[Path, str]]:
         expanded: set[tuple[Path, str]] = set()
@@ -1269,7 +1278,13 @@ class MainWindow(QMainWindow):
             placeholder_scan_budget_ms=15,
             placeholder_limit=2000,
         )
-        directories = self.current_catalog.list_child_directories(self.current_dir_rel, self.current_sort)
+        if self.current_catalog.root in self._shallow_tree_roots:
+            directories = self.current_catalog.list_filesystem_child_directories(
+                self.current_dir_rel,
+                self.current_sort,
+            )
+        else:
+            directories = self.current_catalog.list_child_directories(self.current_dir_rel, self.current_sort)
         self.model.set_images(self.current_catalog, [*directories, *images])
         self.refresh_thumbnail_layout()
         self.update_selection_status()
@@ -1635,6 +1650,7 @@ class MainWindow(QMainWindow):
             if not snapshot.done:
                 continue
             self._directory_discovery_tasks.pop(root, None)
+            self._shallow_tree_roots.discard(root)
             if snapshot.error is None and not snapshot.canceled:
                 should_rebuild = True
         if should_rebuild:
