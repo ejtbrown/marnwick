@@ -22,6 +22,15 @@ class Workspace:
         self._catalogs[resolved] = catalog
         return catalog
 
+    def adopt_catalog(self, catalog: Catalog) -> tuple[Catalog, bool]:
+        existing = self._catalogs.get(catalog.root)
+        if existing is not None:
+            if existing is not catalog:
+                catalog.close()
+            return existing, True
+        self._catalogs[catalog.root] = catalog
+        return catalog, False
+
     def close_catalog(self, root: Path) -> None:
         resolved = root.expanduser().resolve()
         catalog = self._catalogs.pop(resolved, None)
