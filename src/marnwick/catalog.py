@@ -709,6 +709,15 @@ class Catalog:
             raise ValueError("catalog state files are not image catalog entries")
         return rel.as_posix()
 
+    def _rel_path_without_resolve(self, path: Path) -> str:
+        try:
+            rel = path.relative_to(self.root)
+        except ValueError:
+            return self.rel_path(path)
+        if rel.parts and rel.parts[0] == ".marnwick":
+            raise ValueError("catalog state files are not image catalog entries")
+        return rel.as_posix()
+
     def abs_path(self, rel_path: str) -> Path:
         candidate = (self.root / rel_path).resolve()
         candidate.relative_to(self.root)
@@ -774,6 +783,7 @@ class Catalog:
                     dir_rel=child_rel,
                     name=Path(child_rel).name,
                     mtime_ns=stat_mtime,
+                    allow_preview_fallback=False,
                 )
             )
         return sorted(records, key=self._directory_sort_key(sort_order), reverse=self._record_sort_reverse(sort_order))
@@ -1358,23 +1368,33 @@ class Catalog:
         placeholder_limit: int | None = None,
     ) -> list[ImageRecord]:
         indexed = self.list_images(dir_rel, sort_order, include_blobs=include_blobs)
+        if placeholder_limit == 0 or (
+            placeholder_scan_budget_ms is not None and placeholder_scan_budget_ms <= 0
+        ):
+            return indexed
         indexed_by_rel_path = {record.rel_path: record for record in indexed}
         placeholders: list[ImageRecord] = []
-        for path in self._directory_image_files(
+        for path, rel_path, stat in self._directory_image_entries(
             dir_rel,
             scan_budget_ms=placeholder_scan_budget_ms,
             limit=placeholder_limit,
         ):
-            rel_path = self.rel_path(path)
             if rel_path in indexed_by_rel_path:
                 continue
-            placeholder = self._placeholder_record(path)
+            placeholder = self._placeholder_record(path, rel_path=rel_path, stat=stat)
             if placeholder is not None:
                 placeholders.append(placeholder)
         records = [*indexed, *placeholders]
         return sorted(records, key=self._record_sort_key(sort_order), reverse=self._record_sort_reverse(sort_order))
 
-    def list_child_directories(self, dir_rel: str = "", sort_order: SortOrder = SortOrder.NAME_ASC) -> list[DirectoryRecord]:
+    def list_child_directories(
+        self,
+        dir_rel: str = "",
+        sort_order: SortOrder = SortOrder.NAME_ASC,
+        *,
+        include_previews: bool = True,
+        include_filesystem_preview_fallback: bool = True,
+    ) -> list[DirectoryRecord]:
         records: list[DirectoryRecord] = []
         for child_rel in self._direct_child_directories(dir_rel):
             path = self.abs_path(child_rel)
@@ -1384,7 +1404,17 @@ class Catalog:
                 stat_mtime = 0
             else:
                 stat_mtime = stat.st_mtime_ns
-            preview_items = tuple(self.folder_preview_items_under(child_rel, limit=4))
+            preview_items = (
+                tuple(
+                    self.folder_preview_items_under(
+                        child_rel,
+                        limit=4,
+                        include_filesystem_fallback=include_filesystem_preview_fallback,
+                    )
+                )
+                if include_previews
+                else ()
+            )
             records.append(
                 DirectoryRecord(
                     catalog_root=self.root,
@@ -1395,16 +1425,23 @@ class Catalog:
                     aspect_ratio=1.0,
                     preview_blobs=tuple(item.blob for item in preview_items if item.kind == "image" and item.blob),
                     preview_items=preview_items,
+                    allow_preview_fallback=include_filesystem_preview_fallback,
                 )
             )
         return sorted(records, key=self._directory_sort_key(sort_order), reverse=self._record_sort_reverse(sort_order))
 
-    def folder_preview_items_under(self, dir_rel: str, *, limit: int = 4) -> list[FolderPreviewRecord]:
+    def folder_preview_items_under(
+        self,
+        dir_rel: str,
+        *,
+        limit: int = 4,
+        include_filesystem_fallback: bool = True,
+    ) -> list[FolderPreviewRecord]:
         previews = [
             FolderPreviewRecord("image", blob)
             for blob in self.thumbnail_blobs_under(dir_rel, limit=limit)
         ]
-        if len(previews) >= limit:
+        if len(previews) >= limit or not include_filesystem_fallback:
             return previews[:limit]
         seen_image_paths = {
             str(row["rel_path"])
@@ -2298,35 +2335,61 @@ class Catalog:
         scan_budget_ms: float | None = None,
         limit: int | None = None,
     ) -> list[Path]:
+        return [
+            path
+            for path, _, _ in self._directory_image_entries(
+                dir_rel,
+                scan_budget_ms=scan_budget_ms,
+                limit=limit,
+            )
+        ]
+
+    def _directory_image_entries(
+        self,
+        dir_rel: str,
+        *,
+        scan_budget_ms: float | None = None,
+        limit: int | None = None,
+    ) -> list[tuple[Path, str, os.stat_result]]:
         dir_path = self.abs_path(dir_rel) if dir_rel else self.root
         if not dir_path.is_dir():
             return []
         deadline = None if scan_budget_ms is None else time.monotonic() + (scan_budget_ms / 1000.0)
-        paths: list[Path] = []
+        image_entries: list[tuple[Path, str, os.stat_result]] = []
         try:
-            with os.scandir(dir_path) as entries:
-                for entry in entries:
+            with os.scandir(dir_path) as dir_entries:
+                for entry in dir_entries:
                     if deadline is not None and time.monotonic() >= deadline:
                         break
-                    if limit is not None and len(paths) >= limit:
+                    if limit is not None and len(image_entries) >= limit:
                         break
                     if not is_image_name(entry.name):
                         continue
                     try:
                         if entry.is_file(follow_symlinks=False):
-                            paths.append(Path(entry.path))
+                            path = Path(entry.path)
+                            image_entries.append(
+                                (path, self._rel_path_without_resolve(path), entry.stat(follow_symlinks=False))
+                            )
                     except OSError:
                         continue
         except OSError:
             return []
-        return paths
+        return image_entries
 
-    def _placeholder_record(self, path: Path) -> ImageRecord | None:
-        rel_path = self.rel_path(path)
-        try:
-            stat = path.stat()
-        except OSError:
-            return None
+    def _placeholder_record(
+        self,
+        path: Path,
+        *,
+        rel_path: str | None = None,
+        stat: os.stat_result | None = None,
+    ) -> ImageRecord | None:
+        rel_path = rel_path or self.rel_path(path)
+        if stat is None:
+            try:
+                stat = path.stat()
+            except OSError:
+                return None
         dir_rel = Path(rel_path).parent.as_posix()
         if dir_rel == ".":
             dir_rel = ""

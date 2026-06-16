@@ -74,6 +74,7 @@ class DirectoryRecord:
     aspect_ratio: float = 1.0
     preview_blobs: tuple[bytes, ...] = ()
     preview_items: tuple[FolderPreviewRecord, ...] = ()
+    allow_preview_fallback: bool = True
 
     @property
     def absolute_path(self) -> Path:
