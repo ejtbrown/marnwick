@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 from math import ceil, hypot
 import os
@@ -347,7 +348,7 @@ class ThumbnailModel(QAbstractListModel):
         preview_items = list(record.preview_items[:4])
         if not preview_items:
             preview_items = list(record.preview_blobs[:4])
-        if len(preview_items) < 4 and self.catalog is not None:
+        if len(preview_items) < 4 and record.allow_preview_fallback and self.catalog is not None:
             preview_items = self.catalog.folder_preview_items_under(record.dir_rel, limit=4)
         return pixmap_from_pil_image(render_folder_icon(preview_items[:4], max(1, self.tile_size)))
 
@@ -1661,8 +1662,8 @@ class MainWindow(QMainWindow):
             self.current_dir_rel,
             self.current_sort,
             include_blobs=False,
-            placeholder_scan_budget_ms=15,
-            placeholder_limit=2000,
+            placeholder_scan_budget_ms=0,
+            placeholder_limit=0,
         )
         if self.current_catalog.root in self._shallow_tree_roots:
             directories = self.current_catalog.list_filesystem_child_directories(
@@ -1670,7 +1671,12 @@ class MainWindow(QMainWindow):
                 self.current_sort,
             )
         else:
-            directories = self.current_catalog.list_child_directories(self.current_dir_rel, self.current_sort)
+            directories = self.current_catalog.list_child_directories(
+                self.current_dir_rel,
+                self.current_sort,
+                include_previews=True,
+                include_filesystem_preview_fallback=False,
+            )
         self.model.set_images(self.current_catalog, [*directories, *images])
         self.refresh_thumbnail_layout()
         self.update_selection_status()
@@ -3636,13 +3642,29 @@ def copy_files_to_clipboard(paths: list[Path]) -> None:
     QApplication.clipboard().setMimeData(mime)
 
 
+def parse_runtime_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, list[str]]:
+    raw_argv = list(argv or [])
+    if not raw_argv:
+        raw_argv = ["marnwick"]
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--codex-debug", action="store_true")
+    parser.add_argument("--codex-debug-port", "--debug-port", dest="codex_debug_port", type=int, default=8675)
+    args, remaining = parser.parse_known_args(raw_argv[1:])
+    return args, [raw_argv[0], *remaining]
+
+
 def run(argv: list[str] | None = None) -> int:
-    app = QApplication(argv or [])
+    runtime_args, qt_argv = parse_runtime_args(argv)
+    app = QApplication(qt_argv)
     app.setApplicationName("Marnwick")
     app.setApplicationDisplayName("Marnwick")
     if hasattr(app, "setDesktopFileName"):
         app.setDesktopFileName(DESKTOP_FILE_ID)
     app.setWindowIcon(load_app_icon())
     window = MainWindow()
+    if runtime_args.codex_debug:
+        from .debug import DebugCommandServer
+
+        window.debug_command_server = DebugCommandServer(window, port=runtime_args.codex_debug_port)
     window.show()
     return app.exec()

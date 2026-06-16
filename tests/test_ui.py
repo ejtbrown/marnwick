@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 from pathlib import Path
 from time import monotonic
 
@@ -16,6 +17,7 @@ from PySide6.QtWidgets import QAbstractItemView, QApplication, QDialog, QStyleOp
 
 from marnwick.catalog import Catalog  # noqa: E402
 from marnwick.config import NORMAL_DELETE, WIPE_ON_DELETE, AppConfig, WindowConfig, load_config, save_config  # noqa: E402
+from marnwick.debug import DebugCommandServer  # noqa: E402
 from marnwick.image_ops import EditOperation  # noqa: E402
 from marnwick.indexer import IndexProgressSnapshot  # noqa: E402
 from marnwick.models import CatalogSettings, DirectoryRecord, ImageRecord, SortOrder  # noqa: E402
@@ -44,6 +46,61 @@ from marnwick.ui import (  # noqa: E402
 
 def app() -> QApplication:
     return QApplication.instance() or QApplication([])
+
+
+def read_debug_response(qt_app: QApplication, client: socket.socket) -> dict[str, object]:
+    client.setblocking(False)
+    data = b""
+    deadline = monotonic() + 2.0
+    while monotonic() < deadline:
+        qt_app.processEvents()
+        try:
+            chunk = client.recv(65536)
+        except BlockingIOError:
+            continue
+        if not chunk:
+            continue
+        data += chunk
+        if b"\n" in data:
+            line, _, _ = data.partition(b"\n")
+            return json.loads(line.decode("utf-8"))
+    raise AssertionError("timed out waiting for debug response")
+
+
+def test_debug_command_server_accepts_json_lines() -> None:
+    qt_app = app()
+    window = MainWindow()
+    server = DebugCommandServer(window, port=0)
+    client = socket.create_connection(("127.0.0.1", server.port()), timeout=2.0)
+    try:
+        client.sendall(b'{"id":"ping-1","command":"ping"}\n')
+        response = read_debug_response(qt_app, client)
+
+        assert response["id"] == "ping-1"
+        assert response["ok"] is True
+        result = response["result"]
+        assert isinstance(result, dict)
+        assert result["message"] == "pong"
+        assert result["protocol"] == 1
+
+        client.sendall(b'{"id":"status-1","command":"status"}\n')
+        response = read_debug_response(qt_app, client)
+
+        assert response["id"] == "status-1"
+        assert response["ok"] is True
+        result = response["result"]
+        assert isinstance(result, dict)
+        assert result["visible_items"] == 0
+    finally:
+        client.close()
+        server.server.close()
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        window.indexer.shutdown()
+        window.workspace.close()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
 
 
 def test_edit_command_dialog_accepts_single_key_shortcuts() -> None:

@@ -1,0 +1,251 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from time import monotonic
+from typing import TYPE_CHECKING
+
+from PySide6.QtCore import QObject, QTimer
+from PySide6.QtNetwork import QHostAddress, QTcpServer, QTcpSocket
+from PySide6.QtWidgets import QApplication
+
+from .models import DirectoryRecord
+
+if TYPE_CHECKING:
+    from .indexer import IndexProgressSnapshot
+    from .ui import MainWindow
+
+
+class DebugCommandServer(QObject):
+    """JSON-lines control port for automated performance runs."""
+
+    protocol_version = 1
+
+    def __init__(self, window: MainWindow, *, port: int = 8675, parent: QObject | None = None) -> None:
+        super().__init__(parent or window)
+        self.window = window
+        self.server = QTcpServer(self)
+        self.server.newConnection.connect(self._accept_connections)
+        self._buffers: dict[QTcpSocket, bytearray] = {}
+        if not self.server.listen(QHostAddress.SpecialAddress.LocalHost, port):
+            raise OSError(self.server.errorString())
+
+    def port(self) -> int:
+        return int(self.server.serverPort())
+
+    def _accept_connections(self) -> None:
+        while self.server.hasPendingConnections():
+            socket = self.server.nextPendingConnection()
+            if socket is None:
+                return
+            self._buffers[socket] = bytearray()
+            socket.readyRead.connect(lambda socket=socket: self._read_socket(socket))
+            socket.disconnected.connect(lambda socket=socket: self._drop_socket(socket))
+
+    def _drop_socket(self, socket: QTcpSocket) -> None:
+        self._buffers.pop(socket, None)
+        try:
+            socket.deleteLater()
+        except RuntimeError:
+            return
+
+    def _read_socket(self, socket: QTcpSocket) -> None:
+        buffer = self._buffers.setdefault(socket, bytearray())
+        buffer.extend(bytes(socket.readAll()))
+        while b"\n" in buffer:
+            line, _, rest = buffer.partition(b"\n")
+            buffer[:] = rest
+            if not line.strip():
+                continue
+            self._handle_line(socket, line)
+
+    def _handle_line(self, socket: QTcpSocket, line: bytes) -> None:
+        request_id: object = None
+        try:
+            request = json.loads(line.decode("utf-8"))
+            if not isinstance(request, dict):
+                raise ValueError("request must be a JSON object")
+            request_id = request.get("id")
+            command = request.get("command") or request.get("cmd")
+            if not isinstance(command, str):
+                raise ValueError("request command must be a string")
+            params = request.get("params") or {}
+            if not isinstance(params, dict):
+                raise ValueError("request params must be an object")
+            result = self._execute(command, params)
+        except Exception as error:
+            self._write_response(socket, {"id": request_id, "ok": False, "error": str(error)})
+            return
+        self._write_response(socket, {"id": request_id, "ok": True, "result": result})
+
+    def _write_response(self, socket: QTcpSocket, payload: dict[str, object]) -> None:
+        socket.write((json.dumps(payload, sort_keys=True) + "\n").encode("utf-8"))
+        socket.flush()
+
+    def _execute(self, command: str, params: dict[str, object]) -> object:
+        if command == "ping":
+            return {"message": "pong", "protocol": self.protocol_version}
+        if command == "status":
+            return self._status()
+        if command in {"file_open", "open_catalog"}:
+            return self._file_open(params)
+        if command in {"navigate", "select_directory"}:
+            return self._navigate(params)
+        if command == "directories":
+            return self._directories(params)
+        if command == "items":
+            return self._items(params)
+        if command == "timings":
+            return self._timings(params)
+        if command == "quit":
+            QTimer.singleShot(0, QApplication.instance().quit)
+            return {"quitting": True}
+        raise ValueError(f"unknown command: {command}")
+
+    def _status(self) -> dict[str, object]:
+        current_catalog = self.window.current_catalog
+        tree_task = self.window._tree_build_task
+        active_snapshots = [self._snapshot(snapshot) for snapshot in self.window.indexer.active_snapshots()]
+        return {
+            "current_catalog": str(current_catalog.root) if current_catalog is not None else None,
+            "current_dir_rel": self.window.current_dir_rel,
+            "catalogs": [str(catalog.root) for catalog in self.window.workspace.catalogs],
+            "active_catalog_opens": len(self.window._catalog_open_tasks),
+            "active_indexer_tasks": active_snapshots,
+            "directory_discovery_tasks": len(self.window._directory_discovery_tasks),
+            "directory_index_tasks": len(self.window._directory_index_tasks),
+            "thumbnail_prune_tasks": len(self.window._thumbnail_prune_tasks),
+            "shallow_tree_roots": [str(root) for root in sorted(self.window._shallow_tree_roots, key=str)],
+            "tree_build": None
+            if tree_task is None
+            else {
+                "root": str(tree_task.catalog.root),
+                "index": tree_task.index,
+                "total": len(tree_task.directories),
+                "reason": tree_task.reason,
+            },
+            "pending_tree_rebuilds": len(self.window._pending_tree_rebuilds),
+            "visible_items": self.window.model.rowCount(),
+            "progress": {
+                "label": self.window.progress_label.text(),
+                "value": self.window.progress_bar.value(),
+                "minimum": self.window.progress_bar.minimum(),
+                "maximum": self.window.progress_bar.maximum(),
+            },
+        }
+
+    def _snapshot(self, snapshot: IndexProgressSnapshot) -> dict[str, object]:
+        return {
+            "label": snapshot.label,
+            "root": str(snapshot.root),
+            "dir_rel": snapshot.dir_rel,
+            "processed": snapshot.processed,
+            "total": snapshot.total,
+            "current": snapshot.current,
+            "done": snapshot.done,
+            "error": snapshot.error,
+            "interactive": snapshot.interactive,
+            "canceled": snapshot.canceled,
+        }
+
+    def _file_open(self, params: dict[str, object]) -> dict[str, object]:
+        path_value = params.get("path")
+        if not isinstance(path_value, str):
+            raise ValueError("path is required")
+        path = Path(path_value).expanduser()
+        if not path.is_dir():
+            raise ValueError(f"catalog path does not exist: {path}")
+        selected_at = monotonic()
+        self.window.defer_open_catalog(
+            path,
+            log_event=bool(params.get("log_event", True)),
+            selected_at=selected_at,
+            dialog_duration_ms=float(params.get("dialog_duration_ms", 0.0)),
+        )
+        return {"path": str(path), "queued": True}
+
+    def _navigate(self, params: dict[str, object]) -> dict[str, object]:
+        catalog = self._catalog_for_params(params)
+        dir_rel_value = params.get("dir_rel", "")
+        if not isinstance(dir_rel_value, str):
+            raise ValueError("dir_rel must be a string")
+        if dir_rel_value and dir_rel_value not in set(catalog.list_known_directories()):
+            raise ValueError(f"unknown directory: {dir_rel_value}")
+        idle_task = self.window._idle_index_tasks.get(catalog.root)
+        if idle_task is not None and not idle_task.snapshot().done:
+            self.window._resume_idle_refresh_roots.add(catalog.root)
+        self.window.indexer.cancel_idle_tasks(catalog.root)
+        self.window.indexer.cancel_directory_tasks(catalog.root, keep_dir_rel=dir_rel_value)
+        self.window.current_catalog = catalog
+        self.window.current_dir_rel = dir_rel_value
+        self.window.load_current_directory()
+        self.window.queue_directory_index(catalog, dir_rel_value)
+        return {"root": str(catalog.root), "dir_rel": dir_rel_value, "visible_items": self.window.model.rowCount()}
+
+    def _directories(self, params: dict[str, object]) -> dict[str, object]:
+        catalog = self._catalog_for_params(params)
+        prefix = params.get("prefix", "")
+        if not isinstance(prefix, str):
+            raise ValueError("prefix must be a string")
+        limit = int(params.get("limit", 500))
+        offset = int(params.get("offset", 0))
+        directories = catalog.list_known_directories()
+        if prefix:
+            directories = [item for item in directories if item == prefix or item.startswith(f"{prefix}/")]
+        total = len(directories)
+        return {
+            "root": str(catalog.root),
+            "offset": offset,
+            "limit": limit,
+            "total": total,
+            "directories": directories[offset : offset + limit],
+        }
+
+    def _items(self, params: dict[str, object]) -> dict[str, object]:
+        limit = int(params.get("limit", 500))
+        offset = int(params.get("offset", 0))
+        rows = []
+        for record in self.window.model.images[offset : offset + limit]:
+            rows.append(
+                {
+                    "kind": "directory" if isinstance(record, DirectoryRecord) else "image",
+                    "rel_path": record.rel_path,
+                    "filename": record.filename,
+                }
+            )
+        return {
+            "offset": offset,
+            "limit": limit,
+            "total": self.window.model.rowCount(),
+            "items": rows,
+        }
+
+    def _timings(self, params: dict[str, object]) -> dict[str, object]:
+        catalog = self._catalog_for_params(params, required=False)
+        root_value = params.get("root")
+        if catalog is not None:
+            root = catalog.root
+        elif isinstance(root_value, str):
+            root = Path(root_value).expanduser()
+        else:
+            raise ValueError("root is required when no catalog is selected")
+        timings_path = root / ".marnwick" / "timings.json"
+        try:
+            payload = json.loads(timings_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            payload = {"version": 1, "events": []}
+        events = payload.get("events", [])
+        if not isinstance(events, list):
+            events = []
+        tail = int(params.get("tail", 100))
+        return {"root": str(root), "events": events[-tail:]}
+
+    def _catalog_for_params(self, params: dict[str, object], *, required: bool = True):
+        root_value = params.get("root")
+        if isinstance(root_value, str):
+            catalog = self.window.workspace.catalog_for_root(Path(root_value).expanduser())
+        else:
+            catalog = self.window.current_catalog
+        if catalog is None and required:
+            raise ValueError("no matching catalog is open")
+        return catalog
