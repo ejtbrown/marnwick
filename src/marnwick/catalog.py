@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import csv
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 import errno
 import hashlib
@@ -14,6 +14,7 @@ import subprocess
 import threading
 import time
 import zlib
+from collections import defaultdict
 from collections.abc import Callable, Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -72,6 +73,15 @@ INDEX_QUEUE_DEPTH = 20
 INDEX_PIPELINE_MIN_IMAGES = 3
 PIPELINE_SENTINEL = object()
 FOLDER_PREVIEW_SCAN_LIMIT = 256
+SIMILARITY_FEATURE_VERSION = 1
+SIMILARITY_DHASH_HEX_LENGTH = 16
+VERY_SIMILAR_HASH_DISTANCE = 8
+VERY_SIMILAR_ASPECT_RATIO_TOLERANCE = 0.035
+VERY_SIMILAR_COLOR_DISTANCE = 0.18
+SHELL_SAFE_FILENAME_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
+DUPLICATE_DELETE_EXACT = "exact"
+DUPLICATE_DELETE_VERY_SIMILAR = "very_similar"
+TRASH_DIR_NAME = "T-r-a-s-h"
 
 
 def is_image_name(name: str) -> bool:
@@ -119,6 +129,26 @@ def descendant_like_pattern(rel_path: str) -> str:
     return f"{escape_sql_like(rel_path)}/%"
 
 
+def is_trash_rel_path(rel_path: str) -> bool:
+    return rel_path == TRASH_DIR_NAME or rel_path.startswith(f"{TRASH_DIR_NAME}/")
+
+
+def is_inside_trash_rel_path(rel_path: str) -> bool:
+    return rel_path.startswith(f"{TRASH_DIR_NAME}/")
+
+
+def original_rel_path_for_trash(rel_path: str) -> str:
+    if not is_inside_trash_rel_path(rel_path):
+        raise ValueError("path is not inside the trash directory")
+    return rel_path[len(TRASH_DIR_NAME) + 1 :]
+
+
+def trash_rel_path_for_original(rel_path: str) -> str:
+    if not rel_path or is_trash_rel_path(rel_path):
+        raise ValueError("cannot move this path to trash")
+    return f"{TRASH_DIR_NAME}/{rel_path}"
+
+
 def batched(values: Sequence[str], size: int) -> Iterable[Sequence[str]]:
     for start in range(0, len(values), size):
         yield values[start : start + size]
@@ -132,6 +162,37 @@ class ThumbnailPruneResult:
     orphan_files_removed: int = 0
     legacy_blobs_migrated: int = 0
     errors: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class DuplicateDeletionChoice:
+    keep: ImageRecord
+    delete: tuple[ImageRecord, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class DuplicateDeletionPlan:
+    mode: str
+    choices: tuple[DuplicateDeletionChoice, ...]
+
+    @property
+    def delete_count(self) -> int:
+        return sum(len(choice.delete) for choice in self.choices)
+
+
+@dataclass(frozen=True, slots=True)
+class DuplicateDeletionResult:
+    mode: str
+    groups: int = 0
+    kept: int = 0
+    planned_delete_count: int = 0
+    deleted: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class DuplicateMatchGroups:
+    exact: tuple[ImageRecord, ...] = ()
+    very_similar: tuple[ImageRecord, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -161,6 +222,24 @@ class ThumbnailPruneRowResult:
     stale_removed: int = 0
     legacy_migrated: int = 0
     errors: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class SimilarityFeatureRow:
+    id: int
+    rel_path: str
+    filename: str
+    image_hash: str | None
+    aspect_ratio: float
+    perceptual_hash: int
+    color_signature: bytes
+
+
+@dataclass(slots=True)
+class HammingBKTreeNode:
+    hash_value: int
+    rows: list[SimilarityFeatureRow] = field(default_factory=list)
+    children: dict[int, "HammingBKTreeNode"] = field(default_factory=dict)
 
 
 class Catalog:
@@ -1081,7 +1160,8 @@ class Catalog:
             row = self._conn.execute(
                 """
                 SELECT file_size_bytes, modified_at_ns, thumb_rel_path, thumb_cache_key,
-                    thumb_size_px, image_hash
+                    thumb_size_px, image_hash, perceptual_hash, color_signature,
+                    similarity_feature_version
                 FROM images
                 WHERE rel_path = ?
                 """,
@@ -1096,12 +1176,23 @@ class Catalog:
             or row["image_hash"] is None
             or row["thumb_cache_key"] is None
             or row["thumb_rel_path"] is None
+            or not self._image_similarity_features_current(row)
         ):
             return False
         try:
             return self.thumbnail_abs_path(str(row["thumb_rel_path"])).is_file()
         except (OSError, ValueError):
             return False
+
+    def _image_similarity_features_current(self, row: sqlite3.Row) -> bool:
+        perceptual_hash = row["perceptual_hash"]
+        color_signature = row["color_signature"]
+        return (
+            int(row["similarity_feature_version"] or 0) == SIMILARITY_FEATURE_VERSION
+            and isinstance(perceptual_hash, str)
+            and len(perceptual_hash) == SIMILARITY_DHASH_HEX_LENGTH
+            and color_signature is not None
+        )
 
     def _index_read_job(
         self,
@@ -1112,9 +1203,15 @@ class Catalog:
     ) -> None:
         if cancel_check is not None:
             cancel_check()
-        width, height, thumb_blob, thumb_width, thumb_height = self._read_image_metadata_and_thumbnail_from_bytes(
-            job.data
-        )
+        (
+            width,
+            height,
+            thumb_blob,
+            thumb_width,
+            thumb_height,
+            perceptual_hash,
+            color_signature,
+        ) = self._read_image_metadata_and_thumbnail_from_bytes(job.data)
         image_hash, thumb_cache_key = self._image_hashes_for_bytes(job.data)
         thumb_rel_path = self._thumbnail_rel_path(thumb_cache_key, self.settings.thumbnail_native_size)
         queue_put(thumbnail_queue, ThumbnailWriteJob(job.rel_path, thumb_rel_path, thumb_blob))
@@ -1136,10 +1233,12 @@ class Catalog:
                 INSERT INTO images (
                     rel_path, dir_rel, filename, size_bytes, file_size_bytes,
                     mtime_ns, modified_at_ns, image_hash, width, height,
-                    aspect_ratio, thumb_blob, thumb_rel_path, thumb_cache_key,
-                    thumb_width, thumb_height, thumb_size_px, indexed_at_ns
+                    aspect_ratio, perceptual_hash, color_signature,
+                    similarity_feature_version, thumb_blob, thumb_rel_path,
+                    thumb_cache_key, thumb_width, thumb_height, thumb_size_px,
+                    indexed_at_ns
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(rel_path) DO UPDATE SET
                     dir_rel = excluded.dir_rel,
                     filename = excluded.filename,
@@ -1151,6 +1250,9 @@ class Catalog:
                     width = excluded.width,
                     height = excluded.height,
                     aspect_ratio = excluded.aspect_ratio,
+                    perceptual_hash = excluded.perceptual_hash,
+                    color_signature = excluded.color_signature,
+                    similarity_feature_version = excluded.similarity_feature_version,
                     thumb_blob = excluded.thumb_blob,
                     thumb_rel_path = excluded.thumb_rel_path,
                     thumb_cache_key = excluded.thumb_cache_key,
@@ -1171,6 +1273,9 @@ class Catalog:
                     width,
                     height,
                     aspect_ratio,
+                    perceptual_hash,
+                    color_signature,
+                    SIMILARITY_FEATURE_VERSION,
                     None,
                     thumb_rel_path,
                     thumb_cache_key,
@@ -1225,6 +1330,9 @@ class Catalog:
                 thumb_cache_key,
                 thumb_rel_path,
                 thumb_size_px,
+                perceptual_hash,
+                color_signature,
+                similarity_feature_version,
                 thumb_blob,
                 thumb_blob IS NOT NULL AS has_thumb
             FROM images
@@ -1257,10 +1365,19 @@ class Catalog:
                     str(image_hash),
                     thumb_cache_key=str(thumb_cache_key),
                 )
-            return self.get_image(rel_path, include_blob=False)
+            if self._image_similarity_features_current(existing):
+                return self.get_image(rel_path, include_blob=False)
 
         try:
-            width, height, thumb_blob, thumb_width, thumb_height = self._read_image_metadata_and_thumbnail(path)
+            (
+                width,
+                height,
+                thumb_blob,
+                thumb_width,
+                thumb_height,
+                perceptual_hash,
+                color_signature,
+            ) = self._read_image_metadata_and_thumbnail(path)
             image_hash, thumb_cache_key = self._image_file_hashes(path, cancel_check)
             thumb_rel_path = self._write_thumbnail_file(
                 thumb_cache_key,
@@ -1287,10 +1404,12 @@ class Catalog:
             INSERT INTO images (
                 rel_path, dir_rel, filename, size_bytes, file_size_bytes,
                 mtime_ns, modified_at_ns, image_hash, width, height,
-                aspect_ratio, thumb_blob, thumb_rel_path, thumb_cache_key,
-                thumb_width, thumb_height, thumb_size_px, indexed_at_ns
+                aspect_ratio, perceptual_hash, color_signature,
+                similarity_feature_version, thumb_blob, thumb_rel_path,
+                thumb_cache_key, thumb_width, thumb_height, thumb_size_px,
+                indexed_at_ns
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(rel_path) DO UPDATE SET
                 dir_rel = excluded.dir_rel,
                 filename = excluded.filename,
@@ -1302,6 +1421,9 @@ class Catalog:
                 width = excluded.width,
                 height = excluded.height,
                 aspect_ratio = excluded.aspect_ratio,
+                perceptual_hash = excluded.perceptual_hash,
+                color_signature = excluded.color_signature,
+                similarity_feature_version = excluded.similarity_feature_version,
                 thumb_blob = excluded.thumb_blob,
                 thumb_rel_path = excluded.thumb_rel_path,
                 thumb_cache_key = excluded.thumb_cache_key,
@@ -1322,6 +1444,9 @@ class Catalog:
                 width,
                 height,
                 aspect_ratio,
+                perceptual_hash,
+                color_signature,
+                SIMILARITY_FEATURE_VERSION,
                 None,
                 thumb_rel_path,
                 thumb_cache_key,
@@ -1357,6 +1482,471 @@ class Catalog:
             params.extend([limit, offset])
         rows = self._conn.execute(sql, params).fetchall()
         return [self._row_to_record(row, include_blob=include_blobs) for row in rows]
+
+    def list_images_for_tag(
+        self,
+        tag_name: str,
+        sort_order: SortOrder = SortOrder.NAME_ASC,
+        *,
+        include_blobs: bool = True,
+        limit: int | None = None,
+        offset: int = 0,
+    ) -> list[ImageRecord]:
+        order_clause = SQL_SORT_ORDER[sort_order]
+        columns = self._image_columns(include_blobs)
+        sql = f"""
+            SELECT {columns}
+            FROM images
+            WHERE id IN (
+                SELECT image_tags.image_id
+                FROM image_tags
+                JOIN tags ON tags.id = image_tags.tag_id
+                WHERE tags.normalized = ?
+            )
+            ORDER BY {order_clause}
+        """
+        params: list[object] = [normalize_tag(tag_name)]
+        if limit is not None:
+            sql += " LIMIT ? OFFSET ?"
+            params.extend([limit, offset])
+        rows = self._conn.execute(sql, params).fetchall()
+        return [self._row_to_record(row, include_blob=include_blobs) for row in rows]
+
+    def list_duplicate_images(
+        self,
+        sort_order: SortOrder = SortOrder.NAME_ASC,
+        *,
+        include_blobs: bool = True,
+        limit: int | None = None,
+        offset: int = 0,
+    ) -> list[ImageRecord]:
+        order_clause = SQL_SORT_ORDER[sort_order]
+        columns = self._image_columns(include_blobs)
+        sql = f"""
+            SELECT {columns}
+            FROM images
+            WHERE image_hash IS NOT NULL
+                AND rel_path != ?
+                AND rel_path NOT LIKE ? ESCAPE '\\'
+                AND image_hash IN (
+                    SELECT image_hash
+                    FROM images
+                    WHERE image_hash IS NOT NULL
+                        AND rel_path != ?
+                        AND rel_path NOT LIKE ? ESCAPE '\\'
+                    GROUP BY image_hash
+                    HAVING COUNT(*) > 1
+                )
+            ORDER BY image_hash COLLATE NOCASE ASC, {order_clause}
+        """
+        trash_like = descendant_like_pattern(TRASH_DIR_NAME)
+        params: list[object] = [TRASH_DIR_NAME, trash_like, TRASH_DIR_NAME, trash_like]
+        if limit is not None:
+            sql += " LIMIT ? OFFSET ?"
+            params.extend([limit, offset])
+        rows = self._conn.execute(sql, params).fetchall()
+        return [self._row_to_record(row, include_blob=include_blobs) for row in rows]
+
+    def exact_duplicate_image_groups(
+        self,
+        sort_order: SortOrder = SortOrder.NAME_ASC,
+        *,
+        include_blobs: bool = False,
+    ) -> list[list[ImageRecord]]:
+        groups: dict[str, list[ImageRecord]] = {}
+        for record in self.list_duplicate_images(sort_order, include_blobs=include_blobs):
+            if not record.image_hash:
+                continue
+            groups.setdefault(record.image_hash, []).append(record)
+        return [group for group in groups.values() if len(group) > 1]
+
+    def duplicate_matches_for_image(
+        self,
+        rel_path: str,
+        sort_order: SortOrder = SortOrder.NAME_ASC,
+        *,
+        include_blobs: bool = False,
+    ) -> DuplicateMatchGroups:
+        record = self.get_image(rel_path, include_blob=False)
+        if record is None:
+            return DuplicateMatchGroups()
+        exact = tuple(self._exact_duplicate_matches_for_image(record, sort_order, include_blobs=include_blobs))
+        very_similar = tuple(self._very_similar_matches_for_image(record, sort_order, include_blobs=include_blobs))
+        return DuplicateMatchGroups(exact=exact, very_similar=very_similar)
+
+    def _exact_duplicate_matches_for_image(
+        self,
+        record: ImageRecord,
+        sort_order: SortOrder,
+        *,
+        include_blobs: bool,
+    ) -> list[ImageRecord]:
+        if not record.image_hash:
+            return []
+        order_clause = SQL_SORT_ORDER[sort_order]
+        columns = self._image_columns(include_blobs)
+        rows = self._conn.execute(
+            f"""
+            SELECT {columns}
+            FROM images
+            WHERE image_hash = ?
+                AND rel_path != ?
+            ORDER BY {order_clause}
+            """,
+            (record.image_hash, record.rel_path),
+        ).fetchall()
+        return [self._row_to_record(row, include_blob=include_blobs) for row in rows]
+
+    def list_very_similar_images(
+        self,
+        sort_order: SortOrder = SortOrder.NAME_ASC,
+        *,
+        include_blobs: bool = True,
+        limit: int | None = None,
+        offset: int = 0,
+    ) -> list[ImageRecord]:
+        ordered = [
+            record
+            for group in self.very_similar_image_groups(sort_order, include_blobs=include_blobs)
+            for record in group
+        ]
+        if offset:
+            ordered = ordered[offset:]
+        if limit is not None:
+            ordered = ordered[:limit]
+        return ordered
+
+    def very_similar_image_groups(
+        self,
+        sort_order: SortOrder = SortOrder.NAME_ASC,
+        *,
+        include_blobs: bool = False,
+    ) -> list[list[ImageRecord]]:
+        feature_rows = self._similarity_feature_rows(include_trash=False)
+        components = self._very_similar_components(feature_rows)
+        if not components:
+            return []
+        selected_ids = [image_id for component in components for image_id in component]
+        records = self._records_for_image_ids(selected_ids, include_blobs=include_blobs)
+        record_by_id = {record.id: record for record in records}
+        sort_key = self._record_sort_key(sort_order)
+        reverse = self._record_sort_reverse(sort_order)
+        groups: list[list[ImageRecord]] = []
+        for component in components:
+            component_records = [record_by_id[image_id] for image_id in component if image_id in record_by_id]
+            component_records.sort(key=sort_key, reverse=reverse)
+            if len(component_records) > 1:
+                groups.append(component_records)
+        return groups
+
+    def _very_similar_matches_for_image(
+        self,
+        record: ImageRecord,
+        sort_order: SortOrder,
+        *,
+        include_blobs: bool,
+    ) -> list[ImageRecord]:
+        feature_rows = self._similarity_feature_rows(include_trash=True)
+        target = next((row for row in feature_rows if row.id == record.id), None)
+        if target is None:
+            return []
+        matched_ids = [
+            row.id
+            for row in feature_rows
+            if row.id != target.id and self._rows_are_very_similar(target, row)
+        ]
+        records = self._records_for_image_ids(matched_ids, include_blobs=include_blobs)
+        sort_key = self._record_sort_key(sort_order)
+        records.sort(key=sort_key, reverse=self._record_sort_reverse(sort_order))
+        return records
+
+    def duplicate_deletion_plan(self, mode: str) -> DuplicateDeletionPlan:
+        groups = self._duplicate_groups_for_deletion(mode)
+        choices: list[DuplicateDeletionChoice] = []
+        for group in groups:
+            keeper = self._preferred_duplicate_keeper(group)
+            delete = tuple(record for record in group if record.rel_path != keeper.rel_path)
+            if delete:
+                choices.append(DuplicateDeletionChoice(keeper, delete))
+        return DuplicateDeletionPlan(mode=mode, choices=tuple(choices))
+
+    def move_duplicate_images_to_trash(
+        self,
+        mode: str,
+        *,
+        progress_callback: ProgressCallback | None = None,
+        cancel_check: CancelCallback | None = None,
+    ) -> DuplicateDeletionResult:
+        if progress_callback is not None:
+            progress_callback(0, None, "Finding duplicate groups")
+        if cancel_check is not None:
+            cancel_check()
+        plan = self.duplicate_deletion_plan(mode)
+        total = plan.delete_count
+        if progress_callback is not None:
+            progress_callback(0, total, f"Found {total} duplicate image(s) to move")
+        moved = 0
+        affected_dirs: set[str] = set()
+        self._ensure_trash_directory()
+        for choice in plan.choices:
+            for record in choice.delete:
+                if cancel_check is not None:
+                    cancel_check()
+                if progress_callback is not None:
+                    progress_callback(moved, total, record.rel_path)
+                result = self._move_image_to_rel_path(
+                    record.rel_path,
+                    trash_rel_path_for_original(record.rel_path),
+                )
+                moved += 1
+                affected_dirs.add(record.dir_rel)
+                affected_dirs.add(self._parent_dir_rel(result.dest_rel_path))
+                if progress_callback is not None:
+                    progress_callback(moved, total, result.dest_rel_path)
+        if affected_dirs:
+            self.update_hashes_after_targeted_move(affected_dirs)
+        self.append_log(
+            (
+                f"Automatically moved {moved} duplicate image(s) "
+                f"to {TRASH_DIR_NAME} from {len(plan.choices)} duplicate group(s)"
+            )
+        )
+        if progress_callback is not None:
+            progress_callback(moved, total, "Duplicate move complete")
+        return DuplicateDeletionResult(
+            mode=mode,
+            groups=len(plan.choices),
+            kept=len(plan.choices),
+            planned_delete_count=total,
+            deleted=moved,
+        )
+
+    def delete_duplicate_images(
+        self,
+        mode: str,
+        *,
+        wipe: bool = False,
+        progress_callback: ProgressCallback | None = None,
+        cancel_check: CancelCallback | None = None,
+    ) -> DuplicateDeletionResult:
+        return self.move_duplicate_images_to_trash(
+            mode,
+            progress_callback=progress_callback,
+            cancel_check=cancel_check,
+        )
+
+    def _duplicate_groups_for_deletion(self, mode: str) -> list[list[ImageRecord]]:
+        if mode == DUPLICATE_DELETE_EXACT:
+            return self.exact_duplicate_image_groups(SortOrder.NAME_ASC, include_blobs=False)
+        if mode == DUPLICATE_DELETE_VERY_SIMILAR:
+            return self._very_similar_groups_for_deletion(SortOrder.NAME_ASC)
+        raise ValueError(f"unknown duplicate deletion mode: {mode}")
+
+    def _very_similar_groups_for_deletion(self, sort_order: SortOrder) -> list[list[ImageRecord]]:
+        feature_by_id = {row.id: row for row in self._similarity_feature_rows(include_trash=False)}
+        groups: list[list[ImageRecord]] = []
+        for component in self.very_similar_image_groups(sort_order, include_blobs=False):
+            keeper = self._preferred_duplicate_keeper(component)
+            keeper_features = feature_by_id.get(keeper.id)
+            if keeper_features is None:
+                continue
+            delete = [
+                record
+                for record in component
+                if record.id != keeper.id
+                and (features := feature_by_id.get(record.id)) is not None
+                and self._rows_are_very_similar(keeper_features, features)
+            ]
+            if delete:
+                groups.append([keeper, *delete])
+        return groups
+
+    def _preferred_duplicate_keeper(self, records: Sequence[ImageRecord]) -> ImageRecord:
+        return sorted(records, key=self._duplicate_keeper_sort_key)[0]
+
+    def _duplicate_keeper_sort_key(self, record: ImageRecord) -> tuple[int, int, int, int, str]:
+        resolution = max(0, record.width) * max(0, record.height)
+        return (
+            -resolution,
+            -self._duplicate_path_depth(record),
+            record.mtime_ns,
+            self._shell_awkward_path_score(record.rel_path),
+            record.rel_path.casefold(),
+        )
+
+    def _duplicate_path_depth(self, record: ImageRecord) -> int:
+        if not record.dir_rel:
+            return 0
+        return len(Path(record.dir_rel).parts)
+
+    def _shell_awkward_path_score(self, rel_path: str) -> int:
+        parts = Path(rel_path).parts
+        score = sum(
+            1
+            for part in parts
+            for character in part
+            if character not in SHELL_SAFE_FILENAME_CHARS
+        )
+        score += sum(1 for part in parts if part.startswith("-"))
+        return score
+
+    def _similarity_feature_rows(self, *, include_trash: bool) -> list[SimilarityFeatureRow]:
+        trash_filter = ""
+        params: list[object] = [SIMILARITY_FEATURE_VERSION]
+        if not include_trash:
+            trash_filter = """
+                AND rel_path != ?
+                AND rel_path NOT LIKE ? ESCAPE '\\'
+            """
+            params.extend([TRASH_DIR_NAME, descendant_like_pattern(TRASH_DIR_NAME)])
+        rows = self._conn.execute(
+            f"""
+            SELECT id, rel_path, filename, image_hash, aspect_ratio, perceptual_hash, color_signature
+            FROM images
+            WHERE similarity_feature_version = ?
+                AND perceptual_hash IS NOT NULL
+                AND color_signature IS NOT NULL
+                {trash_filter}
+            ORDER BY rel_path COLLATE NOCASE
+            """,
+            params,
+        ).fetchall()
+        features: list[SimilarityFeatureRow] = []
+        for row in rows:
+            try:
+                perceptual_hash = int(str(row["perceptual_hash"]), 16)
+            except ValueError:
+                continue
+            color_signature = bytes(row["color_signature"])
+            if len(color_signature) != 64:
+                continue
+            features.append(
+                SimilarityFeatureRow(
+                    id=int(row["id"]),
+                    rel_path=str(row["rel_path"]),
+                    filename=str(row["filename"]),
+                    image_hash=str(row["image_hash"]) if row["image_hash"] is not None else None,
+                    aspect_ratio=float(row["aspect_ratio"]),
+                    perceptual_hash=perceptual_hash,
+                    color_signature=color_signature,
+                )
+            )
+        return features
+
+    def _very_similar_components(self, rows: list[SimilarityFeatureRow]) -> list[list[int]]:
+        if len(rows) < 2:
+            return []
+        parent = {row.id: row.id for row in rows}
+
+        def find(image_id: int) -> int:
+            while parent[image_id] != image_id:
+                parent[image_id] = parent[parent[image_id]]
+                image_id = parent[image_id]
+            return image_id
+
+        def union(left: int, right: int) -> None:
+            left_root = find(left)
+            right_root = find(right)
+            if left_root != right_root:
+                parent[right_root] = left_root
+
+        root: HammingBKTreeNode | None = None
+        for row in rows:
+            if root is not None:
+                for candidate in self._bk_tree_query(root, row.perceptual_hash, VERY_SIMILAR_HASH_DISTANCE):
+                    if self._rows_are_very_similar(row, candidate):
+                        union(row.id, candidate.id)
+            root = self._bk_tree_insert(root, row)
+
+        component_rows: dict[int, list[SimilarityFeatureRow]] = defaultdict(list)
+        for row in rows:
+            component_rows[find(row.id)].append(row)
+        components = [component for component in component_rows.values() if len(component) > 1]
+        components.sort(key=lambda component: min(row.rel_path.casefold() for row in component))
+        return [[row.id for row in component] for component in components]
+
+    def _rows_are_very_similar(self, left: SimilarityFeatureRow, right: SimilarityFeatureRow) -> bool:
+        if left.image_hash and left.image_hash == right.image_hash:
+            return False
+        if not self._aspect_ratios_are_close(left.aspect_ratio, right.aspect_ratio):
+            return False
+        if self._hamming_distance(left.perceptual_hash, right.perceptual_hash) > VERY_SIMILAR_HASH_DISTANCE:
+            return False
+        return self._color_signature_distance(left.color_signature, right.color_signature) <= VERY_SIMILAR_COLOR_DISTANCE
+
+    def _aspect_ratios_are_close(self, left: float, right: float) -> bool:
+        if left <= 0 or right <= 0:
+            return False
+        return abs(left - right) / max(left, right) <= VERY_SIMILAR_ASPECT_RATIO_TOLERANCE
+
+    def _color_signature_distance(self, left: bytes, right: bytes) -> float:
+        if len(left) != len(right) or not left:
+            return 1.0
+        return sum(abs(a - b) for a, b in zip(left, right)) / 510.0
+
+    def _bk_tree_insert(
+        self,
+        root: HammingBKTreeNode | None,
+        row: SimilarityFeatureRow,
+    ) -> HammingBKTreeNode:
+        if root is None:
+            return HammingBKTreeNode(row.perceptual_hash, [row])
+        node = root
+        while True:
+            distance = self._hamming_distance(row.perceptual_hash, node.hash_value)
+            if distance == 0:
+                node.rows.append(row)
+                return root
+            child = node.children.get(distance)
+            if child is None:
+                node.children[distance] = HammingBKTreeNode(row.perceptual_hash, [row])
+                return root
+            node = child
+
+    def _bk_tree_query(
+        self,
+        node: HammingBKTreeNode,
+        hash_value: int,
+        max_distance: int,
+    ) -> list[SimilarityFeatureRow]:
+        distance = self._hamming_distance(hash_value, node.hash_value)
+        matches: list[SimilarityFeatureRow] = []
+        if distance <= max_distance:
+            matches.extend(node.rows)
+        low = distance - max_distance
+        high = distance + max_distance
+        for edge, child in node.children.items():
+            if low <= edge <= high:
+                matches.extend(self._bk_tree_query(child, hash_value, max_distance))
+        return matches
+
+    def _hamming_distance(self, left: int, right: int) -> int:
+        return (left ^ right).bit_count()
+
+    def _records_for_image_ids(self, image_ids: Sequence[int], *, include_blobs: bool) -> list[ImageRecord]:
+        if not image_ids:
+            return []
+        columns = self._image_columns(include_blobs)
+        records: list[ImageRecord] = []
+        variable_limit = SQLITE_VARIABLE_BATCH_SIZE
+        if hasattr(self._conn, "getlimit"):
+            variable_limit = min(
+                variable_limit,
+                self._conn.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER),
+            )
+        variable_limit = max(1, variable_limit)
+        for chunk_start in range(0, len(image_ids), variable_limit):
+            chunk = image_ids[chunk_start : chunk_start + variable_limit]
+            rows = self._conn.execute(
+                f"""
+                SELECT {columns}
+                FROM images
+                WHERE id IN ({",".join("?" for _ in chunk)})
+                """,
+                chunk,
+            ).fetchall()
+            records.extend(self._row_to_record(row, include_blob=include_blobs) for row in rows)
+        return records
 
     def list_images_with_placeholders(
         self,
@@ -1647,6 +2237,8 @@ class Catalog:
         *,
         wipe_on_delete: bool = False,
     ) -> list[MoveResult]:
+        if self.root != dest_catalog.root and is_trash_rel_path(dest_dir_rel):
+            raise ValueError("cannot move items into another catalog's trash")
         dest_dir = dest_catalog.abs_path(dest_dir_rel) if dest_dir_rel else dest_catalog.root
         dest_dir.mkdir(parents=True, exist_ok=True)
         dest_catalog._remember_directory(dest_dir_rel)
@@ -1669,6 +2261,10 @@ class Catalog:
             dest_rel_path = dest_catalog.rel_path(dest_path)
             if self.root == dest_catalog.root:
                 self._move_db_record_in_place(rel_path, dest_rel_path, dest_catalog)
+                if is_inside_trash_rel_path(dest_rel_path) and not is_trash_rel_path(rel_path):
+                    self._remember_trash_item(dest_rel_path, rel_path, "image")
+                elif is_inside_trash_rel_path(rel_path) and not is_inside_trash_rel_path(dest_rel_path):
+                    self._forget_trash_item(rel_path)
             else:
                 self._transfer_db_record(rel_path, dest_rel_path, dest_catalog)
             impacted_dirs.setdefault(self, set()).add(source_dir_rel)
@@ -1679,6 +2275,39 @@ class Catalog:
                 catalog.update_hashes_after_targeted_move(dir_rels)
         return results
 
+    def restore_image_from_trash(self, rel_path: str) -> MoveResult:
+        if not is_inside_trash_rel_path(rel_path):
+            raise ValueError("image is not inside the trash directory")
+        dest_rel_path = self._trash_original_rel_path(rel_path, "image") or original_rel_path_for_trash(rel_path)
+        source_dir_rel = self._parent_dir_rel(rel_path)
+        result = self._move_image_to_rel_path(rel_path, dest_rel_path)
+        self._forget_trash_item(rel_path)
+        self.update_hashes_after_targeted_move(
+            {
+                source_dir_rel,
+                self._parent_dir_rel(result.dest_rel_path),
+            }
+        )
+        self.append_log(f"Restored image {rel_path} to {result.dest_rel_path}")
+        return result
+
+    def restore_directory_from_trash(self, dir_rel: str) -> MoveResult:
+        if not is_inside_trash_rel_path(dir_rel):
+            raise ValueError("directory is not inside the trash directory")
+        dest_dir_rel = self._trash_original_rel_path(dir_rel, "directory") or original_rel_path_for_trash(dir_rel)
+        source_parent_rel = self._parent_dir_rel(dir_rel)
+        result = self._move_directory_to_rel_path(dir_rel, dest_dir_rel)
+        self._forget_trash_items_under(dir_rel)
+        self.update_hashes_after_targeted_move(
+            {
+                source_parent_rel,
+                result.dest_rel_path,
+                self._parent_dir_rel(result.dest_rel_path),
+            }
+        )
+        self.append_log(f"Restored directory {dir_rel} to {result.dest_rel_path}")
+        return result
+
     def move_directories(
         self,
         dir_rels: Sequence[str],
@@ -1687,6 +2316,8 @@ class Catalog:
         *,
         wipe_on_delete: bool = False,
     ) -> list[MoveResult]:
+        if self.root != dest_catalog.root and is_trash_rel_path(dest_dir_rel):
+            raise ValueError("cannot move items into another catalog's trash")
         dest_parent = dest_catalog.abs_path(dest_dir_rel) if dest_dir_rel else dest_catalog.root
         dest_parent.mkdir(parents=True, exist_ok=True)
         dest_catalog._remember_directory(dest_dir_rel)
@@ -1715,6 +2346,10 @@ class Catalog:
             dest_rel_path = dest_catalog.rel_path(dest_path)
             if self.root == dest_catalog.root:
                 self._move_directory_records_in_place(dir_rel, dest_rel_path)
+                if is_inside_trash_rel_path(dest_rel_path) and not is_trash_rel_path(dir_rel):
+                    self._remember_trash_item(dest_rel_path, dir_rel, "directory")
+                elif is_inside_trash_rel_path(dir_rel) and not is_inside_trash_rel_path(dest_rel_path):
+                    self._forget_trash_items_under(dir_rel)
             else:
                 self._transfer_directory_records(dir_rel, dest_rel_path, dest_catalog)
             source_affected = {source_parent_rel}
@@ -1737,6 +2372,98 @@ class Catalog:
                 deleted += 1
         self._delete_db_records(rel_paths)
         return deleted
+
+    def _ensure_trash_directory(self) -> None:
+        trash_path = self.root / TRASH_DIR_NAME
+        trash_path.mkdir(parents=True, exist_ok=True)
+        self._remember_directory(TRASH_DIR_NAME)
+
+    def _remember_trash_item(self, trash_rel_path: str, original_rel_path: str, kind: str) -> None:
+        if not is_inside_trash_rel_path(trash_rel_path) or is_trash_rel_path(original_rel_path):
+            return
+        self._conn.execute(
+            """
+            INSERT INTO trash_items(trash_rel_path, original_rel_path, kind, moved_at_ns)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(trash_rel_path) DO UPDATE SET
+                original_rel_path = excluded.original_rel_path,
+                kind = excluded.kind,
+                moved_at_ns = excluded.moved_at_ns
+            """,
+            (trash_rel_path, original_rel_path, kind, time.time_ns()),
+        )
+
+    def _trash_original_rel_path(self, trash_rel_path: str, kind: str) -> str | None:
+        row = self._conn.execute(
+            """
+            SELECT original_rel_path
+            FROM trash_items
+            WHERE trash_rel_path = ? AND kind = ?
+            """,
+            (trash_rel_path, kind),
+        ).fetchone()
+        return None if row is None else str(row["original_rel_path"])
+
+    def _forget_trash_item(self, trash_rel_path: str) -> None:
+        self._conn.execute("DELETE FROM trash_items WHERE trash_rel_path = ?", (trash_rel_path,))
+
+    def _forget_trash_items_under(self, dir_rel: str) -> None:
+        nested_like = descendant_like_pattern(dir_rel)
+        self._conn.execute(
+            "DELETE FROM trash_items WHERE trash_rel_path = ? OR trash_rel_path LIKE ? ESCAPE '\\'",
+            (dir_rel, nested_like),
+        )
+
+    def _move_image_to_rel_path(self, source_rel_path: str, dest_rel_path: str) -> MoveResult:
+        if not source_rel_path or source_rel_path == dest_rel_path:
+            raise ValueError("source and destination must be different image paths")
+        source_path = self.abs_path(source_rel_path)
+        if not source_path.is_file():
+            self._delete_db_records([source_rel_path])
+            raise FileNotFoundError(source_path)
+        dest_path = self.abs_path(dest_rel_path)
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        dest_path = self._unique_destination(dest_path)
+        try:
+            os.replace(source_path, dest_path)
+        except OSError as error:
+            if error.errno != errno.EXDEV:
+                raise
+            shutil.copy2(source_path, dest_path)
+            source_path.unlink()
+        actual_dest_rel_path = self.rel_path(dest_path)
+        self._remember_directory(self._parent_dir_rel(actual_dest_rel_path))
+        self._move_db_record_in_place(source_rel_path, actual_dest_rel_path, self)
+        if is_inside_trash_rel_path(actual_dest_rel_path) and not is_trash_rel_path(source_rel_path):
+            self._remember_trash_item(actual_dest_rel_path, source_rel_path, "image")
+        elif is_inside_trash_rel_path(source_rel_path) and not is_inside_trash_rel_path(actual_dest_rel_path):
+            self._forget_trash_item(source_rel_path)
+        return MoveResult(source_rel_path, actual_dest_rel_path, self.root)
+
+    def _move_directory_to_rel_path(self, source_dir_rel: str, dest_dir_rel: str) -> MoveResult:
+        if not source_dir_rel or source_dir_rel == dest_dir_rel:
+            raise ValueError("source and destination must be different directory paths")
+        source_path = self.abs_path(source_dir_rel)
+        if not source_path.is_dir():
+            self._delete_directory_records(source_dir_rel)
+            raise FileNotFoundError(source_path)
+        dest_path = self.abs_path(dest_dir_rel)
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        dest_path = self._unique_destination(dest_path)
+        try:
+            os.replace(source_path, dest_path)
+        except OSError as error:
+            if error.errno != errno.EXDEV:
+                raise
+            shutil.copytree(source_path, dest_path)
+            shutil.rmtree(source_path)
+        actual_dest_dir_rel = self.rel_path(dest_path)
+        self._move_directory_records_in_place(source_dir_rel, actual_dest_dir_rel)
+        if is_inside_trash_rel_path(actual_dest_dir_rel) and not is_trash_rel_path(source_dir_rel):
+            self._remember_trash_item(actual_dest_dir_rel, source_dir_rel, "directory")
+        elif is_inside_trash_rel_path(source_dir_rel) and not is_inside_trash_rel_path(actual_dest_dir_rel):
+            self._forget_trash_items_under(source_dir_rel)
+        return MoveResult(source_dir_rel, actual_dest_dir_rel, self.root)
 
     def remember_directory(self, dir_rel: str) -> None:
         self._remember_directory(dir_rel)
@@ -1786,6 +2513,7 @@ class Catalog:
             "DELETE FROM directories WHERE dir_rel = ? OR dir_rel LIKE ? ESCAPE '\\'",
             (dir_rel, nested_like),
         )
+        self._forget_trash_items_under(dir_rel)
         self._remove_unreferenced_thumbnail_files(old_thumb_rel_paths)
         parent_rel = Path(dir_rel).parent.as_posix()
         if parent_rel == ".":
@@ -1794,8 +2522,10 @@ class Catalog:
 
     def _delete_file(self, path: Path, *, wipe: bool) -> None:
         if wipe and not path.is_symlink():
-            subprocess.run(["shred", "-u", str(path)], check=True)
-            return
+            if shutil.which("shred") is not None:
+                subprocess.run(["shred", "-u", str(path)], check=True)
+                return
+            self.append_log(f"shred is unavailable; deleting without wipe: {self.rel_path(path)}", level="WARNING")
         path.unlink()
 
     def _wipe_directory_files(self, directory: Path) -> None:
@@ -2035,6 +2765,9 @@ class Catalog:
                 width INTEGER NOT NULL,
                 height INTEGER NOT NULL,
                 aspect_ratio REAL NOT NULL,
+                perceptual_hash TEXT,
+                color_signature BLOB,
+                similarity_feature_version INTEGER NOT NULL DEFAULT 0,
                 thumb_blob BLOB,
                 thumb_rel_path TEXT,
                 thumb_cache_key TEXT,
@@ -2080,6 +2813,15 @@ class Catalog:
                 FOREIGN KEY(image_id) REFERENCES images(id) ON DELETE CASCADE,
                 FOREIGN KEY(tag_id) REFERENCES tags(id) ON DELETE CASCADE
             );
+            CREATE INDEX IF NOT EXISTS idx_image_tags_tag
+                ON image_tags(tag_id, image_id);
+
+            CREATE TABLE IF NOT EXISTS trash_items (
+                trash_rel_path TEXT PRIMARY KEY,
+                original_rel_path TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                moved_at_ns INTEGER NOT NULL
+            );
             """
         )
         self._ensure_image_schema()
@@ -2096,6 +2838,14 @@ class Catalog:
             self._conn.execute("ALTER TABLE images ADD COLUMN modified_at_ns INTEGER NOT NULL DEFAULT 0")
         if "image_hash" not in columns:
             self._conn.execute("ALTER TABLE images ADD COLUMN image_hash TEXT")
+        if "perceptual_hash" not in columns:
+            self._conn.execute("ALTER TABLE images ADD COLUMN perceptual_hash TEXT")
+        if "color_signature" not in columns:
+            self._conn.execute("ALTER TABLE images ADD COLUMN color_signature BLOB")
+        if "similarity_feature_version" not in columns:
+            self._conn.execute(
+                "ALTER TABLE images ADD COLUMN similarity_feature_version INTEGER NOT NULL DEFAULT 0"
+            )
         if "thumb_rel_path" not in columns:
             self._conn.execute("ALTER TABLE images ADD COLUMN thumb_rel_path TEXT")
         if "thumb_cache_key" not in columns:
@@ -2130,6 +2880,12 @@ class Catalog:
             """
             CREATE INDEX IF NOT EXISTS idx_images_hash
                 ON images(image_hash)
+            """
+        )
+        self._conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_images_similarity_features
+                ON images(similarity_feature_version, aspect_ratio, perceptual_hash)
             """
         )
         self._conn.execute(
@@ -2473,49 +3229,86 @@ class Catalog:
             if dir_rel == "":
                 self._save_catalog_find_hash_value(find_hash)
 
-    def _read_image_metadata_and_thumbnail(self, path: Path) -> tuple[int, int, bytes, int, int]:
+    def _read_image_metadata_and_thumbnail(self, path: Path) -> tuple[int, int, bytes, int, int, str, bytes]:
         with Image.open(path) as image:
             image = ImageOps.exif_transpose(image)
             width, height = image.size
-            thumb = image.copy()
-            thumb.thumbnail(
-                (self.settings.thumbnail_native_size, self.settings.thumbnail_native_size),
-                Image.Resampling.LANCZOS,
-            )
-            if thumb.mode not in ("RGB", "L"):
-                background = Image.new("RGB", thumb.size, (255, 255, 255))
-                if "A" in thumb.getbands():
-                    background.paste(thumb, mask=thumb.getchannel("A"))
-                    thumb = background
-                else:
-                    thumb = thumb.convert("RGB")
-            elif thumb.mode == "L":
-                thumb = thumb.convert("RGB")
-            out = io.BytesIO()
-            thumb.save(out, format="JPEG", quality=82, optimize=True)
-            return width, height, out.getvalue(), thumb.width, thumb.height
+            perceptual_hash, color_signature = self._image_similarity_features(image)
+            thumb_blob, thumb_width, thumb_height = self._thumbnail_jpeg_blob(image)
+            return width, height, thumb_blob, thumb_width, thumb_height, perceptual_hash, color_signature
 
-    def _read_image_metadata_and_thumbnail_from_bytes(self, data: bytes) -> tuple[int, int, bytes, int, int]:
+    def _read_image_metadata_and_thumbnail_from_bytes(self, data: bytes) -> tuple[int, int, bytes, int, int, str, bytes]:
         with Image.open(io.BytesIO(data)) as image:
             image = ImageOps.exif_transpose(image)
             width, height = image.size
-            thumb = image.copy()
-            thumb.thumbnail(
-                (self.settings.thumbnail_native_size, self.settings.thumbnail_native_size),
-                Image.Resampling.LANCZOS,
-            )
-            if thumb.mode in {"RGBA", "LA"}:
-                background = Image.new("RGB", thumb.size, (255, 255, 255))
-                if thumb.mode == "RGBA":
-                    background.paste(thumb, mask=thumb.getchannel("A"))
-                    thumb = background
-                else:
-                    thumb = thumb.convert("RGB")
-            elif thumb.mode == "L":
-                thumb = thumb.convert("RGB")
-            out = io.BytesIO()
-            thumb.save(out, format="JPEG", quality=82, optimize=True)
-            return width, height, out.getvalue(), thumb.width, thumb.height
+            perceptual_hash, color_signature = self._image_similarity_features(image)
+            thumb_blob, thumb_width, thumb_height = self._thumbnail_jpeg_blob(image)
+            return width, height, thumb_blob, thumb_width, thumb_height, perceptual_hash, color_signature
+
+    def _thumbnail_jpeg_blob(self, image: Image.Image) -> tuple[bytes, int, int]:
+        thumb = image.copy()
+        thumb.thumbnail(
+            (self.settings.thumbnail_native_size, self.settings.thumbnail_native_size),
+            Image.Resampling.LANCZOS,
+        )
+        thumb = self._jpeg_compatible_image(thumb)
+        out = io.BytesIO()
+        thumb.save(out, format="JPEG", quality=82, optimize=True)
+        return out.getvalue(), thumb.width, thumb.height
+
+    def _jpeg_compatible_image(self, image: Image.Image) -> Image.Image:
+        if image.mode == "RGB":
+            return image
+        if image.mode == "L":
+            return image.convert("RGB")
+        if "A" in image.getbands():
+            rgba = image.convert("RGBA")
+            background = Image.new("RGB", rgba.size, (255, 255, 255))
+            background.paste(rgba, mask=rgba.getchannel("A"))
+            return background
+        return image.convert("RGB")
+
+    def _image_similarity_features_for_path(self, path: Path) -> tuple[str, bytes]:
+        with Image.open(path) as image:
+            image = ImageOps.exif_transpose(image)
+            return self._image_similarity_features(image)
+
+    def _image_similarity_features(self, image: Image.Image) -> tuple[str, bytes]:
+        rgb = self._similarity_rgb_image(image)
+        return self._image_dhash(rgb), self._image_color_signature(rgb)
+
+    def _similarity_rgb_image(self, image: Image.Image) -> Image.Image:
+        if "A" in image.getbands():
+            rgba = image.convert("RGBA")
+            background = Image.new("RGB", rgba.size, (255, 255, 255))
+            background.paste(rgba, mask=rgba.getchannel("A"))
+            return background
+        if image.mode == "RGB":
+            return image.copy()
+        return image.convert("RGB")
+
+    def _image_dhash(self, image: Image.Image) -> str:
+        gray = image.convert("L").resize((9, 8), Image.Resampling.LANCZOS)
+        pixels = list(gray.tobytes())
+        value = 0
+        for y in range(8):
+            row = y * 9
+            for x in range(8):
+                value = (value << 1) | int(pixels[row + x] > pixels[row + x + 1])
+        return f"{value:0{SIMILARITY_DHASH_HEX_LENGTH}x}"
+
+    def _image_color_signature(self, image: Image.Image) -> bytes:
+        sample = image.copy()
+        sample.thumbnail((64, 64), Image.Resampling.LANCZOS)
+        bins = [0] * 64
+        data = sample.tobytes("raw", "RGB")
+        for index in range(0, len(data), 3):
+            red = data[index] >> 6
+            green = data[index + 1] >> 6
+            blue = data[index + 2] >> 6
+            bins[(red * 16) + (green * 4) + blue] += 1
+        total = max(1, sum(bins))
+        return bytes(min(255, round(count * 255 / total)) for count in bins)
 
     def _fast_image_hash(self, path: Path, cancel_check: CancelCallback | None = None) -> str:
         return self._image_file_hashes(path, cancel_check)[0]
@@ -2604,6 +3397,7 @@ class Catalog:
         rel_paths = list(rel_paths)
         old_thumb_rel_paths = self._thumbnail_rel_paths_for_records(rel_paths)
         self._conn.executemany("DELETE FROM images WHERE rel_path = ?", [(rel_path,) for rel_path in rel_paths])
+        self._conn.executemany("DELETE FROM trash_items WHERE trash_rel_path = ?", [(rel_path,) for rel_path in rel_paths])
         self._remove_unreferenced_thumbnail_files(old_thumb_rel_paths)
 
     def _delete_directory_records(self, dir_rel: str) -> None:
@@ -2629,6 +3423,7 @@ class Catalog:
                 "DELETE FROM directories WHERE dir_rel = ? OR dir_rel LIKE ? ESCAPE '\\'",
                 (dir_rel, nested_like),
             )
+            self._forget_trash_items_under(dir_rel)
             self._remove_unreferenced_thumbnail_files(old_thumb_rel_paths)
             return
         old_thumb_rel_paths = {
@@ -2637,6 +3432,7 @@ class Catalog:
         }
         self._conn.execute("DELETE FROM images")
         self._conn.execute("DELETE FROM directories WHERE dir_rel != ''")
+        self._conn.execute("DELETE FROM trash_items")
         self._remove_unreferenced_thumbnail_files(old_thumb_rel_paths)
 
     def _delete_missing_child_directories(self, parent_dir_rel: str, child_dirs: Sequence[str]) -> None:
@@ -2775,6 +3571,10 @@ class Catalog:
         thumb_cache_key = row["thumb_cache_key"]
         if not image_hash or not thumb_cache_key:
             image_hash, thumb_cache_key = self._image_file_hashes(dest_path)
+        perceptual_hash = row["perceptual_hash"]
+        color_signature = row["color_signature"]
+        if not self._image_similarity_features_current(row):
+            perceptual_hash, color_signature = self._image_similarity_features_for_path(dest_path)
         thumb_rel_path, thumb_width, thumb_height, thumb_size_px = self._thumbnail_for_transfer(
             row,
             dest_path,
@@ -2789,10 +3589,12 @@ class Catalog:
             INSERT INTO images (
                 rel_path, dir_rel, filename, size_bytes, file_size_bytes,
                 mtime_ns, modified_at_ns, image_hash, width, height,
-                aspect_ratio, thumb_blob, thumb_rel_path, thumb_cache_key,
-                thumb_width, thumb_height, thumb_size_px, indexed_at_ns
+                aspect_ratio, perceptual_hash, color_signature,
+                similarity_feature_version, thumb_blob, thumb_rel_path,
+                thumb_cache_key, thumb_width, thumb_height, thumb_size_px,
+                indexed_at_ns
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(rel_path) DO UPDATE SET
                 dir_rel = excluded.dir_rel,
                 filename = excluded.filename,
@@ -2804,6 +3606,9 @@ class Catalog:
                 width = excluded.width,
                 height = excluded.height,
                 aspect_ratio = excluded.aspect_ratio,
+                perceptual_hash = excluded.perceptual_hash,
+                color_signature = excluded.color_signature,
+                similarity_feature_version = excluded.similarity_feature_version,
                 thumb_blob = excluded.thumb_blob,
                 thumb_rel_path = excluded.thumb_rel_path,
                 thumb_cache_key = excluded.thumb_cache_key,
@@ -2824,6 +3629,9 @@ class Catalog:
                 int(row["width"]),
                 int(row["height"]),
                 float(row["aspect_ratio"]),
+                perceptual_hash,
+                color_signature,
+                SIMILARITY_FEATURE_VERSION,
                 None,
                 thumb_rel_path,
                 thumb_cache_key,
@@ -2860,7 +3668,7 @@ class Catalog:
         if source_size == desired_size and row["thumb_blob"] is not None:
             thumb_rel_path = self._write_thumbnail_file(thumb_cache_key, desired_size, bytes(row["thumb_blob"]))
             return thumb_rel_path, int(row["thumb_width"]), int(row["thumb_height"]), desired_size
-        _, _, thumb_blob, thumb_width, thumb_height = self._read_image_metadata_and_thumbnail(dest_path)
+        _, _, thumb_blob, thumb_width, thumb_height, _, _ = self._read_image_metadata_and_thumbnail(dest_path)
         thumb_rel_path = self._write_thumbnail_file(thumb_cache_key, desired_size, thumb_blob)
         return thumb_rel_path, thumb_width, thumb_height, desired_size
 

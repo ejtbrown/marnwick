@@ -4,22 +4,23 @@ import json
 import os
 import socket
 from pathlib import Path
-from time import monotonic
+from threading import Event
+from time import monotonic, sleep
 
 from PIL import Image
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("MARNWICK_DISABLE_CONFIG", "1")
 
-from PySide6.QtCore import QEvent, QPoint, QPointF, QRect, Qt  # noqa: E402
+from PySide6.QtCore import QEvent, QItemSelectionModel, QPoint, QPointF, QRect, Qt  # noqa: E402
 from PySide6.QtGui import QFontMetrics, QKeyEvent, QMouseEvent, QPixmap  # noqa: E402
-from PySide6.QtWidgets import QAbstractItemView, QApplication, QDialog, QStyleOptionViewItem  # noqa: E402
+from PySide6.QtWidgets import QAbstractItemView, QApplication, QDialog, QMenu, QStyleOptionViewItem  # noqa: E402
 
-from marnwick.catalog import Catalog  # noqa: E402
+from marnwick.catalog import DuplicateMatchGroups, SIMILARITY_FEATURE_VERSION, TRASH_DIR_NAME, Catalog  # noqa: E402
 from marnwick.config import NORMAL_DELETE, WIPE_ON_DELETE, AppConfig, WindowConfig, load_config, save_config  # noqa: E402
 from marnwick.debug import DebugCommandServer  # noqa: E402
 from marnwick.image_ops import EditOperation  # noqa: E402
-from marnwick.indexer import IndexProgressSnapshot  # noqa: E402
+from marnwick.indexer import IndexProgressSnapshot, IndexTask, IndexTaskCancelled  # noqa: E402
 from marnwick.models import CatalogSettings, DirectoryRecord, ImageRecord, SortOrder  # noqa: E402
 from marnwick.navigation import ImageNavigator  # noqa: E402
 from marnwick.ui import (  # noqa: E402
@@ -27,6 +28,8 @@ from marnwick.ui import (  # noqa: E402
     DIALOG_STYLESHEET,
     DIR_REL_ROLE,
     DirectoryPropertiesDialog,
+    DuplicateDeleteTask,
+    DuplicateListDialog,
     FullscreenViewer,
     LogsDialog,
     MainWindow,
@@ -34,6 +37,11 @@ from marnwick.ui import (  # noqa: E402
     ThumbnailDelegate,
     ThumbnailModel,
     ThumbnailView,
+    VIRTUAL_KIND_DUPLICATES,
+    VIRTUAL_KIND_ROLE,
+    VIRTUAL_KIND_TAG,
+    VIRTUAL_KIND_VERY_SIMILAR,
+    VIRTUAL_VALUE_ROLE,
     copy_files_to_clipboard,
     create_delete_message_box,
     create_save_edits_message_box,
@@ -65,6 +73,48 @@ def read_debug_response(qt_app: QApplication, client: socket.socket) -> dict[str
             line, _, _ = data.partition(b"\n")
             return json.loads(line.decode("utf-8"))
     raise AssertionError("timed out waiting for debug response")
+
+
+def select_thumbnail_rows(window: MainWindow, rows: list[int]) -> None:
+    selection = window.thumbnail_view.selectionModel()
+    selection.clearSelection()
+    for row in rows:
+        selection.select(window.model.index(row, 0), QItemSelectionModel.SelectionFlag.Select)
+    if rows:
+        selection.setCurrentIndex(
+            window.model.index(rows[-1], 0),
+            QItemSelectionModel.SelectionFlag.NoUpdate,
+        )
+
+
+def settle_virtual_view_tasks(window: MainWindow, qt_app: QApplication, *, timeout: float = 2.0) -> None:
+    deadline = monotonic() + timeout
+    while window._virtual_view_tasks and monotonic() < deadline:
+        qt_app.processEvents()
+        window._settle_virtual_view_tasks()
+        sleep(0.01)
+    window._settle_virtual_view_tasks()
+    assert not window._virtual_view_tasks
+
+
+def settle_duplicate_delete_task(window: MainWindow, qt_app: QApplication, *, timeout: float = 2.0) -> None:
+    deadline = monotonic() + timeout
+    while window._duplicate_delete_task is not None and monotonic() < deadline:
+        qt_app.processEvents()
+        window._settle_duplicate_delete_task()
+        sleep(0.01)
+    window._settle_duplicate_delete_task()
+    assert window._duplicate_delete_task is None
+
+
+def find_virtual_tree_root(window: MainWindow):
+    root_item = window.tree.topLevelItem(0)
+    assert root_item is not None
+    for index in range(root_item.childCount()):
+        child = root_item.child(index)
+        if child.text(0) == "Virtual Directories":
+            return child
+    raise AssertionError("virtual directories item was not found")
 
 
 def test_debug_command_server_accepts_json_lines() -> None:
@@ -185,6 +235,45 @@ def test_fullscreen_navigation_exits_at_list_edges(tmp_path: Path) -> None:
 
             assert viewer.result() == QDialog.DialogCode.Accepted
             assert viewer.last_viewed_rel_path == "second.jpg"
+        finally:
+            viewer.close()
+            viewer.deleteLater()
+            qt_app.processEvents()
+
+
+def test_fullscreen_z_toggles_file_info_overlay(tmp_path: Path) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    first = root / "first.jpg"
+    second = root / "second.jpg"
+    Image.new("RGB", (8, 8), (10, 20, 30)).save(first)
+    Image.new("RGB", (8, 8), (40, 50, 60)).save(second)
+
+    with Catalog(root) as catalog:
+        viewer = FullscreenViewer(catalog, ImageNavigator.sequential(["first.jpg", "second.jpg"], "first.jpg"))
+        try:
+            viewer.label.resize(800, 600)
+
+            viewer.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Z, Qt.KeyboardModifier.NoModifier, "z"))
+
+            assert viewer.info_overlay_enabled
+            assert not viewer.info_overlay.isHidden()
+            assert f"Full path: {catalog.abs_path('first.jpg')}" in viewer.info_overlay.text()
+            assert "File date:" in viewer.info_overlay.text()
+            assert "1 of 2 images" in viewer.info_overlay.text()
+            assert viewer.info_overlay.pos().x() == 16
+            assert viewer.info_overlay.geometry().bottom() <= viewer.label.height() - 16
+
+            viewer.navigate(1)
+
+            assert f"Full path: {catalog.abs_path('second.jpg')}" in viewer.info_overlay.text()
+            assert "2 of 2 images" in viewer.info_overlay.text()
+
+            viewer.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Z, Qt.KeyboardModifier.NoModifier, "z"))
+
+            assert not viewer.info_overlay_enabled
+            assert viewer.info_overlay.isHidden()
         finally:
             viewer.close()
             viewer.deleteLater()
@@ -678,6 +767,41 @@ def test_thumbnail_delegate_centers_card_inside_distributed_grid_cell(tmp_path: 
     assert rect.left() == 40
 
 
+def test_thumbnail_model_tooltip_describes_image(tmp_path: Path) -> None:
+    app()
+    model = ThumbnailModel()
+    model.set_images(
+        None,
+        [
+            ImageRecord(
+                id=1,
+                catalog_root=tmp_path,
+                rel_path="album/image.jpg",
+                dir_rel="album",
+                filename="image.jpg",
+                size_bytes=1536,
+                mtime_ns=0,
+                width=640,
+                height=480,
+                aspect_ratio=640 / 480,
+                thumb_width=160,
+                thumb_height=120,
+            )
+        ],
+    )
+
+    tooltip = model.data(model.index(0, 0), Qt.ItemDataRole.ToolTipRole)
+
+    assert tooltip == "\n".join(
+        [
+            f"Path: {tmp_path / 'album'}",
+            "Filename: image.jpg",
+            "Dimensions: 640 x 480",
+            "Size: 1.5 kB",
+        ]
+    )
+
+
 def test_thumbnail_view_builds_visible_drag_pixmap() -> None:
     qt_app = app()
     model = ThumbnailModel()
@@ -705,6 +829,131 @@ def test_thumbnail_view_uses_pixel_scrolling_for_smooth_movement() -> None:
     finally:
         view.close()
         view.deleteLater()
+        qt_app.processEvents()
+
+
+def test_thumbnail_selection_survives_same_directory_reload(tmp_path: Path) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    Image.new("RGB", (8, 8), (10, 20, 30)).save(root / "one.jpg")
+    Image.new("RGB", (8, 8), (40, 50, 60)).save(root / "two.jpg")
+    Image.new("RGB", (8, 8), (70, 80, 90)).save(root / "three.jpg")
+
+    window = MainWindow()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        catalog.refresh()
+        window.current_catalog = catalog
+        window.current_dir_rel = ""
+        window.load_current_directory()
+
+        select_thumbnail_rows(window, [0, 1])
+
+        assert window.selected_rel_paths() == ["one.jpg", "three.jpg"]
+
+        window.load_current_directory(preserve_selection=True)
+
+        assert window.selected_rel_paths() == ["one.jpg", "three.jpg"]
+        assert window.thumbnail_view.currentIndex().row() == 1
+    finally:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        window.indexer.shutdown()
+        window.workspace.close()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_duplicate_list_dialog_double_click_navigates_to_image(tmp_path: Path) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    Image.new("RGB", (8, 8), (10, 20, 30)).save(root / "one.jpg")
+    (root / "album").mkdir()
+    Image.new("RGB", (8, 8), (10, 20, 30)).save(root / "album" / "two.jpg")
+
+    window = MainWindow()
+    dialog = None
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        catalog.refresh()
+        source = catalog.get_image("one.jpg", include_blob=False)
+        target = catalog.get_image("album/two.jpg", include_blob=False)
+        assert source is not None
+        assert target is not None
+        window.current_catalog = catalog
+        window.current_dir_rel = ""
+        window.rebuild_tree()
+        window.load_current_directory()
+        dialog = DuplicateListDialog(
+            catalog,
+            source,
+            DuplicateMatchGroups(exact=(target,), very_similar=()),
+            window.navigate_to_image,
+            window,
+        )
+        target_item = None
+        for row in range(dialog.list_widget.count()):
+            item = dialog.list_widget.item(row)
+            if item.data(Qt.ItemDataRole.UserRole) == "album/two.jpg":
+                target_item = item
+                break
+        assert target_item is not None
+
+        dialog._item_double_clicked(target_item)
+
+        assert window.current_dir_rel == "album"
+        assert window.selected_rel_paths() == ["album/two.jpg"]
+        selected_tree_item = window.tree.currentItem()
+        assert selected_tree_item is not None
+        assert selected_tree_item.data(0, DIR_REL_ROLE) == "album"
+    finally:
+        if dialog is not None:
+            dialog.close()
+            dialog.deleteLater()
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        window.indexer.shutdown()
+        window.workspace.close()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_thumbnail_context_menu_uses_directory_actions(tmp_path: Path) -> None:
+    qt_app = app()
+    window = MainWindow()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        record = DirectoryRecord(
+            catalog_root=tmp_path,
+            dir_rel="album",
+            name="album",
+        )
+        menu = QMenu()
+        try:
+            actions = window._thumbnail_context_menu_actions(menu, record)
+            labels = [action.text() for action in menu.actions() if action.text()]
+
+            assert labels == ["Open", "Properties", "Delete Directory"]
+            assert set(actions) == {"open", "properties", "delete_directory"}
+        finally:
+            menu.close()
+            menu.deleteLater()
+    finally:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        window.indexer.shutdown()
+        window.workspace.close()
+        window.close()
+        window.deleteLater()
         qt_app.processEvents()
 
 
@@ -1055,6 +1304,44 @@ def test_move_payload_to_directory_moves_selected_images_across_catalogs(tmp_pat
         qt_app.processEvents()
 
 
+def test_move_payload_to_directory_rejects_cross_catalog_trash_drop(tmp_path: Path, monkeypatch) -> None:
+    qt_app = app()
+    source_root = tmp_path / "source"
+    dest_root = tmp_path / "dest"
+    source_root.mkdir()
+    dest_root.mkdir()
+    Image.new("RGB", (8, 8), (10, 20, 30)).save(source_root / "image.jpg")
+    errors: list[tuple[str, str]] = []
+    monkeypatch.setattr("marnwick.ui.show_error", lambda _parent, title, message: errors.append((title, message)))
+
+    window = MainWindow()
+    try:
+        source = window.workspace.open_catalog(source_root)
+        dest = window.workspace.open_catalog(dest_root)
+        source.refresh()
+        dest.refresh()
+
+        window.move_payload_to_directory(
+            [{"catalog_root": str(source.root), "rel_path": "image.jpg"}],
+            dest.root,
+            TRASH_DIR_NAME,
+        )
+
+        assert errors == [("Move", "Cannot move items into another catalog's trash.")]
+        assert (source_root / "image.jpg").is_file()
+        assert not (dest_root / TRASH_DIR_NAME).exists()
+        assert source.get_image("image.jpg") is not None
+        assert dest.list_images(TRASH_DIR_NAME) == []
+    finally:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        window.indexer.shutdown()
+        window.workspace.close()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
 def test_right_pane_shows_directory_tiles_before_images_and_navigates(tmp_path: Path) -> None:
     qt_app = app()
     root = tmp_path / "catalog"
@@ -1245,6 +1532,165 @@ def test_tools_menu_prune_thumbnails_schedules_current_catalog_prune(tmp_path: P
         assert fake_indexer.calls == [(catalog.root, True, True)]
         assert window._thumbnail_prune_tasks[catalog.root] is not None
     finally:
+        window.workspace.close()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_tools_menu_auto_delete_duplicates_runs_in_background(tmp_path: Path, monkeypatch) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    Image.new("RGB", (8, 8), (10, 20, 30)).save(root / "one.jpg")
+    Image.new("RGB", (8, 8), (10, 20, 30)).save(root / "two.jpg")
+    Image.new("RGB", (8, 8), (70, 80, 90)).save(root / "other.jpg")
+
+    window = MainWindow()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        monkeypatch.setattr("marnwick.ui.ask_automatically_delete_duplicates", lambda parent: True)
+        catalog = window.workspace.open_catalog(root)
+        catalog.refresh()
+        window.current_catalog = catalog
+        window.current_dir_rel = ""
+        window.rebuild_tree()
+        window.load_current_directory()
+
+        window._update_tools_menu_actions()
+
+        assert not window.auto_delete_duplicates_action.isVisible()
+
+        root_item = window.tree.topLevelItem(0)
+        assert root_item is not None
+        duplicate_item = None
+        very_similar_item = None
+        for index in range(root_item.childCount()):
+            child = root_item.child(index)
+            if child.text(0) != "Virtual Directories":
+                continue
+            duplicate_item = child.child(1)
+            very_similar_item = child.child(2)
+            break
+        assert duplicate_item is not None
+        assert very_similar_item is not None
+
+        window._directory_clicked(duplicate_item)
+        window._update_tools_menu_actions()
+
+        assert window.auto_delete_duplicates_action.isVisible()
+        assert window.auto_delete_duplicates_action.isEnabled()
+
+        window.automatically_delete_duplicates()
+
+        assert window._duplicate_delete_task is not None
+        assert window.progress_label.text().startswith("Moving duplicates")
+
+        settle_duplicate_delete_task(window, qt_app)
+
+        assert (root / "one.jpg").is_file()
+        assert not (root / "two.jpg").exists()
+        assert (root / "T-r-a-s-h" / "two.jpg").is_file()
+        assert [record.rel_path for record in window.model.images if isinstance(record, ImageRecord)] == []
+        assert "Moved 1 duplicate image(s)" in window.progress_label.text()
+
+        window.current_virtual_kind = None
+        window.current_virtual_value = ""
+        window.current_dir_rel = "T-r-a-s-h"
+        window.load_current_directory()
+
+        assert [record.rel_path for record in window.model.images if isinstance(record, ImageRecord)] == [
+            "T-r-a-s-h/two.jpg"
+        ]
+        assert window.is_restorable_trash_record(window.model.images[0])
+
+        select_thumbnail_rows(window, [0])
+        window.restore_selected_trash_records()
+
+        assert (root / "two.jpg").is_file()
+        assert not (root / "T-r-a-s-h" / "two.jpg").exists()
+
+        root_item = window.tree.topLevelItem(0)
+        assert root_item is not None
+        very_similar_item = None
+        for index in range(root_item.childCount()):
+            child = root_item.child(index)
+            if child.text(0) == "Virtual Directories":
+                very_similar_item = child.child(2)
+                break
+        assert very_similar_item is not None
+        window._directory_clicked(very_similar_item)
+        settle_virtual_view_tasks(window, qt_app)
+        window._update_tools_menu_actions()
+
+        assert window.auto_delete_duplicates_action.isVisible()
+    finally:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        window.indexer.shutdown()
+        window.workspace.close()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_close_catalog_waits_for_duplicate_delete_cancellation(tmp_path: Path) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    started = Event()
+    canceled = Event()
+
+    window = MainWindow()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        task = IndexTask(
+            "test duplicate delete",
+            catalog.root,
+            None,
+            interactive=True,
+            idle_sleep_seconds=0.0,
+        )
+
+        def worker() -> None:
+            started.set()
+            while True:
+                try:
+                    task.check_canceled()
+                except IndexTaskCancelled:
+                    canceled.set()
+                    task.mark_canceled()
+                    raise
+                sleep(0.01)
+
+        future = window.duplicate_delete_executor.submit(worker)
+        task.bind_future(future)
+        window._duplicate_delete_task = DuplicateDeleteTask(
+            root=catalog.root,
+            kind=VIRTUAL_KIND_DUPLICATES,
+            task=task,
+            future=future,
+            started_at=monotonic(),
+        )
+
+        assert started.wait(1.0)
+
+        window.close_catalog(catalog.root)
+
+        assert canceled.is_set()
+        assert window._duplicate_delete_task is None
+        assert future.done()
+        assert window.workspace.catalog_for_root(root) is None
+    finally:
+        if window._duplicate_delete_task is not None:
+            window._duplicate_delete_task.task.cancel()
+            settle_duplicate_delete_task(window, qt_app)
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        window.indexer.shutdown()
         window.workspace.close()
         window.close()
         window.deleteLater()
@@ -1872,6 +2318,180 @@ def test_tree_rebuild_preserves_selected_empty_directory_and_expands_ancestors(t
         qt_app.processEvents()
 
 
+def test_virtual_directory_tree_loads_tag_and_duplicate_aggregates(tmp_path: Path) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    Image.new("RGB", (8, 8), (10, 20, 30)).save(root / "one.jpg")
+    Image.new("RGB", (8, 8), (10, 20, 30)).save(root / "two.jpg")
+    Image.new("RGB", (8, 8), (90, 80, 70)).save(root / "other.jpg")
+    Image.new("RGB", (8, 8), (120, 20, 20)).save(root / "near-a.jpg")
+    Image.new("RGB", (8, 8), (122, 22, 22)).save(root / "near-b.jpg")
+
+    window = MainWindow()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        catalog.refresh()
+        catalog.set_image_tags("one.jpg", ["Keep"], replace=True)
+        catalog._conn.execute(
+            "UPDATE images SET similarity_feature_version = 0 WHERE rel_path NOT IN (?, ?)",
+            ("near-a.jpg", "near-b.jpg"),
+        )
+        color_signature = bytes([255, *([0] * 63)])
+        for rel_path, image_hash, aspect_ratio, perceptual_hash in [
+            ("near-a.jpg", "near-a", 1.0, "0000000000000000"),
+            ("near-b.jpg", "near-b", 1.01, "000000000000000f"),
+        ]:
+            catalog._conn.execute(
+                """
+                UPDATE images
+                SET image_hash = ?,
+                    aspect_ratio = ?,
+                    perceptual_hash = ?,
+                    color_signature = ?,
+                    similarity_feature_version = ?
+                WHERE rel_path = ?
+                """,
+                (
+                    image_hash,
+                    aspect_ratio,
+                    perceptual_hash,
+                    color_signature,
+                    SIMILARITY_FEATURE_VERSION,
+                    rel_path,
+                ),
+            )
+        window.current_catalog = catalog
+        window.current_dir_rel = ""
+        window.rebuild_tree()
+
+        root_item = window.tree.topLevelItem(0)
+        assert root_item is not None
+        virtual_root = None
+        for index in range(root_item.childCount()):
+            child = root_item.child(index)
+            if child.text(0) == "Virtual Directories":
+                virtual_root = child
+                break
+        assert virtual_root is not None
+        assert not virtual_root.icon(0).isNull()
+        tags_root = virtual_root.child(0)
+        duplicates_item = virtual_root.child(1)
+        very_similar_item = virtual_root.child(2)
+        assert tags_root is not None
+        assert duplicates_item is not None
+        assert very_similar_item is not None
+        assert duplicates_item.text(0) == "Exact Duplicates"
+        assert very_similar_item.text(0) == "Very Similar"
+        tag_item = tags_root.child(0)
+        assert tag_item is not None
+        assert tag_item.data(0, VIRTUAL_KIND_ROLE) == VIRTUAL_KIND_TAG
+        assert tag_item.data(0, VIRTUAL_VALUE_ROLE) == "Keep"
+
+        window._directory_clicked(tag_item)
+
+        assert window.current_virtual_kind == VIRTUAL_KIND_TAG
+        assert [record.rel_path for record in window.model.images if isinstance(record, ImageRecord)] == ["one.jpg"]
+
+        assert duplicates_item.data(0, VIRTUAL_KIND_ROLE) == VIRTUAL_KIND_DUPLICATES
+        window._directory_clicked(duplicates_item)
+
+        assert window.current_virtual_kind == VIRTUAL_KIND_DUPLICATES
+        assert [record.rel_path for record in window.model.images if isinstance(record, ImageRecord)] == [
+            "one.jpg",
+            "two.jpg",
+        ]
+
+        assert very_similar_item.data(0, VIRTUAL_KIND_ROLE) == VIRTUAL_KIND_VERY_SIMILAR
+        window._directory_clicked(very_similar_item)
+
+        assert window.current_virtual_kind == VIRTUAL_KIND_VERY_SIMILAR
+        assert window.model.images == []
+        assert window.progress_bar.minimum() == 0
+        assert window.progress_bar.maximum() == 0
+        assert window.progress_label.text().startswith("Building Very Similar view")
+
+        settle_virtual_view_tasks(window, qt_app)
+
+        assert [record.rel_path for record in window.model.images if isinstance(record, ImageRecord)] == [
+            "near-a.jpg",
+            "near-b.jpg",
+        ]
+
+        select_thumbnail_rows(window, [0, 1])
+
+        assert window.selected_rel_paths() == ["near-a.jpg", "near-b.jpg"]
+
+        window.load_current_directory(preserve_selection=True)
+
+        assert window.current_virtual_kind == VIRTUAL_KIND_VERY_SIMILAR
+        assert not window._virtual_view_tasks
+        assert window.selected_rel_paths() == ["near-a.jpg", "near-b.jpg"]
+        assert window.thumbnail_view.currentIndex().row() == 1
+    finally:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        window.indexer.shutdown()
+        window.workspace.close()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_virtual_directory_tree_rebuild_preserves_virtual_expansion_state(tmp_path: Path) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    Image.new("RGB", (8, 8), (10, 20, 30)).save(root / "one.jpg")
+
+    window = MainWindow()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        catalog.refresh()
+        catalog.set_image_tags("one.jpg", ["Keep"], replace=True)
+        window.current_catalog = catalog
+        window.current_dir_rel = ""
+        window.rebuild_tree()
+
+        virtual_root = find_virtual_tree_root(window)
+        tags_root = virtual_root.child(0)
+        assert tags_root is not None
+        assert virtual_root.isExpanded()
+        assert tags_root.isExpanded()
+
+        virtual_root.setExpanded(False)
+        tags_root.setExpanded(False)
+        window.rebuild_tree()
+
+        virtual_root = find_virtual_tree_root(window)
+        tags_root = virtual_root.child(0)
+        assert tags_root is not None
+        assert not virtual_root.isExpanded()
+        assert not tags_root.isExpanded()
+
+        virtual_root.setExpanded(True)
+        tags_root.setExpanded(False)
+        window.rebuild_tree()
+
+        virtual_root = find_virtual_tree_root(window)
+        tags_root = virtual_root.child(0)
+        assert tags_root is not None
+        assert virtual_root.isExpanded()
+        assert not tags_root.isExpanded()
+    finally:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        window.indexer.shutdown()
+        window.workspace.close()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
 def test_incremental_tree_rebuild_yields_between_batches(tmp_path: Path, monkeypatch) -> None:
     qt_app = app()
     root = tmp_path / "Pictures"
@@ -1904,8 +2524,9 @@ def test_incremental_tree_rebuild_yields_between_batches(tmp_path: Path, monkeyp
         selected = window.tree.currentItem()
         assert selected is not None
         assert selected.data(0, DIR_REL_ROLE) == "a/b/c"
-        assert root_item.childCount() == 2
+        assert root_item.childCount() == 3
         assert root_item.child(0).child(0).child(0).data(0, DIR_REL_ROLE) == "a/b/c"
+        assert root_item.child(2).text(0) == "Virtual Directories"
     finally:
         window.progress_timer.stop()
         window.idle_timer.stop()

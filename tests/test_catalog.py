@@ -8,13 +8,28 @@ from pathlib import Path
 from PIL import Image
 
 import marnwick.catalog as catalog_module
-from marnwick.catalog import MAX_LOG_BYTES, Catalog, parse_tag_entry
+from marnwick.catalog import (
+    DUPLICATE_DELETE_EXACT,
+    DUPLICATE_DELETE_VERY_SIMILAR,
+    MAX_LOG_BYTES,
+    SIMILARITY_FEATURE_VERSION,
+    TRASH_DIR_NAME,
+    Catalog,
+    parse_tag_entry,
+)
 from marnwick.models import CatalogSettings, SortOrder
 
 
 def make_image(path: Path, size: tuple[int, int] = (80, 60), color: tuple[int, int, int] = (80, 120, 180)) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     Image.new("RGB", size, color).save(path)
+
+
+def make_palette_image(path: Path, size: tuple[int, int] = (80, 60)) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    image = Image.new("P", size)
+    image.putpalette([0, 0, 0, 255, 0, 0] + [0, 0, 0] * 254)
+    image.save(path)
 
 
 def test_catalog_state_is_created_inside_catalog_root(tmp_path: Path) -> None:
@@ -117,6 +132,24 @@ def test_refresh_indexes_images_with_relative_paths_and_thumbnails(tmp_path: Pat
         assert records[0].thumb_width <= 96
         assert records[0].thumb_height <= 96
         assert catalog.list_known_directories() == ["", "set-a"]
+
+
+def test_refresh_pipeline_indexes_palette_mode_images(tmp_path: Path) -> None:
+    root = tmp_path / "catalog"
+    for index in range(3):
+        make_palette_image(root / f"palette-{index}.png")
+
+    with Catalog(root) as catalog:
+        catalog.refresh()
+        records = catalog.list_images("", include_blobs=False)
+
+        assert [record.rel_path for record in records] == [
+            "palette-0.png",
+            "palette-1.png",
+            "palette-2.png",
+        ]
+        assert all(catalog.get_thumbnail_blob(record.rel_path) for record in records)
+        assert not any("cannot write mode P as JPEG" in line for line in catalog.read_log_lines())
 
 
 def test_indexing_stores_thumbnail_as_file_not_database_blob(tmp_path: Path) -> None:
@@ -406,6 +439,399 @@ def test_duplicate_count_for_hash_excludes_selected_image(tmp_path: Path) -> Non
         assert catalog.duplicate_count_for_hash(record.image_hash, exclude_rel_path="one.jpg") == 1
 
 
+def test_list_duplicate_images_returns_all_images_with_repeated_hashes(tmp_path: Path) -> None:
+    root = tmp_path / "catalog"
+    make_image(root / "one.jpg", (20, 20), (1, 2, 3))
+    make_image(root / "two.jpg", (20, 20), (1, 2, 3))
+    make_image(root / "other.jpg", (20, 20), (8, 9, 10))
+
+    with Catalog(root) as catalog:
+        catalog.refresh()
+
+        assert [record.rel_path for record in catalog.list_duplicate_images()] == ["one.jpg", "two.jpg"]
+
+
+def test_list_duplicate_images_orders_by_hash_to_group_matches(tmp_path: Path) -> None:
+    root = tmp_path / "catalog"
+    for index, rel_path in enumerate(["a-b.jpg", "b-a.jpg", "c-b.jpg", "d-a.jpg"]):
+        make_image(root / rel_path, (20, 20), (index, index + 1, index + 2))
+
+    with Catalog(root) as catalog:
+        catalog.refresh()
+        for rel_path, image_hash in [
+            ("a-b.jpg", "hash-b"),
+            ("b-a.jpg", "hash-a"),
+            ("c-b.jpg", "hash-b"),
+            ("d-a.jpg", "hash-a"),
+        ]:
+            catalog._conn.execute(
+                "UPDATE images SET image_hash = ? WHERE rel_path = ?",
+                (image_hash, rel_path),
+            )
+
+        assert [record.rel_path for record in catalog.list_duplicate_images()] == [
+            "b-a.jpg",
+            "d-a.jpg",
+            "a-b.jpg",
+            "c-b.jpg",
+        ]
+
+
+def test_list_very_similar_images_uses_hash_aspect_and_color_filters(tmp_path: Path) -> None:
+    root = tmp_path / "catalog"
+    for index, rel_path in enumerate(["near-a.jpg", "near-b.jpg", "color.jpg", "wide.jpg"]):
+        make_image(root / rel_path, (20, 20), (index * 30, index * 30 + 10, index * 30 + 20))
+
+    def signature(index: int) -> bytes:
+        values = bytearray(64)
+        values[index] = 255
+        return bytes(values)
+
+    with Catalog(root) as catalog:
+        catalog.refresh()
+        for rel_path, image_hash, aspect_ratio, perceptual_hash, color_signature in [
+            ("near-a.jpg", "hash-a", 1.0, "0000000000000000", signature(4)),
+            ("near-b.jpg", "hash-b", 1.02, "000000000000000f", signature(4)),
+            ("color.jpg", "hash-c", 1.0, "0000000000000001", signature(50)),
+            ("wide.jpg", "hash-d", 1.4, "0000000000000001", signature(4)),
+        ]:
+            catalog._conn.execute(
+                """
+                UPDATE images
+                SET image_hash = ?,
+                    aspect_ratio = ?,
+                    perceptual_hash = ?,
+                    color_signature = ?,
+                    similarity_feature_version = ?
+                WHERE rel_path = ?
+                """,
+                (
+                    image_hash,
+                    aspect_ratio,
+                    perceptual_hash,
+                    color_signature,
+                    SIMILARITY_FEATURE_VERSION,
+                    rel_path,
+                ),
+            )
+
+        assert [record.rel_path for record in catalog.list_very_similar_images()] == [
+            "near-a.jpg",
+            "near-b.jpg",
+        ]
+
+
+def test_list_very_similar_images_excludes_exact_duplicate_pairs(tmp_path: Path) -> None:
+    root = tmp_path / "catalog"
+    make_image(root / "same-a.jpg", (20, 20), (30, 40, 50))
+    make_image(root / "same-b.jpg", (20, 20), (30, 40, 50))
+
+    with Catalog(root) as catalog:
+        catalog.refresh()
+
+        assert catalog.list_duplicate_images()
+        assert catalog.list_very_similar_images() == []
+
+
+def test_duplicate_matches_for_image_include_trash_paths(tmp_path: Path) -> None:
+    root = tmp_path / "catalog"
+    make_image(root / "one.jpg", (20, 20), (1, 2, 3))
+    make_image(root / "two.jpg", (20, 20), (1, 2, 3))
+    make_image(root / "near-a.jpg", (20, 20), (120, 20, 20))
+    make_image(root / "near-b.jpg", (20, 20), (122, 22, 22))
+    color_signature = bytes([255, *([0] * 63)])
+
+    with Catalog(root) as catalog:
+        catalog.refresh()
+        catalog.move_duplicate_images_to_trash(DUPLICATE_DELETE_EXACT)
+        catalog.move_images(["near-b.jpg"], catalog, "T-r-a-s-h")
+        catalog._conn.execute(
+            "UPDATE images SET similarity_feature_version = 0 WHERE rel_path NOT IN (?, ?)",
+            ("near-a.jpg", "T-r-a-s-h/near-b.jpg"),
+        )
+        for rel_path, image_hash, perceptual_hash in [
+            ("near-a.jpg", "near-a", "0000000000000000"),
+            ("T-r-a-s-h/near-b.jpg", "near-b", "000000000000000f"),
+        ]:
+            catalog._conn.execute(
+                """
+                UPDATE images
+                SET image_hash = ?,
+                    aspect_ratio = ?,
+                    perceptual_hash = ?,
+                    color_signature = ?,
+                    similarity_feature_version = ?
+                WHERE rel_path = ?
+                """,
+                (
+                    image_hash,
+                    1.0,
+                    perceptual_hash,
+                    color_signature,
+                    SIMILARITY_FEATURE_VERSION,
+                    rel_path,
+                ),
+            )
+
+        exact_matches = catalog.duplicate_matches_for_image("one.jpg")
+        near_matches = catalog.duplicate_matches_for_image("near-a.jpg")
+
+        assert [record.rel_path for record in exact_matches.exact] == ["T-r-a-s-h/two.jpg"]
+        assert [record.rel_path for record in near_matches.very_similar] == ["T-r-a-s-h/near-b.jpg"]
+
+
+def test_delete_duplicate_images_keeps_best_ranked_exact_duplicate(tmp_path: Path) -> None:
+    root = tmp_path / "catalog"
+    for rel_path in [
+        "plain.jpg",
+        "album/older-lower-depth.jpg",
+        "album/deep/best.jpg",
+        "album/deep/bad name.jpg",
+    ]:
+        make_image(root / rel_path, (20, 20))
+
+    updates = {
+        "plain.jpg": (300, 300, 1),
+        "album/older-lower-depth.jpg": (400, 400, 1),
+        "album/deep/best.jpg": (400, 400, 10),
+        "album/deep/bad name.jpg": (400, 400, 10),
+    }
+    with Catalog(root) as catalog:
+        catalog.refresh()
+        for rel_path, (width, height, mtime_ns) in updates.items():
+            catalog._conn.execute(
+                """
+                UPDATE images
+                SET image_hash = ?,
+                    width = ?,
+                    height = ?,
+                    aspect_ratio = ?,
+                    mtime_ns = ?,
+                    modified_at_ns = ?
+                WHERE rel_path = ?
+                """,
+                ("same-hash", width, height, width / height, mtime_ns, mtime_ns, rel_path),
+            )
+
+        plan = catalog.duplicate_deletion_plan(DUPLICATE_DELETE_EXACT)
+
+        assert len(plan.choices) == 1
+        assert plan.choices[0].keep.rel_path == "album/deep/best.jpg"
+        assert {record.rel_path for record in plan.choices[0].delete} == {
+            "plain.jpg",
+            "album/older-lower-depth.jpg",
+            "album/deep/bad name.jpg",
+        }
+
+        progress: list[tuple[int, int | None, str]] = []
+        result = catalog.move_duplicate_images_to_trash(
+            DUPLICATE_DELETE_EXACT,
+            progress_callback=lambda processed, total, current: progress.append((processed, total, current)),
+        )
+
+        assert result.groups == 1
+        assert result.deleted == 3
+        assert (root / "album/deep/best.jpg").is_file()
+        assert not (root / "plain.jpg").exists()
+        assert not (root / "album/older-lower-depth.jpg").exists()
+        assert not (root / "album/deep/bad name.jpg").exists()
+        assert (root / "T-r-a-s-h/plain.jpg").is_file()
+        assert (root / "T-r-a-s-h/album/older-lower-depth.jpg").is_file()
+        assert (root / "T-r-a-s-h/album/deep/bad name.jpg").is_file()
+        assert [record.rel_path for record in catalog.list_images("album/deep")] == ["album/deep/best.jpg"]
+        assert catalog.list_duplicate_images() == []
+        assert progress[-1] == (3, 3, "Duplicate move complete")
+
+        restore = catalog.restore_image_from_trash("T-r-a-s-h/plain.jpg")
+
+        assert restore.dest_rel_path == "plain.jpg"
+        assert (root / "plain.jpg").is_file()
+        assert not (root / "T-r-a-s-h/plain.jpg").exists()
+
+
+def test_delete_duplicate_images_handles_very_similar_groups(tmp_path: Path) -> None:
+    root = tmp_path / "catalog"
+    make_image(root / "small.jpg", (20, 20), (120, 20, 20))
+    make_image(root / "deep" / "large.jpg", (30, 30), (122, 22, 22))
+    color_signature = bytes([255, *([0] * 63)])
+
+    with Catalog(root) as catalog:
+        catalog.refresh()
+        for rel_path, image_hash, width, height, perceptual_hash in [
+            ("small.jpg", "small", 20, 20, "0000000000000000"),
+            ("deep/large.jpg", "large", 30, 30, "000000000000000f"),
+        ]:
+            catalog._conn.execute(
+                """
+                UPDATE images
+                SET image_hash = ?,
+                    width = ?,
+                    height = ?,
+                    aspect_ratio = ?,
+                    perceptual_hash = ?,
+                    color_signature = ?,
+                    similarity_feature_version = ?
+                WHERE rel_path = ?
+                """,
+                (
+                    image_hash,
+                    width,
+                    height,
+                    width / height,
+                    perceptual_hash,
+                    color_signature,
+                    SIMILARITY_FEATURE_VERSION,
+                    rel_path,
+                ),
+            )
+
+        result = catalog.move_duplicate_images_to_trash(DUPLICATE_DELETE_VERY_SIMILAR)
+
+        assert result.groups == 1
+        assert result.deleted == 1
+        assert (root / "deep" / "large.jpg").is_file()
+        assert not (root / "small.jpg").exists()
+        assert (root / "T-r-a-s-h" / "small.jpg").is_file()
+        assert catalog.list_very_similar_images() == []
+
+
+def test_very_similar_deletion_does_not_delete_transitive_only_matches(tmp_path: Path) -> None:
+    root = tmp_path / "catalog"
+    make_image(root / "a.jpg", (20, 20), (120, 20, 20))
+    make_image(root / "b.jpg", (20, 20), (122, 22, 22))
+    make_image(root / "c.jpg", (20, 20), (124, 24, 24))
+    color_signature = bytes([255, *([0] * 63)])
+
+    with Catalog(root) as catalog:
+        catalog.refresh()
+        for rel_path, image_hash, perceptual_hash in [
+            ("a.jpg", "hash-a", "0000000000000000"),
+            ("b.jpg", "hash-b", "00000000000000ff"),
+            ("c.jpg", "hash-c", "000000000000ffff"),
+        ]:
+            catalog._conn.execute(
+                """
+                UPDATE images
+                SET image_hash = ?,
+                    aspect_ratio = ?,
+                    perceptual_hash = ?,
+                    color_signature = ?,
+                    similarity_feature_version = ?
+                WHERE rel_path = ?
+                """,
+                (
+                    image_hash,
+                    1.0,
+                    perceptual_hash,
+                    color_signature,
+                    SIMILARITY_FEATURE_VERSION,
+                    rel_path,
+                ),
+            )
+
+        plan = catalog.duplicate_deletion_plan(DUPLICATE_DELETE_VERY_SIMILAR)
+
+        assert len(plan.choices) == 1
+        assert plan.choices[0].keep.rel_path == "a.jpg"
+        assert [record.rel_path for record in plan.choices[0].delete] == ["b.jpg"]
+
+        result = catalog.move_duplicate_images_to_trash(DUPLICATE_DELETE_VERY_SIMILAR)
+
+        assert result.deleted == 1
+        assert (root / "a.jpg").is_file()
+        assert not (root / "b.jpg").exists()
+        assert (root / "c.jpg").is_file()
+        assert (root / "T-r-a-s-h" / "b.jpg").is_file()
+
+
+def test_restore_directory_from_trash_moves_original_tree_back(tmp_path: Path) -> None:
+    root = tmp_path / "catalog"
+    make_image(root / "album" / "one.jpg", (20, 20), (10, 20, 30))
+    make_image(root / "album" / "two.jpg", (20, 20), (10, 20, 30))
+
+    with Catalog(root) as catalog:
+        catalog.refresh()
+
+        catalog.move_duplicate_images_to_trash(DUPLICATE_DELETE_EXACT)
+
+        assert (root / "album" / "one.jpg").is_file()
+        assert not (root / "album" / "two.jpg").exists()
+        assert (root / "T-r-a-s-h" / "album" / "two.jpg").is_file()
+
+        result = catalog.restore_directory_from_trash("T-r-a-s-h/album")
+
+        assert result.dest_rel_path == "album (1)"
+        assert (root / "album" / "one.jpg").is_file()
+        assert (root / "album (1)" / "two.jpg").is_file()
+        assert catalog.get_image("album (1)/two.jpg") is not None
+
+
+def test_restore_image_from_trash_uses_recorded_original_path_after_trash_collision(tmp_path: Path) -> None:
+    root = tmp_path / "catalog"
+    make_image(root / "a.jpg", (20, 20), (10, 20, 30))
+    make_image(root / "album" / "a.jpg", (20, 20), (10, 20, 30))
+    make_image(root / "T-r-a-s-h" / "a.jpg", (20, 20), (90, 80, 70))
+
+    with Catalog(root) as catalog:
+        catalog.refresh()
+
+        catalog.move_duplicate_images_to_trash(DUPLICATE_DELETE_EXACT)
+
+        assert not (root / "a.jpg").exists()
+        assert (root / "T-r-a-s-h" / "a.jpg").is_file()
+        assert (root / "T-r-a-s-h" / "a (1).jpg").is_file()
+        assert catalog.get_image("T-r-a-s-h/a (1).jpg") is not None
+
+        result = catalog.restore_image_from_trash("T-r-a-s-h/a (1).jpg")
+
+        assert result.dest_rel_path == "a.jpg"
+        assert (root / "a.jpg").is_file()
+        assert not (root / "T-r-a-s-h" / "a (1).jpg").exists()
+        assert catalog.get_image("a.jpg") is not None
+
+
+def test_delete_trash_image_purges_recorded_restore_path(tmp_path: Path) -> None:
+    root = tmp_path / "catalog"
+    make_image(root / "album" / "a.jpg", (20, 20), (10, 20, 30))
+
+    with Catalog(root) as catalog:
+        catalog.refresh()
+        catalog.move_images(["album/a.jpg"], catalog, TRASH_DIR_NAME)
+
+        assert (root / TRASH_DIR_NAME / "a.jpg").is_file()
+
+        catalog.delete_images([f"{TRASH_DIR_NAME}/a.jpg"])
+        make_image(root / TRASH_DIR_NAME / "a.jpg", (20, 20), (90, 80, 70))
+        catalog.index_image(f"{TRASH_DIR_NAME}/a.jpg")
+
+        result = catalog.restore_image_from_trash(f"{TRASH_DIR_NAME}/a.jpg")
+
+        assert result.dest_rel_path == "a.jpg"
+        assert (root / "a.jpg").is_file()
+        assert not (root / "album" / "a.jpg").exists()
+
+
+def test_delete_trash_directory_purges_recorded_restore_path(tmp_path: Path) -> None:
+    root = tmp_path / "catalog"
+    make_image(root / "set" / "album" / "a.jpg", (20, 20), (10, 20, 30))
+
+    with Catalog(root) as catalog:
+        catalog.refresh()
+        catalog.move_directories(["set/album"], catalog, TRASH_DIR_NAME)
+
+        assert (root / TRASH_DIR_NAME / "album" / "a.jpg").is_file()
+
+        catalog.delete_directory(f"{TRASH_DIR_NAME}/album")
+        make_image(root / TRASH_DIR_NAME / "album" / "a.jpg", (20, 20), (90, 80, 70))
+        catalog.refresh_directory(f"{TRASH_DIR_NAME}/album")
+
+        result = catalog.restore_directory_from_trash(f"{TRASH_DIR_NAME}/album")
+
+        assert result.dest_rel_path == "album"
+        assert (root / "album" / "a.jpg").is_file()
+        assert not (root / "set" / "album" / "a.jpg").exists()
+
+
 def test_unindexed_directory_lists_placeholder_records_for_image_files(tmp_path: Path) -> None:
     root = tmp_path / "catalog"
     make_image(root / "set-a" / "wide.jpg", (640, 320))
@@ -523,6 +949,21 @@ def test_tags_are_catalog_defined_and_csv_entry_selects_new_tags(tmp_path: Path)
 
         assert selected == ["Black and White", "Family", "travel"]
         assert catalog.list_tags() == ["Black and White", "Family", "travel"]
+
+
+def test_list_images_for_tag_uses_normalized_tag_names(tmp_path: Path) -> None:
+    root = tmp_path / "catalog"
+    make_image(root / "one.jpg")
+    make_image(root / "two.jpg", color=(10, 20, 30))
+    make_image(root / "other.jpg", color=(30, 20, 10))
+
+    with Catalog(root) as catalog:
+        catalog.refresh()
+        catalog.set_image_tags("one.jpg", ["Family"], replace=True)
+        catalog.set_image_tags("two.jpg", [" family "], replace=True)
+        catalog.set_image_tags("other.jpg", ["Travel"], replace=True)
+
+        assert [record.rel_path for record in catalog.list_images_for_tag(" FAMILY ")] == ["one.jpg", "two.jpg"]
 
 
 def test_parse_tag_entry_handles_commas_quotes_and_duplicates() -> None:
@@ -765,6 +1206,32 @@ def test_cross_catalog_directory_move_rebuilds_thumbnail_for_destination_native_
         assert dest.thumbnail_abs_path(row["thumb_rel_path"]).is_file()
 
 
+def test_cross_catalog_move_rejects_destination_trash(tmp_path: Path) -> None:
+    source_root = tmp_path / "source"
+    dest_root = tmp_path / "dest"
+    make_image(source_root / "image.jpg", (120, 90))
+    make_image(source_root / "set" / "nested.jpg", (120, 90))
+
+    with Catalog(source_root) as source, Catalog(dest_root) as dest:
+        source.refresh()
+        dest.refresh()
+
+        for action in [
+            lambda: source.move_images(["image.jpg"], dest, TRASH_DIR_NAME),
+            lambda: source.move_directories(["set"], dest, TRASH_DIR_NAME),
+        ]:
+            try:
+                action()
+            except ValueError as error:
+                assert "another catalog's trash" in str(error)
+            else:
+                raise AssertionError("cross-catalog trash move should be rejected")
+
+        assert (source_root / "image.jpg").is_file()
+        assert (source_root / "set" / "nested.jpg").is_file()
+        assert not (dest_root / TRASH_DIR_NAME).exists()
+
+
 def test_cross_filesystem_move_copies_then_wipes_source(tmp_path: Path, monkeypatch) -> None:
     source_root = tmp_path / "source"
     dest_root = tmp_path / "dest"
@@ -781,6 +1248,7 @@ def test_cross_filesystem_move_copies_then_wipes_source(tmp_path: Path, monkeypa
 
     monkeypatch.setattr("marnwick.catalog.os.replace", fake_replace)
     monkeypatch.setattr("marnwick.catalog.subprocess.run", fake_run)
+    monkeypatch.setattr("marnwick.catalog.shutil.which", lambda name: "/usr/bin/shred" if name == "shred" else None)
 
     with Catalog(source_root) as source, Catalog(dest_root) as dest:
         source.refresh()
@@ -907,6 +1375,7 @@ def test_delete_images_can_wipe_files(tmp_path: Path, monkeypatch) -> None:
         return object()
 
     monkeypatch.setattr("marnwick.catalog.subprocess.run", fake_run)
+    monkeypatch.setattr("marnwick.catalog.shutil.which", lambda name: "/usr/bin/shred" if name == "shred" else None)
 
     with Catalog(root) as catalog:
         catalog.refresh()
@@ -915,6 +1384,25 @@ def test_delete_images_can_wipe_files(tmp_path: Path, monkeypatch) -> None:
         assert shred_calls == [["shred", "-u", str(root / "one.jpg")]]
         assert not (root / "one.jpg").exists()
         assert catalog.get_image("one.jpg") is None
+
+
+def test_delete_images_with_wipe_falls_back_when_shred_is_unavailable(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "catalog"
+    make_image(root / "one.jpg")
+
+    def fail_run(command: list[str], *, check: bool):  # type: ignore[no-untyped-def]
+        raise AssertionError("shred should not be called")
+
+    monkeypatch.setattr("marnwick.catalog.subprocess.run", fail_run)
+    monkeypatch.setattr("marnwick.catalog.shutil.which", lambda name: None)
+
+    with Catalog(root) as catalog:
+        catalog.refresh()
+
+        assert catalog.delete_images(["one.jpg"], wipe=True) == 1
+        assert not (root / "one.jpg").exists()
+        assert catalog.get_image("one.jpg") is None
+        assert any("shred is unavailable" in line for line in catalog.read_log_lines())
 
 
 def test_create_delete_directory_and_summary(tmp_path: Path) -> None:
