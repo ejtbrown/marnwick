@@ -5,6 +5,7 @@ import json
 from math import ceil, hypot
 import os
 from collections import OrderedDict, defaultdict
+from collections.abc import Callable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
@@ -63,8 +64,19 @@ from PySide6.QtWidgets import (
 )
 from PIL import ExifTags, Image, ImageOps
 
-from .app_icon import DESKTOP_FILE_ID, app_icon_bytes
-from .catalog import Catalog, is_image_name, parse_tag_entry
+from .app_icon import DESKTOP_FILE_ID, app_icon_bytes, virtual_folder_icon_bytes
+from .catalog import (
+    DUPLICATE_DELETE_EXACT,
+    DUPLICATE_DELETE_VERY_SIMILAR,
+    TRASH_DIR_NAME,
+    Catalog,
+    DuplicateMatchGroups,
+    DuplicateDeletionResult,
+    is_inside_trash_rel_path,
+    is_trash_rel_path,
+    is_image_name,
+    parse_tag_entry,
+)
 from .config import (
     NORMAL_DELETE,
     WIPE_ON_DELETE,
@@ -83,17 +95,25 @@ from .image_ops import (
     save_image,
     save_image_preserving_file_dates,
 )
-from .indexer import BackgroundIndexer, IndexTask
+from .indexer import BackgroundIndexer, IndexTask, IndexTaskCancelled
 from .models import CatalogSettings, DirectoryRecord, ImageRecord, PaneRecord, SortOrder
 from .navigation import ImageNavigator
 from .workspace import Workspace
 
 CATALOG_ROOT_ROLE = Qt.ItemDataRole.UserRole
 DIR_REL_ROLE = Qt.ItemDataRole.UserRole + 1
+VIRTUAL_KIND_ROLE = Qt.ItemDataRole.UserRole + 2
+VIRTUAL_VALUE_ROLE = Qt.ItemDataRole.UserRole + 3
 TIMINGS_FILE_NAME = "timings.json"
 MAX_TIMING_EVENTS = 1000
 TREE_BUILD_BATCH_SIZE = 400
 TREE_BUILD_BUDGET_SECONDS = 0.008
+VIRTUAL_KIND_ROOT = "virtual-root"
+VIRTUAL_KIND_TAG_ROOT = "tag-root"
+VIRTUAL_KIND_TAG = "tag"
+VIRTUAL_KIND_DUPLICATES = "duplicates"
+VIRTUAL_KIND_VERY_SIMILAR = "very-similar"
+TreeStateKey = tuple[Path, str, str, str]
 
 
 @dataclass(slots=True)
@@ -115,12 +135,47 @@ class CatalogOpenTask:
 class TreeBuildTask:
     catalog: Catalog
     directories: list[str]
-    expanded_items: set[tuple[Path, str]]
+    expanded_items: set[TreeStateKey]
+    known_items: set[TreeStateKey]
     item_by_dir: dict[str, QTreeWidgetItem]
     index: int
     selected_item: QTreeWidgetItem | None
     started_at: float
     reason: str
+
+
+@dataclass(slots=True)
+class VirtualViewResult:
+    root: Path
+    kind: str
+    value: str
+    sort_order: SortOrder
+    fingerprint: int
+    images: list[ImageRecord]
+    duration_ms: float
+
+
+@dataclass(slots=True)
+class VirtualViewTask:
+    root: Path
+    kind: str
+    value: str
+    sort_order: SortOrder
+    fingerprint: int
+    future: Future[VirtualViewResult]
+    started_at: float
+    selection_keys: set[tuple[str, str]]
+    current_key: tuple[str, str] | None
+
+
+@dataclass(slots=True)
+class DuplicateDeleteTask:
+    root: Path
+    kind: str
+    task: IndexTask
+    future: Future[DuplicateDeletionResult]
+    started_at: float
+
 
 DIALOG_STYLESHEET = """
 QDialog,
@@ -283,6 +338,15 @@ class ThumbnailModel(QAbstractListModel):
             return record.filename
         if role == Qt.ItemDataRole.UserRole:
             return record.rel_path
+        if role == Qt.ItemDataRole.ToolTipRole and isinstance(record, ImageRecord):
+            return "\n".join(
+                [
+                    f"Path: {record.absolute_path.parent}",
+                    f"Filename: {record.filename}",
+                    f"Dimensions: {record.width} x {record.height}",
+                    f"Size: {format_bytes(record.size_bytes)}",
+                ]
+            )
         if role == Qt.ItemDataRole.DecorationRole:
             if isinstance(record, DirectoryRecord):
                 pixmap = self._pixmap_cache.get(record.rel_path)
@@ -645,7 +709,10 @@ class ThumbnailView(QListView):
         viewport_pos = tree.viewport().mapFromGlobal(global_pos)
         if not tree.viewport().rect().contains(viewport_pos):
             return None
-        return tree.itemAt(viewport_pos)
+        item = tree.itemAt(viewport_pos)
+        if item is not None and self.main_window.is_virtual_tree_item(item):
+            return None
+        return item
 
     def drag_pixmap_for_indexes(self, indexes: list[QModelIndex]) -> QPixmap:
         size = 128
@@ -704,7 +771,7 @@ class DirectoryTree(QTreeWidget):
 
     def startDrag(self, supported_actions: Qt.DropAction) -> None:
         item = self.currentItem()
-        if item is None or item.parent() is None:
+        if item is None or item.parent() is None or self.window.is_virtual_tree_item(item):
             return
         payload = [
             {
@@ -730,8 +797,14 @@ class DirectoryTree(QTreeWidget):
 
     def dragMoveEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         if event.mimeData().hasFormat(ThumbnailModel.MIME_TYPE):
-            self.set_drag_hover_item(self.itemAt(event.position().toPoint()))
-            event.acceptProposedAction()
+            item = self.itemAt(event.position().toPoint())
+            if item is not None and self.window.is_virtual_tree_item(item):
+                item = None
+            self.set_drag_hover_item(item)
+            if item is None:
+                event.ignore()
+            else:
+                event.acceptProposedAction()
             return
         super().dragMoveEvent(event)
 
@@ -744,6 +817,9 @@ class DirectoryTree(QTreeWidget):
         self.set_drag_hover_item(None)
         if item is None or not event.mimeData().hasFormat(ThumbnailModel.MIME_TYPE):
             super().dropEvent(event)
+            return
+        if self.window.is_virtual_tree_item(item):
+            event.ignore()
             return
         root = Path(item.data(0, CATALOG_ROOT_ROLE))
         dir_rel = item.data(0, DIR_REL_ROLE)
@@ -766,9 +842,15 @@ class DirectoryTree(QTreeWidget):
         item = self.itemAt(pos)
         if item is None:
             return
+        if self.window.is_virtual_tree_item(item):
+            return
         root = Path(item.data(0, CATALOG_ROOT_ROLE))
         dir_rel = item.data(0, DIR_REL_ROLE)
         menu = QMenu(self)
+        restore_action = None
+        if self.window.is_restorable_trash_rel(dir_rel):
+            restore_action = menu.addAction("Restore")
+            menu.addSeparator()
         properties_action = menu.addAction("Properties")
         create_action = menu.addAction("Create Directory")
         delete_action = menu.addAction("Delete Directory") if dir_rel else None
@@ -779,7 +861,9 @@ class DirectoryTree(QTreeWidget):
             tags_action = menu.addAction("Tags")
             close_action = menu.addAction("Close")
         selected = menu.exec(self.viewport().mapToGlobal(pos))
-        if selected == properties_action:
+        if restore_action is not None and selected == restore_action:
+            self.window.restore_trash_directory(root, dir_rel)
+        elif selected == properties_action:
             self.window.open_directory_properties(root, dir_rel)
         elif selected == create_action:
             self.window.create_directory(root, dir_rel)
@@ -804,8 +888,12 @@ class MainWindow(QMainWindow):
         self.workspace = Workspace()
         self.indexer = BackgroundIndexer()
         self.catalog_open_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="marnwick-open")
+        self.virtual_view_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="marnwick-virtual")
+        self.duplicate_delete_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="marnwick-delete")
         self.current_catalog: Catalog | None = None
         self.current_dir_rel = ""
+        self.current_virtual_kind: str | None = None
+        self.current_virtual_value = ""
         self.current_sort = self.sort_order_from_config(self.app_config.sort_order)
         self._swept_catalog_roots: set[Path] = set()
         self._pruned_catalog_roots: set[Path] = set()
@@ -816,6 +904,9 @@ class MainWindow(QMainWindow):
         self._resume_idle_refresh_roots: set[Path] = set()
         self._shallow_tree_roots: set[Path] = set()
         self._catalog_open_tasks: dict[Future[CatalogOpenResult], CatalogOpenTask] = {}
+        self._virtual_view_tasks: dict[Future[VirtualViewResult], VirtualViewTask] = {}
+        self._very_similar_cache: dict[tuple[Path, str, int], list[ImageRecord]] = {}
+        self._duplicate_delete_task: DuplicateDeleteTask | None = None
         self._tree_build_task: TreeBuildTask | None = None
         self._pending_tree_rebuilds: dict[Path, tuple[Catalog, str]] = {}
         self._indexing_was_active = False
@@ -880,6 +971,7 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(splitter)
 
         self.folder_icon = self.style().standardIcon(QStyle.StandardPixmap.SP_DirIcon)
+        self.virtual_folder_icon = load_virtual_folder_icon()
 
         self.status_left_label = QLabel("-")
         self.status_left_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
@@ -909,7 +1001,10 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         self.save_window_config()
+        self._cancel_active_duplicate_delete_task(wait=True)
         self.catalog_open_executor.shutdown(wait=False, cancel_futures=True)
+        self.virtual_view_executor.shutdown(wait=False, cancel_futures=True)
+        self.duplicate_delete_executor.shutdown(wait=True, cancel_futures=True)
         self.indexer.shutdown()
         self.workspace.close()
         super().closeEvent(event)
@@ -1041,6 +1136,10 @@ class MainWindow(QMainWindow):
         self.refresh_catalog_action = QAction("Refresh Catalog", self)
         self.refresh_catalog_action.triggered.connect(self.refresh_current_catalog)
         self.tools_menu.addAction(self.refresh_catalog_action)
+        self.auto_delete_duplicates_action = QAction("Automatically Delete Duplicates", self)
+        self.auto_delete_duplicates_action.triggered.connect(self.automatically_delete_duplicates)
+        self.auto_delete_duplicates_action.setVisible(False)
+        self.tools_menu.addAction(self.auto_delete_duplicates_action)
         self.logs_action = QAction("Logs", self)
         self.logs_action.triggered.connect(self.open_logs)
         self.tools_menu.addAction(self.logs_action)
@@ -1050,8 +1149,22 @@ class MainWindow(QMainWindow):
         self.preferences_action = QAction("Preferences", self)
         self.preferences_action.triggered.connect(self.open_app_preferences)
         self.tools_menu.addAction(self.preferences_action)
+        self.tools_menu.aboutToShow.connect(self._update_tools_menu_actions)
 
         QShortcut(QKeySequence("Ctrl+O"), self, activated=self.open_catalog_dialog)
+
+    def _update_tools_menu_actions(self) -> None:
+        duplicate_view_selected = self.current_virtual_kind in {
+            VIRTUAL_KIND_DUPLICATES,
+            VIRTUAL_KIND_VERY_SIMILAR,
+        }
+        self.auto_delete_duplicates_action.setVisible(duplicate_view_selected)
+        self.auto_delete_duplicates_action.setEnabled(
+            duplicate_view_selected
+            and self.current_catalog is not None
+            and self._duplicate_delete_task is None
+            and self._active_virtual_view_task() is None
+        )
 
     def open_catalog_dialog(self) -> None:
         dialog_started_at = monotonic()
@@ -1102,6 +1215,76 @@ class MainWindow(QMainWindow):
         )
         self._poll_indexer()
 
+    def automatically_delete_duplicates(self) -> None:
+        if self.current_catalog is None:
+            return
+        if self.current_virtual_kind not in {VIRTUAL_KIND_DUPLICATES, VIRTUAL_KIND_VERY_SIMILAR}:
+            return
+        if self._duplicate_delete_task is not None:
+            self._show_duplicate_delete_status(self._duplicate_delete_task.task.snapshot())
+            return
+        if self._active_virtual_view_task() is not None:
+            self.progress_label.setText("Wait for the virtual directory to finish building")
+            return
+        if not ask_automatically_delete_duplicates(self):
+            return
+        catalog = self.current_catalog
+        mode = (
+            DUPLICATE_DELETE_EXACT
+            if self.current_virtual_kind == VIRTUAL_KIND_DUPLICATES
+            else DUPLICATE_DELETE_VERY_SIMILAR
+        )
+        self.indexer.cancel_idle_tasks(catalog.root)
+        self.indexer.cancel_directory_tasks(catalog.root)
+        self._swept_catalog_roots.discard(catalog.root)
+        self._pruned_catalog_roots.discard(catalog.root)
+        task = IndexTask(
+            "Moving duplicates to trash",
+            catalog.root,
+            None,
+            interactive=True,
+            idle_sleep_seconds=0.0,
+            force_refresh=True,
+        )
+        future = self.duplicate_delete_executor.submit(
+            self._duplicate_delete_worker,
+            catalog.root,
+            mode,
+            task,
+        )
+        task.bind_future(future)
+        self._duplicate_delete_task = DuplicateDeleteTask(
+            root=catalog.root,
+            kind=self.current_virtual_kind,
+            task=task,
+            future=future,
+            started_at=monotonic(),
+        )
+        self._show_duplicate_delete_status(task.snapshot())
+        self._update_tools_menu_actions()
+
+    def _duplicate_delete_worker(
+        self,
+        root: Path,
+        mode: str,
+        task: IndexTask,
+    ) -> DuplicateDeletionResult:
+        try:
+            with Catalog(root) as catalog:
+                result = catalog.move_duplicate_images_to_trash(
+                    mode,
+                    progress_callback=task.update,
+                    cancel_check=task.check_canceled,
+                )
+            task.mark_done()
+            return result
+        except IndexTaskCancelled:
+            task.mark_canceled()
+            raise
+        except Exception as error:
+            task.mark_failed(error)
+            raise
+
     def open_catalog_preferences(self, root: Path) -> None:
         catalog = self.workspace.catalog_for_root(root)
         if catalog is None:
@@ -1131,6 +1314,7 @@ class MainWindow(QMainWindow):
             return
         dialog = CatalogTagsDialog(catalog, self)
         dialog.exec()
+        self.rebuild_tree()
 
     def open_directory_properties(self, root: Path, dir_rel: str) -> None:
         catalog = self.workspace.catalog_for_root(root)
@@ -1180,6 +1364,65 @@ class MainWindow(QMainWindow):
                 self.current_catalog = catalog
         self.reload_tree_and_directory()
         self.queue_directory_index(catalog, self.current_dir_rel if self.current_catalog == catalog else "")
+
+    def is_restorable_trash_rel(self, rel_path: str) -> bool:
+        return is_inside_trash_rel_path(rel_path)
+
+    def is_restorable_trash_record(self, record: PaneRecord) -> bool:
+        if isinstance(record, DirectoryRecord):
+            return self.is_restorable_trash_rel(record.dir_rel)
+        return self.is_restorable_trash_rel(record.rel_path)
+
+    def restore_trash_directory(self, root: Path, dir_rel: str) -> None:
+        catalog = self.workspace.catalog_for_root(root)
+        if catalog is None:
+            return
+        try:
+            catalog.restore_directory_from_trash(dir_rel)
+        except (OSError, ValueError) as error:
+            show_error(self, "Restore", str(error))
+            return
+        self._finish_trash_restore(catalog, dir_rel)
+
+    def restore_selected_trash_records(self) -> None:
+        if self.current_catalog is None:
+            return
+        records = [
+            record
+            for record in self.selected_records()
+            if self.is_restorable_trash_record(record)
+        ]
+        if not records:
+            return
+        catalog = self.current_catalog
+        restored_sources: list[str] = []
+        try:
+            for record in sorted(records, key=lambda item: item.rel_path.count("/"), reverse=True):
+                if isinstance(record, DirectoryRecord):
+                    catalog.restore_directory_from_trash(record.dir_rel)
+                    restored_sources.append(record.dir_rel)
+                else:
+                    catalog.restore_image_from_trash(record.rel_path)
+                    restored_sources.append(record.rel_path)
+        except (OSError, ValueError) as error:
+            show_error(self, "Restore", str(error))
+            return
+        self._finish_trash_restore(catalog, *restored_sources)
+
+    def _finish_trash_restore(self, catalog: Catalog, *source_rel_paths: str) -> None:
+        self._drop_very_similar_cache(catalog.root)
+        self._swept_catalog_roots.discard(catalog.root)
+        self._pruned_catalog_roots.discard(catalog.root)
+        if self.current_catalog is not None and self.current_catalog.root == catalog.root:
+            self.current_virtual_kind = None
+            self.current_virtual_value = ""
+            for source_rel_path in source_rel_paths:
+                if self.current_dir_rel == source_rel_path or self.current_dir_rel.startswith(f"{source_rel_path}/"):
+                    parent_rel = Path(source_rel_path).parent.as_posix()
+                    self.current_dir_rel = TRASH_DIR_NAME if parent_rel == "." else parent_rel
+                    break
+        self.rebuild_tree()
+        self.load_current_directory()
 
     def open_catalog(self, root: Path, *, log_event: bool = True) -> None:
         operation_started_at = monotonic()
@@ -1288,6 +1531,8 @@ class MainWindow(QMainWindow):
 
         self.current_catalog = catalog
         self.current_dir_rel = ""
+        self.current_virtual_kind = None
+        self.current_virtual_value = ""
 
         phase_started_at = monotonic()
         self.rebuild_tree()
@@ -1421,6 +1666,9 @@ class MainWindow(QMainWindow):
     def close_catalog(self, root: Path) -> None:
         resolved = root.resolve()
         self._cancel_catalog_open_tasks(resolved)
+        self._cancel_virtual_view_tasks(resolved)
+        self._cancel_duplicate_delete_task(resolved, wait=True)
+        self._drop_very_similar_cache(resolved)
         catalog = self.workspace.catalog_for_root(root)
         if catalog is not None:
             catalog.append_log("Catalog removed from workspace")
@@ -1439,6 +1687,8 @@ class MainWindow(QMainWindow):
         if self.current_catalog and self.current_catalog.root == resolved:
             self.current_catalog = None
             self.current_dir_rel = ""
+            self.current_virtual_kind = None
+            self.current_virtual_value = ""
             self.model.set_images(None, [])
             self.update_selection_status()
         self.rebuild_tree()
@@ -1447,6 +1697,7 @@ class MainWindow(QMainWindow):
         self._tree_build_task = None
         self._pending_tree_rebuilds.clear()
         expanded_items = self._expanded_tree_items()
+        known_items = self._known_tree_items()
         self.tree.clear()
         selected_item: QTreeWidgetItem | None = None
         for catalog in self.workspace.catalogs:
@@ -1477,8 +1728,11 @@ class MainWindow(QMainWindow):
                     selected_item = item
             root_item.setExpanded(True)
             for dir_rel, item in item_by_dir.items():
-                if (catalog.root, dir_rel) in expanded_items:
+                if self._tree_state_key_for_directory(catalog.root, dir_rel) in expanded_items:
                     item.setExpanded(True)
+            virtual_selected_item = self._add_virtual_tree_items(catalog, root_item, expanded_items, known_items)
+            if virtual_selected_item is not None:
+                selected_item = virtual_selected_item
         if selected_item is not None:
             self.tree.setCurrentItem(selected_item)
             self._expand_tree_item_ancestors(selected_item)
@@ -1501,6 +1755,7 @@ class MainWindow(QMainWindow):
         phase_started_at = monotonic()
         self._pending_tree_rebuilds.pop(catalog.root, None)
         expanded_items = self._expanded_tree_items()
+        known_items = self._known_tree_items()
         root_item = self._tree_item_for_root(catalog.root)
         if root_item is None:
             root_item = QTreeWidgetItem([catalog.root.name or str(catalog.root)])
@@ -1521,6 +1776,7 @@ class MainWindow(QMainWindow):
             catalog=catalog,
             directories=directories,
             expanded_items=expanded_items,
+            known_items=known_items,
             item_by_dir={"": root_item},
             index=0,
             selected_item=root_item if self._is_current_tree_item(catalog.root, "") else None,
@@ -1557,7 +1813,7 @@ class MainWindow(QMainWindow):
             task.item_by_dir[dir_rel] = item
             if self._is_current_tree_item(task.catalog.root, dir_rel):
                 task.selected_item = item
-            if (task.catalog.root, dir_rel) in task.expanded_items:
+            if self._tree_state_key_for_directory(task.catalog.root, dir_rel) in task.expanded_items:
                 item.setExpanded(True)
             processed += 1
             if processed >= TREE_BUILD_BATCH_SIZE or monotonic() >= deadline:
@@ -1569,6 +1825,14 @@ class MainWindow(QMainWindow):
             self.progress_label.setText(f"Building folder tree {task.index}/{total}")
             QTimer.singleShot(0, self._continue_incremental_tree_rebuild)
             return
+        virtual_selected_item = self._add_virtual_tree_items(
+            task.catalog,
+            task.item_by_dir[""],
+            task.expanded_items,
+            task.known_items,
+        )
+        if virtual_selected_item is not None:
+            task.selected_item = virtual_selected_item
         if task.selected_item is not None:
             self.tree.setCurrentItem(task.selected_item)
             self._expand_tree_item_ancestors(task.selected_item)
@@ -1602,17 +1866,127 @@ class MainWindow(QMainWindow):
                 return item
         return None
 
+    def _add_virtual_tree_items(
+        self,
+        catalog: Catalog,
+        root_item: QTreeWidgetItem,
+        expanded_items: set[TreeStateKey],
+        known_items: set[TreeStateKey],
+    ) -> QTreeWidgetItem | None:
+        selected_item: QTreeWidgetItem | None = None
+
+        virtual_root = QTreeWidgetItem(["Virtual Directories"])
+        self._set_virtual_tree_item_data(virtual_root, catalog, VIRTUAL_KIND_ROOT, "")
+        root_item.addChild(virtual_root)
+        virtual_root.setExpanded(
+            self._virtual_tree_item_should_expand(
+                catalog.root,
+                VIRTUAL_KIND_ROOT,
+                "",
+                expanded_items,
+                known_items,
+                default=True,
+            )
+        )
+
+        tags_root = QTreeWidgetItem(["Tags"])
+        self._set_virtual_tree_item_data(tags_root, catalog, VIRTUAL_KIND_TAG_ROOT, "")
+        virtual_root.addChild(tags_root)
+        tags_root.setExpanded(
+            self._virtual_tree_item_should_expand(
+                catalog.root,
+                VIRTUAL_KIND_TAG_ROOT,
+                "",
+                expanded_items,
+                known_items,
+                default=True,
+            )
+        )
+        for tag in catalog.list_tags():
+            item = QTreeWidgetItem([tag])
+            self._set_virtual_tree_item_data(item, catalog, VIRTUAL_KIND_TAG, tag)
+            tags_root.addChild(item)
+            if self._is_current_virtual_item(catalog.root, VIRTUAL_KIND_TAG, tag):
+                selected_item = item
+
+        duplicates_item = QTreeWidgetItem(["Exact Duplicates"])
+        self._set_virtual_tree_item_data(duplicates_item, catalog, VIRTUAL_KIND_DUPLICATES, "")
+        virtual_root.addChild(duplicates_item)
+        if self._is_current_virtual_item(catalog.root, VIRTUAL_KIND_DUPLICATES, ""):
+            selected_item = duplicates_item
+
+        very_similar_item = QTreeWidgetItem(["Very Similar"])
+        self._set_virtual_tree_item_data(very_similar_item, catalog, VIRTUAL_KIND_VERY_SIMILAR, "")
+        virtual_root.addChild(very_similar_item)
+        if self._is_current_virtual_item(catalog.root, VIRTUAL_KIND_VERY_SIMILAR, ""):
+            selected_item = very_similar_item
+        return selected_item
+
+    def _tree_state_key_for_directory(self, root: Path, dir_rel: str) -> TreeStateKey:
+        return (root.resolve(), "dir", dir_rel, "")
+
+    def _tree_state_key_for_virtual(self, root: Path, kind: str, value: str) -> TreeStateKey:
+        return (root.resolve(), "virtual", kind, value)
+
+    def _tree_item_state_key(self, item: QTreeWidgetItem) -> TreeStateKey:
+        root = Path(item.data(0, CATALOG_ROOT_ROLE)).resolve()
+        virtual_kind = item.data(0, VIRTUAL_KIND_ROLE) or ""
+        if virtual_kind:
+            return self._tree_state_key_for_virtual(root, virtual_kind, item.data(0, VIRTUAL_VALUE_ROLE) or "")
+        return self._tree_state_key_for_directory(root, item.data(0, DIR_REL_ROLE) or "")
+
+    def _virtual_tree_item_should_expand(
+        self,
+        root: Path,
+        kind: str,
+        value: str,
+        expanded_items: set[TreeStateKey],
+        known_items: set[TreeStateKey],
+        *,
+        default: bool,
+    ) -> bool:
+        key = self._tree_state_key_for_virtual(root, kind, value)
+        if key in expanded_items:
+            return True
+        if key in known_items:
+            return False
+        return default
+
+    def _set_virtual_tree_item_data(
+        self,
+        item: QTreeWidgetItem,
+        catalog: Catalog,
+        kind: str,
+        value: str,
+    ) -> None:
+        item.setIcon(0, self.virtual_folder_icon)
+        item.setData(0, CATALOG_ROOT_ROLE, str(catalog.root))
+        item.setData(0, DIR_REL_ROLE, "")
+        item.setData(0, VIRTUAL_KIND_ROLE, kind)
+        item.setData(0, VIRTUAL_VALUE_ROLE, value)
+        if kind == VIRTUAL_KIND_TAG:
+            item.setToolTip(0, f"Images tagged {value}")
+        elif kind == VIRTUAL_KIND_DUPLICATES:
+            item.setToolTip(0, "Images with matching exact content hashes")
+        elif kind == VIRTUAL_KIND_VERY_SIMILAR:
+            item.setToolTip(0, "Images with close aspect ratios, perceptual hashes, and color distributions")
+        else:
+            item.setToolTip(0, "Virtual directories")
+
+    def is_virtual_tree_item(self, item: QTreeWidgetItem | None) -> bool:
+        return item is not None and bool(item.data(0, VIRTUAL_KIND_ROLE))
+
     def _tree_directory_rels_for_catalog(self, catalog: Catalog) -> list[str]:
         if catalog.root in self._shallow_tree_roots:
             return catalog.list_filesystem_child_directory_rels("")
         return catalog.list_known_directories()
 
-    def _expanded_tree_items(self) -> set[tuple[Path, str]]:
-        expanded: set[tuple[Path, str]] = set()
+    def _expanded_tree_items(self) -> set[TreeStateKey]:
+        expanded: set[TreeStateKey] = set()
 
         def visit(item: QTreeWidgetItem) -> None:
             if item.isExpanded():
-                expanded.add((Path(item.data(0, CATALOG_ROOT_ROLE)).resolve(), item.data(0, DIR_REL_ROLE)))
+                expanded.add(self._tree_item_state_key(item))
             for index in range(item.childCount()):
                 visit(item.child(index))
 
@@ -1620,11 +1994,32 @@ class MainWindow(QMainWindow):
             visit(self.tree.topLevelItem(index))
         return expanded
 
+    def _known_tree_items(self) -> set[TreeStateKey]:
+        known: set[TreeStateKey] = set()
+
+        def visit(item: QTreeWidgetItem) -> None:
+            known.add(self._tree_item_state_key(item))
+            for index in range(item.childCount()):
+                visit(item.child(index))
+
+        for index in range(self.tree.topLevelItemCount()):
+            visit(self.tree.topLevelItem(index))
+        return known
+
     def _is_current_tree_item(self, root: Path, dir_rel: str) -> bool:
         return (
             self.current_catalog is not None
             and self.current_catalog.root == root
+            and self.current_virtual_kind is None
             and self.current_dir_rel == dir_rel
+        )
+
+    def _is_current_virtual_item(self, root: Path, kind: str, value: str) -> bool:
+        return (
+            self.current_catalog is not None
+            and self.current_catalog.root == root
+            and self.current_virtual_kind == kind
+            and self.current_virtual_value == value
         )
 
     def _expand_tree_item_ancestors(self, item: QTreeWidgetItem) -> None:
@@ -1642,6 +2037,9 @@ class MainWindow(QMainWindow):
         catalog = self.workspace.catalog_for_root(root)
         if catalog is None:
             return
+        if self.is_virtual_tree_item(item):
+            self._virtual_directory_clicked(catalog, item)
+            return
         dir_rel = item.data(0, DIR_REL_ROLE)
         idle_task = self._idle_index_tasks.get(catalog.root)
         if idle_task is not None and not idle_task.snapshot().done:
@@ -1650,13 +2048,40 @@ class MainWindow(QMainWindow):
         self.indexer.cancel_directory_tasks(catalog.root, keep_dir_rel=dir_rel)
         self.current_catalog = catalog
         self.current_dir_rel = dir_rel
+        self.current_virtual_kind = None
+        self.current_virtual_value = ""
         self.load_current_directory()
         self.queue_directory_index(catalog, self.current_dir_rel)
 
-    def load_current_directory(self) -> None:
+    def _virtual_directory_clicked(self, catalog: Catalog, item: QTreeWidgetItem) -> None:
+        kind = item.data(0, VIRTUAL_KIND_ROLE)
+        value = item.data(0, VIRTUAL_VALUE_ROLE) or ""
+        if kind in {VIRTUAL_KIND_ROOT, VIRTUAL_KIND_TAG_ROOT}:
+            item.setExpanded(not item.isExpanded())
+            return
+        if kind not in {VIRTUAL_KIND_TAG, VIRTUAL_KIND_DUPLICATES, VIRTUAL_KIND_VERY_SIMILAR}:
+            return
+        self.indexer.cancel_idle_tasks(catalog.root)
+        self.indexer.cancel_directory_tasks(catalog.root)
+        self.current_catalog = catalog
+        self.current_dir_rel = ""
+        self.current_virtual_kind = kind
+        self.current_virtual_value = value
+        self.load_current_directory()
+
+    def load_current_directory(self, *, preserve_selection: bool = False) -> None:
+        selection_keys = self._thumbnail_selection_keys() if preserve_selection else set()
+        current_key = self._current_thumbnail_selection_key() if preserve_selection else None
         if self.current_catalog is None:
             self.model.set_images(None, [])
             self.update_selection_status()
+            return
+        if self.current_virtual_kind is not None:
+            self.load_current_virtual_directory(
+                preserve_selection=preserve_selection,
+                selection_keys=selection_keys,
+                current_key=current_key,
+            )
             return
         images = self.current_catalog.list_images_with_placeholders(
             self.current_dir_rel,
@@ -1679,7 +2104,371 @@ class MainWindow(QMainWindow):
             )
         self.model.set_images(self.current_catalog, [*directories, *images])
         self.refresh_thumbnail_layout()
+        if preserve_selection:
+            self._restore_thumbnail_selection(selection_keys, current_key)
         self.update_selection_status()
+
+    def load_current_virtual_directory(
+        self,
+        *,
+        preserve_selection: bool = False,
+        selection_keys: set[tuple[str, str]] | None = None,
+        current_key: tuple[str, str] | None = None,
+    ) -> None:
+        if self.current_catalog is None or self.current_virtual_kind is None:
+            return
+        if preserve_selection and selection_keys is None:
+            selection_keys = self._thumbnail_selection_keys()
+            current_key = self._current_thumbnail_selection_key()
+        if self.current_virtual_kind == VIRTUAL_KIND_TAG:
+            images = self.current_catalog.list_images_for_tag(
+                self.current_virtual_value,
+                self.current_sort,
+                include_blobs=False,
+            )
+        elif self.current_virtual_kind == VIRTUAL_KIND_DUPLICATES:
+            images = self.current_catalog.list_duplicate_images(
+                self.current_sort,
+                include_blobs=False,
+            )
+        elif self.current_virtual_kind == VIRTUAL_KIND_VERY_SIMILAR:
+            self._load_very_similar_virtual_directory(
+                preserve_selection=preserve_selection,
+                selection_keys=selection_keys or set(),
+                current_key=current_key,
+            )
+            return
+        else:
+            images = []
+        self.model.set_images(self.current_catalog, images)
+        self.refresh_thumbnail_layout()
+        if preserve_selection:
+            self._restore_thumbnail_selection(selection_keys or set(), current_key)
+        self.update_selection_status()
+
+    def _thumbnail_record_key(self, record: PaneRecord) -> tuple[str, str]:
+        if isinstance(record, DirectoryRecord):
+            return ("directory", record.dir_rel)
+        return ("image", record.rel_path)
+
+    def _thumbnail_selection_keys(self) -> set[tuple[str, str]]:
+        keys: set[tuple[str, str]] = set()
+        for index in self.thumbnail_view.selectedIndexes():
+            if index.isValid() and index.row() < len(self.model.images):
+                keys.add(self._thumbnail_record_key(self.model.images[index.row()]))
+        return keys
+
+    def _current_thumbnail_selection_key(self) -> tuple[str, str] | None:
+        current = self.thumbnail_view.currentIndex()
+        if not current.isValid() or current.row() >= len(self.model.images):
+            return None
+        return self._thumbnail_record_key(self.model.images[current.row()])
+
+    def _restore_thumbnail_selection(
+        self,
+        selection_keys: set[tuple[str, str]],
+        current_key: tuple[str, str] | None,
+    ) -> None:
+        selection = self.thumbnail_view.selectionModel()
+        if selection is None:
+            return
+        selection.clearSelection()
+        current_index = QModelIndex()
+        for row, record in enumerate(self.model.images):
+            key = self._thumbnail_record_key(record)
+            if key not in selection_keys and key != current_key:
+                continue
+            index = self.model.index(row, 0)
+            if key in selection_keys:
+                selection.select(index, QItemSelectionModel.SelectionFlag.Select)
+            if key == current_key:
+                current_index = index
+        if current_index.isValid():
+            selection.setCurrentIndex(current_index, QItemSelectionModel.SelectionFlag.NoUpdate)
+
+    def _load_very_similar_virtual_directory(
+        self,
+        *,
+        preserve_selection: bool,
+        selection_keys: set[tuple[str, str]],
+        current_key: tuple[str, str] | None,
+    ) -> None:
+        if self.current_catalog is None:
+            return
+        catalog = self.current_catalog
+        fingerprint = catalog.catalog_database_mtime_ns()
+        cache_key = self._very_similar_cache_key(catalog.root, self.current_sort, fingerprint)
+        cached_images = self._very_similar_cache.get(cache_key)
+        if cached_images is not None:
+            self.model.set_images(catalog, list(cached_images))
+            self.refresh_thumbnail_layout()
+            if preserve_selection:
+                self._restore_thumbnail_selection(selection_keys, current_key)
+            self.update_selection_status()
+            return
+
+        task = self._matching_virtual_view_task(
+            catalog.root,
+            VIRTUAL_KIND_VERY_SIMILAR,
+            "",
+            self.current_sort,
+            fingerprint,
+        )
+        if task is None:
+            future = self.virtual_view_executor.submit(
+                self._very_similar_virtual_view_worker,
+                catalog.root,
+                self.current_sort.value,
+                fingerprint,
+            )
+            task = VirtualViewTask(
+                root=catalog.root,
+                kind=VIRTUAL_KIND_VERY_SIMILAR,
+                value="",
+                sort_order=self.current_sort,
+                fingerprint=fingerprint,
+                future=future,
+                started_at=monotonic(),
+                selection_keys=set(selection_keys),
+                current_key=current_key,
+            )
+            self._virtual_view_tasks[future] = task
+        elif preserve_selection:
+            task.selection_keys = set(selection_keys)
+            task.current_key = current_key
+
+        self.model.set_images(catalog, [])
+        self.refresh_thumbnail_layout()
+        self.update_selection_status()
+        self._show_virtual_view_status(task)
+
+    def _very_similar_virtual_view_worker(
+        self,
+        root: Path,
+        sort_value: str,
+        fingerprint: int,
+    ) -> VirtualViewResult:
+        started_at = monotonic()
+        sort_order = SortOrder(sort_value)
+        with Catalog(root) as catalog:
+            images = catalog.list_very_similar_images(sort_order, include_blobs=False)
+        return VirtualViewResult(
+            root=root,
+            kind=VIRTUAL_KIND_VERY_SIMILAR,
+            value="",
+            sort_order=sort_order,
+            fingerprint=fingerprint,
+            images=images,
+            duration_ms=(monotonic() - started_at) * 1000,
+        )
+
+    def _very_similar_cache_key(
+        self,
+        root: Path,
+        sort_order: SortOrder,
+        fingerprint: int,
+    ) -> tuple[Path, str, int]:
+        return (root.expanduser().resolve(), sort_order.value, fingerprint)
+
+    def _drop_very_similar_cache(self, root: Path) -> None:
+        resolved = root.expanduser().resolve()
+        self._very_similar_cache = {
+            key: images for key, images in self._very_similar_cache.items() if key[0] != resolved
+        }
+
+    def _matching_virtual_view_task(
+        self,
+        root: Path,
+        kind: str,
+        value: str,
+        sort_order: SortOrder,
+        fingerprint: int,
+    ) -> VirtualViewTask | None:
+        resolved = root.expanduser().resolve()
+        for task in self._virtual_view_tasks.values():
+            if (
+                task.root == resolved
+                and task.kind == kind
+                and task.value == value
+                and task.sort_order == sort_order
+                and task.fingerprint == fingerprint
+            ):
+                return task
+        return None
+
+    def _cancel_virtual_view_tasks(self, root: Path) -> None:
+        resolved = root.expanduser().resolve()
+        for future, task in list(self._virtual_view_tasks.items()):
+            if task.root != resolved:
+                continue
+            future.cancel()
+            self._virtual_view_tasks.pop(future, None)
+
+    def _settle_virtual_view_tasks(self) -> None:
+        for future, task in list(self._virtual_view_tasks.items()):
+            if not future.done():
+                continue
+            self._virtual_view_tasks.pop(future, None)
+            if future.cancelled():
+                continue
+            try:
+                result = future.result()
+            except Exception as error:
+                if self._is_current_virtual_task(task):
+                    self.progress_bar.setRange(0, 1)
+                    self.progress_bar.setValue(0)
+                    self.progress_label.setText("Ready")
+                    show_error(self, "Very Similar", str(error))
+                continue
+
+            cache_key = self._very_similar_cache_key(result.root, result.sort_order, result.fingerprint)
+            self._very_similar_cache = {
+                key: images
+                for key, images in self._very_similar_cache.items()
+                if key[0] != cache_key[0] or key[1] != cache_key[1]
+            }
+            self._very_similar_cache[cache_key] = list(result.images)
+            self._append_timing_event(
+                result.root,
+                "very_similar_virtual_view",
+                result.duration_ms,
+                {"images": len(result.images)},
+            )
+            if not self._is_current_virtual_result(result):
+                continue
+            catalog = self.current_catalog
+            if catalog is None:
+                continue
+            current_fingerprint = catalog.catalog_database_mtime_ns()
+            if current_fingerprint != result.fingerprint:
+                self.load_current_directory(preserve_selection=True)
+                continue
+            self.model.set_images(catalog, list(result.images))
+            self.refresh_thumbnail_layout()
+            self._restore_thumbnail_selection(task.selection_keys, task.current_key)
+            self.update_selection_status()
+
+    def _active_virtual_view_task(self) -> VirtualViewTask | None:
+        active_tasks = [
+            task
+            for task in self._virtual_view_tasks.values()
+            if self._is_current_virtual_task(task)
+        ]
+        if not active_tasks:
+            return None
+        return sorted(active_tasks, key=lambda task: task.started_at)[0]
+
+    def _is_current_virtual_task(self, task: VirtualViewTask) -> bool:
+        return (
+            self.current_catalog is not None
+            and self.current_catalog.root == task.root
+            and self.current_virtual_kind == task.kind
+            and self.current_virtual_value == task.value
+            and self.current_sort == task.sort_order
+        )
+
+    def _is_current_virtual_result(self, result: VirtualViewResult) -> bool:
+        return (
+            self.current_catalog is not None
+            and self.current_catalog.root == result.root
+            and self.current_virtual_kind == result.kind
+            and self.current_virtual_value == result.value
+            and self.current_sort == result.sort_order
+        )
+
+    def _show_virtual_view_status(self, task: VirtualViewTask) -> None:
+        elapsed = int(monotonic() - task.started_at)
+        self.progress_bar.setRange(0, 0)
+        if task.kind == VIRTUAL_KIND_VERY_SIMILAR:
+            self.progress_label.setText(f"Building Very Similar view ({elapsed}s)")
+        else:
+            self.progress_label.setText("Building virtual directory")
+
+    def _cancel_active_duplicate_delete_task(self, *, wait: bool = False) -> None:
+        task = self._duplicate_delete_task
+        if task is None:
+            return
+        self._cancel_duplicate_delete_task(task.root, wait=wait)
+
+    def _cancel_duplicate_delete_task(self, root: Path, *, wait: bool = False) -> None:
+        task = self._duplicate_delete_task
+        if task is None or task.root != root.expanduser().resolve():
+            return
+        task.task.cancel()
+        if wait:
+            self._wait_for_duplicate_delete_task(task)
+        else:
+            self._settle_duplicate_delete_task()
+        self._update_tools_menu_actions()
+
+    def _wait_for_duplicate_delete_task(self, task: DuplicateDeleteTask) -> None:
+        if not task.future.done():
+            try:
+                task.future.result()
+            except Exception:
+                pass
+        self._settle_duplicate_delete_task()
+
+    def _settle_duplicate_delete_task(self) -> None:
+        delete_task = self._duplicate_delete_task
+        if delete_task is None or not delete_task.future.done():
+            return
+        self._duplicate_delete_task = None
+        self._update_tools_menu_actions()
+        snapshot = delete_task.task.snapshot()
+        if delete_task.future.cancelled() or snapshot.canceled:
+            self.progress_bar.setRange(0, 1)
+            self.progress_bar.setValue(0)
+            self.progress_label.setText("Ready")
+            return
+        try:
+            result = delete_task.future.result()
+        except IndexTaskCancelled:
+            self.progress_bar.setRange(0, 1)
+            self.progress_bar.setValue(0)
+            self.progress_label.setText("Ready")
+            return
+        except Exception as error:
+            self.progress_bar.setRange(0, 1)
+            self.progress_bar.setValue(0)
+            self.progress_label.setText("Ready")
+            show_error(self, "Automatically Delete Duplicates", str(error))
+            return
+
+        self._drop_very_similar_cache(delete_task.root)
+        self._swept_catalog_roots.discard(delete_task.root)
+        self._pruned_catalog_roots.discard(delete_task.root)
+        if self.current_catalog is not None and self.current_catalog.root == delete_task.root:
+            self.rebuild_tree()
+            self.load_current_directory(preserve_selection=True)
+        self.progress_bar.setRange(0, max(result.planned_delete_count, 1))
+        self.progress_bar.setValue(min(result.deleted, max(result.planned_delete_count, 1)))
+        self.progress_label.setText(
+            f"Moved {result.deleted} duplicate image(s) to {TRASH_DIR_NAME} from {result.groups} group(s)"
+        )
+
+    def _active_duplicate_delete_task(self) -> DuplicateDeleteTask | None:
+        task = self._duplicate_delete_task
+        if task is None:
+            return None
+        if task.future.done():
+            return None
+        return task
+
+    def _has_active_duplicate_delete_task(self) -> bool:
+        return self._active_duplicate_delete_task() is not None
+
+    def _show_duplicate_delete_status(self, snapshot: IndexProgressSnapshot) -> None:
+        if snapshot.total is None:
+            self.progress_bar.setRange(0, 0)
+            detail = snapshot.current or "Finding duplicate groups"
+        else:
+            self.progress_bar.setRange(0, max(snapshot.total, 1))
+            self.progress_bar.setValue(min(snapshot.processed, max(snapshot.total, 1)))
+            detail = f"{snapshot.processed}/{snapshot.total}"
+            if snapshot.current:
+                detail = f"{detail}: {snapshot.current}"
+        self.progress_label.setText(f"Moving duplicates to {TRASH_DIR_NAME}: {detail}")
 
     def _thumbnail_size_changed(self, value: int) -> None:
         self.set_thumbnail_size(value)
@@ -1719,7 +2508,7 @@ class MainWindow(QMainWindow):
 
     def _sort_changed(self) -> None:
         self.set_sort_order(SortOrder(self.sort_combo.currentData()))
-        self.load_current_directory()
+        self.load_current_directory(preserve_selection=True)
 
     def set_sort_order(self, sort_order: SortOrder) -> None:
         self.current_sort = sort_order
@@ -1785,6 +2574,7 @@ class MainWindow(QMainWindow):
             return
         self.indexer.cancel_idle_tasks(self.current_catalog.root)
         self.current_catalog.delete_images(rel_paths, wipe=self.wipe_on_delete_enabled())
+        self._drop_very_similar_cache(self.current_catalog.root)
         self._pruned_catalog_roots.discard(self.current_catalog.root)
         self.load_current_directory()
 
@@ -1800,13 +2590,56 @@ class MainWindow(QMainWindow):
             self.thumbnail_view.setCurrentIndex(index)
         record = self.model.images[index.row()]
         menu = QMenu(self)
-        delete_action = menu.addAction("Delete")
-        metadata_action = menu.addAction("Metadata")
+        actions = self._thumbnail_context_menu_actions(menu, record)
         selected = menu.exec(self.thumbnail_view.viewport().mapToGlobal(pos))
-        if selected == delete_action:
+        if selected is None:
+            return
+        if selected == actions.get("restore"):
+            self.restore_selected_trash_records()
+        elif selected == actions.get("open") and isinstance(record, DirectoryRecord):
+            self.navigate_to_directory(record.dir_rel)
+        elif selected == actions.get("properties") and isinstance(record, DirectoryRecord):
+            self.open_directory_properties(self.current_catalog.root, record.dir_rel)
+        elif selected == actions.get("delete_directory") and isinstance(record, DirectoryRecord):
+            self.delete_directory(self.current_catalog.root, record.dir_rel)
+        elif selected == actions.get("list_duplicates") and isinstance(record, ImageRecord):
+            self.open_duplicate_list_dialog(record)
+        elif selected == actions.get("delete"):
             self.delete_selected()
-        elif selected == metadata_action:
+        elif selected == actions.get("metadata") and isinstance(record, ImageRecord):
             MetadataDialog(record.absolute_path, self).exec()
+
+    def _thumbnail_context_menu_actions(self, menu: QMenu, record: PaneRecord) -> dict[str, QAction]:
+        actions: dict[str, QAction] = {}
+        if self.is_restorable_trash_record(record):
+            actions["restore"] = menu.addAction("Restore")
+            menu.addSeparator()
+        if isinstance(record, DirectoryRecord):
+            actions["open"] = menu.addAction("Open")
+            actions["properties"] = menu.addAction("Properties")
+            if record.dir_rel:
+                actions["delete_directory"] = menu.addAction("Delete Directory")
+            return actions
+        actions["list_duplicates"] = menu.addAction("List Duplicates")
+        actions["delete"] = menu.addAction("Delete")
+        actions["metadata"] = menu.addAction("Metadata")
+        return actions
+
+    def open_duplicate_list_dialog(self, record: ImageRecord) -> None:
+        if self.current_catalog is None:
+            return
+        matches = self.current_catalog.duplicate_matches_for_image(
+            record.rel_path,
+            SortOrder.NAME_ASC,
+            include_blobs=False,
+        )
+        DuplicateListDialog(
+            self.current_catalog,
+            record,
+            matches,
+            self.navigate_to_image,
+            self,
+        ).exec()
 
     def open_tag_dialog_for_selection(self) -> None:
         if self.current_catalog is None:
@@ -1817,6 +2650,9 @@ class MainWindow(QMainWindow):
         dialog = TagDialog(self.current_catalog, rel_paths[0], self)
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self.current_catalog.set_image_tags(rel_paths[0], dialog.selected_tags(), replace=True)
+            self.rebuild_tree()
+            if self.current_virtual_kind is not None:
+                self.load_current_directory(preserve_selection=True)
 
     def open_viewer(self, index: QModelIndex, *, random_mode: bool) -> None:
         if self.current_catalog is None or not index.isValid() or index.row() >= len(self.model.images):
@@ -1843,9 +2679,22 @@ class MainWindow(QMainWindow):
         if self.current_catalog is None:
             return
         self.current_dir_rel = dir_rel
+        self.current_virtual_kind = None
+        self.current_virtual_value = ""
         self.load_current_directory()
         self.queue_directory_index(self.current_catalog, dir_rel)
         self.rebuild_tree()
+
+    def navigate_to_image(self, rel_path: str) -> None:
+        if self.current_catalog is None:
+            return
+        dir_rel = Path(rel_path).parent.as_posix()
+        self.current_dir_rel = "" if dir_rel == "." else dir_rel
+        self.current_virtual_kind = None
+        self.current_virtual_value = ""
+        self.rebuild_tree()
+        self.load_current_directory()
+        self.select_rel_path(rel_path)
 
     def move_payload_to_directory(self, payload: list[dict[str, str]], dest_root: Path, dest_dir_rel: str) -> None:
         dest_catalog = self.workspace.catalog_for_root(dest_root)
@@ -1856,6 +2705,11 @@ class MainWindow(QMainWindow):
         for item in payload:
             group = directory_groups if item.get("kind") == "directory" else image_groups
             group[Path(item["catalog_root"]).resolve()].append(item["rel_path"])
+        if is_trash_rel_path(dest_dir_rel):
+            source_roots = {*directory_groups.keys(), *image_groups.keys()}
+            if any(source_root != dest_catalog.root for source_root in source_roots):
+                show_error(self, "Move", "Cannot move items into another catalog's trash.")
+                return
         affected_roots = {dest_catalog.root, *directory_groups.keys(), *image_groups.keys()}
         for root in affected_roots:
             self.indexer.cancel_idle_tasks(root)
@@ -1917,6 +2771,8 @@ class MainWindow(QMainWindow):
     def _schedule_idle_indexing(self) -> None:
         if self._has_active_catalog_open_tasks():
             return
+        if self._has_active_duplicate_delete_task():
+            return
         self._settle_directory_discovery_tasks()
         self._settle_directory_index_tasks()
         self._settle_idle_tasks()
@@ -1942,9 +2798,19 @@ class MainWindow(QMainWindow):
 
     def _poll_indexer(self) -> None:
         self._settle_catalog_open_tasks()
+        self._settle_duplicate_delete_task()
+        self._settle_virtual_view_tasks()
         active_open_task = self._active_catalog_open_task()
         if active_open_task is not None:
             self._show_catalog_open_status(active_open_task.root)
+            return
+        active_delete_task = self._active_duplicate_delete_task()
+        if active_delete_task is not None:
+            self._show_duplicate_delete_status(active_delete_task.task.snapshot())
+            return
+        active_virtual_task = self._active_virtual_view_task()
+        if active_virtual_task is not None:
+            self._show_virtual_view_status(active_virtual_task)
             return
         self._settle_directory_discovery_tasks()
         self._settle_directory_index_tasks()
@@ -1954,7 +2820,7 @@ class MainWindow(QMainWindow):
         if not snapshots:
             if self._indexing_was_active:
                 self._indexing_was_active = False
-                self.load_current_directory()
+                self.load_current_directory(preserve_selection=True)
             self._schedule_idle_indexing()
             if self._tree_build_task is not None:
                 self._show_tree_build_status(self._tree_build_task)
@@ -2135,6 +3001,67 @@ class TagDialog(QDialog):
                 seen.add(key)
                 result.append(name)
         return result
+
+
+class DuplicateListDialog(QDialog):
+    def __init__(
+        self,
+        catalog: Catalog,
+        source: ImageRecord,
+        matches: DuplicateMatchGroups,
+        navigate_callback: Callable[[str], None],
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.catalog = catalog
+        self.source = source
+        self.matches = matches
+        self.navigate_callback = navigate_callback
+        self.setWindowTitle("Duplicates")
+        self.setWindowIcon(load_app_icon())
+        self.setStyleSheet(DIALOG_STYLESHEET)
+
+        layout = QVBoxLayout(self)
+        source_label = QLabel(source.rel_path)
+        source_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(source_label)
+
+        self.list_widget = QListWidget()
+        self.list_widget.itemDoubleClicked.connect(self._item_double_clicked)
+        layout.addWidget(self.list_widget, 1)
+
+        self._add_section("Exact Duplicates", matches.exact)
+        self._add_section("Very Similar", matches.very_similar)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self.resize(720, 420)
+
+    def _add_section(self, title: str, records: Sequence[ImageRecord]) -> None:
+        header = QListWidgetItem(title)
+        header_font = header.font()
+        header_font.setBold(True)
+        header.setFont(header_font)
+        header.setFlags(Qt.ItemFlag.NoItemFlags)
+        self.list_widget.addItem(header)
+        if not records:
+            empty = QListWidgetItem("  (none)")
+            empty.setFlags(Qt.ItemFlag.NoItemFlags)
+            self.list_widget.addItem(empty)
+            return
+        for record in records:
+            item = QListWidgetItem(f"  {record.rel_path}")
+            item.setToolTip(str(record.absolute_path))
+            item.setData(Qt.ItemDataRole.UserRole, record.rel_path)
+            self.list_widget.addItem(item)
+
+    def _item_double_clicked(self, item: QListWidgetItem) -> None:
+        rel_path = item.data(Qt.ItemDataRole.UserRole)
+        if not rel_path:
+            return
+        self.navigate_callback(str(rel_path))
+        self.accept()
 
 
 class AppPreferencesDialog(QDialog):
@@ -2826,6 +3753,7 @@ class FullscreenViewer(QDialog):
         self.pan_offset = QPoint(0, 0)
         self.pan_drag_start: QPoint | None = None
         self.pan_offset_at_drag_start = QPoint(0, 0)
+        self.info_overlay_enabled = False
         self.setWindowTitle("Marnwick")
         self.setWindowIcon(load_app_icon())
         self.setStyleSheet("background: black;")
@@ -2833,6 +3761,15 @@ class FullscreenViewer(QDialog):
         self.label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.label.setMouseTracking(True)
         self.label.installEventFilter(self)
+        self.info_overlay = QLabel(self.label)
+        self.info_overlay.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.info_overlay.setTextFormat(Qt.TextFormat.PlainText)
+        self.info_overlay.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self.info_overlay.setWordWrap(True)
+        self.info_overlay.setStyleSheet(
+            "color: #f8fafc; background: rgba(0, 0, 0, 175); padding: 8px 10px; border-radius: 4px;"
+        )
+        self.info_overlay.hide()
         self.rubber_band = QRubberBand(QRubberBand.Shape.Rectangle, self.label)
         self.clone_overlay = CloneBrushOverlay(self.label)
         layout = QVBoxLayout(self)
@@ -2857,6 +3794,9 @@ class FullscreenViewer(QDialog):
             return
         if key == Qt.Key.Key_E:
             self.open_edit_tools()
+            return
+        if key == Qt.Key.Key_Z:
+            self.toggle_info_overlay()
             return
         if self.is_zoomed() and key in (Qt.Key.Key_Left, Qt.Key.Key_Right, Qt.Key.Key_Up, Qt.Key.Key_Down):
             if key == Qt.Key.Key_Left:
@@ -2997,6 +3937,8 @@ class FullscreenViewer(QDialog):
         if hasattr(self, "pan_offset"):
             self.pan_offset = self.clamped_pan_offset(self.pan_offset)
         self._fit_pixmap()
+        if hasattr(self, "info_overlay"):
+            self.update_info_overlay()
 
     def closeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         if not self.confirm_pending_edits():
@@ -3051,8 +3993,54 @@ class FullscreenViewer(QDialog):
         self.base_pixmap = load_oriented_pixmap(self.current_path)
         if self.current_path.suffix.casefold() == ".gif":
             self.start_movie()
+            self.update_info_overlay()
             return
         self._fit_pixmap()
+        self.update_info_overlay()
+
+    def toggle_info_overlay(self) -> None:
+        self.info_overlay_enabled = not self.info_overlay_enabled
+        self.update_info_overlay()
+
+    def update_info_overlay(self) -> None:
+        if not self.info_overlay_enabled:
+            self.info_overlay.hide()
+            return
+        self.info_overlay.setText(self.info_overlay_text())
+        self.position_info_overlay()
+        self.info_overlay.show()
+        self.info_overlay.raise_()
+
+    def info_overlay_text(self) -> str:
+        try:
+            stat = self.current_path.stat()
+            file_date = datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+        except OSError:
+            file_date = "Unavailable"
+        total = len(self.navigator.order)
+        ordinal = self.navigator.index + 1 if total else 0
+        return "\n".join(
+            [
+                f"Full path: {self.current_path}",
+                f"File date: {file_date}",
+                f"{ordinal} of {total} images",
+            ]
+        )
+
+    def position_info_overlay(self) -> None:
+        margin = 16
+        max_width = max(1, self.label.width() - 2 * margin)
+        max_height = max(1, self.label.height() - 2 * margin)
+        self.info_overlay.setMaximumWidth(max_width)
+        self.info_overlay.adjustSize()
+        width = min(max_width, max(1, self.info_overlay.width()))
+        height = min(max_height, max(1, self.info_overlay.height()))
+        self.info_overlay.setGeometry(
+            margin,
+            max(margin, self.label.height() - height - margin),
+            width,
+            height,
+        )
 
     def start_movie(self) -> None:
         movie = QMovie(str(self.current_path))
@@ -3482,6 +4470,12 @@ def load_app_icon() -> QIcon:
     return QIcon(pixmap)
 
 
+def load_virtual_folder_icon() -> QIcon:
+    pixmap = QPixmap()
+    pixmap.loadFromData(virtual_folder_icon_bytes(), "PNG")
+    return QIcon(pixmap)
+
+
 def widget_device_pixel_ratio(widget: QWidget) -> float:
     window = widget.window()
     handle = window.windowHandle() if window is not None else None
@@ -3549,6 +4543,24 @@ def format_bytes(size: int) -> str:
 
 def ask_delete_files(parent: QWidget, count: int) -> bool:
     box, delete_button = create_delete_message_box(parent, count)
+    box.exec()
+    return box.clickedButton() == delete_button
+
+
+def ask_automatically_delete_duplicates(parent: QWidget) -> bool:
+    box = QMessageBox(parent)
+    box.setWindowTitle("Automatically Delete Duplicates")
+    box.setIcon(QMessageBox.Icon.Warning)
+    box.setText("Automatically move duplicates in this virtual directory to trash?")
+    box.setInformativeText(
+        f"Marnwick will keep one image from each duplicate group and move the rest into {TRASH_DIR_NAME}."
+    )
+    box.setStyleSheet(DIALOG_STYLESHEET)
+    delete_button = box.addButton("Move Duplicates", QMessageBox.ButtonRole.AcceptRole)
+    cancel_button = box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+    box.setDefaultButton(cancel_button)
+    box.setEscapeButton(cancel_button)
+    style_message_box_buttons(box)
     box.exec()
     return box.clickedButton() == delete_button
 

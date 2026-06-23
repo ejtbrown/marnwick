@@ -109,6 +109,8 @@ class DebugCommandServer(QObject):
         return {
             "current_catalog": str(current_catalog.root) if current_catalog is not None else None,
             "current_dir_rel": self.window.current_dir_rel,
+            "current_virtual_kind": self.window.current_virtual_kind,
+            "current_virtual_value": self.window.current_virtual_value,
             "catalogs": [str(catalog.root) for catalog in self.window.workspace.catalogs],
             "active_catalog_opens": len(self.window._catalog_open_tasks),
             "active_indexer_tasks": active_snapshots,
