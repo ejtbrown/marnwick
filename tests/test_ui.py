@@ -32,6 +32,7 @@ from marnwick.ui import (  # noqa: E402
     DuplicateListDialog,
     FullscreenViewer,
     LogsDialog,
+    MovePayloadResult,
     MainWindow,
     TagDialog,
     ThumbnailDelegate,
@@ -105,6 +106,16 @@ def settle_duplicate_delete_task(window: MainWindow, qt_app: QApplication, *, ti
         sleep(0.01)
     window._settle_duplicate_delete_task()
     assert window._duplicate_delete_task is None
+
+
+def settle_move_payload_task(window: MainWindow, qt_app: QApplication, *, timeout: float = 2.0) -> None:
+    deadline = monotonic() + timeout
+    while window._move_payload_task is not None and monotonic() < deadline:
+        qt_app.processEvents()
+        window._settle_move_payload_task()
+        sleep(0.01)
+    window._settle_move_payload_task()
+    assert window._move_payload_task is None
 
 
 def find_virtual_tree_root(window: MainWindow):
@@ -1283,6 +1294,7 @@ def test_move_payload_to_directory_moves_selected_images_across_catalogs(tmp_pat
             dest.root,
             "target",
         )
+        settle_move_payload_task(window, qt_app)
 
         assert not (source_root / "set" / "image.jpg").exists()
         assert (dest_root / "target" / "image.jpg").exists()
@@ -1333,6 +1345,57 @@ def test_move_payload_to_directory_rejects_cross_catalog_trash_drop(tmp_path: Pa
         assert source.get_image("image.jpg") is not None
         assert dest.list_images(TRASH_DIR_NAME) == []
     finally:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        window.indexer.shutdown()
+        window.workspace.close()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_move_payload_to_directory_returns_while_worker_is_busy(tmp_path: Path, monkeypatch) -> None:
+    qt_app = app()
+    source_root = tmp_path / "source"
+    dest_root = tmp_path / "dest"
+    source_root.mkdir()
+    (dest_root / "target").mkdir(parents=True)
+    Image.new("RGB", (8, 8), (10, 20, 30)).save(source_root / "image.jpg")
+    started = Event()
+    release = Event()
+
+    window = MainWindow()
+    try:
+        source = window.workspace.open_catalog(source_root)
+        dest = window.workspace.open_catalog(dest_root)
+        source.refresh()
+        dest.refresh()
+
+        def slow_worker(_image_groups, _directory_groups, _dest_root, _dest_dir_rel, _wipe_on_delete, task):
+            started.set()
+            task.update(0, 1, "waiting")
+            if not release.wait(timeout=1.0):
+                raise TimeoutError("move worker was not allowed to finish")
+            task.mark_done()
+            return MovePayloadResult(requested=1, moved=0, affected_roots={source.root, dest.root})
+
+        monkeypatch.setattr(window, "_move_payload_worker", slow_worker)
+
+        started_at = monotonic()
+        window.move_payload_to_directory(
+            [{"catalog_root": str(source.root), "rel_path": "image.jpg"}],
+            dest.root,
+            "target",
+        )
+
+        assert monotonic() - started_at < 0.5
+        assert window._move_payload_task is not None
+        assert started.wait(timeout=1.0)
+        assert not window._move_payload_task.future.done()
+        release.set()
+        settle_move_payload_task(window, qt_app)
+    finally:
+        release.set()
         window.progress_timer.stop()
         window.idle_timer.stop()
         window.indexer.shutdown()
@@ -1428,6 +1491,7 @@ def test_move_payload_to_directory_moves_directories_across_catalogs(tmp_path: P
             dest.root,
             "target",
         )
+        settle_move_payload_task(window, qt_app)
 
         assert not (source_root / "set").exists()
         assert (dest_root / "target" / "set" / "nested" / "image.jpg").exists()
