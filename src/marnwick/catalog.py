@@ -2236,18 +2236,31 @@ class Catalog:
         dest_dir_rel: str = "",
         *,
         wipe_on_delete: bool = False,
+        progress_callback: ProgressCallback | None = None,
+        cancel_check: CancelCallback | None = None,
     ) -> list[MoveResult]:
         if self.root != dest_catalog.root and is_trash_rel_path(dest_dir_rel):
             raise ValueError("cannot move items into another catalog's trash")
+        total = len(rel_paths)
+        processed = 0
+        if progress_callback is not None:
+            progress_callback(0, total, dest_dir_rel or ".")
         dest_dir = dest_catalog.abs_path(dest_dir_rel) if dest_dir_rel else dest_catalog.root
         dest_dir.mkdir(parents=True, exist_ok=True)
         dest_catalog._remember_directory(dest_dir_rel)
         results: list[MoveResult] = []
         impacted_dirs: dict[Catalog, set[str]] = {self: set(), dest_catalog: set()}
         for rel_path in rel_paths:
+            if cancel_check is not None:
+                cancel_check()
+            if progress_callback is not None:
+                progress_callback(processed, total, rel_path)
             source_path = self.abs_path(rel_path)
             if not source_path.exists():
                 self._delete_db_records([rel_path])
+                processed += 1
+                if progress_callback is not None:
+                    progress_callback(processed, total, rel_path)
                 continue
             source_dir_rel = self._parent_dir_rel(rel_path)
             dest_path = self._unique_destination(dest_dir / source_path.name)
@@ -2270,6 +2283,9 @@ class Catalog:
             impacted_dirs.setdefault(self, set()).add(source_dir_rel)
             impacted_dirs.setdefault(dest_catalog, set()).add(self._parent_dir_rel(dest_rel_path))
             results.append(MoveResult(rel_path, dest_rel_path, dest_catalog.root))
+            processed += 1
+            if progress_callback is not None:
+                progress_callback(processed, total, dest_rel_path)
         for catalog, dir_rels in impacted_dirs.items():
             if dir_rels:
                 catalog.update_hashes_after_targeted_move(dir_rels)
@@ -2315,22 +2331,39 @@ class Catalog:
         dest_dir_rel: str = "",
         *,
         wipe_on_delete: bool = False,
+        progress_callback: ProgressCallback | None = None,
+        cancel_check: CancelCallback | None = None,
     ) -> list[MoveResult]:
         if self.root != dest_catalog.root and is_trash_rel_path(dest_dir_rel):
             raise ValueError("cannot move items into another catalog's trash")
+        sorted_dir_rels = sorted(set(dir_rels), key=lambda value: value.count("/"))
+        total = len(sorted_dir_rels)
+        processed = 0
+        if progress_callback is not None:
+            progress_callback(0, total, dest_dir_rel or ".")
         dest_parent = dest_catalog.abs_path(dest_dir_rel) if dest_dir_rel else dest_catalog.root
         dest_parent.mkdir(parents=True, exist_ok=True)
         dest_catalog._remember_directory(dest_dir_rel)
         results: list[MoveResult] = []
         impacted_dirs: dict[Catalog, set[str]] = {self: set(), dest_catalog: set()}
-        for dir_rel in sorted(set(dir_rels), key=lambda value: value.count("/")):
+        for dir_rel in sorted_dir_rels:
+            if cancel_check is not None:
+                cancel_check()
+            if progress_callback is not None:
+                progress_callback(processed, total, dir_rel or ".")
             if not dir_rel:
+                processed += 1
+                if progress_callback is not None:
+                    progress_callback(processed, total, ".")
                 continue
             if self.root == dest_catalog.root and (dest_dir_rel == dir_rel or dest_dir_rel.startswith(f"{dir_rel}/")):
                 raise ValueError("cannot move a directory into itself")
             source_path = self.abs_path(dir_rel)
             if not source_path.is_dir():
                 self._delete_directory_records(dir_rel)
+                processed += 1
+                if progress_callback is not None:
+                    progress_callback(processed, total, dir_rel)
                 continue
             source_parent_rel = self._parent_dir_rel(dir_rel)
             dest_path = self._unique_destination(dest_parent / source_path.name)
@@ -2358,6 +2391,9 @@ class Catalog:
             impacted_dirs.setdefault(self, set()).update(source_affected)
             impacted_dirs.setdefault(dest_catalog, set()).update(dest_affected)
             results.append(MoveResult(dir_rel, dest_rel_path, dest_catalog.root))
+            processed += 1
+            if progress_callback is not None:
+                progress_callback(processed, total, dest_rel_path)
         for catalog, affected in impacted_dirs.items():
             if affected:
                 catalog.update_hashes_after_targeted_move(affected)

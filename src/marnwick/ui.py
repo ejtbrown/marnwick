@@ -177,6 +177,23 @@ class DuplicateDeleteTask:
     started_at: float
 
 
+@dataclass(slots=True)
+class MovePayloadResult:
+    requested: int
+    moved: int
+    affected_roots: set[Path]
+
+
+@dataclass(slots=True)
+class MovePayloadTask:
+    dest_root: Path
+    dest_dir_rel: str
+    affected_roots: set[Path]
+    task: IndexTask
+    future: Future[MovePayloadResult]
+    started_at: float
+
+
 DIALOG_STYLESHEET = """
 QDialog,
 QMessageBox {
@@ -890,6 +907,7 @@ class MainWindow(QMainWindow):
         self.catalog_open_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="marnwick-open")
         self.virtual_view_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="marnwick-virtual")
         self.duplicate_delete_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="marnwick-delete")
+        self.file_move_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="marnwick-move")
         self.current_catalog: Catalog | None = None
         self.current_dir_rel = ""
         self.current_virtual_kind: str | None = None
@@ -907,6 +925,7 @@ class MainWindow(QMainWindow):
         self._virtual_view_tasks: dict[Future[VirtualViewResult], VirtualViewTask] = {}
         self._very_similar_cache: dict[tuple[Path, str, int], list[ImageRecord]] = {}
         self._duplicate_delete_task: DuplicateDeleteTask | None = None
+        self._move_payload_task: MovePayloadTask | None = None
         self._tree_build_task: TreeBuildTask | None = None
         self._pending_tree_rebuilds: dict[Path, tuple[Catalog, str]] = {}
         self._indexing_was_active = False
@@ -1002,9 +1021,11 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         self.save_window_config()
         self._cancel_active_duplicate_delete_task(wait=True)
+        self._cancel_active_move_payload_task(wait=True)
         self.catalog_open_executor.shutdown(wait=False, cancel_futures=True)
         self.virtual_view_executor.shutdown(wait=False, cancel_futures=True)
         self.duplicate_delete_executor.shutdown(wait=True, cancel_futures=True)
+        self.file_move_executor.shutdown(wait=True, cancel_futures=True)
         self.indexer.shutdown()
         self.workspace.close()
         super().closeEvent(event)
@@ -1163,6 +1184,7 @@ class MainWindow(QMainWindow):
             duplicate_view_selected
             and self.current_catalog is not None
             and self._duplicate_delete_task is None
+            and self._move_payload_task is None
             and self._active_virtual_view_task() is None
         )
 
@@ -1222,6 +1244,10 @@ class MainWindow(QMainWindow):
             return
         if self._duplicate_delete_task is not None:
             self._show_duplicate_delete_status(self._duplicate_delete_task.task.snapshot())
+            return
+        self._settle_move_payload_task()
+        if self._move_payload_task is not None:
+            self.progress_label.setText("Wait for the current move to finish")
             return
         if self._active_virtual_view_task() is not None:
             self.progress_label.setText("Wait for the virtual directory to finish building")
@@ -1668,6 +1694,7 @@ class MainWindow(QMainWindow):
         self._cancel_catalog_open_tasks(resolved)
         self._cancel_virtual_view_tasks(resolved)
         self._cancel_duplicate_delete_task(resolved, wait=True)
+        self._cancel_move_payload_task(resolved, wait=True)
         self._drop_very_similar_cache(resolved)
         catalog = self.workspace.catalog_for_root(root)
         if catalog is not None:
@@ -2470,6 +2497,102 @@ class MainWindow(QMainWindow):
                 detail = f"{detail}: {snapshot.current}"
         self.progress_label.setText(f"Moving duplicates to {TRASH_DIR_NAME}: {detail}")
 
+    def _cancel_active_move_payload_task(self, *, wait: bool = False) -> None:
+        task = self._move_payload_task
+        if task is None:
+            return
+        task.task.cancel()
+        if wait:
+            self._wait_for_move_payload_task(task)
+        else:
+            self._settle_move_payload_task()
+        self._update_tools_menu_actions()
+
+    def _cancel_move_payload_task(self, root: Path, *, wait: bool = False) -> None:
+        task = self._move_payload_task
+        if task is None:
+            return
+        resolved = root.expanduser().resolve()
+        if resolved not in task.affected_roots:
+            return
+        task.task.cancel()
+        if wait:
+            self._wait_for_move_payload_task(task)
+        else:
+            self._settle_move_payload_task()
+        self._update_tools_menu_actions()
+
+    def _wait_for_move_payload_task(self, task: MovePayloadTask) -> None:
+        if not task.future.done():
+            try:
+                task.future.result()
+            except Exception:
+                pass
+        self._settle_move_payload_task()
+
+    def _settle_move_payload_task(self) -> None:
+        move_task = self._move_payload_task
+        if move_task is None or not move_task.future.done():
+            return
+        self._move_payload_task = None
+        self._update_tools_menu_actions()
+        affected_roots = set(move_task.affected_roots)
+        if move_task.future.cancelled():
+            self.progress_bar.setRange(0, 1)
+            self.progress_bar.setValue(0)
+            self.progress_label.setText("Ready")
+            return
+        try:
+            result = move_task.future.result()
+        except IndexTaskCancelled:
+            self._refresh_after_move_payload(affected_roots)
+            self.progress_bar.setRange(0, 1)
+            self.progress_bar.setValue(0)
+            self.progress_label.setText("Ready")
+            return
+        except Exception as error:
+            self._refresh_after_move_payload(affected_roots)
+            self.progress_bar.setRange(0, 1)
+            self.progress_bar.setValue(0)
+            self.progress_label.setText("Ready")
+            show_error(self, "Move", str(error))
+            return
+
+        affected_roots.update(result.affected_roots)
+        self._refresh_after_move_payload(affected_roots)
+        self.progress_bar.setRange(0, max(result.requested, 1))
+        self.progress_bar.setValue(min(result.requested, max(result.requested, 1)))
+        self.progress_label.setText(f"Moved {result.moved} item(s)")
+
+    def _refresh_after_move_payload(self, affected_roots: set[Path]) -> None:
+        for root in affected_roots:
+            resolved_root = root.expanduser().resolve()
+            self._swept_catalog_roots.discard(resolved_root)
+            self._pruned_catalog_roots.discard(resolved_root)
+            self._drop_very_similar_cache(resolved_root)
+        self.reload_tree_and_directory()
+
+    def _active_move_payload_task(self) -> MovePayloadTask | None:
+        task = self._move_payload_task
+        if task is None:
+            return None
+        if task.future.done():
+            return None
+        return task
+
+    def _show_move_payload_status(self, snapshot: IndexProgressSnapshot) -> None:
+        if snapshot.total is None:
+            self.progress_bar.setRange(0, 0)
+            detail = snapshot.current or "Preparing move"
+        else:
+            total = max(snapshot.total, 1)
+            self.progress_bar.setRange(0, total)
+            self.progress_bar.setValue(min(snapshot.processed, total))
+            detail = f"{snapshot.processed}/{snapshot.total}"
+            if snapshot.current:
+                detail = f"{detail}: {snapshot.current}"
+        self.progress_label.setText(f"Moving items: {detail}")
+
     def _thumbnail_size_changed(self, value: int) -> None:
         self.set_thumbnail_size(value)
 
@@ -2697,51 +2820,157 @@ class MainWindow(QMainWindow):
         self.select_rel_path(rel_path)
 
     def move_payload_to_directory(self, payload: list[dict[str, str]], dest_root: Path, dest_dir_rel: str) -> None:
+        self._settle_move_payload_task()
+        active_task = self._active_move_payload_task()
+        if active_task is not None:
+            self._show_move_payload_status(active_task.task.snapshot())
+            return
+        if self._active_duplicate_delete_task() is not None:
+            self.progress_label.setText("Wait for duplicate cleanup to finish")
+            return
         dest_catalog = self.workspace.catalog_for_root(dest_root)
         if dest_catalog is None:
             return
         image_groups: dict[Path, list[str]] = defaultdict(list)
         directory_groups: dict[Path, list[str]] = defaultdict(list)
         for item in payload:
+            try:
+                source_root = Path(item["catalog_root"]).resolve()
+                rel_path = item["rel_path"]
+            except (KeyError, OSError):
+                continue
+            if self.workspace.catalog_for_root(source_root) is None:
+                continue
             group = directory_groups if item.get("kind") == "directory" else image_groups
-            group[Path(item["catalog_root"]).resolve()].append(item["rel_path"])
+            group[source_root].append(rel_path)
+        image_payload = {
+            root: list(dict.fromkeys(rel_paths))
+            for root, rel_paths in image_groups.items()
+            if rel_paths
+        }
+        directory_payload = {
+            root: sorted(set(dir_rels), key=lambda value: value.count("/"))
+            for root, dir_rels in directory_groups.items()
+            if dir_rels
+        }
+        if not image_payload and not directory_payload:
+            return
         if is_trash_rel_path(dest_dir_rel):
-            source_roots = {*directory_groups.keys(), *image_groups.keys()}
+            source_roots = {*directory_payload.keys(), *image_payload.keys()}
             if any(source_root != dest_catalog.root for source_root in source_roots):
                 show_error(self, "Move", "Cannot move items into another catalog's trash.")
                 return
-        affected_roots = {dest_catalog.root, *directory_groups.keys(), *image_groups.keys()}
+        affected_roots = {dest_catalog.root, *directory_payload.keys(), *image_payload.keys()}
         for root in affected_roots:
             self.indexer.cancel_idle_tasks(root)
             self.indexer.cancel_directory_tasks(root)
+        task = IndexTask(
+            "Moving items",
+            dest_catalog.root,
+            dest_dir_rel,
+            interactive=True,
+            idle_sleep_seconds=0.0,
+            force_refresh=True,
+        )
+        future = self.file_move_executor.submit(
+            self._move_payload_worker,
+            image_payload,
+            directory_payload,
+            dest_catalog.root,
+            dest_dir_rel,
+            self.wipe_on_delete_enabled(),
+            task,
+        )
+        task.bind_future(future)
+        self._move_payload_task = MovePayloadTask(
+            dest_root=dest_catalog.root,
+            dest_dir_rel=dest_dir_rel,
+            affected_roots=set(affected_roots),
+            task=task,
+            future=future,
+            started_at=monotonic(),
+        )
+        self._show_move_payload_status(task.snapshot())
+        self._update_tools_menu_actions()
+
+    def _move_payload_worker(
+        self,
+        image_groups: dict[Path, list[str]],
+        directory_groups: dict[Path, list[str]],
+        dest_root: Path,
+        dest_dir_rel: str,
+        wipe_on_delete: bool,
+        task: IndexTask,
+    ) -> MovePayloadResult:
+        affected_roots = {dest_root, *directory_groups.keys(), *image_groups.keys()}
+        requested = sum(len(items) for items in directory_groups.values()) + sum(
+            len(items) for items in image_groups.values()
+        )
+        processed = 0
+        moved = 0
+        catalogs: dict[Path, Catalog] = {}
+
+        def catalog_for(root: Path) -> Catalog:
+            resolved = root.expanduser().resolve()
+            catalog = catalogs.get(resolved)
+            if catalog is None:
+                catalog = Catalog(resolved)
+                catalogs[resolved] = catalog
+            return catalog
+
+        task.update(0, requested, dest_dir_rel or ".")
         try:
+            dest_catalog = catalog_for(dest_root)
             for source_root, dir_rels in directory_groups.items():
-                source_catalog = self.workspace.catalog_for_root(source_root)
-                if source_catalog is None:
-                    continue
-                source_catalog.move_directories(
+                source_catalog = catalog_for(source_root)
+                base_processed = processed
+
+                def directory_progress(local_processed: int, _total: int | None, current: str) -> None:
+                    task.update(min(base_processed + local_processed, requested), requested, current)
+
+                results = source_catalog.move_directories(
                     dir_rels,
                     dest_catalog,
                     dest_dir_rel,
-                    wipe_on_delete=self.wipe_on_delete_enabled(),
+                    wipe_on_delete=wipe_on_delete,
+                    progress_callback=directory_progress,
+                    cancel_check=task.check_canceled,
                 )
+                processed += len(dir_rels)
+                moved += len(results)
+                task.update(min(processed, requested), requested, dest_dir_rel or ".")
             for source_root, rel_paths in image_groups.items():
-                source_catalog = self.workspace.catalog_for_root(source_root)
-                if source_catalog is not None:
-                    source_catalog.move_images(
-                        rel_paths,
-                        dest_catalog,
-                        dest_dir_rel,
-                        wipe_on_delete=self.wipe_on_delete_enabled(),
-                    )
-        except (OSError, ValueError) as error:
-            show_error(self, "Move", str(error))
-            return
-        for source_root in [*directory_groups.keys(), *image_groups.keys(), dest_catalog.root]:
-            resolved_root = Path(source_root).resolve()
-            self._swept_catalog_roots.discard(resolved_root)
-            self._pruned_catalog_roots.discard(resolved_root)
-        self.reload_tree_and_directory()
+                source_catalog = catalog_for(source_root)
+                base_processed = processed
+
+                def image_progress(local_processed: int, _total: int | None, current: str) -> None:
+                    task.update(min(base_processed + local_processed, requested), requested, current)
+
+                results = source_catalog.move_images(
+                    rel_paths,
+                    dest_catalog,
+                    dest_dir_rel,
+                    wipe_on_delete=wipe_on_delete,
+                    progress_callback=image_progress,
+                    cancel_check=task.check_canceled,
+                )
+                processed += len(rel_paths)
+                moved += len(results)
+                task.update(min(processed, requested), requested, dest_dir_rel or ".")
+            task.mark_done()
+            return MovePayloadResult(requested=requested, moved=moved, affected_roots=affected_roots)
+        except IndexTaskCancelled:
+            task.mark_canceled()
+            raise
+        except Exception as error:
+            task.mark_failed(error)
+            raise
+        finally:
+            for catalog in catalogs.values():
+                try:
+                    catalog.close()
+                except Exception:
+                    pass
 
     def select_rel_path(self, rel_path: str) -> None:
         for row, record in enumerate(self.model.images):
@@ -2799,6 +3028,7 @@ class MainWindow(QMainWindow):
     def _poll_indexer(self) -> None:
         self._settle_catalog_open_tasks()
         self._settle_duplicate_delete_task()
+        self._settle_move_payload_task()
         self._settle_virtual_view_tasks()
         active_open_task = self._active_catalog_open_task()
         if active_open_task is not None:
@@ -2807,6 +3037,10 @@ class MainWindow(QMainWindow):
         active_delete_task = self._active_duplicate_delete_task()
         if active_delete_task is not None:
             self._show_duplicate_delete_status(active_delete_task.task.snapshot())
+            return
+        active_move_task = self._active_move_payload_task()
+        if active_move_task is not None:
+            self._show_move_payload_status(active_move_task.task.snapshot())
             return
         active_virtual_task = self._active_virtual_view_task()
         if active_virtual_task is not None:
