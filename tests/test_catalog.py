@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import errno
+import json
 import os
 import sqlite3
 from pathlib import Path
@@ -68,6 +69,27 @@ def test_discover_directories_remembers_tree_without_indexing_images(tmp_path: P
         assert catalog.list_known_directories() == ["", "one", "one/two"]
         assert catalog.list_images("one/two") == []
         assert any("Folder discovery complete" in line for line in catalog.read_log_lines())
+
+
+def test_discover_directories_writes_nested_tree_cache(tmp_path: Path) -> None:
+    root = tmp_path / "catalog"
+    (root / "one" / "two").mkdir(parents=True)
+    (root / "alpha").mkdir(parents=True)
+
+    with Catalog(root) as catalog:
+        catalog.discover_directories()
+
+        payload = json.loads(catalog.directory_tree_cache_path.read_text(encoding="utf-8"))
+        assert payload["version"] == 1
+        assert payload["directories"] == {
+            "alpha": {},
+            "one": {
+                "two": {},
+            },
+        }
+        assert catalog.list_cached_directories() == ["", "alpha", "one", "one/two"]
+        assert catalog.list_cached_child_directory_rels("") == ["alpha", "one"]
+        assert catalog.list_cached_child_directory_rels("one") == ["one/two"]
 
 
 def test_discover_directories_preserves_whitespace_directory_names(tmp_path: Path) -> None:
@@ -410,6 +432,40 @@ def test_refresh_continues_after_single_file_indexing_error(tmp_path: Path, monk
             "ERROR Indexing error for bad.jpg: decoder failed" in line
             for line in catalog.read_log_lines()
         )
+
+
+def test_unchanged_indexing_failure_is_skipped_until_file_changes(tmp_path: Path) -> None:
+    root = tmp_path / "catalog"
+    bad_path = root / "bad.jpg"
+    bad_path.parent.mkdir(parents=True)
+    bad_path.write_bytes(b"not actually an image")
+
+    with Catalog(root) as catalog:
+        assert catalog.refresh_directory("")
+        first_log_count = sum("Indexing error for bad.jpg" in line for line in catalog.read_log_lines())
+        failure_row = catalog._conn.execute(
+            "SELECT rel_path, file_size_bytes, modified_at_ns FROM image_index_failures WHERE rel_path = ?",
+            ("bad.jpg",),
+        ).fetchone()
+
+        assert first_log_count == 1
+        assert failure_row is not None
+        assert catalog.get_image("bad.jpg") is None
+
+        assert catalog.refresh_directory("", force=True)
+        second_log_count = sum("Indexing error for bad.jpg" in line for line in catalog.read_log_lines())
+
+        assert second_log_count == first_log_count
+
+        make_image(bad_path, (32, 24), (20, 40, 80))
+        os.utime(bad_path, ns=(bad_path.stat().st_atime_ns, bad_path.stat().st_mtime_ns + 1_000_000))
+
+        assert catalog.refresh_directory("", force=True)
+        assert catalog.get_image("bad.jpg") is not None
+        assert catalog._conn.execute(
+            "SELECT rel_path FROM image_index_failures WHERE rel_path = ?",
+            ("bad.jpg",),
+        ).fetchone() is None
 
 
 def test_skip_check_refreshes_when_find_hash_changes(tmp_path: Path) -> None:

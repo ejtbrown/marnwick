@@ -334,6 +334,7 @@ class BackgroundIndexer:
                 catalog.prune_thumbnails(
                     self._progress_callback(task),
                     task.check_canceled,
+                    workers=None if task.interactive else 1,
                 )
             task.mark_done()
         except IndexTaskCancelled:
