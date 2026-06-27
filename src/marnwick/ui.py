@@ -540,42 +540,19 @@ class ThumbnailDelegate(QStyledItemDelegate):
         return super().sizeHint(option, index)
 
 
-class DragPreviewOverlay(QLabel):
-    def __init__(self, pixmap: QPixmap, hotspot: QPoint) -> None:
-        super().__init__(None)
-        self.hotspot = hotspot
-        self.setWindowFlags(
-            Qt.WindowType.ToolTip
-            | Qt.WindowType.FramelessWindowHint
-            | Qt.WindowType.WindowStaysOnTopHint
-        )
-        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
-        self.setPixmap(pixmap)
-        self.resize(pixmap.size())
-
-    def start(self, global_pos: QPoint) -> None:
-        self.move_to_global(global_pos)
-        self.show()
-
-    def stop(self) -> None:
-        self.hide()
-
-    def move_to_global(self, global_pos: QPoint) -> None:
-        self.move(global_pos - self.hotspot)
-
-
 class ThumbnailView(QListView):
     SMOOTH_SCROLL_STEP = 24
+    DRAG_ICON_SIZE = 72
+    _single_drag_pixmap: QPixmap | None = None
+    _multi_drag_pixmap: QPixmap | None = None
 
     def __init__(self, window: "MainWindow | None" = None) -> None:
         super().__init__()
         self.main_window = window
         self._drag_start_pos: QPoint | None = None
-        self._drag_payload: list[dict[str, str]] | None = None
-        self._drag_overlay: DragPreviewOverlay | None = None
+        self._drag_indexes: list[QModelIndex] = []
         self._drag_destination_item: QTreeWidgetItem | None = None
+        self._manual_drag_active = False
         self._drag_cursor_active = False
         self.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         self.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
@@ -595,7 +572,7 @@ class ThumbnailView(QListView):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event) -> None:  # type: ignore[no-untyped-def]
-        if self._drag_overlay is not None:
+        if self._manual_drag_active:
             self.update_manual_drag(event.globalPosition().toPoint())
             event.accept()
             return
@@ -613,7 +590,7 @@ class ThumbnailView(QListView):
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:  # type: ignore[no-untyped-def]
-        if self._drag_overlay is not None:
+        if self._manual_drag_active:
             self.finish_manual_drag(event.globalPosition().toPoint())
             event.accept()
             return
@@ -643,13 +620,7 @@ class ThumbnailView(QListView):
         drag.setPixmap(drag_pixmap)
         drag.setHotSpot(hotspot)
         drag.setDragCursor(drag_pixmap, Qt.DropAction.MoveAction)
-        overlay = DragPreviewOverlay(drag_pixmap, hotspot)
-        overlay.start(QCursor.pos())
-        try:
-            drag.exec(supported_actions, Qt.DropAction.MoveAction)
-        finally:
-            overlay.stop()
-            overlay.deleteLater()
+        drag.exec(supported_actions, Qt.DropAction.MoveAction)
 
     def selected_drag_indexes(self) -> list[QModelIndex]:
         selection = self.selectionModel()
@@ -668,25 +639,21 @@ class ThumbnailView(QListView):
 
     def begin_manual_drag(self, indexes: list[QModelIndex], global_pos: QPoint) -> bool:
         model = self.model()
-        if model is None:
+        if not isinstance(model, ThumbnailModel) or model.catalog is None:
             return False
-        mime_data = model.mimeData(indexes)
-        if not mime_data.hasFormat(ThumbnailModel.MIME_TYPE):
+        valid_indexes = [index for index in indexes if index.isValid()]
+        if not valid_indexes:
             return False
-        data = bytes(mime_data.data(ThumbnailModel.MIME_TYPE)).decode("utf-8")
-        self._drag_payload = json.loads(data)
-        drag_pixmap = self.drag_pixmap_for_indexes(indexes)
+        self._drag_indexes = valid_indexes
+        drag_pixmap = self.drag_pixmap_for_indexes(valid_indexes)
         hotspot = QPoint(int(drag_pixmap.width() / 2), int(drag_pixmap.height() / 2))
-        self._drag_overlay = DragPreviewOverlay(drag_pixmap, hotspot)
-        self._drag_overlay.start(global_pos)
-        QApplication.setOverrideCursor(Qt.CursorShape.ClosedHandCursor)
+        QApplication.setOverrideCursor(QCursor(drag_pixmap, hotspot.x(), hotspot.y()))
+        self._manual_drag_active = True
         self._drag_cursor_active = True
         self.update_manual_drag(global_pos)
         return True
 
     def update_manual_drag(self, global_pos: QPoint) -> None:
-        if self._drag_overlay is not None:
-            self._drag_overlay.move_to_global(global_pos)
         item = self.tree_item_at_global(global_pos)
         self._drag_destination_item = item
         if self.main_window is not None:
@@ -695,11 +662,13 @@ class ThumbnailView(QListView):
     def finish_manual_drag(self, global_pos: QPoint) -> None:
         self.update_manual_drag(global_pos)
         move_request: tuple["MainWindow", list[dict[str, str]], Path, str] | None = None
-        if self.main_window is not None and self._drag_payload is not None and self._drag_destination_item is not None:
+        if self.main_window is not None and self._drag_indexes and self._drag_destination_item is not None:
             item = self._drag_destination_item
             root = Path(item.data(0, CATALOG_ROOT_ROLE))
             dir_rel = item.data(0, DIR_REL_ROLE)
-            move_request = (self.main_window, list(self._drag_payload), root, dir_rel)
+            payload = self.drag_payload_for_indexes(self._drag_indexes)
+            if payload:
+                move_request = (self.main_window, payload, root, dir_rel)
         self.cleanup_manual_drag()
         if move_request is not None:
             window, payload, root, dir_rel = move_request
@@ -708,15 +677,12 @@ class ThumbnailView(QListView):
     def cleanup_manual_drag(self) -> None:
         if self.main_window is not None:
             self.main_window.tree.set_drag_hover_item(None)
-        if self._drag_overlay is not None:
-            self._drag_overlay.stop()
-            self._drag_overlay.deleteLater()
         if self._drag_cursor_active:
             QApplication.restoreOverrideCursor()
         self._drag_start_pos = None
-        self._drag_payload = None
-        self._drag_overlay = None
+        self._drag_indexes = []
         self._drag_destination_item = None
+        self._manual_drag_active = False
         self._drag_cursor_active = False
 
     def tree_item_at_global(self, global_pos: QPoint) -> QTreeWidgetItem | None:
@@ -732,46 +698,73 @@ class ThumbnailView(QListView):
         return item
 
     def drag_pixmap_for_indexes(self, indexes: list[QModelIndex]) -> QPixmap:
-        size = 128
+        return self.static_drag_pixmap(multiple=len(indexes) > 1)
+
+    def drag_payload_for_indexes(self, indexes: list[QModelIndex]) -> list[dict[str, str]]:
+        model = self.model()
+        if model is None:
+            return []
+        mime_data = model.mimeData(indexes)
+        if not mime_data.hasFormat(ThumbnailModel.MIME_TYPE):
+            return []
+        data = bytes(mime_data.data(ThumbnailModel.MIME_TYPE)).decode("utf-8")
+        payload = json.loads(data)
+        return payload if isinstance(payload, list) else []
+
+    @classmethod
+    def static_drag_pixmap(cls, *, multiple: bool) -> QPixmap:
+        if multiple:
+            if cls._multi_drag_pixmap is None:
+                cls._multi_drag_pixmap = cls._build_static_drag_pixmap(multiple=True)
+            return cls._multi_drag_pixmap
+        if cls._single_drag_pixmap is None:
+            cls._single_drag_pixmap = cls._build_static_drag_pixmap(multiple=False)
+        return cls._single_drag_pixmap
+
+    @classmethod
+    def _build_static_drag_pixmap(cls, *, multiple: bool) -> QPixmap:
+        size = cls.DRAG_ICON_SIZE
         pixmap = QPixmap(size, size)
         pixmap.fill(Qt.GlobalColor.transparent)
         painter = QPainter(pixmap)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.setOpacity(0.78)
-        painter.setBrush(QBrush(QColor("#eef2ff")))
-        painter.setPen(QPen(QColor("#2563eb"), 2))
-        painter.drawRoundedRect(2, 2, size - 4, size - 4, 6, 6)
-
-        thumbnail = self._drag_thumbnail(indexes[0])
-        if not thumbnail.isNull():
-            painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-            target = QRect(10, 10, size - 20, size - 20)
-            scaled_size = thumbnail.size()
-            scaled_size.scale(target.size(), Qt.AspectRatioMode.KeepAspectRatio)
-            target = QRect(
-                target.left() + int((target.width() - scaled_size.width()) / 2),
-                target.top() + int((target.height() - scaled_size.height()) / 2),
-                scaled_size.width(),
-                scaled_size.height(),
-            )
-            painter.drawPixmap(target, thumbnail)
-        if len({index.row() for index in indexes}) > 1:
-            painter.setOpacity(0.92)
-            painter.setBrush(QBrush(QColor("#2563eb")))
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.drawEllipse(size - 38, size - 38, 32, 32)
-            painter.setPen(QColor("#ffffff"))
-            painter.drawText(QRect(size - 38, size - 38, 32, 32), Qt.AlignmentFlag.AlignCenter, str(len(indexes)))
+        if multiple:
+            cls._draw_photo_icon(painter, QRect(16, 6, 38, 30), "#dbeafe", "#1d4ed8")
+            cls._draw_photo_icon(painter, QRect(20, 15, 38, 30), "#bfdbfe", "#1d4ed8")
+            cls._draw_photo_icon(painter, QRect(24, 24, 38, 30), "#ffffff", "#1d4ed8")
+        else:
+            cls._draw_photo_icon(painter, QRect(12, 14, 48, 38), "#ffffff", "#1d4ed8")
         painter.end()
         return pixmap
 
-    def _drag_thumbnail(self, index: QModelIndex) -> QPixmap:
-        decoration = index.data(Qt.ItemDataRole.DecorationRole)
-        if isinstance(decoration, QPixmap):
-            return decoration
-        if isinstance(decoration, QIcon):
-            return decoration.pixmap(QSize(64, 64))
-        return self.style().standardIcon(QStyle.StandardPixmap.SP_FileIcon).pixmap(QSize(64, 64))
+    @staticmethod
+    def _draw_photo_icon(painter: QPainter, rect: QRect, fill: str, stroke: str) -> None:
+        painter.setBrush(QBrush(QColor(fill)))
+        painter.setPen(QPen(QColor(stroke), 3))
+        painter.drawRect(rect)
+
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(QColor("#facc15")))
+        sun_size = max(5, int(rect.width() * 0.16))
+        painter.drawEllipse(rect.left() + 7, rect.top() + 6, sun_size, sun_size)
+
+        painter.setBrush(QBrush(QColor("#16a34a")))
+        bottom = rect.bottom() - 4
+        painter.drawPolygon(
+            [
+                QPoint(rect.left() + 5, bottom),
+                QPoint(rect.left() + int(rect.width() * 0.38), rect.top() + int(rect.height() * 0.52)),
+                QPoint(rect.left() + int(rect.width() * 0.68), bottom),
+            ]
+        )
+        painter.setBrush(QBrush(QColor("#15803d")))
+        painter.drawPolygon(
+            [
+                QPoint(rect.left() + int(rect.width() * 0.32), bottom),
+                QPoint(rect.left() + int(rect.width() * 0.68), rect.top() + int(rect.height() * 0.42)),
+                QPoint(rect.right() - 5, bottom),
+            ]
+        )
 
 
 class DirectoryTree(QTreeWidget):
@@ -779,6 +772,9 @@ class DirectoryTree(QTreeWidget):
         super().__init__()
         self.window = window
         self._drag_hover_item: QTreeWidgetItem | None = None
+        self._drag_hover_background = QBrush()
+        self._drag_hover_foreground = QBrush()
+        self._drag_hover_font = QFont()
         self.setHeaderHidden(True)
         self.setAcceptDrops(True)
         self.setDragEnabled(True)
@@ -848,12 +844,19 @@ class DirectoryTree(QTreeWidget):
         if self._drag_hover_item is item:
             return
         if self._drag_hover_item is not None:
-            self._drag_hover_item.setBackground(0, QBrush())
-            self._drag_hover_item.setForeground(0, QBrush())
+            self._drag_hover_item.setBackground(0, self._drag_hover_background)
+            self._drag_hover_item.setForeground(0, self._drag_hover_foreground)
+            self._drag_hover_item.setFont(0, self._drag_hover_font)
         self._drag_hover_item = item
         if item is not None:
-            item.setBackground(0, QBrush(QColor("#dbeafe")))
-            item.setForeground(0, QBrush(QColor("#111827")))
+            self._drag_hover_background = item.background(0)
+            self._drag_hover_foreground = item.foreground(0)
+            self._drag_hover_font = item.font(0)
+            hover_font = QFont(self._drag_hover_font)
+            hover_font.setBold(True)
+            item.setBackground(0, QBrush(QColor("#1d4ed8")))
+            item.setForeground(0, QBrush(QColor("#ffffff")))
+            item.setFont(0, hover_font)
 
     def _open_context_menu(self, pos) -> None:  # type: ignore[no-untyped-def]
         item = self.itemAt(pos)
@@ -2005,6 +2008,9 @@ class MainWindow(QMainWindow):
 
     def _tree_directory_rels_for_catalog(self, catalog: Catalog) -> list[str]:
         if catalog.root in self._shallow_tree_roots:
+            cached = catalog.list_cached_directories()
+            if cached:
+                return cached
             return catalog.list_filesystem_child_directory_rels("")
         return catalog.list_known_directories()
 
@@ -2118,10 +2124,7 @@ class MainWindow(QMainWindow):
             placeholder_limit=0,
         )
         if self.current_catalog.root in self._shallow_tree_roots:
-            directories = self.current_catalog.list_filesystem_child_directories(
-                self.current_dir_rel,
-                self.current_sort,
-            )
+            directories = self._shallow_child_directories(self.current_catalog, self.current_dir_rel)
         else:
             directories = self.current_catalog.list_child_directories(
                 self.current_dir_rel,
@@ -2134,6 +2137,29 @@ class MainWindow(QMainWindow):
         if preserve_selection:
             self._restore_thumbnail_selection(selection_keys, current_key)
         self.update_selection_status()
+
+    def _shallow_child_directories(self, catalog: Catalog, dir_rel: str) -> list[DirectoryRecord]:
+        if not catalog.directory_tree_cache_available():
+            return catalog.list_filesystem_child_directories(dir_rel, self.current_sort)
+        records: list[DirectoryRecord] = []
+        for child_rel in catalog.list_cached_child_directory_rels(dir_rel):
+            path = catalog.abs_path(child_rel)
+            try:
+                stat = path.stat()
+            except OSError:
+                stat_mtime = 0
+            else:
+                stat_mtime = stat.st_mtime_ns
+            records.append(
+                DirectoryRecord(
+                    catalog_root=catalog.root,
+                    dir_rel=child_rel,
+                    name=Path(child_rel).name,
+                    mtime_ns=stat_mtime,
+                    allow_preview_fallback=False,
+                )
+            )
+        return sorted(records, key=catalog._directory_sort_key(self.current_sort), reverse=catalog._record_sort_reverse(self.current_sort))
 
     def load_current_virtual_directory(
         self,
@@ -3051,13 +3077,20 @@ class MainWindow(QMainWindow):
         self._settle_idle_tasks()
         self._settle_thumbnail_prune_tasks()
         snapshots = self.indexer.active_snapshots()
-        if not snapshots:
+        visible_snapshots = [
+            snapshot
+            for snapshot in snapshots
+            if snapshot.interactive or not snapshot.label.startswith("Pruning thumbnails")
+        ]
+        if not visible_snapshots:
             if self._indexing_was_active:
                 self._indexing_was_active = False
                 self.load_current_directory(preserve_selection=True)
             self._schedule_idle_indexing()
             if self._tree_build_task is not None:
                 self._show_tree_build_status(self._tree_build_task)
+                return
+            if snapshots:
                 return
             self.progress_bar.setRange(0, 1)
             self.progress_bar.setValue(0)
@@ -3066,7 +3099,7 @@ class MainWindow(QMainWindow):
             return
 
         self._indexing_was_active = True
-        snapshot = sorted(snapshots, key=lambda item: (item.interactive, item.started_at), reverse=True)[0]
+        snapshot = sorted(visible_snapshots, key=lambda item: (item.interactive, item.started_at), reverse=True)[0]
         if snapshot.total is None:
             synthetic_total = max(snapshot.processed + 64, 1)
             self.progress_bar.setRange(0, synthetic_total)

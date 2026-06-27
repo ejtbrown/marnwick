@@ -12,7 +12,7 @@ from PIL import Image
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("MARNWICK_DISABLE_CONFIG", "1")
 
-from PySide6.QtCore import QEvent, QItemSelectionModel, QPoint, QPointF, QRect, Qt  # noqa: E402
+from PySide6.QtCore import QEvent, QItemSelectionModel, QModelIndex, QPoint, QPointF, QRect, Qt  # noqa: E402
 from PySide6.QtGui import QFontMetrics, QKeyEvent, QMouseEvent, QPixmap  # noqa: E402
 from PySide6.QtWidgets import QAbstractItemView, QApplication, QDialog, QMenu, QStyleOptionViewItem  # noqa: E402
 
@@ -813,17 +813,38 @@ def test_thumbnail_model_tooltip_describes_image(tmp_path: Path) -> None:
     )
 
 
-def test_thumbnail_view_builds_visible_drag_pixmap() -> None:
+def test_thumbnail_view_builds_visible_drag_pixmap(tmp_path: Path) -> None:
     qt_app = app()
-    model = ThumbnailModel()
+    class DecorationCountingModel(ThumbnailModel):
+        def __init__(self) -> None:
+            super().__init__()
+            self.decoration_requests = 0
+
+        def data(self, index: QModelIndex, role: int = Qt.ItemDataRole.DisplayRole) -> object:
+            if role == Qt.ItemDataRole.DecorationRole:
+                self.decoration_requests += 1
+            return super().data(index, role)
+
+    model = DecorationCountingModel()
     view = ThumbnailView()
     try:
+        model.set_images(
+            None,
+            [
+                DirectoryRecord(tmp_path, "one", "one"),
+                DirectoryRecord(tmp_path, "two", "two"),
+            ],
+        )
         view.setModel(model)
         pixmap = view.drag_pixmap_for_indexes([model.index(0, 0)])
+        multi_pixmap = view.drag_pixmap_for_indexes([model.index(0, 0), model.index(1, 0)])
 
         assert not pixmap.isNull()
-        assert pixmap.width() == 128
-        assert pixmap.height() == 128
+        assert pixmap.width() == ThumbnailView.DRAG_ICON_SIZE
+        assert pixmap.height() == ThumbnailView.DRAG_ICON_SIZE
+        assert multi_pixmap.cacheKey() == ThumbnailView.static_drag_pixmap(multiple=True).cacheKey()
+        assert pixmap.cacheKey() != multi_pixmap.cacheKey()
+        assert model.decoration_requests == 0
     finally:
         view.close()
         view.deleteLater()
@@ -968,7 +989,7 @@ def test_thumbnail_context_menu_uses_directory_actions(tmp_path: Path) -> None:
         qt_app.processEvents()
 
 
-def test_thumbnail_view_manual_drag_overlay_follows_mouse(tmp_path: Path) -> None:
+def test_thumbnail_view_manual_drag_uses_static_cursor(tmp_path: Path) -> None:
     qt_app = app()
     root = tmp_path / "catalog"
     root.mkdir()
@@ -984,15 +1005,15 @@ def test_thumbnail_view_manual_drag_overlay_follows_mouse(tmp_path: Path) -> Non
         index = window.model.index(0, 0)
 
         assert window.thumbnail_view.begin_manual_drag([index], QPoint(100, 100))
-        assert window.thumbnail_view._drag_overlay is not None
-        first_pos = window.thumbnail_view._drag_overlay.pos()
+        assert window.thumbnail_view._manual_drag_active
+        assert QApplication.overrideCursor() is not None
 
         window.thumbnail_view.update_manual_drag(QPoint(240, 260))
 
-        assert window.thumbnail_view._drag_overlay.pos() != first_pos
-        assert window.thumbnail_view._drag_overlay.pos() == QPoint(176, 196)
+        assert window.thumbnail_view._manual_drag_active
     finally:
         window.thumbnail_view.cleanup_manual_drag()
+        assert QApplication.overrideCursor() is None
         window.progress_timer.stop()
         window.idle_timer.stop()
         window.indexer.shutdown()
@@ -1851,6 +1872,62 @@ def test_progress_label_shows_relative_directory_path_instead_of_file_name(tmp_p
         qt_app.processEvents()
 
 
+def test_idle_thumbnail_prune_does_not_update_status_bar(tmp_path: Path) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+
+    class FakeTask:
+        def snapshot(self) -> IndexProgressSnapshot:
+            return IndexProgressSnapshot(
+                label="Pruning thumbnails catalog",
+                root=root.resolve(),
+                dir_rel=None,
+                processed=12,
+                total=100,
+                current="image.jpg",
+                done=False,
+                error=None,
+                interactive=False,
+                canceled=False,
+                started_at=1.0,
+            )
+
+    class FakeIndexer:
+        def active_snapshots(self) -> list[IndexProgressSnapshot]:
+            return [FakeTask().snapshot()]
+
+        def has_active_tasks(self) -> bool:
+            return True
+
+        def shutdown(self) -> None:
+            return None
+
+    window = MainWindow()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        window.indexer.shutdown()
+        window.indexer = FakeIndexer()  # type: ignore[assignment]
+        window.progress_label.setText("Ready")
+        window.progress_bar.setRange(0, 1)
+        window.progress_bar.setValue(0)
+        window._thumbnail_prune_tasks[root.resolve()] = FakeTask()  # type: ignore[assignment]
+
+        window._poll_indexer()
+
+        assert window.progress_label.text() == "Ready"
+        assert window.progress_bar.value() == 0
+    finally:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        window.indexer.shutdown()
+        window.workspace.close()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
 def test_idle_catalog_refresh_resumes_after_interactive_directory_index(tmp_path: Path, monkeypatch) -> None:
     qt_app = app()
     root = tmp_path / "catalog"
@@ -2080,7 +2157,7 @@ def test_async_open_catalog_writes_phase_timings(tmp_path: Path) -> None:
         qt_app.processEvents()
 
 
-def test_open_catalog_uses_shallow_tree_until_directory_discovery_finishes(tmp_path: Path) -> None:
+def test_open_catalog_uses_cached_tree_until_directory_discovery_finishes(tmp_path: Path) -> None:
     qt_app = app()
     root = tmp_path / "catalog"
     (root / "top" / "nested").mkdir(parents=True)
@@ -2182,7 +2259,9 @@ def test_open_catalog_uses_shallow_tree_until_directory_discovery_finishes(tmp_p
         top_item = root_item.child(0)
         assert top_item is not None
         assert top_item.data(0, DIR_REL_ROLE) == "top"
-        assert top_item.childCount() == 0
+        nested_item = top_item.child(0)
+        assert nested_item is not None
+        assert nested_item.data(0, DIR_REL_ROLE) == "top/nested"
         assert root.resolve() in window._shallow_tree_roots
         assert "Discovering folders" in window.progress_label.text()
         assert [record.dir_rel for record in window.model.images if isinstance(record, DirectoryRecord)] == ["top"]
@@ -2614,12 +2693,15 @@ def test_directory_tree_drag_hover_highlights_destination(tmp_path: Path) -> Non
 
         window.tree.set_drag_hover_item(item)
 
-        assert item.background(0).color().name() == "#dbeafe"
+        assert item.background(0).color().name() == "#1d4ed8"
+        assert item.foreground(0).color().name() == "#ffffff"
+        assert item.font(0).bold()
 
         window.tree.set_drag_hover_item(None)
 
         assert window.tree._drag_hover_item is None
         assert item.background(0).style() == Qt.BrushStyle.NoBrush
+        assert not item.font(0).bold()
     finally:
         window.progress_timer.stop()
         window.idle_timer.stop()

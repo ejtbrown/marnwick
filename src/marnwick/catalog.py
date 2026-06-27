@@ -6,6 +6,7 @@ from datetime import datetime
 import errno
 import hashlib
 import io
+import json
 import os
 import queue
 import shutil
@@ -64,6 +65,7 @@ HASH_CHUNK_SIZE = 1024 * 1024
 FIND_POLL_INTERVAL_SECONDS = 0.02
 LOG_FILE_NAME = "marnwick.log"
 MAX_LOG_BYTES = 1024 * 1024
+DIRECTORY_TREE_CACHE_FILE_NAME = "directory-tree.json"
 THUMBNAIL_DIR_NAME = "thumbnails"
 THUMBNAIL_FILE_SUFFIX = ".jpg"
 SQL_LIKE_ESCAPE = "\\"
@@ -250,6 +252,7 @@ class Catalog:
         self.state_dir = self.root / ".marnwick"
         self.db_path = self.state_dir / "catalog.sqlite3"
         self.log_path = self.state_dir / LOG_FILE_NAME
+        self.directory_tree_cache_path = self.state_dir / DIRECTORY_TREE_CACHE_FILE_NAME
         self.thumbnail_dir = self.state_dir / THUMBNAIL_DIR_NAME
         self.root.mkdir(parents=True, exist_ok=True)
         self.state_dir.mkdir(parents=True, exist_ok=True)
@@ -825,6 +828,102 @@ class Catalog:
             directories.update(self._directory_and_parents(str(row["dir_rel"])))
         return sorted(directories, key=lambda item: item.casefold())
 
+    def list_cached_directories(self) -> list[str]:
+        tree = self._read_directory_tree_cache()
+        if tree is None:
+            return []
+        directories = [""]
+        directories.extend(self._flatten_directory_tree(tree))
+        return sorted(dict.fromkeys(directories), key=lambda item: item.casefold())
+
+    def directory_tree_cache_available(self) -> bool:
+        return self._read_directory_tree_cache() is not None
+
+    def list_cached_child_directory_rels(self, dir_rel: str = "") -> list[str]:
+        tree = self._read_directory_tree_cache()
+        if tree is None:
+            return []
+        node = self._directory_tree_node(tree, dir_rel)
+        if node is None:
+            return []
+        children = [
+            f"{dir_rel}/{name}" if dir_rel else name
+            for name in node
+        ]
+        return sorted(children, key=lambda item: item.casefold())
+
+    def save_directory_tree_cache(self, dir_rels: Iterable[str] | None = None) -> None:
+        directories = self.list_known_directories() if dir_rels is None else list(dir_rels)
+        tree: dict[str, dict] = {}
+        for dir_rel in sorted({item for item in directories if item}, key=lambda item: item.casefold()):
+            node = tree
+            for part in Path(dir_rel).parts:
+                node = node.setdefault(part, {})
+        payload = {
+            "version": 1,
+            "generated_at_ns": time.time_ns(),
+            "directories": tree,
+        }
+        temp = self.directory_tree_cache_path.with_name(
+            f"{self.directory_tree_cache_path.name}.{os.getpid()}.{time.time_ns()}.tmp"
+        )
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            temp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            temp.replace(self.directory_tree_cache_path)
+        finally:
+            temp.unlink(missing_ok=True)
+
+    def _save_directory_tree_cache_safely(self) -> None:
+        try:
+            self.save_directory_tree_cache()
+        except (OSError, TypeError, ValueError) as error:
+            self.append_log(f"Directory tree cache update failed: {error}", level="WARNING")
+
+    def _read_directory_tree_cache(self) -> dict[str, dict] | None:
+        try:
+            payload = json.loads(self.directory_tree_cache_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        if not isinstance(payload, dict) or payload.get("version") != 1:
+            return None
+        directories = payload.get("directories")
+        if not isinstance(directories, dict):
+            return None
+        return self._sanitize_directory_tree(directories)
+
+    def _sanitize_directory_tree(self, value: object) -> dict[str, dict] | None:
+        if not isinstance(value, dict):
+            return None
+        clean: dict[str, dict] = {}
+        for name, child in value.items():
+            if not isinstance(name, str) or not name or "/" in name or name in {".", "..", ".marnwick"}:
+                return None
+            clean_child = self._sanitize_directory_tree(child)
+            if clean_child is None:
+                return None
+            clean[name] = clean_child
+        return clean
+
+    def _flatten_directory_tree(self, tree: dict[str, dict], prefix: str = "") -> list[str]:
+        directories: list[str] = []
+        for name, child in tree.items():
+            rel_path = f"{prefix}/{name}" if prefix else name
+            directories.append(rel_path)
+            directories.extend(self._flatten_directory_tree(child, rel_path))
+        return directories
+
+    def _directory_tree_node(self, tree: dict[str, dict], dir_rel: str) -> dict[str, dict] | None:
+        node = tree
+        if not dir_rel:
+            return node
+        for part in Path(dir_rel).parts:
+            child = node.get(part)
+            if not isinstance(child, dict):
+                return None
+            node = child
+        return node
+
     def list_filesystem_child_directory_rels(self, dir_rel: str = "") -> list[str]:
         directory = self.abs_path(dir_rel) if dir_rel else self.root
         child_dirs: list[str] = []
@@ -880,6 +979,7 @@ class Catalog:
             self.append_log("Catalog refresh complete: up to date")
             return False
         refreshed = self._refresh_catalog_tree(progress, cancel_check, force=force)
+        self._save_directory_tree_cache_safely()
         self.append_log("Catalog refresh complete")
         return refreshed
 
@@ -899,6 +999,7 @@ class Catalog:
             count = self._discover_directories_python(progress, cancel_check)
         if progress is not None:
             progress(count, count, "Folder discovery complete")
+        self._save_directory_tree_cache_safely()
         self.append_log(f"Folder discovery complete: {count} folders")
         return count
 
@@ -1078,6 +1179,9 @@ class Catalog:
                         if self._image_row_is_current(rel_path, stat):
                             put_with_cancel(image_queue, ImageSkipJob(rel_path))
                             continue
+                        if self._image_index_failure_is_current(rel_path, stat):
+                            put_with_cancel(image_queue, ImageSkipJob(rel_path))
+                            continue
                         data = path.read_bytes()
                     except OSError as error:
                         self.append_log(f"Indexing error for {rel_path}: {error}", level="ERROR")
@@ -1111,6 +1215,7 @@ class Catalog:
                             self.append_log(f"Indexing error for {item.rel_path}: {error}", level="ERROR")
                             with self._db_lock:
                                 self._delete_db_records([item.rel_path])
+                                self._remember_index_failure(item.rel_path, item.stat, error)
                     with processed_lock:
                         processed += 1
                         current_processed = processed
@@ -1183,6 +1288,63 @@ class Catalog:
             return self.thumbnail_abs_path(str(row["thumb_rel_path"])).is_file()
         except (OSError, ValueError):
             return False
+
+    def _image_index_failure_is_current(self, rel_path: str, stat: os.stat_result) -> bool:
+        with self._db_lock:
+            row = self._conn.execute(
+                """
+                SELECT file_size_bytes, modified_at_ns, thumb_size_px
+                FROM image_index_failures
+                WHERE rel_path = ?
+                """,
+                (rel_path,),
+            ).fetchone()
+        return (
+            row is not None
+            and int(row["file_size_bytes"]) == stat.st_size
+            and int(row["modified_at_ns"]) == stat.st_mtime_ns
+            and int(row["thumb_size_px"]) == self.settings.thumbnail_native_size
+        )
+
+    def _remember_index_failure(self, rel_path: str, stat: os.stat_result, error: BaseException | str) -> None:
+        error_text = " ".join(str(error).split()) or error.__class__.__name__
+        error_hash = hashlib.sha256(error_text.encode("utf-8", errors="replace")).hexdigest()
+        dir_rel = Path(rel_path).parent.as_posix()
+        if dir_rel == ".":
+            dir_rel = ""
+        self._remember_directory(dir_rel)
+        self._conn.execute(
+            """
+            INSERT INTO image_index_failures(
+                rel_path, dir_rel, filename, file_size_bytes, modified_at_ns,
+                thumb_size_px, error, error_hash, failed_at_ns
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(rel_path) DO UPDATE SET
+                dir_rel = excluded.dir_rel,
+                filename = excluded.filename,
+                file_size_bytes = excluded.file_size_bytes,
+                modified_at_ns = excluded.modified_at_ns,
+                thumb_size_px = excluded.thumb_size_px,
+                error = excluded.error,
+                error_hash = excluded.error_hash,
+                failed_at_ns = excluded.failed_at_ns
+            """,
+            (
+                rel_path,
+                dir_rel,
+                Path(rel_path).name,
+                stat.st_size,
+                stat.st_mtime_ns,
+                self.settings.thumbnail_native_size,
+                error_text[:1000],
+                error_hash,
+                time.time_ns(),
+            ),
+        )
+
+    def _clear_index_failure(self, rel_path: str) -> None:
+        self._conn.execute("DELETE FROM image_index_failures WHERE rel_path = ?", (rel_path,))
 
     def _image_similarity_features_current(self, row: sqlite3.Row) -> bool:
         perceptual_hash = row["perceptual_hash"]
@@ -1285,6 +1447,7 @@ class Catalog:
                     time.time_ns(),
                 ),
             )
+            self._clear_index_failure(job.rel_path)
             self._remove_unreferenced_thumbnail_files(old_thumb_rel_paths - {thumb_rel_path})
 
     def refresh_directory(
@@ -1305,6 +1468,7 @@ class Catalog:
             return False
         self._refresh_directory_contents(dir_rel, progress, cancel_check, prune_missing_children=True)
         self.save_directory_find_hash(dir_rel, cancel_check, complete=False)
+        self._save_directory_tree_cache_safely()
         if progress is not None:
             progress(1, 1, "Directory scan complete")
         return True
@@ -1319,6 +1483,8 @@ class Catalog:
         except OSError as error:
             self.append_log(f"Indexing error for {rel_path}: {error}", level="ERROR")
             self._delete_db_records([rel_path])
+            return None
+        if self._image_index_failure_is_current(rel_path, stat):
             return None
         existing = self._conn.execute(
             """
@@ -1357,6 +1523,7 @@ class Catalog:
                 except OSError:
                     self.append_log(f"Indexing error for {rel_path}: could not read image file", level="ERROR")
                     self._delete_db_records([rel_path])
+                    self._remember_index_failure(rel_path, stat, "could not read image file")
                     return None
                 self._update_file_identity(
                     rel_path,
@@ -1389,6 +1556,7 @@ class Catalog:
                 cancel_check()
             self.append_log(f"Indexing error for {rel_path}: {error}", level="ERROR")
             self._delete_db_records([rel_path])
+            self._remember_index_failure(rel_path, stat, error)
             return None
 
         old_thumb_rel_paths = set()
@@ -1456,6 +1624,7 @@ class Catalog:
                 time.time_ns(),
             ),
         )
+        self._clear_index_failure(rel_path)
         self._remove_unreferenced_thumbnail_files(old_thumb_rel_paths - {thumb_rel_path})
         return self.get_image(rel_path, include_blob=True)
 
@@ -2289,6 +2458,7 @@ class Catalog:
         for catalog, dir_rels in impacted_dirs.items():
             if dir_rels:
                 catalog.update_hashes_after_targeted_move(dir_rels)
+                catalog._save_directory_tree_cache_safely()
         return results
 
     def restore_image_from_trash(self, rel_path: str) -> MoveResult:
@@ -2304,6 +2474,7 @@ class Catalog:
                 self._parent_dir_rel(result.dest_rel_path),
             }
         )
+        self._save_directory_tree_cache_safely()
         self.append_log(f"Restored image {rel_path} to {result.dest_rel_path}")
         return result
 
@@ -2321,6 +2492,7 @@ class Catalog:
                 self._parent_dir_rel(result.dest_rel_path),
             }
         )
+        self._save_directory_tree_cache_safely()
         self.append_log(f"Restored directory {dir_rel} to {result.dest_rel_path}")
         return result
 
@@ -2397,6 +2569,7 @@ class Catalog:
         for catalog, affected in impacted_dirs.items():
             if affected:
                 catalog.update_hashes_after_targeted_move(affected)
+                catalog._save_directory_tree_cache_safely()
         return results
 
     def delete_images(self, rel_paths: Sequence[str], *, wipe: bool = False) -> int:
@@ -2517,6 +2690,7 @@ class Catalog:
         target.mkdir()
         rel_path = self.rel_path(target)
         self._remember_directory(rel_path)
+        self._save_directory_tree_cache_safely()
         return rel_path
 
     def delete_directory(self, dir_rel: str, *, wipe: bool = False) -> None:
@@ -2555,6 +2729,7 @@ class Catalog:
         if parent_rel == ".":
             parent_rel = ""
         self._remember_directory(parent_rel)
+        self._save_directory_tree_cache_safely()
 
     def _delete_file(self, path: Path, *, wipe: bool) -> None:
         if wipe and not path.is_symlink():
@@ -2627,10 +2802,12 @@ class Catalog:
         self,
         progress: ProgressCallback | None = None,
         cancel_check: CancelCallback | None = None,
+        *,
+        workers: int | None = None,
     ) -> ThumbnailPruneResult:
         total_row = self._conn.execute("SELECT COUNT(*) AS count FROM images").fetchone()
         total = 0 if total_row is None else int(total_row["count"])
-        workers = max(1, int(self.settings.prune_parallelism))
+        workers = max(1, int(self.settings.prune_parallelism if workers is None else workers))
         checked = 0
         rebuilt = 0
         stale_removed = 0
@@ -2858,6 +3035,20 @@ class Catalog:
                 kind TEXT NOT NULL,
                 moved_at_ns INTEGER NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS image_index_failures (
+                rel_path TEXT PRIMARY KEY,
+                dir_rel TEXT NOT NULL,
+                filename TEXT NOT NULL,
+                file_size_bytes INTEGER NOT NULL,
+                modified_at_ns INTEGER NOT NULL,
+                thumb_size_px INTEGER NOT NULL,
+                error TEXT NOT NULL,
+                error_hash TEXT NOT NULL,
+                failed_at_ns INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_image_index_failures_dir
+                ON image_index_failures(dir_rel, filename COLLATE NOCASE);
             """
         )
         self._ensure_image_schema()
@@ -3434,6 +3625,10 @@ class Catalog:
         old_thumb_rel_paths = self._thumbnail_rel_paths_for_records(rel_paths)
         self._conn.executemany("DELETE FROM images WHERE rel_path = ?", [(rel_path,) for rel_path in rel_paths])
         self._conn.executemany("DELETE FROM trash_items WHERE trash_rel_path = ?", [(rel_path,) for rel_path in rel_paths])
+        self._conn.executemany(
+            "DELETE FROM image_index_failures WHERE rel_path = ?",
+            [(rel_path,) for rel_path in rel_paths],
+        )
         self._remove_unreferenced_thumbnail_files(old_thumb_rel_paths)
 
     def _delete_directory_records(self, dir_rel: str) -> None:
@@ -3459,6 +3654,10 @@ class Catalog:
                 "DELETE FROM directories WHERE dir_rel = ? OR dir_rel LIKE ? ESCAPE '\\'",
                 (dir_rel, nested_like),
             )
+            self._conn.execute(
+                "DELETE FROM image_index_failures WHERE dir_rel = ? OR dir_rel LIKE ? ESCAPE '\\'",
+                (dir_rel, nested_like),
+            )
             self._forget_trash_items_under(dir_rel)
             self._remove_unreferenced_thumbnail_files(old_thumb_rel_paths)
             return
@@ -3467,6 +3666,7 @@ class Catalog:
             for row in self._conn.execute("SELECT thumb_rel_path FROM images WHERE thumb_rel_path IS NOT NULL")
         }
         self._conn.execute("DELETE FROM images")
+        self._conn.execute("DELETE FROM image_index_failures")
         self._conn.execute("DELETE FROM directories WHERE dir_rel != ''")
         self._conn.execute("DELETE FROM trash_items")
         self._remove_unreferenced_thumbnail_files(old_thumb_rel_paths)
