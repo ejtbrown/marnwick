@@ -7,7 +7,7 @@ from time import monotonic, sleep
 from PIL import Image
 
 from marnwick.catalog import Catalog
-from marnwick.indexer import BackgroundIndexer
+from marnwick.indexer import ActionPriority, BackgroundIndexer
 
 
 def make_image(path: Path, size: tuple[int, int] = (32, 24)) -> None:
@@ -189,4 +189,55 @@ def test_new_interactive_directory_index_cancels_previous_directory_scan(tmp_pat
         assert calls == ["first", "second"]
         assert second_finished.is_set()
     finally:
+        indexer.shutdown()
+
+
+def test_action_pipeline_runs_queued_tasks_by_priority(tmp_path: Path) -> None:
+    root = tmp_path / "catalog"
+    root.mkdir()
+    blocker_started = Event()
+    release_blocker = Event()
+    completed: list[str] = []
+
+    indexer = BackgroundIndexer(max_workers=1)
+    try:
+        blocker, _ = indexer.submit_action(
+            "blocker",
+            root,
+            None,
+            priority=ActionPriority.DIRECTORY_INVENTORY,
+            worker=lambda task: (
+                blocker_started.set(),
+                release_blocker.wait(timeout=2.0),
+                completed.append("blocker"),
+            ),
+            key="blocker",
+        )
+        assert blocker_started.wait(timeout=2.0)
+
+        low, _ = indexer.submit_action(
+            "prune",
+            root,
+            None,
+            priority=ActionPriority.PRUNE,
+            worker=lambda task: completed.append("prune"),
+            key="prune",
+        )
+        high, _ = indexer.submit_action(
+            "selected",
+            root,
+            "selected",
+            priority=ActionPriority.SELECTED_DIRECTORY_INDEX,
+            worker=lambda task: completed.append("selected"),
+            key="selected",
+        )
+
+        release_blocker.set()
+        blocker.wait(timeout=5)
+        high.wait(timeout=5)
+        low.wait(timeout=5)
+
+        assert completed == ["blocker", "selected", "prune"]
+    finally:
+        release_blocker.set()
         indexer.shutdown()

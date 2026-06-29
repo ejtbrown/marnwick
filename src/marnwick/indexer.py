@@ -1,13 +1,26 @@
 from __future__ import annotations
 
+import heapq
+import itertools
 from collections.abc import Callable
-from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
+from concurrent.futures import Future
+from dataclasses import dataclass, field
+from enum import IntEnum
 from pathlib import Path
-from threading import Event, Lock
+from threading import Condition, Event, Lock, Thread
 from time import monotonic, sleep
+from typing import Generic, TypeVar
 
 from .catalog import Catalog
+
+
+class ActionPriority(IntEnum):
+    SELECTED_DIRECTORY_INDEX = 0
+    FILE_MOVE_CROSS_CATALOG = 1
+    FILE_MOVE_WITHIN_CATALOG = 2
+    DIRECTORY_INVENTORY = 3
+    THUMBNAIL_INDEX = 4
+    PRUNE = 5
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,6 +52,7 @@ class IndexTask:
         interactive: bool,
         idle_sleep_seconds: float,
         force_refresh: bool = False,
+        priority: ActionPriority = ActionPriority.THUMBNAIL_INDEX,
     ) -> None:
         self.label = label
         self.root = root.expanduser().resolve()
@@ -46,6 +60,7 @@ class IndexTask:
         self.interactive = interactive
         self.idle_sleep_seconds = idle_sleep_seconds
         self.force_refresh = force_refresh
+        self.priority = priority
         self.started_at = monotonic()
         self._processed = 0
         self._total: int | None = None
@@ -53,11 +68,12 @@ class IndexTask:
         self._done = False
         self._canceled = False
         self._error: str | None = None
-        self._future: Future[None] | None = None
+        self._future: Future[object] | None = None
         self._lock = Lock()
         self._cancel_event = Event()
+        self._done_event = Event()
 
-    def bind_future(self, future: Future[None]) -> None:
+    def bind_future(self, future: Future[object]) -> None:
         self._future = future
 
     def update(self, processed: int, total: int | None, current: str) -> None:
@@ -69,21 +85,24 @@ class IndexTask:
     def mark_done(self) -> None:
         with self._lock:
             self._done = True
+        self._done_event.set()
 
     def mark_canceled(self) -> None:
         with self._lock:
             self._done = True
             self._canceled = True
+        self._done_event.set()
 
     def mark_failed(self, error: BaseException) -> None:
         with self._lock:
             self._done = True
             self._error = str(error)
+        self._done_event.set()
 
     def cancel(self) -> None:
         self._cancel_event.set()
-        if self._future is not None:
-            self._future.cancel()
+        if self._future is not None and self._future.cancel():
+            self.mark_canceled()
 
     def check_canceled(self) -> None:
         if self._cancel_event.is_set():
@@ -114,20 +133,48 @@ class IndexTask:
             )
 
     def wait(self, timeout: float | None = None) -> None:
-        if self._future is None:
+        if self._future is not None:
+            self._future.result(timeout=timeout)
             return
-        self._future.result(timeout=timeout)
+        if not self._done_event.wait(timeout=timeout):
+            raise TimeoutError(self.label)
+
+
+ResultT = TypeVar("ResultT")
+ActionWorker = Callable[[IndexTask], ResultT]
+
+
+@dataclass(order=True, slots=True)
+class QueuedAction(Generic[ResultT]):
+    priority: int
+    sequence: int
+    key: str = field(compare=False)
+    task: IndexTask = field(compare=False)
+    future: Future[ResultT] = field(compare=False)
+    worker: ActionWorker[ResultT] = field(compare=False)
+    preemptible: bool = field(compare=False, default=True)
 
 
 class BackgroundIndexer:
-    """Keeps catalog scans and thumbnail work off the UI thread."""
+    """Runs catalog work through one prioritized non-UI action pipeline."""
 
     def __init__(self, max_workers: int | None = 1, *, idle_sleep_seconds: float = 0.08) -> None:
-        self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="marnwick-index")
         self._idle_sleep_seconds = idle_sleep_seconds
-        self._lock = Lock()
+        self._condition = Condition()
+        self._sequence = itertools.count()
+        self._queue: list[QueuedAction[object]] = []
         self._tasks: dict[str, IndexTask] = {}
-        self._futures: dict[Future[None], str] = {}
+        self._running: QueuedAction[object] | None = None
+        self._shutdown = False
+        worker_count = max(1, int(max_workers or 1))
+        # The action pipeline is intentionally serialized; extra workers would
+        # make priority/preemption semantics ambiguous for filesystem moves.
+        self._workers = [
+            Thread(target=self._worker_loop, name=f"marnwick-action-{index}", daemon=True)
+            for index in range(min(worker_count, 1))
+        ]
+        for worker in self._workers:
+            worker.start()
 
     def refresh_catalog(self, root: Path, *, interactive: bool = False, force: bool = False) -> IndexTask:
         root = root.expanduser().resolve()
@@ -142,6 +189,7 @@ class BackgroundIndexer:
                 interactive=interactive,
                 idle_sleep_seconds=self._idle_sleep_seconds,
                 force_refresh=force,
+                priority=ActionPriority.THUMBNAIL_INDEX,
             ),
             self._refresh_catalog,
         )
@@ -158,6 +206,7 @@ class BackgroundIndexer:
                 None,
                 interactive=interactive,
                 idle_sleep_seconds=self._idle_sleep_seconds,
+                priority=ActionPriority.DIRECTORY_INVENTORY,
             ),
             self._discover_directories,
         )
@@ -175,6 +224,7 @@ class BackgroundIndexer:
                 interactive=interactive,
                 idle_sleep_seconds=self._idle_sleep_seconds,
                 force_refresh=force,
+                priority=ActionPriority.PRUNE,
             ),
             self._prune_thumbnails,
         )
@@ -191,6 +241,11 @@ class BackgroundIndexer:
         directory_label = dir_rel or root.name or str(root)
         label = f"Indexing {directory_label}"
         key = f"directory-force:{root}:{dir_rel}" if force else f"directory:{root}:{dir_rel}"
+        priority = (
+            ActionPriority.SELECTED_DIRECTORY_INDEX
+            if interactive
+            else ActionPriority.THUMBNAIL_INDEX
+        )
         return self._submit_unique(
             key,
             IndexTask(
@@ -200,30 +255,80 @@ class BackgroundIndexer:
                 interactive=interactive,
                 idle_sleep_seconds=self._idle_sleep_seconds,
                 force_refresh=force,
+                priority=priority,
             ),
             self._refresh_directory,
         )
 
+    def submit_action(
+        self,
+        label: str,
+        root: Path,
+        dir_rel: str | None,
+        *,
+        priority: ActionPriority,
+        worker: ActionWorker[ResultT],
+        key: str | None = None,
+        interactive: bool = True,
+        force_refresh: bool = False,
+        preemptible: bool = True,
+    ) -> tuple[IndexTask, Future[ResultT]]:
+        root = root.expanduser().resolve()
+        task = IndexTask(
+            label,
+            root,
+            dir_rel,
+            interactive=interactive,
+            idle_sleep_seconds=self._idle_sleep_seconds,
+            force_refresh=force_refresh,
+            priority=priority,
+        )
+        action_key = key or f"custom:{next(self._sequence)}:{label}:{root}:{dir_rel or ''}"
+        future: Future[ResultT] = Future()
+        task.bind_future(future)  # type: ignore[arg-type]
+        action = QueuedAction(
+            int(priority),
+            next(self._sequence),
+            action_key,
+            task,
+            future,
+            worker,
+            preemptible=preemptible,
+        )
+        with self._condition:
+            self._tasks[action_key] = task
+            heapq.heappush(self._queue, action)  # type: ignore[arg-type]
+            self._preempt_running_if_needed(action)
+            self._condition.notify()
+        return task, future
+
     def active_snapshots(self) -> list[IndexProgressSnapshot]:
-        with self._lock:
-            tasks = list(self._tasks.values())
-        snapshots = [task.snapshot() for task in tasks]
-        return [snapshot for snapshot in snapshots if not snapshot.done]
+        with self._condition:
+            running = self._running
+        if running is None:
+            return []
+        snapshot = running.task.snapshot()
+        return [] if snapshot.done else [snapshot]
 
     def has_active_tasks(self) -> bool:
-        return bool(self.active_snapshots())
+        with self._condition:
+            if self._running is not None and not self._running.task.snapshot().done:
+                return True
+            return any(not task.snapshot().done for task in self._tasks.values())
 
     def cancel_idle_tasks(self, root: Path | None = None) -> None:
         resolved_root = root.expanduser().resolve() if root is not None else None
-        with self._lock:
+        with self._condition:
             tasks = list(self._tasks.values())
         for task in tasks:
             if not task.interactive and (resolved_root is None or task.root == resolved_root):
                 task.cancel()
+        with self._condition:
+            self._condition.notify()
 
     def cancel_directory_tasks(self, root: Path, *, keep_dir_rel: str | None = None) -> None:
         resolved_root = root.expanduser().resolve()
-        with self._lock:
+        with self._condition:
             tasks = list(self._tasks.values())
         for task in tasks:
             if task.root != resolved_root or task.dir_rel is None:
@@ -231,13 +336,18 @@ class BackgroundIndexer:
             if keep_dir_rel is not None and task.dir_rel == keep_dir_rel:
                 continue
             task.cancel()
+        with self._condition:
+            self._condition.notify()
 
     def shutdown(self) -> None:
-        with self._lock:
+        with self._condition:
+            self._shutdown = True
             tasks = list(self._tasks.values())
+            self._condition.notify_all()
         for task in tasks:
             task.cancel()
-        self._executor.shutdown(wait=False, cancel_futures=True)
+        for worker in self._workers:
+            worker.join(timeout=1.0)
 
     def _submit_unique(
         self,
@@ -245,12 +355,12 @@ class BackgroundIndexer:
         task: IndexTask,
         worker: Callable[[IndexTask], None],
     ) -> IndexTask:
-        with self._lock:
+        with self._condition:
             existing = self._tasks.get(key)
             if existing is not None and not existing.snapshot().done:
                 return existing
             if task.interactive:
-                for existing_key, existing_task in self._tasks.items():
+                for existing_key, existing_task in list(self._tasks.items()):
                     if existing_key == key:
                         continue
                     if not existing_task.interactive:
@@ -261,20 +371,72 @@ class BackgroundIndexer:
                         and existing_task.root == task.root
                     ):
                         existing_task.cancel()
-            future = self._executor.submit(worker, task)
-            task.bind_future(future)
+            future: Future[None] = Future()
+            task.bind_future(future)  # type: ignore[arg-type]
+            action = QueuedAction(
+                int(task.priority),
+                next(self._sequence),
+                key,
+                task,
+                future,
+                worker,
+                preemptible=True,
+            )
             self._tasks[key] = task
-            self._futures[future] = key
-        future.add_done_callback(self._discard_future)
-        return task
+            heapq.heappush(self._queue, action)  # type: ignore[arg-type]
+            self._preempt_running_if_needed(action)
+            self._condition.notify()
+            return task
 
-    def _discard_future(self, future: Future[None]) -> None:
-        with self._lock:
-            key = self._futures.pop(future, None)
-            if key is not None:
-                task = self._tasks.pop(key, None)
-                if task is not None and future.cancelled():
-                    task.mark_canceled()
+    def _preempt_running_if_needed(self, action: QueuedAction[object]) -> None:
+        running = self._running
+        if running is None:
+            return
+        if not running.preemptible:
+            return
+        if action.priority < running.priority:
+            running.task.cancel()
+
+    def _worker_loop(self) -> None:
+        while True:
+            with self._condition:
+                while not self._shutdown and not self._queue:
+                    self._condition.wait()
+                if self._shutdown and not self._queue:
+                    return
+                action = heapq.heappop(self._queue)
+                self._running = action
+            self._run_action(action)
+            with self._condition:
+                if self._running is action:
+                    self._running = None
+                self._tasks.pop(action.key, None)
+                self._condition.notify_all()
+
+    def _run_action(self, action: QueuedAction[object]) -> None:
+        task = action.task
+        future = action.future
+        if future.cancelled() or task.snapshot().canceled:
+            task.mark_canceled()
+            return
+        if not future.set_running_or_notify_cancel():
+            task.mark_canceled()
+            return
+        try:
+            result = action.worker(task)
+        except IndexTaskCancelled as error:
+            if not task.snapshot().done:
+                task.mark_canceled()
+            future.set_exception(error)
+            return
+        except Exception as error:
+            if not task.snapshot().done:
+                task.mark_failed(error)
+            future.set_exception(error)
+            return
+        if not task.snapshot().done:
+            task.mark_done()
+        future.set_result(result)
 
     def _progress_callback(self, task: IndexTask) -> Callable[[int, int | None, str], None]:
         def update(processed: int, total: int | None, current: str) -> None:

@@ -1426,6 +1426,117 @@ def test_move_payload_to_directory_returns_while_worker_is_busy(tmp_path: Path, 
         qt_app.processEvents()
 
 
+def test_move_payload_to_directory_queues_multiple_moves_and_hides_thumbnails(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    source_root = tmp_path / "source"
+    dest_root = tmp_path / "dest"
+    source_root.mkdir()
+    (dest_root / "target").mkdir(parents=True)
+    Image.new("RGB", (8, 8), (10, 20, 30)).save(source_root / "one.jpg")
+    Image.new("RGB", (8, 8), (40, 50, 60)).save(source_root / "two.jpg")
+    started = Event()
+    release = Event()
+    calls = 0
+
+    window = MainWindow()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        source = window.workspace.open_catalog(source_root)
+        dest = window.workspace.open_catalog(dest_root)
+        source.refresh()
+        dest.refresh()
+        window.current_catalog = source
+        window.current_dir_rel = ""
+        window.load_current_directory()
+
+        def slow_first_worker(_image_groups, _directory_groups, _dest_root, _dest_dir_rel, _wipe_on_delete, task):
+            nonlocal calls
+            calls += 1
+            task.update(0, 1, "waiting")
+            if calls == 1:
+                started.set()
+                if not release.wait(timeout=1.0):
+                    raise TimeoutError("move worker was not allowed to finish")
+            task.mark_done()
+            return MovePayloadResult(requested=1, moved=0, affected_roots={source.root, dest.root})
+
+        monkeypatch.setattr(window, "_move_payload_worker", slow_first_worker)
+
+        window.move_payload_to_directory(
+            [{"catalog_root": str(source.root), "rel_path": "one.jpg"}],
+            dest.root,
+            "target",
+        )
+        assert started.wait(timeout=1.0)
+        assert [record.rel_path for record in window.model.images if isinstance(record, ImageRecord)] == ["two.jpg"]
+
+        window.move_payload_to_directory(
+            [{"catalog_root": str(source.root), "rel_path": "two.jpg"}],
+            dest.root,
+            "target",
+        )
+
+        assert len(window._move_payload_tasks) == 2
+        assert [record.rel_path for record in window.model.images if isinstance(record, ImageRecord)] == []
+
+        release.set()
+        settle_move_payload_task(window, qt_app)
+        assert calls == 2
+    finally:
+        release.set()
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        window.indexer.shutdown()
+        window.workspace.close()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_move_refresh_preserves_directory_tree_scrollbar(tmp_path: Path) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    for index in range(80):
+        (root / f"dir-{index:02d}").mkdir(parents=True)
+
+    window = MainWindow()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        catalog.discover_directories()
+        window.current_catalog = catalog
+        window.current_dir_rel = "dir-79"
+        window.resize(420, 220)
+        window.show()
+        window.rebuild_tree()
+        deadline = monotonic() + 1.0
+        while window.tree.verticalScrollBar().maximum() == 0 and monotonic() < deadline:
+            qt_app.processEvents()
+            sleep(0.01)
+        scroll_bar = window.tree.verticalScrollBar()
+        assert scroll_bar.maximum() > 0
+        scroll_bar.setValue(0)
+        qt_app.processEvents()
+
+        window._refresh_after_move_payload({catalog.root})
+        qt_app.processEvents()
+
+        assert scroll_bar.value() == 0
+    finally:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        window.indexer.shutdown()
+        window.workspace.close()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
 def test_right_pane_shows_directory_tiles_before_images_and_navigates(tmp_path: Path) -> None:
     qt_app = app()
     root = tmp_path / "catalog"
@@ -2408,7 +2519,7 @@ def test_save_edits_dialog_includes_preserve_date_option() -> None:
     qt_app = app()
     box, save_button, preserve_button, discard_button = create_save_edits_message_box(None)
     try:
-        assert box.defaultButton() == save_button
+        assert box.defaultButton() == preserve_button
         assert save_button.text() == "Save"
         assert preserve_button.text() == "Save && Preserve Dates"
         assert discard_button.text() == "Discard"

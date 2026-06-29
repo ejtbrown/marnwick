@@ -95,7 +95,7 @@ from .image_ops import (
     save_image,
     save_image_preserving_file_dates,
 )
-from .indexer import BackgroundIndexer, IndexTask, IndexTaskCancelled
+from .indexer import ActionPriority, BackgroundIndexer, IndexTask, IndexTaskCancelled
 from .models import CatalogSettings, DirectoryRecord, ImageRecord, PaneRecord, SortOrder
 from .navigation import ImageNavigator
 from .workspace import Workspace
@@ -909,6 +909,8 @@ class MainWindow(QMainWindow):
         self.indexer = BackgroundIndexer()
         self.catalog_open_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="marnwick-open")
         self.virtual_view_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="marnwick-virtual")
+        # Kept for compatibility with older direct callers; UI file work is
+        # routed through BackgroundIndexer.submit_action below.
         self.duplicate_delete_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="marnwick-delete")
         self.file_move_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="marnwick-move")
         self.current_catalog: Catalog | None = None
@@ -928,6 +930,7 @@ class MainWindow(QMainWindow):
         self._virtual_view_tasks: dict[Future[VirtualViewResult], VirtualViewTask] = {}
         self._very_similar_cache: dict[tuple[Path, str, int], list[ImageRecord]] = {}
         self._duplicate_delete_task: DuplicateDeleteTask | None = None
+        self._move_payload_tasks: list[MovePayloadTask] = []
         self._move_payload_task: MovePayloadTask | None = None
         self._tree_build_task: TreeBuildTask | None = None
         self._pending_tree_rebuilds: dict[Path, tuple[Catalog, str]] = {}
@@ -1023,6 +1026,8 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         self.save_window_config()
+        self.idle_timer.stop()
+        self._wait_for_pending_file_tasks_on_exit()
         self._cancel_active_duplicate_delete_task(wait=True)
         self._cancel_active_move_payload_task(wait=True)
         self.catalog_open_executor.shutdown(wait=False, cancel_futures=True)
@@ -1032,6 +1037,64 @@ class MainWindow(QMainWindow):
         self.indexer.shutdown()
         self.workspace.close()
         super().closeEvent(event)
+
+    def _wait_for_pending_file_tasks_on_exit(self) -> None:
+        self._settle_duplicate_delete_task()
+        self._settle_move_payload_task()
+        if not self._has_pending_file_tasks():
+            return
+        for catalog in self.workspace.catalogs:
+            self.indexer.cancel_idle_tasks(catalog.root)
+            self.indexer.cancel_directory_tasks(catalog.root)
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Finishing File Moves")
+        dialog.setWindowIcon(load_app_icon())
+        dialog.setStyleSheet(DIALOG_STYLESHEET)
+        dialog.setWindowFlag(Qt.WindowType.WindowCloseButtonHint, False)
+        layout = QVBoxLayout(dialog)
+        label = QLabel("Finishing pending file moves...")
+        label.setMinimumWidth(480)
+        progress = QProgressBar()
+        progress.setRange(0, 0)
+        layout.addWidget(label)
+        layout.addWidget(progress)
+        dialog.setModal(True)
+
+        def update() -> None:
+            self._settle_duplicate_delete_task()
+            self._settle_move_payload_task()
+            active_move = self._active_move_payload_task()
+            active_duplicate = self._active_duplicate_delete_task()
+            active_task = active_move.task if active_move is not None else None
+            if active_task is None and active_duplicate is not None:
+                active_task = active_duplicate.task
+            if active_task is None:
+                dialog.accept()
+                return
+            snapshot = active_task.snapshot()
+            if snapshot.total is None:
+                progress.setRange(0, 0)
+                detail = snapshot.current or snapshot.label
+            else:
+                total = max(snapshot.total, 1)
+                progress.setRange(0, total)
+                progress.setValue(min(snapshot.processed, total))
+                detail = f"{snapshot.processed}/{snapshot.total}"
+                if snapshot.current:
+                    detail = f"{detail}: {snapshot.current}"
+            label.setText(f"{snapshot.label}: {detail}")
+
+        timer = QTimer(dialog)
+        timer.setInterval(100)
+        timer.timeout.connect(update)
+        timer.start()
+        update()
+        if self._has_pending_file_tasks():
+            dialog.exec()
+        timer.stop()
+
+    def _has_pending_file_tasks(self) -> bool:
+        return self._has_pending_move_payload_tasks() or self._has_active_duplicate_delete_task()
 
     def showEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         super().showEvent(event)
@@ -1187,7 +1250,7 @@ class MainWindow(QMainWindow):
             duplicate_view_selected
             and self.current_catalog is not None
             and self._duplicate_delete_task is None
-            and self._move_payload_task is None
+            and not self._has_pending_move_payload_tasks()
             and self._active_virtual_view_task() is None
         )
 
@@ -1248,10 +1311,6 @@ class MainWindow(QMainWindow):
         if self._duplicate_delete_task is not None:
             self._show_duplicate_delete_status(self._duplicate_delete_task.task.snapshot())
             return
-        self._settle_move_payload_task()
-        if self._move_payload_task is not None:
-            self.progress_label.setText("Wait for the current move to finish")
-            return
         if self._active_virtual_view_task() is not None:
             self.progress_label.setText("Wait for the virtual directory to finish building")
             return
@@ -1267,21 +1326,21 @@ class MainWindow(QMainWindow):
         self.indexer.cancel_directory_tasks(catalog.root)
         self._swept_catalog_roots.discard(catalog.root)
         self._pruned_catalog_roots.discard(catalog.root)
-        task = IndexTask(
+        task, future = self.indexer.submit_action(
             "Moving duplicates to trash",
             catalog.root,
             None,
+            priority=ActionPriority.FILE_MOVE_WITHIN_CATALOG,
+            worker=lambda action_task: self._duplicate_delete_worker(
+                catalog.root,
+                mode,
+                action_task,
+            ),
+            key=f"duplicate-delete:{catalog.root}:{mode}:{monotonic()}",
             interactive=True,
-            idle_sleep_seconds=0.0,
             force_refresh=True,
+            preemptible=False,
         )
-        future = self.duplicate_delete_executor.submit(
-            self._duplicate_delete_worker,
-            catalog.root,
-            mode,
-            task,
-        )
-        task.bind_future(future)
         self._duplicate_delete_task = DuplicateDeleteTask(
             root=catalog.root,
             kind=self.current_virtual_kind,
@@ -2061,9 +2120,29 @@ class MainWindow(QMainWindow):
             parent.setExpanded(True)
             parent = parent.parent()
 
-    def reload_tree_and_directory(self) -> None:
+    def reload_tree_and_directory(self, *, preserve_tree_scroll: bool = False) -> None:
+        tree_scroll_position = self._tree_scroll_position() if preserve_tree_scroll else None
         self.rebuild_tree()
         self.load_current_directory()
+        if tree_scroll_position is not None:
+            self._restore_tree_scroll_position(tree_scroll_position)
+            QTimer.singleShot(
+                0,
+                lambda position=tree_scroll_position: self._restore_tree_scroll_position(position),
+            )
+
+    def _tree_scroll_position(self) -> tuple[int, int]:
+        return (
+            self.tree.verticalScrollBar().value(),
+            self.tree.horizontalScrollBar().value(),
+        )
+
+    def _restore_tree_scroll_position(self, position: tuple[int, int]) -> None:
+        vertical, horizontal = position
+        vertical_bar = self.tree.verticalScrollBar()
+        horizontal_bar = self.tree.horizontalScrollBar()
+        vertical_bar.setValue(max(vertical_bar.minimum(), min(vertical, vertical_bar.maximum())))
+        horizontal_bar.setValue(max(horizontal_bar.minimum(), min(horizontal, horizontal_bar.maximum())))
 
     def _directory_clicked(self, item: QTreeWidgetItem) -> None:
         root = Path(item.data(0, CATALOG_ROOT_ROLE))
@@ -2524,26 +2603,30 @@ class MainWindow(QMainWindow):
         self.progress_label.setText(f"Moving duplicates to {TRASH_DIR_NAME}: {detail}")
 
     def _cancel_active_move_payload_task(self, *, wait: bool = False) -> None:
-        task = self._move_payload_task
-        if task is None:
+        tasks = list(self._move_payload_tasks)
+        if not tasks:
+            self._refresh_active_move_payload_task()
             return
-        task.task.cancel()
+        for task in tasks:
+            task.task.cancel()
         if wait:
-            self._wait_for_move_payload_task(task)
+            for task in tasks:
+                self._wait_for_move_payload_task(task)
         else:
             self._settle_move_payload_task()
         self._update_tools_menu_actions()
 
     def _cancel_move_payload_task(self, root: Path, *, wait: bool = False) -> None:
-        task = self._move_payload_task
-        if task is None:
-            return
         resolved = root.expanduser().resolve()
-        if resolved not in task.affected_roots:
+        tasks = [task for task in self._move_payload_tasks if resolved in task.affected_roots]
+        if not tasks:
+            self._refresh_active_move_payload_task()
             return
-        task.task.cancel()
+        for task in tasks:
+            task.task.cancel()
         if wait:
-            self._wait_for_move_payload_task(task)
+            for task in tasks:
+                self._wait_for_move_payload_task(task)
         else:
             self._settle_move_payload_task()
         self._update_tools_menu_actions()
@@ -2557,38 +2640,49 @@ class MainWindow(QMainWindow):
         self._settle_move_payload_task()
 
     def _settle_move_payload_task(self) -> None:
-        move_task = self._move_payload_task
-        if move_task is None or not move_task.future.done():
+        completed = [task for task in self._move_payload_tasks if task.future.done()]
+        if not completed:
+            self._refresh_active_move_payload_task()
             return
-        self._move_payload_task = None
         self._update_tools_menu_actions()
-        affected_roots = set(move_task.affected_roots)
-        if move_task.future.cancelled():
-            self.progress_bar.setRange(0, 1)
-            self.progress_bar.setValue(0)
-            self.progress_label.setText("Ready")
-            return
-        try:
-            result = move_task.future.result()
-        except IndexTaskCancelled:
+        last_result: MovePayloadResult | None = None
+        last_error: BaseException | None = None
+        canceled = False
+        affected_roots: set[Path] = set()
+        for move_task in completed:
+            self._move_payload_tasks.remove(move_task)
+            affected_roots.update(move_task.affected_roots)
+            if move_task.future.cancelled():
+                canceled = True
+                continue
+            try:
+                result = move_task.future.result()
+            except IndexTaskCancelled:
+                canceled = True
+                continue
+            except Exception as error:
+                last_error = error
+                continue
+            affected_roots.update(result.affected_roots)
+            last_result = result
+        self._refresh_active_move_payload_task()
+        if affected_roots:
             self._refresh_after_move_payload(affected_roots)
+        if last_error is not None:
             self.progress_bar.setRange(0, 1)
             self.progress_bar.setValue(0)
             self.progress_label.setText("Ready")
+            show_error(self, "Move", str(last_error))
             return
-        except Exception as error:
-            self._refresh_after_move_payload(affected_roots)
+        if last_result is not None:
+            self.progress_bar.setRange(0, max(last_result.requested, 1))
+            self.progress_bar.setValue(min(last_result.requested, max(last_result.requested, 1)))
+            self.progress_label.setText(f"Moved {last_result.moved} item(s)")
+            return
+        if canceled and not self._move_payload_tasks:
             self.progress_bar.setRange(0, 1)
             self.progress_bar.setValue(0)
             self.progress_label.setText("Ready")
-            show_error(self, "Move", str(error))
-            return
-
-        affected_roots.update(result.affected_roots)
-        self._refresh_after_move_payload(affected_roots)
-        self.progress_bar.setRange(0, max(result.requested, 1))
-        self.progress_bar.setValue(min(result.requested, max(result.requested, 1)))
-        self.progress_label.setText(f"Moved {result.moved} item(s)")
 
     def _refresh_after_move_payload(self, affected_roots: set[Path]) -> None:
         for root in affected_roots:
@@ -2596,15 +2690,21 @@ class MainWindow(QMainWindow):
             self._swept_catalog_roots.discard(resolved_root)
             self._pruned_catalog_roots.discard(resolved_root)
             self._drop_very_similar_cache(resolved_root)
-        self.reload_tree_and_directory()
+        self.reload_tree_and_directory(preserve_tree_scroll=True)
 
     def _active_move_payload_task(self) -> MovePayloadTask | None:
-        task = self._move_payload_task
-        if task is None:
-            return None
-        if task.future.done():
-            return None
-        return task
+        self._refresh_active_move_payload_task()
+        return self._move_payload_task
+
+    def _has_pending_move_payload_tasks(self) -> bool:
+        self._refresh_active_move_payload_task()
+        return bool(self._move_payload_tasks)
+
+    def _refresh_active_move_payload_task(self) -> None:
+        self._move_payload_task = next(
+            (task for task in self._move_payload_tasks if not task.future.done()),
+            None,
+        )
 
     def _show_move_payload_status(self, snapshot: IndexProgressSnapshot) -> None:
         if snapshot.total is None:
@@ -2847,13 +2947,6 @@ class MainWindow(QMainWindow):
 
     def move_payload_to_directory(self, payload: list[dict[str, str]], dest_root: Path, dest_dir_rel: str) -> None:
         self._settle_move_payload_task()
-        active_task = self._active_move_payload_task()
-        if active_task is not None:
-            self._show_move_payload_status(active_task.task.snapshot())
-            return
-        if self._active_duplicate_delete_task() is not None:
-            self.progress_label.setText("Wait for duplicate cleanup to finish")
-            return
         dest_catalog = self.workspace.catalog_for_root(dest_root)
         if dest_catalog is None:
             return
@@ -2890,25 +2983,31 @@ class MainWindow(QMainWindow):
         for root in affected_roots:
             self.indexer.cancel_idle_tasks(root)
             self.indexer.cancel_directory_tasks(root)
-        task = IndexTask(
+        cross_catalog = any(root != dest_catalog.root for root in affected_roots)
+        priority = (
+            ActionPriority.FILE_MOVE_CROSS_CATALOG
+            if cross_catalog
+            else ActionPriority.FILE_MOVE_WITHIN_CATALOG
+        )
+        task, future = self.indexer.submit_action(
             "Moving items",
             dest_catalog.root,
             dest_dir_rel,
+            priority=priority,
+            worker=lambda action_task: self._move_payload_worker(
+                image_payload,
+                directory_payload,
+                dest_catalog.root,
+                dest_dir_rel,
+                self.wipe_on_delete_enabled(),
+                action_task,
+            ),
+            key=f"move:{dest_catalog.root}:{dest_dir_rel}:{monotonic()}",
             interactive=True,
-            idle_sleep_seconds=0.0,
             force_refresh=True,
+            preemptible=False,
         )
-        future = self.file_move_executor.submit(
-            self._move_payload_worker,
-            image_payload,
-            directory_payload,
-            dest_catalog.root,
-            dest_dir_rel,
-            self.wipe_on_delete_enabled(),
-            task,
-        )
-        task.bind_future(future)
-        self._move_payload_task = MovePayloadTask(
+        move_task = MovePayloadTask(
             dest_root=dest_catalog.root,
             dest_dir_rel=dest_dir_rel,
             affected_roots=set(affected_roots),
@@ -2916,8 +3015,41 @@ class MainWindow(QMainWindow):
             future=future,
             started_at=monotonic(),
         )
-        self._show_move_payload_status(task.snapshot())
+        self._move_payload_tasks.append(move_task)
+        self._refresh_active_move_payload_task()
+        self._remove_queued_move_records_from_current_view(image_payload, directory_payload)
+        if self._move_payload_task is not None:
+            self._show_move_payload_status(self._move_payload_task.task.snapshot())
         self._update_tools_menu_actions()
+
+    def _remove_queued_move_records_from_current_view(
+        self,
+        image_payload: dict[Path, list[str]],
+        directory_payload: dict[Path, list[str]],
+    ) -> None:
+        if self.current_catalog is None:
+            return
+        root = self.current_catalog.root
+        image_rels = set(image_payload.get(root, ()))
+        directory_rels = set(directory_payload.get(root, ()))
+        if not image_rels and not directory_rels:
+            return
+        filtered: list[PaneRecord] = []
+        changed = False
+        for record in self.model.images:
+            remove = False
+            if isinstance(record, ImageRecord):
+                remove = record.rel_path in image_rels
+            else:
+                remove = record.dir_rel in directory_rels
+            if remove:
+                changed = True
+                continue
+            filtered.append(record)
+        if not changed:
+            return
+        self.model.set_images(self.current_catalog, filtered)
+        self.update_selection_status()
 
     def _move_payload_worker(
         self,
@@ -3028,6 +3160,8 @@ class MainWindow(QMainWindow):
             return
         if self._has_active_duplicate_delete_task():
             return
+        if self._has_pending_move_payload_tasks():
+            return
         self._settle_directory_discovery_tasks()
         self._settle_directory_index_tasks()
         self._settle_idle_tasks()
@@ -3060,12 +3194,13 @@ class MainWindow(QMainWindow):
         if active_open_task is not None:
             self._show_catalog_open_status(active_open_task.root)
             return
+        snapshots = self.indexer.active_snapshots()
         active_delete_task = self._active_duplicate_delete_task()
-        if active_delete_task is not None:
+        if active_delete_task is not None and self._task_is_running(active_delete_task.task, snapshots):
             self._show_duplicate_delete_status(active_delete_task.task.snapshot())
             return
         active_move_task = self._active_move_payload_task()
-        if active_move_task is not None:
+        if active_move_task is not None and self._task_is_running(active_move_task.task, snapshots):
             self._show_move_payload_status(active_move_task.task.snapshot())
             return
         active_virtual_task = self._active_virtual_view_task()
@@ -3135,6 +3270,14 @@ class MainWindow(QMainWindow):
             ):
                 self.model.refresh_thumbnail(snapshot.current)
         self.progress_label.setText(detail)
+
+    def _task_is_running(self, task: IndexTask, snapshots: Sequence[IndexProgressSnapshot]) -> bool:
+        return any(
+            snapshot.started_at == task.started_at
+            and snapshot.label == task.label
+            and snapshot.root == task.root
+            for snapshot in snapshots
+        )
 
     def _show_tree_build_status(self, task: TreeBuildTask) -> None:
         total = len(task.directories)
@@ -4886,7 +5029,7 @@ def create_save_edits_message_box(parent: QWidget | None) -> tuple[QMessageBox, 
     preserve_button = box.addButton("Save && Preserve Dates", QMessageBox.ButtonRole.AcceptRole)
     discard_button = box.addButton("Discard", QMessageBox.ButtonRole.DestructiveRole)
     cancel_button = box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
-    box.setDefaultButton(save_button)
+    box.setDefaultButton(preserve_button)
     box.setEscapeButton(cancel_button)
     style_message_box_buttons(box)
     return box, save_button, preserve_button, discard_button
