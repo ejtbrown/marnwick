@@ -9,6 +9,7 @@ from collections.abc import Callable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
+from functools import partial
 from pathlib import Path
 from time import monotonic
 
@@ -78,6 +79,9 @@ from .catalog import (
     parse_tag_entry,
 )
 from .config import (
+    DEFAULT_THUMBNAIL_COLUMNS,
+    MAX_THUMBNAIL_COLUMNS,
+    MIN_THUMBNAIL_COLUMNS,
     NORMAL_DELETE,
     WIPE_ON_DELETE,
     AppConfig,
@@ -166,6 +170,7 @@ class VirtualViewTask:
     started_at: float
     selection_keys: set[tuple[str, str]]
     current_key: tuple[str, str] | None
+    scroll_key: TreeStateKey | None
 
 
 @dataclass(slots=True)
@@ -448,7 +453,7 @@ class ThumbnailDelegate(QStyledItemDelegate):
         rect = self.card_rect(option, index)
         is_selected = bool(option.state & QStyle.StateFlag.State_Selected)
         if is_selected:
-            painter.fillRect(rect, QColor("#dbeafe"))
+            painter.fillRect(option.rect, QColor("#0067ff"))
 
         font_metrics = QFontMetrics(option.font)
         label_height = font_metrics.height()
@@ -484,7 +489,7 @@ class ThumbnailDelegate(QStyledItemDelegate):
             painter.drawPixmap(target_rect.topLeft(), scaled_pixmap)
 
         text = str(index.data(Qt.ItemDataRole.DisplayRole) or "")
-        painter.setPen(QColor("#111827") if not is_selected else QColor("#111827"))
+        painter.setPen(QColor("#ffffff") if is_selected else QColor("#111827"))
         painter.drawText(
             label_rect,
             Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
@@ -918,6 +923,7 @@ class MainWindow(QMainWindow):
         self.current_virtual_kind: str | None = None
         self.current_virtual_value = ""
         self.current_sort = self.sort_order_from_config(self.app_config.sort_order)
+        self.thumbnail_columns = self.thumbnail_columns_from_config(self.app_config.thumbnail_size)
         self._swept_catalog_roots: set[Path] = set()
         self._pruned_catalog_roots: set[Path] = set()
         self._idle_index_tasks: dict[Path, IndexTask] = {}
@@ -934,13 +940,14 @@ class MainWindow(QMainWindow):
         self._move_payload_task: MovePayloadTask | None = None
         self._tree_build_task: TreeBuildTask | None = None
         self._pending_tree_rebuilds: dict[Path, tuple[Catalog, str]] = {}
+        self._thumbnail_scroll_positions: dict[TreeStateKey, tuple[int, int]] = {}
+        self._thumbnail_scroll_key: TreeStateKey | None = None
         self._indexing_was_active = False
 
         self.tree = DirectoryTree(self)
         self.tree.itemClicked.connect(self._directory_clicked)
 
         self.model = ThumbnailModel()
-        self.model.set_tile_size(self.app_config.thumbnail_size)
         self.thumbnail_view = ThumbnailView(self)
         self.thumbnail_view.setModel(self.model)
         self.thumbnail_view.setItemDelegate(ThumbnailDelegate(self.thumbnail_view))
@@ -962,8 +969,9 @@ class MainWindow(QMainWindow):
         selection_model.selectionChanged.connect(lambda *_: self.update_selection_status())
 
         self.size_slider = QSlider(Qt.Orientation.Horizontal)
-        self.size_slider.setRange(64, 4096)
-        self.size_slider.setValue(self.model.tile_size)
+        self.size_slider.setRange(MIN_THUMBNAIL_COLUMNS, MAX_THUMBNAIL_COLUMNS)
+        self.size_slider.setValue(self.thumbnail_columns)
+        self.size_slider.setToolTip("Thumbnails per row")
         self.size_slider.valueChanged.connect(self._thumbnail_size_changed)
 
         self.sort_combo = QComboBox()
@@ -978,11 +986,12 @@ class MainWindow(QMainWindow):
         right_layout = QVBoxLayout(right)
         right_layout.setContentsMargins(8, 8, 8, 8)
         controls = QHBoxLayout()
-        self.native_thumbnail_button = QPushButton("Thumbnail size")
-        self.native_thumbnail_button.setToolTip("Set display size to the selected catalog's saved thumbnail size")
+        self.native_thumbnail_button = QPushButton("Default columns")
+        self.native_thumbnail_button.setToolTip("Reset to the default number of thumbnails per row")
         self.native_thumbnail_button.clicked.connect(self.set_thumbnail_size_to_native)
         controls.addWidget(self.native_thumbnail_button)
         controls.addWidget(self.size_slider, 1)
+        controls.addWidget(QLabel("Columns"))
         controls.addWidget(QLabel("Sort"))
         controls.addWidget(self.sort_combo)
         right_layout.addLayout(controls)
@@ -1136,14 +1145,14 @@ class MainWindow(QMainWindow):
                 maximized=self.isMaximized(),
             ),
             catalogs=[str(catalog.root) for catalog in self.workspace.catalogs],
-            thumbnail_size=self.model.tile_size,
+            thumbnail_size=self.thumbnail_columns,
             delete_behavior=self.app_config.delete_behavior,
             sort_order=self.current_sort.value,
         )
 
     def apply_app_config(self, config: AppConfig) -> None:
         self.app_config = config
-        self.set_thumbnail_size(config.thumbnail_size)
+        self.set_thumbnail_size(self.thumbnail_columns_from_config(config.thumbnail_size))
         self.set_sort_order(self.sort_order_from_config(config.sort_order))
         self.sync_catalogs_to_config(config.catalogs)
         if config.window.maximized:
@@ -1183,6 +1192,13 @@ class MainWindow(QMainWindow):
             return SortOrder(value)
         except ValueError:
             return SortOrder.NAME_ASC
+
+    def thumbnail_columns_from_config(self, value: int) -> int:
+        if MIN_THUMBNAIL_COLUMNS <= int(value) <= MAX_THUMBNAIL_COLUMNS:
+            return int(value)
+        if int(value) >= 64:
+            return max(MIN_THUMBNAIL_COLUMNS, min(MAX_THUMBNAIL_COLUMNS, round(960 / int(value))))
+        return DEFAULT_THUMBNAIL_COLUMNS
 
     def eventFilter(self, watched: object, event: QEvent) -> bool:
         if watched == self.thumbnail_view and event.type() == QEvent.Type.KeyPress:
@@ -2182,10 +2198,13 @@ class MainWindow(QMainWindow):
         self.load_current_directory()
 
     def load_current_directory(self, *, preserve_selection: bool = False) -> None:
+        self._remember_thumbnail_scroll_position()
+        target_scroll_key = self._current_thumbnail_scroll_key()
         selection_keys = self._thumbnail_selection_keys() if preserve_selection else set()
         current_key = self._current_thumbnail_selection_key() if preserve_selection else None
         if self.current_catalog is None:
             self.model.set_images(None, [])
+            self._thumbnail_scroll_key = None
             self.update_selection_status()
             return
         if self.current_virtual_kind is not None:
@@ -2193,6 +2212,7 @@ class MainWindow(QMainWindow):
                 preserve_selection=preserve_selection,
                 selection_keys=selection_keys,
                 current_key=current_key,
+                scroll_key=target_scroll_key,
             )
             return
         images = self.current_catalog.list_images_with_placeholders(
@@ -2215,7 +2235,56 @@ class MainWindow(QMainWindow):
         self.refresh_thumbnail_layout()
         if preserve_selection:
             self._restore_thumbnail_selection(selection_keys, current_key)
+        self._restore_thumbnail_scroll_position(target_scroll_key)
         self.update_selection_status()
+
+    def _current_thumbnail_scroll_key(self) -> TreeStateKey | None:
+        if self.current_catalog is None:
+            return None
+        if self.current_virtual_kind is not None:
+            return self._tree_state_key_for_virtual(
+                self.current_catalog.root,
+                self.current_virtual_kind,
+                self.current_virtual_value,
+            )
+        return self._tree_state_key_for_directory(self.current_catalog.root, self.current_dir_rel)
+
+    def _remember_thumbnail_scroll_position(self) -> None:
+        if self._thumbnail_scroll_key is None:
+            return
+        self._thumbnail_scroll_positions[self._thumbnail_scroll_key] = (
+            self.thumbnail_view.verticalScrollBar().value(),
+            self.thumbnail_view.horizontalScrollBar().value(),
+        )
+
+    def _restore_thumbnail_scroll_position(self, key: TreeStateKey | None) -> None:
+        self._thumbnail_scroll_key = key
+        vertical, horizontal = self._thumbnail_scroll_positions.get(key, (0, 0)) if key is not None else (0, 0)
+        self._set_thumbnail_scroll_position(key, vertical, horizontal, retries=5)
+
+    def _set_thumbnail_scroll_position(
+        self,
+        key: TreeStateKey | None,
+        vertical: int,
+        horizontal: int,
+        *,
+        retries: int,
+    ) -> None:
+        if key != self._thumbnail_scroll_key:
+            return
+        vertical_bar = self.thumbnail_view.verticalScrollBar()
+        horizontal_bar = self.thumbnail_view.horizontalScrollBar()
+        vertical_bar.setValue(max(vertical_bar.minimum(), min(vertical, vertical_bar.maximum())))
+        horizontal_bar.setValue(max(horizontal_bar.minimum(), min(horizontal, horizontal_bar.maximum())))
+        if retries <= 0:
+            return
+        if vertical <= vertical_bar.maximum() and horizontal <= horizontal_bar.maximum():
+            return
+        next_retries = retries - 1
+        QTimer.singleShot(
+            0,
+            partial(self._set_thumbnail_scroll_position, key, vertical, horizontal, retries=next_retries),
+        )
 
     def _shallow_child_directories(self, catalog: Catalog, dir_rel: str) -> list[DirectoryRecord]:
         if not catalog.directory_tree_cache_available():
@@ -2246,6 +2315,7 @@ class MainWindow(QMainWindow):
         preserve_selection: bool = False,
         selection_keys: set[tuple[str, str]] | None = None,
         current_key: tuple[str, str] | None = None,
+        scroll_key: TreeStateKey | None = None,
     ) -> None:
         if self.current_catalog is None or self.current_virtual_kind is None:
             return
@@ -2268,6 +2338,7 @@ class MainWindow(QMainWindow):
                 preserve_selection=preserve_selection,
                 selection_keys=selection_keys or set(),
                 current_key=current_key,
+                scroll_key=scroll_key,
             )
             return
         else:
@@ -2276,6 +2347,7 @@ class MainWindow(QMainWindow):
         self.refresh_thumbnail_layout()
         if preserve_selection:
             self._restore_thumbnail_selection(selection_keys or set(), current_key)
+        self._restore_thumbnail_scroll_position(scroll_key)
         self.update_selection_status()
 
     def _thumbnail_record_key(self, record: PaneRecord) -> tuple[str, str]:
@@ -2324,6 +2396,7 @@ class MainWindow(QMainWindow):
         preserve_selection: bool,
         selection_keys: set[tuple[str, str]],
         current_key: tuple[str, str] | None,
+        scroll_key: TreeStateKey | None,
     ) -> None:
         if self.current_catalog is None:
             return
@@ -2336,6 +2409,7 @@ class MainWindow(QMainWindow):
             self.refresh_thumbnail_layout()
             if preserve_selection:
                 self._restore_thumbnail_selection(selection_keys, current_key)
+            self._restore_thumbnail_scroll_position(scroll_key)
             self.update_selection_status()
             return
 
@@ -2363,14 +2437,17 @@ class MainWindow(QMainWindow):
                 started_at=monotonic(),
                 selection_keys=set(selection_keys),
                 current_key=current_key,
+                scroll_key=scroll_key,
             )
             self._virtual_view_tasks[future] = task
         elif preserve_selection:
             task.selection_keys = set(selection_keys)
             task.current_key = current_key
+            task.scroll_key = scroll_key
 
         self.model.set_images(catalog, [])
         self.refresh_thumbnail_layout()
+        self._restore_thumbnail_scroll_position(scroll_key)
         self.update_selection_status()
         self._show_virtual_view_status(task)
 
@@ -2478,6 +2555,7 @@ class MainWindow(QMainWindow):
             self.model.set_images(catalog, list(result.images))
             self.refresh_thumbnail_layout()
             self._restore_thumbnail_selection(task.selection_keys, task.current_key)
+            self._restore_thumbnail_scroll_position(task.scroll_key)
             self.update_selection_status()
 
     def _active_virtual_view_task(self) -> VirtualViewTask | None:
@@ -2723,37 +2801,42 @@ class MainWindow(QMainWindow):
         self.set_thumbnail_size(value)
 
     def set_thumbnail_size(self, value: int) -> None:
-        value = max(64, min(4096, int(value)))
+        value = max(MIN_THUMBNAIL_COLUMNS, min(MAX_THUMBNAIL_COLUMNS, int(value)))
         if value < self.size_slider.minimum() or value > self.size_slider.maximum():
             self.size_slider.setRange(min(self.size_slider.minimum(), value), max(self.size_slider.maximum(), value))
         if self.size_slider.value() != value:
             self.size_slider.blockSignals(True)
             self.size_slider.setValue(value)
             self.size_slider.blockSignals(False)
-        self.model.set_tile_size(value)
+        self.thumbnail_columns = value
         self.app_config.thumbnail_size = value
         self.refresh_thumbnail_layout()
 
     def refresh_thumbnail_layout(self) -> None:
-        self.model.set_device_pixel_ratio(widget_device_pixel_ratio(self.thumbnail_view))
+        device_pixel_ratio = widget_device_pixel_ratio(self.thumbnail_view)
+        self.model.set_device_pixel_ratio(device_pixel_ratio)
+        grid_size, logical_tile_size = self.thumbnail_grid_size_for_width(
+            self.thumbnail_view.viewport().width(),
+        )
+        physical_tile_size = max(1, int(round(logical_tile_size * device_pixel_ratio)))
+        if self.model.tile_size != physical_tile_size:
+            self.model.set_tile_size(physical_tile_size)
         logical_tile_size = self.model.logical_tile_size()
         self.thumbnail_view.setIconSize(QSize(logical_tile_size, logical_tile_size))
-        self.thumbnail_view.setGridSize(
-            self.thumbnail_grid_size_for_width(self.thumbnail_view.viewport().width())
-        )
+        self.thumbnail_view.setGridSize(grid_size)
 
-    def thumbnail_grid_size_for_width(self, available_width: int) -> QSize:
-        card_size = self.model.card_size(self.thumbnail_view.font())
-        card_width = max(1, card_size.width())
+    def thumbnail_grid_size_for_width(self, available_width: int) -> tuple[QSize, int]:
+        columns = max(MIN_THUMBNAIL_COLUMNS, min(MAX_THUMBNAIL_COLUMNS, self.thumbnail_columns))
         available_width = max(1, int(available_width))
-        columns = max(1, available_width // card_width)
-        grid_width = max(card_width, available_width // columns)
-        return QSize(grid_width, card_size.height())
+        grid_width = max(1, available_width // columns)
+        font_metrics = QFontMetrics(self.thumbnail_view.font())
+        inset = 2 * self.model.CARD_PADDING
+        logical_tile_size = max(24, grid_width - inset)
+        grid_height = logical_tile_size + font_metrics.height() + self.model.LABEL_GAP + inset
+        return QSize(grid_width, grid_height), logical_tile_size
 
     def set_thumbnail_size_to_native(self) -> None:
-        if self.current_catalog is None:
-            return
-        self.set_thumbnail_size(self.current_catalog.settings.thumbnail_native_size)
+        self.set_thumbnail_size(DEFAULT_THUMBNAIL_COLUMNS)
 
     def _sort_changed(self) -> None:
         self.set_sort_order(SortOrder(self.sort_combo.currentData()))
@@ -3500,9 +3583,11 @@ class AppPreferencesDialog(QDialog):
         self.window_maximized.setChecked(config.window.maximized)
 
         self.thumbnail_size = QSpinBox()
-        self.thumbnail_size.setRange(64, 4096)
-        self.thumbnail_size.setSingleStep(16)
-        self.thumbnail_size.setValue(config.thumbnail_size)
+        self.thumbnail_size.setRange(MIN_THUMBNAIL_COLUMNS, MAX_THUMBNAIL_COLUMNS)
+        self.thumbnail_size.setSingleStep(1)
+        self.thumbnail_size.setValue(
+            max(MIN_THUMBNAIL_COLUMNS, min(MAX_THUMBNAIL_COLUMNS, int(config.thumbnail_size)))
+        )
 
         self.sort_order = QComboBox()
         for sort_order in SortOrder:
@@ -3523,7 +3608,7 @@ class AppPreferencesDialog(QDialog):
         form.addRow("Window width", self.window_width)
         form.addRow("Window height", self.window_height)
         form.addRow("Window maximized", self.window_maximized)
-        form.addRow("Thumbnail display size", self.thumbnail_size)
+        form.addRow("Thumbnails per row", self.thumbnail_size)
         form.addRow("Sort order", self.sort_order)
         form.addRow("Delete behavior", self.delete_behavior)
         layout.addLayout(form)
@@ -4086,6 +4171,29 @@ class CloneBrushOverlay(QWidget):
         painter.drawEllipse(self.center, self.radius, self.radius)
 
 
+class CircularSelectionOverlay(QWidget):
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent)
+        self.selection_rect = QRect()
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.hide()
+
+    def update_selection(self, rect: QRect | None) -> None:
+        self.selection_rect = QRect() if rect is None else QRect(rect)
+        self.setVisible(rect is not None and not self.selection_rect.isNull())
+        self.update()
+
+    def paintEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        if self.selection_rect.isNull():
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QPen(QColor("#38bdf8"), 2))
+        painter.setBrush(QColor(56, 189, 248, 48))
+        painter.drawEllipse(self.selection_rect)
+
+
 class ImageDisplayLabel(QLabel):
     def __init__(self) -> None:
         super().__init__()
@@ -4182,6 +4290,7 @@ class FullscreenViewer(QDialog):
         self.info_overlay.hide()
         self.rubber_band = QRubberBand(QRubberBand.Shape.Rectangle, self.label)
         self.clone_overlay = CloneBrushOverlay(self.label)
+        self.red_eye_overlay = CircularSelectionOverlay(self.label)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self.label, 1)
@@ -4245,18 +4354,27 @@ class FullscreenViewer(QDialog):
         if watched == self.label and self.edit_mode is not None:
             if event.type() == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:  # type: ignore[attr-defined]
                 self.drag_origin = event.position().toPoint()  # type: ignore[attr-defined]
-                self.rubber_band.setGeometry(QRect(self.drag_origin, QSize()))
-                self.rubber_band.show()
+                if self.edit_mode == "red_eye":
+                    self.red_eye_overlay.setGeometry(self.label.rect())
+                    self.red_eye_overlay.update_selection(QRect(self.drag_origin, QSize(1, 1)))
+                else:
+                    self.rubber_band.setGeometry(QRect(self.drag_origin, QSize()))
+                    self.rubber_band.show()
                 return True
             if event.type() == QEvent.Type.MouseMove and self.drag_origin is not None:
                 current = event.position().toPoint()  # type: ignore[attr-defined]
-                self.rubber_band.setGeometry(QRect(self.drag_origin, current).normalized())
+                rect = self.region_selection_rect(self.drag_origin, current)
+                if self.edit_mode == "red_eye":
+                    self.red_eye_overlay.update_selection(rect)
+                else:
+                    self.rubber_band.setGeometry(rect)
                 return True
             if event.type() == QEvent.Type.MouseButtonRelease and self.drag_origin is not None:
                 current = event.position().toPoint()  # type: ignore[attr-defined]
-                rect = QRect(self.drag_origin, current).normalized()
+                rect = self.region_selection_rect(self.drag_origin, current)
                 self.drag_origin = None
                 self.rubber_band.hide()
+                self.red_eye_overlay.update_selection(None)
                 self.complete_region_drag(rect)
                 return True
         if watched == self.label and self.edit_mode is None and self.is_zoomed():
@@ -4344,6 +4462,8 @@ class FullscreenViewer(QDialog):
         super().resizeEvent(event)
         if hasattr(self, "clone_overlay"):
             self.clone_overlay.setGeometry(self.label.rect())
+        if hasattr(self, "red_eye_overlay"):
+            self.red_eye_overlay.setGeometry(self.label.rect())
         if hasattr(self, "pan_offset"):
             self.pan_offset = self.clamped_pan_offset(self.pan_offset)
         self._fit_pixmap()
@@ -4588,9 +4708,14 @@ class FullscreenViewer(QDialog):
         if mode == "clone_heal":
             self.clone_overlay.setGeometry(self.label.rect())
             self.clone_overlay.update_brush(None, self.clone_brush_radius_label, False)
+            self.red_eye_overlay.update_selection(None)
             self.label.setCursor(Qt.CursorShape.BlankCursor)
         else:
             self.clone_overlay.update_brush(None, self.clone_brush_radius_label, False)
+            if mode == "red_eye":
+                self.red_eye_overlay.setGeometry(self.label.rect())
+            else:
+                self.red_eye_overlay.update_selection(None)
             self.label.setCursor(Qt.CursorShape.CrossCursor)
 
     def exit_region_edit(self) -> None:
@@ -4604,8 +4729,21 @@ class FullscreenViewer(QDialog):
             self.rubber_band.hide()
         if hasattr(self, "clone_overlay"):
             self.clone_overlay.update_brush(None, self.clone_brush_radius_label, False)
+        if hasattr(self, "red_eye_overlay"):
+            self.red_eye_overlay.update_selection(None)
         if hasattr(self, "label"):
             self.label.unsetCursor()
+
+    def region_selection_rect(self, origin: QPoint, current: QPoint) -> QRect:
+        if self.edit_mode != "red_eye":
+            return QRect(origin, current).normalized()
+        dx = current.x() - origin.x()
+        dy = current.y() - origin.y()
+        side = max(abs(dx), abs(dy), 1)
+        x_direction = -1 if dx < 0 else 1
+        y_direction = -1 if dy < 0 else 1
+        corner = QPoint(origin.x() + x_direction * side, origin.y() + y_direction * side)
+        return QRect(origin, corner).normalized()
 
     def complete_region_drag(self, rect: QRect) -> None:
         box = self.image_box_from_label_rect(rect)
@@ -4625,7 +4763,7 @@ class FullscreenViewer(QDialog):
             self.operations.append(
                 EditOperation(
                     "red_eye",
-                    {"left": box[0], "top": box[1], "right": box[2], "bottom": box[3]},
+                    {"left": box[0], "top": box[1], "right": box[2], "bottom": box[3], "ellipse": True},
                 )
             )
             self.render_preview()

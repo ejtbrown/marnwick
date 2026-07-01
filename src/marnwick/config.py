@@ -9,6 +9,9 @@ from typing import Any
 NORMAL_DELETE = "normal_delete"
 WIPE_ON_DELETE = "wipe_on_delete"
 DELETE_BEHAVIORS = {NORMAL_DELETE, WIPE_ON_DELETE}
+DEFAULT_THUMBNAIL_COLUMNS = 5
+MIN_THUMBNAIL_COLUMNS = 1
+MAX_THUMBNAIL_COLUMNS = 20
 
 
 @dataclass(slots=True)
@@ -24,7 +27,7 @@ class WindowConfig:
 class AppConfig:
     window: WindowConfig = field(default_factory=WindowConfig)
     catalogs: list[str] = field(default_factory=list)
-    thumbnail_size: int = 160
+    thumbnail_size: int = DEFAULT_THUMBNAIL_COLUMNS
     delete_behavior: str = NORMAL_DELETE
     sort_order: str = "name"
 
@@ -59,7 +62,7 @@ def load_config(path: Path | None = None) -> AppConfig:
             maximized=bool(window_raw.get("maximized", False)),
         ),
         catalogs=catalogs,
-        thumbnail_size=max(64, _int_or_default(raw.get("thumbnail_size"), 160)),
+        thumbnail_size=_thumbnail_columns_or_default(raw.get("thumbnail_size")),
         delete_behavior=_delete_behavior_or_default(raw.get("delete_behavior")),
         sort_order=str(raw.get("sort_order", "name")),
     )
@@ -108,3 +111,14 @@ def _delete_behavior_or_default(value: object) -> str:
     if isinstance(value, str) and value in DELETE_BEHAVIORS:
         return value
     return NORMAL_DELETE
+
+
+def _thumbnail_columns_or_default(value: object) -> int:
+    integer = _int_or_default(value, DEFAULT_THUMBNAIL_COLUMNS)
+    if MIN_THUMBNAIL_COLUMNS <= integer <= MAX_THUMBNAIL_COLUMNS:
+        return integer
+    if integer >= 64:
+        # Older configs stored a target thumbnail pixel size. Convert common
+        # values into an approximate column count for the default right pane.
+        return max(MIN_THUMBNAIL_COLUMNS, min(MAX_THUMBNAIL_COLUMNS, round(960 / integer)))
+    return DEFAULT_THUMBNAIL_COLUMNS
