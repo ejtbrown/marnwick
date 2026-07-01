@@ -70,6 +70,20 @@ def test_red_eye_operation_can_be_limited_to_selected_box() -> None:
     assert edited.getpixel((4, 4)) == (255, 10, 10)
 
 
+def test_red_eye_operation_can_apply_selected_box_as_ellipse() -> None:
+    image = Image.new("RGB", (5, 5), (30, 30, 30))
+    image.putpixel((0, 0), (255, 10, 10))
+    image.putpixel((2, 2), (255, 10, 10))
+
+    edited = apply_operation_to_image(
+        image,
+        EditOperation("red_eye", {"left": 0, "top": 0, "right": 5, "bottom": 5, "ellipse": True}),
+    )
+
+    assert edited.getpixel((2, 2))[0] < 255
+    assert edited.getpixel((0, 0)) == (255, 10, 10)
+
+
 def test_clone_heal_brush_uses_soft_circular_mask() -> None:
     image = Image.new("RGB", (60, 30), (0, 0, 0))
     for x in range(20):

@@ -13,15 +13,15 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("MARNWICK_DISABLE_CONFIG", "1")
 
 from PySide6.QtCore import QEvent, QItemSelectionModel, QModelIndex, QPoint, QPointF, QRect, Qt  # noqa: E402
-from PySide6.QtGui import QFontMetrics, QKeyEvent, QMouseEvent, QPixmap  # noqa: E402
-from PySide6.QtWidgets import QAbstractItemView, QApplication, QDialog, QMenu, QStyleOptionViewItem  # noqa: E402
+from PySide6.QtGui import QColor, QFontMetrics, QKeyEvent, QMouseEvent, QPainter, QPixmap  # noqa: E402
+from PySide6.QtWidgets import QAbstractItemView, QApplication, QDialog, QMenu, QStyle, QStyleOptionViewItem  # noqa: E402
 
 from marnwick.catalog import DuplicateMatchGroups, SIMILARITY_FEATURE_VERSION, TRASH_DIR_NAME, Catalog  # noqa: E402
 from marnwick.config import NORMAL_DELETE, WIPE_ON_DELETE, AppConfig, WindowConfig, load_config, save_config  # noqa: E402
 from marnwick.debug import DebugCommandServer  # noqa: E402
 from marnwick.image_ops import EditOperation  # noqa: E402
 from marnwick.indexer import IndexProgressSnapshot, IndexTask, IndexTaskCancelled  # noqa: E402
-from marnwick.models import CatalogSettings, DirectoryRecord, ImageRecord, SortOrder  # noqa: E402
+from marnwick.models import DirectoryRecord, ImageRecord, SortOrder  # noqa: E402
 from marnwick.navigation import ImageNavigator  # noqa: E402
 from marnwick.ui import (  # noqa: E402
     AppPreferencesDialog,
@@ -405,6 +405,28 @@ def test_clone_brush_ctrl_left_click_does_not_set_source(tmp_path: Path) -> None
             qt_app.processEvents()
 
 
+def test_red_eye_selection_rect_keeps_square_aspect_ratio(tmp_path: Path) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    Image.new("RGB", (100, 100), (10, 20, 30)).save(root / "image.jpg")
+
+    with Catalog(root) as catalog:
+        viewer = FullscreenViewer(catalog, ImageNavigator.sequential(["image.jpg"], "image.jpg"))
+        try:
+            viewer.start_region_edit("red_eye")
+
+            rect = viewer.region_selection_rect(QPoint(10, 10), QPoint(40, 20))
+
+            assert rect.width() == rect.height()
+            assert rect.topLeft() == QPoint(10, 10)
+        finally:
+            viewer.operations.clear()
+            viewer.close()
+            viewer.deleteLater()
+            qt_app.processEvents()
+
+
 def test_fullscreen_display_targets_physical_pixels_on_scaled_displays(tmp_path: Path, monkeypatch) -> None:
     qt_app = app()
     root = tmp_path / "catalog"
@@ -725,14 +747,45 @@ def test_thumbnail_grid_distributes_extra_horizontal_space() -> None:
     qt_app = app()
     window = MainWindow()
     try:
-        card = window.model.card_size(window.thumbnail_view.font())
-        available_width = card.width() * 4 + 97
+        window.set_thumbnail_size(4)
+        available_width = 897
 
-        grid = window.thumbnail_grid_size_for_width(available_width)
+        grid, logical_tile_size = window.thumbnail_grid_size_for_width(available_width)
 
         assert grid.width() == available_width // 4
-        assert grid.width() > card.width()
-        assert grid.height() == card.height()
+        assert logical_tile_size == grid.width() - (2 * window.model.CARD_PADDING)
+        assert grid.height() == (
+            logical_tile_size
+            + QFontMetrics(window.thumbnail_view.font()).height()
+            + window.model.LABEL_GAP
+            + (2 * window.model.CARD_PADDING)
+        )
+    finally:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        window.indexer.shutdown()
+        window.workspace.close()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_thumbnail_view_resize_recomputes_tile_size() -> None:
+    qt_app = app()
+    window = MainWindow()
+    try:
+        window.set_thumbnail_size(4)
+        window.resize(520, 260)
+        window.show()
+        qt_app.processEvents()
+        window.refresh_thumbnail_layout()
+        first_tile_size = window.model.tile_size
+
+        window.resize(1000, 260)
+        qt_app.processEvents()
+
+        assert window.model.tile_size > first_tile_size
+        assert window.thumbnail_view.gridSize().width() == window.thumbnail_view.viewport().width() // 4
     finally:
         window.progress_timer.stop()
         window.idle_timer.stop()
@@ -776,6 +829,44 @@ def test_thumbnail_delegate_centers_card_inside_distributed_grid_cell(tmp_path: 
     assert rect.width() == card.width()
     assert rect.height() == card.height()
     assert rect.left() == 40
+
+
+def test_thumbnail_delegate_paints_selected_grid_square_vivid_blue(tmp_path: Path) -> None:
+    app()
+    model = ThumbnailModel()
+    model.set_images(
+        None,
+        [
+            ImageRecord(
+                id=1,
+                catalog_root=tmp_path,
+                rel_path="image.jpg",
+                dir_rel="",
+                filename="image.jpg",
+                size_bytes=10,
+                mtime_ns=0,
+                width=8,
+                height=8,
+                aspect_ratio=1.0,
+                thumb_width=8,
+                thumb_height=8,
+            )
+        ],
+    )
+    option = QStyleOptionViewItem()
+    option.font = QApplication.font()
+    option.state = QStyle.StateFlag.State_Selected
+    card = model.card_size(option.font)
+    option.rect = QRect(0, 0, card.width() + 80, card.height())
+    pixmap = QPixmap(option.rect.size())
+    pixmap.fill(QColor("#ffffff"))
+    painter = QPainter(pixmap)
+    try:
+        ThumbnailDelegate().paint(painter, option, model.index(0, 0))
+    finally:
+        painter.end()
+
+    assert pixmap.toImage().pixelColor(1, 1) == QColor("#0067ff")
 
 
 def test_thumbnail_model_tooltip_describes_image(tmp_path: Path) -> None:
@@ -890,6 +981,62 @@ def test_thumbnail_selection_survives_same_directory_reload(tmp_path: Path) -> N
 
         assert window.selected_rel_paths() == ["one.jpg", "three.jpg"]
         assert window.thumbnail_view.currentIndex().row() == 1
+    finally:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        window.indexer.shutdown()
+        window.workspace.close()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_thumbnail_scroll_position_is_remembered_per_directory(tmp_path: Path) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    first = root / "first"
+    second = root / "second"
+    first.mkdir(parents=True)
+    second.mkdir()
+    for index in range(80):
+        Image.new("RGB", (8, 8), (index % 255, 20, 30)).save(first / f"image-{index:02d}.jpg")
+
+    window = MainWindow()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        catalog.refresh()
+        window.current_catalog = catalog
+        window.current_dir_rel = "first"
+        window.set_thumbnail_size(2)
+        window.resize(520, 260)
+        window.show()
+        window.load_current_directory()
+
+        scroll_bar = window.thumbnail_view.verticalScrollBar()
+        deadline = monotonic() + 1.0
+        while scroll_bar.maximum() == 0 and monotonic() < deadline:
+            qt_app.processEvents()
+            sleep(0.01)
+        assert scroll_bar.maximum() > 0
+
+        scroll_bar.setValue(scroll_bar.maximum())
+        saved_position = scroll_bar.value()
+        window.current_dir_rel = "second"
+        window.load_current_directory()
+        qt_app.processEvents()
+
+        assert scroll_bar.value() == 0
+
+        window.current_dir_rel = "first"
+        window.load_current_directory()
+        deadline = monotonic() + 1.0
+        while scroll_bar.value() != saved_position and monotonic() < deadline:
+            qt_app.processEvents()
+            sleep(0.01)
+
+        assert scroll_bar.value() == saved_position
     finally:
         window.progress_timer.stop()
         window.idle_timer.stop()
@@ -1165,7 +1312,7 @@ def test_config_file_round_trips_window_and_catalogs(tmp_path: Path) -> None:
         AppConfig(
             window=WindowConfig(x=11, y=22, width=640, height=480, maximized=True),
             catalogs=["/photos/one", "/photos/two"],
-            thumbnail_size=224,
+            thumbnail_size=7,
             delete_behavior=WIPE_ON_DELETE,
             sort_order=SortOrder.DATE_DESC.value,
         ),
@@ -1180,7 +1327,7 @@ def test_config_file_round_trips_window_and_catalogs(tmp_path: Path) -> None:
     assert loaded.window.height == 480
     assert loaded.window.maximized is True
     assert loaded.catalogs == ["/photos/one", "/photos/two"]
-    assert loaded.thumbnail_size == 224
+    assert loaded.thumbnail_size == 7
     assert loaded.delete_behavior == WIPE_ON_DELETE
     assert loaded.sort_order == SortOrder.DATE_DESC.value
 
@@ -1194,7 +1341,7 @@ def test_main_window_restores_and_persists_config_catalogs(tmp_path: Path) -> No
         AppConfig(
             window=WindowConfig(x=10, y=20, width=640, height=480, maximized=False),
             catalogs=[str(catalog_root)],
-            thumbnail_size=224,
+            thumbnail_size=6,
             delete_behavior=WIPE_ON_DELETE,
             sort_order=SortOrder.SIZE_DESC.value,
         ),
@@ -1208,15 +1355,15 @@ def test_main_window_restores_and_persists_config_catalogs(tmp_path: Path) -> No
         assert [catalog.root for catalog in window.workspace.catalogs] == [catalog_root.resolve()]
         assert window.size().width() == 640
         assert window.size().height() == 480
-        assert window.model.tile_size == 224
-        assert window.size_slider.value() == 224
+        assert window.thumbnail_columns == 6
+        assert window.size_slider.value() == 6
         assert window.app_config.delete_behavior == WIPE_ON_DELETE
         assert window.current_sort == SortOrder.SIZE_DESC
         assert window.sort_combo.currentData() == SortOrder.SIZE_DESC.value
 
         window.resize(800, 600)
         window.move(30, 40)
-        window.set_thumbnail_size(192)
+        window.set_thumbnail_size(8)
         window.set_sort_order(SortOrder.ASPECT_ASC)
         window.save_window_config()
 
@@ -1226,7 +1373,7 @@ def test_main_window_restores_and_persists_config_catalogs(tmp_path: Path) -> No
         assert saved.window.height == 600
         assert saved.window.maximized is False
         assert saved.catalogs == [str(catalog_root.resolve())]
-        assert saved.thumbnail_size == 192
+        assert saved.thumbnail_size == 8
         assert saved.delete_behavior == WIPE_ON_DELETE
         assert saved.sort_order == SortOrder.ASPECT_ASC.value
     finally:
@@ -1243,20 +1390,20 @@ def test_app_preferences_dialog_exposes_config_settings(tmp_path: Path) -> None:
         AppConfig(
             window=WindowConfig(x=1, y=2, width=700, height=500, maximized=False),
             catalogs=[str(tmp_path / "one")],
-            thumbnail_size=256,
+            thumbnail_size=5,
             delete_behavior=NORMAL_DELETE,
             sort_order=SortOrder.NAME_ASC.value,
         )
     )
     try:
-        dialog.thumbnail_size.setValue(320)
+        dialog.thumbnail_size.setValue(9)
         dialog.sort_order.setCurrentIndex(dialog.sort_order.findData(SortOrder.DATE_ASC.value))
         dialog.delete_behavior.setCurrentIndex(dialog.delete_behavior.findData(WIPE_ON_DELETE))
         dialog.catalog_list.addItem(str(tmp_path / "two"))
 
         selected = dialog.selected_config()
 
-        assert selected.thumbnail_size == 320
+        assert selected.thumbnail_size == 9
         assert selected.delete_behavior == WIPE_ON_DELETE
         assert selected.sort_order == SortOrder.DATE_ASC.value
         assert selected.catalogs == [str(tmp_path / "one"), str(tmp_path / "two")]
@@ -1266,22 +1413,21 @@ def test_app_preferences_dialog_exposes_config_settings(tmp_path: Path) -> None:
         qt_app.processEvents()
 
 
-def test_thumbnail_size_button_uses_current_catalog_native_size(tmp_path: Path) -> None:
+def test_thumbnail_size_button_resets_to_default_columns(tmp_path: Path) -> None:
     qt_app = app()
     root = tmp_path / "catalog"
     root.mkdir()
     window = MainWindow()
     try:
         catalog = window.workspace.open_catalog(root)
-        catalog.set_settings(CatalogSettings(thumbnail_native_size=384))
         window.current_catalog = catalog
-        window.set_thumbnail_size(128)
+        window.set_thumbnail_size(9)
 
         window.native_thumbnail_button.click()
 
-        assert window.model.tile_size == 384
-        assert window.size_slider.value() == 384
-        assert window.current_app_config().thumbnail_size == 384
+        assert window.thumbnail_columns == 5
+        assert window.size_slider.value() == 5
+        assert window.current_app_config().thumbnail_size == 5
     finally:
         window.progress_timer.stop()
         window.idle_timer.stop()

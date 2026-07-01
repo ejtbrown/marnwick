@@ -53,13 +53,15 @@ def apply_operation_to_image(image: Image.Image, operation: EditOperation) -> Im
     if operation.name == "red_eye":
         box = _optional_box(params)
         if box is not None:
+            source_region = image.crop(box)
             region = reduce_red_eye(
-                image.crop(box),
+                source_region,
                 red_threshold=int(params.get("red_threshold", 150)),
                 dominance=float(params.get("dominance", 1.45)),
             )
             result = image.copy()
-            result.paste(region, box[:2])
+            mask = _ellipse_mask(region.size) if params.get("ellipse") else None
+            result.paste(region, box[:2], mask)
             return result
         return reduce_red_eye(
             image,
@@ -278,6 +280,15 @@ def _optional_box(params: dict[str, Any]) -> tuple[int, int, int, int] | None:
         int(params["right"]),
         int(params["bottom"]),
     )
+
+
+@lru_cache(maxsize=64)
+def _ellipse_mask(size: tuple[int, int]) -> Image.Image:
+    width, height = max(1, int(size[0])), max(1, int(size[1]))
+    mask = Image.new("L", (width, height), 0)
+    draw = ImageDraw.Draw(mask)
+    draw.ellipse((0, 0, width - 1, height - 1), fill=255)
+    return mask
 
 
 def clone_heal(image: Image.Image, source_box: tuple[int, int, int, int], target_xy: tuple[int, int]) -> Image.Image:
