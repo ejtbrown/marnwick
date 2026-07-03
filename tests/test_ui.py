@@ -232,6 +232,44 @@ def test_fullscreen_viewer_plays_displayed_gif(tmp_path: Path) -> None:
             qt_app.processEvents()
 
 
+def test_fullscreen_viewer_hides_cursor_except_for_edit_and_dialogs(tmp_path: Path) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    Image.new("RGB", (16, 12), (10, 20, 30)).save(root / "image.jpg")
+
+    with Catalog(root) as catalog:
+        catalog.refresh()
+        viewer = FullscreenViewer(catalog, ImageNavigator.sequential(["image.jpg"], "image.jpg"))
+        try:
+            assert viewer.cursor().shape() == Qt.CursorShape.BlankCursor
+            assert viewer.label.cursor().shape() == Qt.CursorShape.BlankCursor
+
+            seen_cursor_shapes: list[tuple[Qt.CursorShape, Qt.CursorShape]] = []
+
+            def record_visible_cursor() -> str:
+                seen_cursor_shapes.append((viewer.cursor().shape(), viewer.label.cursor().shape()))
+                return "ok"
+
+            assert viewer.run_with_visible_cursor(record_visible_cursor) == "ok"
+            assert seen_cursor_shapes == [(Qt.CursorShape.ArrowCursor, Qt.CursorShape.ArrowCursor)]
+            assert viewer.label.cursor().shape() == Qt.CursorShape.BlankCursor
+
+            viewer.start_region_edit("crop")
+
+            assert viewer.cursor().shape() == Qt.CursorShape.ArrowCursor
+            assert viewer.label.cursor().shape() == Qt.CursorShape.CrossCursor
+
+            viewer.exit_region_edit()
+
+            assert viewer.label.cursor().shape() == Qt.CursorShape.BlankCursor
+        finally:
+            viewer.restore_cursor_visibility()
+            viewer.close()
+            viewer.deleteLater()
+            qt_app.processEvents()
+
+
 def test_fullscreen_navigation_exits_at_list_edges(tmp_path: Path) -> None:
     qt_app = app()
     root = tmp_path / "catalog"
@@ -770,6 +808,56 @@ def test_thumbnail_grid_distributes_extra_horizontal_space() -> None:
         qt_app.processEvents()
 
 
+def test_thumbnail_layout_reserves_scrollbar_width_for_multirow_views(tmp_path: Path) -> None:
+    qt_app = app()
+    window = MainWindow()
+    try:
+        window.set_thumbnail_size(4)
+        records = [
+            ImageRecord(
+                id=index,
+                catalog_root=tmp_path,
+                rel_path=f"image-{index}.jpg",
+                dir_rel="",
+                filename=f"image-{index}.jpg",
+                size_bytes=10,
+                mtime_ns=0,
+                width=8,
+                height=8,
+                aspect_ratio=1.0,
+                thumb_width=8,
+                thumb_height=8,
+            )
+            for index in range(8)
+        ]
+        window.model.set_images(None, records)
+        window.thumbnail_view.resize(897, 240)
+        qt_app.processEvents()
+
+        reserved_width = window.stable_thumbnail_layout_width()
+        viewport_width = window.thumbnail_view.viewport().width()
+        scrollbar_width = window.thumbnail_view.verticalScrollBar().sizeHint().width()
+        expected = (
+            viewport_width
+            if window.thumbnail_view.verticalScrollBar().isVisible()
+            else max(1, viewport_width - scrollbar_width)
+        )
+
+        assert reserved_width == expected
+        if not window.thumbnail_view.verticalScrollBar().isVisible():
+            assert reserved_width < viewport_width
+        grid, _ = window.thumbnail_grid_size_for_width(reserved_width)
+        assert grid.width() * 4 <= reserved_width
+    finally:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        window.indexer.shutdown()
+        window.workspace.close()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
 def test_thumbnail_view_resize_recomputes_tile_size() -> None:
     qt_app = app()
     window = MainWindow()
@@ -1161,6 +1249,111 @@ def test_thumbnail_view_manual_drag_uses_static_cursor(tmp_path: Path) -> None:
     finally:
         window.thumbnail_view.cleanup_manual_drag()
         assert QApplication.overrideCursor() is None
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        window.indexer.shutdown()
+        window.workspace.close()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_thumbnail_view_manual_drag_cleans_cursor_when_button_state_is_lost(tmp_path: Path) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    Image.new("RGB", (8, 8), (10, 20, 30)).save(root / "image.jpg")
+
+    window = MainWindow()
+    try:
+        catalog = window.workspace.open_catalog(root)
+        catalog.refresh()
+        window.current_catalog = catalog
+        window.current_dir_rel = ""
+        window.load_current_directory()
+        index = window.model.index(0, 0)
+
+        assert window.thumbnail_view.begin_manual_drag([index], QPoint(100, 100))
+        assert QApplication.overrideCursor() is not None
+
+        event = QMouseEvent(
+            QEvent.Type.MouseMove,
+            QPointF(12, 12),
+            QPointF(12, 12),
+            Qt.MouseButton.NoButton,
+            Qt.MouseButton.NoButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        window.thumbnail_view.mouseMoveEvent(event)
+
+        assert not window.thumbnail_view._manual_drag_active
+        assert QApplication.overrideCursor() is None
+    finally:
+        window.thumbnail_view.cleanup_manual_drag()
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        window.indexer.shutdown()
+        window.workspace.close()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_thumbnail_keyboard_open_uses_first_image_when_selection_is_empty(tmp_path: Path) -> None:
+    qt_app = app()
+    window = MainWindow()
+    try:
+        window.model.set_images(
+            None,
+            [
+                DirectoryRecord(catalog_root=tmp_path, dir_rel="folder", name="folder"),
+                ImageRecord(
+                    id=1,
+                    catalog_root=tmp_path,
+                    rel_path="first.jpg",
+                    dir_rel="",
+                    filename="first.jpg",
+                    size_bytes=10,
+                    mtime_ns=0,
+                    width=8,
+                    height=8,
+                    aspect_ratio=1.0,
+                    thumb_width=8,
+                    thumb_height=8,
+                ),
+                ImageRecord(
+                    id=2,
+                    catalog_root=tmp_path,
+                    rel_path="second.jpg",
+                    dir_rel="",
+                    filename="second.jpg",
+                    size_bytes=10,
+                    mtime_ns=0,
+                    width=8,
+                    height=8,
+                    aspect_ratio=1.0,
+                    thumb_width=8,
+                    thumb_height=8,
+                ),
+            ],
+        )
+        selection = window.thumbnail_view.selectionModel()
+        selection.clearSelection()
+        selection.setCurrentIndex(window.model.index(0, 0), QItemSelectionModel.SelectionFlag.NoUpdate)
+        calls: list[tuple[int, bool]] = []
+
+        def record_open(index: QModelIndex, *, random_mode: bool) -> None:
+            calls.append((index.row(), random_mode))
+
+        window.open_viewer = record_open  # type: ignore[method-assign]
+
+        enter_event = QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Return, Qt.KeyboardModifier.NoModifier, "\r")
+        s_event = QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_S, Qt.KeyboardModifier.NoModifier, "s")
+
+        assert window.eventFilter(window.thumbnail_view, enter_event)
+        assert window.eventFilter(window.thumbnail_view, s_event)
+        assert calls == [(1, False), (1, True)]
+    finally:
         window.progress_timer.stop()
         window.idle_timer.stop()
         window.indexer.shutdown()
