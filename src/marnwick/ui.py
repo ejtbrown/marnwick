@@ -571,6 +571,15 @@ class ThumbnailView(QListView):
         if self.main_window is not None and hasattr(self.main_window, "refresh_thumbnail_layout"):
             self.main_window.refresh_thumbnail_layout()
 
+    def event(self, event: QEvent) -> bool:
+        if self._manual_drag_active and event.type() in {
+            QEvent.Type.FocusOut,
+            QEvent.Type.Hide,
+            QEvent.Type.WindowDeactivate,
+        }:
+            self.cleanup_manual_drag()
+        return super().event(event)
+
     def mousePressEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         if event.button() == Qt.MouseButton.LeftButton:
             self._drag_start_pos = event.position().toPoint()
@@ -578,6 +587,10 @@ class ThumbnailView(QListView):
 
     def mouseMoveEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         if self._manual_drag_active:
+            if not (event.buttons() & Qt.MouseButton.LeftButton):
+                self.cleanup_manual_drag()
+                event.accept()
+                return
             self.update_manual_drag(event.globalPosition().toPoint())
             event.accept()
             return
@@ -601,6 +614,13 @@ class ThumbnailView(QListView):
             return
         self._drag_start_pos = None
         super().mouseReleaseEvent(event)
+
+    def keyPressEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        if self._manual_drag_active and event.key() == Qt.Key.Key_Escape:
+            self.cleanup_manual_drag()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def startDrag(self, supported_actions: Qt.DropAction) -> None:
         selection = self.selectionModel()
@@ -643,6 +663,8 @@ class ThumbnailView(QListView):
         return [current] if current.isValid() else []
 
     def begin_manual_drag(self, indexes: list[QModelIndex], global_pos: QPoint) -> bool:
+        if self._manual_drag_active:
+            self.cleanup_manual_drag()
         model = self.model()
         if not isinstance(model, ThumbnailModel) or model.catalog is None:
             return False
@@ -652,10 +674,15 @@ class ThumbnailView(QListView):
         self._drag_indexes = valid_indexes
         drag_pixmap = self.drag_pixmap_for_indexes(valid_indexes)
         hotspot = QPoint(int(drag_pixmap.width() / 2), int(drag_pixmap.height() / 2))
-        QApplication.setOverrideCursor(QCursor(drag_pixmap, hotspot.x(), hotspot.y()))
         self._manual_drag_active = True
         self._drag_cursor_active = True
-        self.update_manual_drag(global_pos)
+        try:
+            QApplication.setOverrideCursor(QCursor(drag_pixmap, hotspot.x(), hotspot.y()))
+            self.grabMouse()
+            self.update_manual_drag(global_pos)
+        except Exception:
+            self.cleanup_manual_drag()
+            raise
         return True
 
     def update_manual_drag(self, global_pos: QPoint) -> None:
@@ -665,16 +692,18 @@ class ThumbnailView(QListView):
             self.main_window.tree.set_drag_hover_item(item)
 
     def finish_manual_drag(self, global_pos: QPoint) -> None:
-        self.update_manual_drag(global_pos)
         move_request: tuple["MainWindow", list[dict[str, str]], Path, str] | None = None
-        if self.main_window is not None and self._drag_indexes and self._drag_destination_item is not None:
-            item = self._drag_destination_item
-            root = Path(item.data(0, CATALOG_ROOT_ROLE))
-            dir_rel = item.data(0, DIR_REL_ROLE)
-            payload = self.drag_payload_for_indexes(self._drag_indexes)
-            if payload:
-                move_request = (self.main_window, payload, root, dir_rel)
-        self.cleanup_manual_drag()
+        try:
+            self.update_manual_drag(global_pos)
+            if self.main_window is not None and self._drag_indexes and self._drag_destination_item is not None:
+                item = self._drag_destination_item
+                root = Path(item.data(0, CATALOG_ROOT_ROLE))
+                dir_rel = item.data(0, DIR_REL_ROLE)
+                payload = self.drag_payload_for_indexes(self._drag_indexes)
+                if payload:
+                    move_request = (self.main_window, payload, root, dir_rel)
+        finally:
+            self.cleanup_manual_drag()
         if move_request is not None:
             window, payload, root, dir_rel = move_request
             QTimer.singleShot(0, lambda: window.move_payload_to_directory(payload, root, dir_rel))
@@ -682,8 +711,11 @@ class ThumbnailView(QListView):
     def cleanup_manual_drag(self) -> None:
         if self.main_window is not None:
             self.main_window.tree.set_drag_hover_item(None)
+        if QWidget.mouseGrabber() is self:
+            self.releaseMouse()
         if self._drag_cursor_active:
-            QApplication.restoreOverrideCursor()
+            if QApplication.overrideCursor() is not None:
+                QApplication.restoreOverrideCursor()
         self._drag_start_pos = None
         self._drag_indexes = []
         self._drag_destination_item = None
@@ -1211,10 +1243,10 @@ class MainWindow(QMainWindow):
                 self.delete_selected()
                 return True
             if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
-                self.open_viewer(self.thumbnail_view.currentIndex(), random_mode=False)
+                self.open_viewer(self.thumbnail_keyboard_activation_index(), random_mode=False)
                 return True
             if key == Qt.Key.Key_S:
-                self.open_viewer(self.thumbnail_view.currentIndex(), random_mode=True)
+                self.open_viewer(self.thumbnail_keyboard_activation_index(), random_mode=True)
                 return True
             if key == Qt.Key.Key_T:
                 self.open_tag_dialog_for_selection()
@@ -2816,14 +2848,27 @@ class MainWindow(QMainWindow):
         device_pixel_ratio = widget_device_pixel_ratio(self.thumbnail_view)
         self.model.set_device_pixel_ratio(device_pixel_ratio)
         grid_size, logical_tile_size = self.thumbnail_grid_size_for_width(
-            self.thumbnail_view.viewport().width(),
+            self.stable_thumbnail_layout_width(),
         )
         physical_tile_size = max(1, int(round(logical_tile_size * device_pixel_ratio)))
         if self.model.tile_size != physical_tile_size:
             self.model.set_tile_size(physical_tile_size)
         logical_tile_size = self.model.logical_tile_size()
-        self.thumbnail_view.setIconSize(QSize(logical_tile_size, logical_tile_size))
-        self.thumbnail_view.setGridSize(grid_size)
+        icon_size = QSize(logical_tile_size, logical_tile_size)
+        if self.thumbnail_view.iconSize() != icon_size:
+            self.thumbnail_view.setIconSize(icon_size)
+        if self.thumbnail_view.gridSize() != grid_size:
+            self.thumbnail_view.setGridSize(grid_size)
+
+    def stable_thumbnail_layout_width(self) -> int:
+        viewport_width = max(1, int(self.thumbnail_view.viewport().width()))
+        columns = max(MIN_THUMBNAIL_COLUMNS, min(MAX_THUMBNAIL_COLUMNS, self.thumbnail_columns))
+        if self.model.rowCount() <= columns:
+            return viewport_width
+        if self.thumbnail_view.verticalScrollBar().isVisible():
+            return viewport_width
+        scrollbar_width = max(0, int(self.thumbnail_view.verticalScrollBar().sizeHint().width()))
+        return max(1, viewport_width - scrollbar_width)
 
     def thumbnail_grid_size_for_width(self, available_width: int) -> tuple[QSize, int]:
         columns = max(MIN_THUMBNAIL_COLUMNS, min(MAX_THUMBNAIL_COLUMNS, self.thumbnail_columns))
@@ -2857,6 +2902,25 @@ class MainWindow(QMainWindow):
 
     def selected_rel_paths(self) -> list[str]:
         return [record.rel_path for record in self.selected_records() if isinstance(record, ImageRecord)]
+
+    def thumbnail_keyboard_activation_index(self) -> QModelIndex:
+        selection = self.thumbnail_view.selectionModel()
+        current = self.thumbnail_view.currentIndex()
+        if (
+            current.isValid()
+            and current.row() < len(self.model.images)
+            and selection is not None
+            and selection.isSelected(current)
+        ):
+            return current
+        selected_rows = sorted({index.row() for index in self.thumbnail_view.selectedIndexes()})
+        for row in selected_rows:
+            if row < len(self.model.images):
+                return self.model.index(row, 0)
+        for row, record in enumerate(self.model.images):
+            if isinstance(record, ImageRecord):
+                return self.model.index(row, 0)
+        return QModelIndex()
 
     def current_selected_row(self) -> int | None:
         current = self.thumbnail_view.currentIndex()
@@ -2987,7 +3051,11 @@ class MainWindow(QMainWindow):
                 self.load_current_directory(preserve_selection=True)
 
     def open_viewer(self, index: QModelIndex, *, random_mode: bool) -> None:
-        if self.current_catalog is None or not index.isValid() or index.row() >= len(self.model.images):
+        if self.current_catalog is None:
+            return
+        if not index.isValid() or index.row() >= len(self.model.images):
+            index = self.thumbnail_keyboard_activation_index()
+        if not index.isValid() or index.row() >= len(self.model.images):
             return
         selected_record = self.model.images[index.row()]
         if isinstance(selected_record, DirectoryRecord):
@@ -4295,6 +4363,7 @@ class FullscreenViewer(QDialog):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self.label, 1)
         self.load_current()
+        self.update_cursor_visibility()
 
     def keyPressEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         key = event.key()
@@ -4348,6 +4417,10 @@ class FullscreenViewer(QDialog):
             return
         super().keyPressEvent(event)
 
+    def showEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        super().showEvent(event)
+        self.update_cursor_visibility()
+
     def eventFilter(self, watched: object, event: QEvent) -> bool:
         if watched == self.label and self.edit_mode == "clone_heal":
             return self.handle_clone_event(event)
@@ -4389,7 +4462,7 @@ class FullscreenViewer(QDialog):
                 return False
             self.pan_drag_start = point
             self.pan_offset_at_drag_start = QPoint(self.pan_offset)
-            self.label.setCursor(Qt.CursorShape.ClosedHandCursor)
+            self.update_cursor_visibility()
             return True
         if event_type == QEvent.Type.MouseMove and self.pan_drag_start is not None:
             if not (event.buttons() & Qt.MouseButton.LeftButton):  # type: ignore[attr-defined]
@@ -4400,7 +4473,7 @@ class FullscreenViewer(QDialog):
             return True
         if event_type == QEvent.Type.MouseButtonRelease and event.button() == Qt.MouseButton.LeftButton:  # type: ignore[attr-defined]
             self.pan_drag_start = None
-            self.label.setCursor(Qt.CursorShape.OpenHandCursor if self.is_zoomed() else Qt.CursorShape.ArrowCursor)
+            self.update_cursor_visibility()
             return True
         return False
 
@@ -4473,10 +4546,16 @@ class FullscreenViewer(QDialog):
     def closeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         if not self.confirm_pending_edits():
             event.ignore()
+            self.update_cursor_visibility()
             return
+        self.restore_cursor_visibility()
         self.stop_movie()
         self.cleanup_preview()
         super().closeEvent(event)
+
+    def done(self, result: int) -> None:
+        self.restore_cursor_visibility()
+        super().done(result)
 
     @property
     def current_path(self) -> Path:
@@ -4495,7 +4574,7 @@ class FullscreenViewer(QDialog):
         if not self.confirm_pending_edits():
             return
         rel_path = self.navigator.current
-        if not ask_delete_files(self, 1):
+        if not self.run_with_visible_cursor(lambda: ask_delete_files(self, 1)):
             return
         self.catalog.delete_images([rel_path], wipe=self.wipe_on_delete)
         old_index = self.navigator.index
@@ -4629,7 +4708,7 @@ class FullscreenViewer(QDialog):
             return
         self.zoom_level = min(self.MAX_ZOOM, self.zoom_level * self.ZOOM_STEP)
         self.pan_offset = self.clamped_pan_offset(self.pan_offset)
-        self.label.setCursor(Qt.CursorShape.OpenHandCursor)
+        self.update_cursor_visibility()
         self._fit_pixmap()
 
     def zoom_out(self) -> None:
@@ -4648,8 +4727,7 @@ class FullscreenViewer(QDialog):
         self.pan_offset = QPoint(0, 0)
         self.pan_drag_start = None
         self.pan_offset_at_drag_start = QPoint(0, 0)
-        if self.edit_mode is None:
-            self.label.unsetCursor()
+        self.update_cursor_visibility()
         self._fit_pixmap()
 
     def pan_by(self, dx: int, dy: int) -> None:
@@ -4671,13 +4749,25 @@ class FullscreenViewer(QDialog):
         )
 
     def open_tags(self) -> None:
-        dialog = TagDialog(self.catalog, self.navigator.current, self)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
+        dialog: TagDialog | None = None
+
+        def exec_dialog() -> int:
+            nonlocal dialog
+            dialog = TagDialog(self.catalog, self.navigator.current, self)
+            return int(dialog.exec())
+
+        if self.run_with_visible_cursor(exec_dialog) == int(QDialog.DialogCode.Accepted) and dialog is not None:
             self.catalog.set_image_tags(self.navigator.current, dialog.selected_tags(), replace=True)
 
     def open_edit_tools(self) -> None:
-        dialog = EditCommandDialog(self)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
+        dialog: EditCommandDialog | None = None
+
+        def exec_dialog() -> int:
+            nonlocal dialog
+            dialog = EditCommandDialog(self)
+            return int(dialog.exec())
+
+        if self.run_with_visible_cursor(exec_dialog) != int(QDialog.DialogCode.Accepted) or dialog is None:
             return
         command = dialog.selected_command()
         if command in {"rotate_left", "rotate_right", "flip_horizontal", "flip_vertical"}:
@@ -4709,14 +4799,13 @@ class FullscreenViewer(QDialog):
             self.clone_overlay.setGeometry(self.label.rect())
             self.clone_overlay.update_brush(None, self.clone_brush_radius_label, False)
             self.red_eye_overlay.update_selection(None)
-            self.label.setCursor(Qt.CursorShape.BlankCursor)
         else:
             self.clone_overlay.update_brush(None, self.clone_brush_radius_label, False)
             if mode == "red_eye":
                 self.red_eye_overlay.setGeometry(self.label.rect())
             else:
                 self.red_eye_overlay.update_selection(None)
-            self.label.setCursor(Qt.CursorShape.CrossCursor)
+        self.update_cursor_visibility()
 
     def exit_region_edit(self) -> None:
         self.edit_mode = None
@@ -4732,7 +4821,29 @@ class FullscreenViewer(QDialog):
         if hasattr(self, "red_eye_overlay"):
             self.red_eye_overlay.update_selection(None)
         if hasattr(self, "label"):
+            self.update_cursor_visibility()
+
+    def update_cursor_visibility(self) -> None:
+        if not hasattr(self, "label"):
+            return
+        if self.edit_mode is None:
+            self.setCursor(Qt.CursorShape.BlankCursor)
+            self.label.setCursor(Qt.CursorShape.BlankCursor)
+            return
+        self.unsetCursor()
+        self.label.setCursor(Qt.CursorShape.CrossCursor)
+
+    def restore_cursor_visibility(self) -> None:
+        self.unsetCursor()
+        if hasattr(self, "label"):
             self.label.unsetCursor()
+
+    def run_with_visible_cursor(self, callback: Callable[[], object]) -> object:
+        self.restore_cursor_visibility()
+        try:
+            return callback()
+        finally:
+            self.update_cursor_visibility()
 
     def region_selection_rect(self, origin: QPoint, current: QPoint) -> QRect:
         if self.edit_mode != "red_eye":
@@ -4982,7 +5093,7 @@ class FullscreenViewer(QDialog):
     def confirm_pending_edits(self) -> bool:
         if not self.operations:
             return True
-        response = ask_save_edits(self)
+        response = self.run_with_visible_cursor(lambda: ask_save_edits(self))
         if response == "cancel":
             return False
         if response in {"save", "save_preserve_date"}:
