@@ -13,7 +13,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("MARNWICK_DISABLE_CONFIG", "1")
 
 from PySide6.QtCore import QEvent, QItemSelectionModel, QModelIndex, QPoint, QPointF, QRect, Qt  # noqa: E402
-from PySide6.QtGui import QColor, QFontMetrics, QKeyEvent, QMouseEvent, QPainter, QPixmap  # noqa: E402
+from PySide6.QtGui import QColor, QCursor, QFontMetrics, QKeyEvent, QMouseEvent, QPainter, QPixmap  # noqa: E402
 from PySide6.QtWidgets import QAbstractItemView, QApplication, QDialog, QMenu, QStyle, QStyleOptionViewItem  # noqa: E402
 
 from marnwick.catalog import DuplicateMatchGroups, SIMILARITY_FEATURE_VERSION, TRASH_DIR_NAME, Catalog  # noqa: E402
@@ -1288,6 +1288,74 @@ def test_thumbnail_view_manual_drag_cleans_cursor_when_button_state_is_lost(tmp_
 
         assert not window.thumbnail_view._manual_drag_active
         assert QApplication.overrideCursor() is None
+    finally:
+        window.thumbnail_view.cleanup_manual_drag()
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        window.indexer.shutdown()
+        window.workspace.close()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_thumbnail_drag_watchdog_highlights_and_drops_on_directory(tmp_path: Path, monkeypatch) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    (root / "dest").mkdir(parents=True)
+    Image.new("RGB", (8, 8), (10, 20, 30)).save(root / "image.jpg")
+
+    window = MainWindow()
+    try:
+        catalog = window.workspace.open_catalog(root)
+        catalog.refresh()
+        window.current_catalog = catalog
+        window.current_dir_rel = ""
+        window.rebuild_tree()
+        window.load_current_directory()
+        window.resize(800, 480)
+        window.show()
+        qt_app.processEvents()
+
+        root_item = window.tree.topLevelItem(0)
+        assert root_item is not None
+        root_item.setExpanded(True)
+        dest_item = next(
+            root_item.child(index)
+            for index in range(root_item.childCount())
+            if root_item.child(index).text(0) == "dest"
+        )
+        window.tree.scrollToItem(dest_item)
+        qt_app.processEvents()
+        dest_point = window.tree.viewport().mapToGlobal(window.tree.visualItemRect(dest_item).center())
+        image_row = next(row for row, record in enumerate(window.model.images) if isinstance(record, ImageRecord))
+        buttons = [Qt.MouseButton.LeftButton]
+        calls: list[tuple[list[dict[str, str]], Path, str]] = []
+
+        monkeypatch.setattr(QCursor, "pos", staticmethod(lambda: dest_point))
+        monkeypatch.setattr(QApplication, "mouseButtons", staticmethod(lambda: buttons[0]))
+
+        def record_move(payload: list[dict[str, str]], dest_root: Path, dest_dir_rel: str) -> None:
+            calls.append((payload, dest_root, dest_dir_rel))
+
+        window.move_payload_to_directory = record_move  # type: ignore[method-assign]
+
+        assert window.thumbnail_view.begin_manual_drag([window.model.index(image_row, 0)], dest_point)
+        window.thumbnail_view._poll_manual_drag()
+
+        assert window.tree._drag_hover_item is dest_item
+
+        buttons[0] = Qt.MouseButton.NoButton
+        window.thumbnail_view._poll_manual_drag()
+        qt_app.processEvents()
+
+        assert not window.thumbnail_view._manual_drag_active
+        assert QApplication.overrideCursor() is None
+        assert len(calls) == 1
+        payload, dest_root, dest_dir_rel = calls[0]
+        assert dest_root == catalog.root
+        assert dest_dir_rel == "dest"
+        assert payload == [{"catalog_root": str(catalog.root), "rel_path": "image.jpg", "kind": "image"}]
     finally:
         window.thumbnail_view.cleanup_manual_drag()
         window.progress_timer.stop()

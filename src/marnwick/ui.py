@@ -559,6 +559,9 @@ class ThumbnailView(QListView):
         self._drag_destination_item: QTreeWidgetItem | None = None
         self._manual_drag_active = False
         self._drag_cursor_active = False
+        self._manual_drag_watchdog = QTimer(self)
+        self._manual_drag_watchdog.setInterval(50)
+        self._manual_drag_watchdog.timeout.connect(self._poll_manual_drag)
         self.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         self.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         self.verticalScrollBar().setSingleStep(self.SMOOTH_SCROLL_STEP)
@@ -588,7 +591,7 @@ class ThumbnailView(QListView):
     def mouseMoveEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         if self._manual_drag_active:
             if not (event.buttons() & Qt.MouseButton.LeftButton):
-                self.cleanup_manual_drag()
+                self.finish_manual_drag(event.globalPosition().toPoint())
                 event.accept()
                 return
             self.update_manual_drag(event.globalPosition().toPoint())
@@ -678,12 +681,22 @@ class ThumbnailView(QListView):
         self._drag_cursor_active = True
         try:
             QApplication.setOverrideCursor(QCursor(drag_pixmap, hotspot.x(), hotspot.y()))
-            self.grabMouse()
             self.update_manual_drag(global_pos)
+            self._manual_drag_watchdog.start()
         except Exception:
             self.cleanup_manual_drag()
             raise
         return True
+
+    def _poll_manual_drag(self) -> None:
+        if not self._manual_drag_active:
+            self._manual_drag_watchdog.stop()
+            return
+        global_pos = QCursor.pos()
+        if QApplication.mouseButtons() & Qt.MouseButton.LeftButton:
+            self.update_manual_drag(global_pos)
+            return
+        self.finish_manual_drag(global_pos)
 
     def update_manual_drag(self, global_pos: QPoint) -> None:
         item = self.tree_item_at_global(global_pos)
@@ -711,8 +724,7 @@ class ThumbnailView(QListView):
     def cleanup_manual_drag(self) -> None:
         if self.main_window is not None:
             self.main_window.tree.set_drag_hover_item(None)
-        if QWidget.mouseGrabber() is self:
-            self.releaseMouse()
+        self._manual_drag_watchdog.stop()
         if self._drag_cursor_active:
             if QApplication.overrideCursor() is not None:
                 QApplication.restoreOverrideCursor()
