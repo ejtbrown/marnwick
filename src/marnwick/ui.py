@@ -556,9 +556,11 @@ class ThumbnailView(QListView):
         self.main_window = window
         self._drag_start_pos: QPoint | None = None
         self._drag_indexes: list[QModelIndex] = []
+        self._drag_payload: list[dict[str, str]] = []
         self._drag_destination_item: QTreeWidgetItem | None = None
         self._manual_drag_active = False
         self._drag_cursor_active = False
+        self._drag_cursor_restore_count = 0
         self._manual_drag_watchdog = QTimer(self)
         self._manual_drag_watchdog.setInterval(50)
         self._manual_drag_watchdog.timeout.connect(self._poll_manual_drag)
@@ -576,7 +578,6 @@ class ThumbnailView(QListView):
 
     def event(self, event: QEvent) -> bool:
         if self._manual_drag_active and event.type() in {
-            QEvent.Type.FocusOut,
             QEvent.Type.Hide,
             QEvent.Type.WindowDeactivate,
         }:
@@ -625,6 +626,9 @@ class ThumbnailView(QListView):
             return
         super().keyPressEvent(event)
 
+    def manual_drag_active(self) -> bool:
+        return self._manual_drag_active
+
     def startDrag(self, supported_actions: Qt.DropAction) -> None:
         selection = self.selectionModel()
         if selection is None:
@@ -666,7 +670,7 @@ class ThumbnailView(QListView):
         return [current] if current.isValid() else []
 
     def begin_manual_drag(self, indexes: list[QModelIndex], global_pos: QPoint) -> bool:
-        if self._manual_drag_active:
+        if self._manual_drag_active or self._drag_cursor_active:
             self.cleanup_manual_drag()
         model = self.model()
         if not isinstance(model, ThumbnailModel) or model.catalog is None:
@@ -674,13 +678,18 @@ class ThumbnailView(QListView):
         valid_indexes = [index for index in indexes if index.isValid()]
         if not valid_indexes:
             return False
+        payload = self.drag_payload_for_indexes(valid_indexes)
+        if not payload:
+            return False
         self._drag_indexes = valid_indexes
+        self._drag_payload = payload
         drag_pixmap = self.drag_pixmap_for_indexes(valid_indexes)
         hotspot = QPoint(int(drag_pixmap.width() / 2), int(drag_pixmap.height() / 2))
         self._manual_drag_active = True
         self._drag_cursor_active = True
         try:
             QApplication.setOverrideCursor(QCursor(drag_pixmap, hotspot.x(), hotspot.y()))
+            self._drag_cursor_restore_count += 1
             self.update_manual_drag(global_pos)
             self._manual_drag_watchdog.start()
         except Exception:
@@ -712,7 +721,7 @@ class ThumbnailView(QListView):
                 item = self._drag_destination_item
                 root = Path(item.data(0, CATALOG_ROOT_ROLE))
                 dir_rel = item.data(0, DIR_REL_ROLE)
-                payload = self.drag_payload_for_indexes(self._drag_indexes)
+                payload = list(self._drag_payload)
                 if payload:
                     move_request = (self.main_window, payload, root, dir_rel)
         finally:
@@ -725,11 +734,13 @@ class ThumbnailView(QListView):
         if self.main_window is not None:
             self.main_window.tree.set_drag_hover_item(None)
         self._manual_drag_watchdog.stop()
-        if self._drag_cursor_active:
-            if QApplication.overrideCursor() is not None:
-                QApplication.restoreOverrideCursor()
+        while self._drag_cursor_restore_count > 0 and QApplication.overrideCursor() is not None:
+            QApplication.restoreOverrideCursor()
+            self._drag_cursor_restore_count -= 1
+        self._drag_cursor_restore_count = 0
         self._drag_start_pos = None
         self._drag_indexes = []
+        self._drag_payload = []
         self._drag_destination_item = None
         self._manual_drag_active = False
         self._drag_cursor_active = False
@@ -3319,6 +3330,8 @@ class MainWindow(QMainWindow):
         self._poll_indexer()
 
     def _schedule_idle_indexing(self) -> None:
+        if self.thumbnail_view.manual_drag_active():
+            return
         if self._has_active_catalog_open_tasks():
             return
         if self._has_active_duplicate_delete_task():
@@ -3349,6 +3362,8 @@ class MainWindow(QMainWindow):
                 return
 
     def _poll_indexer(self) -> None:
+        if self.thumbnail_view.manual_drag_active():
+            return
         self._settle_catalog_open_tasks()
         self._settle_duplicate_delete_task()
         self._settle_move_payload_task()
