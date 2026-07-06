@@ -1367,6 +1367,70 @@ def test_thumbnail_drag_watchdog_highlights_and_drops_on_directory(tmp_path: Pat
         qt_app.processEvents()
 
 
+def test_thumbnail_drag_watchdog_drops_on_right_pane_folder(tmp_path: Path, monkeypatch) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    (root / "dest").mkdir(parents=True)
+    Image.new("RGB", (8, 8), (10, 20, 30)).save(root / "image.jpg")
+
+    window = MainWindow()
+    try:
+        catalog = window.workspace.open_catalog(root)
+        catalog.refresh()
+        window.current_catalog = catalog
+        window.current_dir_rel = ""
+        window.rebuild_tree()
+        window.load_current_directory()
+        window.resize(800, 480)
+        window.show()
+        qt_app.processEvents()
+
+        folder_row = next(row for row, record in enumerate(window.model.images) if isinstance(record, DirectoryRecord))
+        image_row = next(row for row, record in enumerate(window.model.images) if isinstance(record, ImageRecord))
+        folder_index = window.model.index(folder_row, 0)
+        window.thumbnail_view.scrollTo(folder_index)
+        qt_app.processEvents()
+        folder_rect = window.thumbnail_view.visualRect(folder_index)
+        assert folder_rect.isValid()
+        folder_point = window.thumbnail_view.viewport().mapToGlobal(folder_rect.center())
+        buttons = [Qt.MouseButton.LeftButton]
+        calls: list[tuple[list[dict[str, str]], Path, str]] = []
+
+        monkeypatch.setattr(QCursor, "pos", staticmethod(lambda: folder_point))
+        monkeypatch.setattr(QApplication, "mouseButtons", staticmethod(lambda: buttons[0]))
+
+        def record_move(payload: list[dict[str, str]], dest_root: Path, dest_dir_rel: str) -> None:
+            calls.append((payload, dest_root, dest_dir_rel))
+
+        window.move_payload_to_directory = record_move  # type: ignore[method-assign]
+
+        assert window.thumbnail_view.begin_manual_drag([window.model.index(image_row, 0)], folder_point)
+        window.thumbnail_view._poll_manual_drag()
+
+        assert window.tree._drag_hover_item is None
+
+        buttons[0] = Qt.MouseButton.NoButton
+        window.thumbnail_view._poll_manual_drag()
+        qt_app.processEvents()
+
+        assert not window.thumbnail_view._manual_drag_active
+        assert QApplication.overrideCursor() is None
+        assert len(calls) == 1
+        payload, dest_root, dest_dir_rel = calls[0]
+        assert dest_root == catalog.root
+        assert dest_dir_rel == "dest"
+        assert payload == [{"catalog_root": str(catalog.root), "rel_path": "image.jpg", "kind": "image"}]
+    finally:
+        window.thumbnail_view.cleanup_manual_drag()
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        window.indexer.shutdown()
+        window.workspace.close()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
 def test_thumbnail_drag_defers_indexer_refresh_and_keeps_payload(tmp_path: Path, monkeypatch) -> None:
     qt_app = app()
     root = tmp_path / "catalog"
@@ -2045,6 +2109,62 @@ def test_right_pane_shows_directory_tiles_before_images_and_navigates(tmp_path: 
         selected = window.tree.currentItem()
         assert selected is not None
         assert selected.data(0, DIR_REL_ROLE) == "z-child"
+    finally:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        window.indexer.shutdown()
+        window.workspace.close()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_create_directory_from_tree_does_not_navigate_right_pane(tmp_path: Path, monkeypatch) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    Image.new("RGB", (8, 8), (10, 20, 30)).save(root / "one.jpg")
+    Image.new("RGB", (8, 8), (40, 50, 60)).save(root / "two.jpg")
+
+    class FakeDirectoryNameDialog:
+        def __init__(self, parent_path: Path, parent=None) -> None:  # type: ignore[no-untyped-def]
+            self.parent_path = parent_path
+
+        def exec(self) -> QDialog.DialogCode:
+            return QDialog.DialogCode.Accepted
+
+        def directory_name(self) -> str:
+            return "new-folder"
+
+    window = MainWindow()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        catalog.refresh()
+        window.current_catalog = catalog
+        window.current_dir_rel = ""
+        window.rebuild_tree()
+        window.load_current_directory()
+        window.select_rel_path("one.jpg")
+        queue_calls: list[tuple[Path, str, dict[str, object]]] = []
+
+        def record_queue(catalog_arg: Catalog, dir_rel: str, **kwargs: object) -> None:
+            queue_calls.append((catalog_arg.root, dir_rel, kwargs))
+
+        monkeypatch.setattr("marnwick.ui.DirectoryNameDialog", FakeDirectoryNameDialog)
+        window.queue_directory_index = record_queue  # type: ignore[method-assign]
+
+        window.create_directory(catalog.root, "")
+
+        assert (root / "new-folder").is_dir()
+        assert window.current_catalog == catalog
+        assert window.current_dir_rel == ""
+        assert window.selected_rel_paths() == ["one.jpg"]
+        selected_item = window.tree.currentItem()
+        assert selected_item is not None
+        assert selected_item.data(0, DIR_REL_ROLE) == ""
+        assert queue_calls == [(catalog.root, "new-folder", {"interactive": False})]
     finally:
         window.progress_timer.stop()
         window.idle_timer.stop()

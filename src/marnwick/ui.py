@@ -558,6 +558,8 @@ class ThumbnailView(QListView):
         self._drag_indexes: list[QModelIndex] = []
         self._drag_payload: list[dict[str, str]] = []
         self._drag_destination_item: QTreeWidgetItem | None = None
+        self._drag_destination_root: Path | None = None
+        self._drag_destination_dir_rel: str | None = None
         self._manual_drag_active = False
         self._drag_cursor_active = False
         self._drag_cursor_restore_count = 0
@@ -710,20 +712,39 @@ class ThumbnailView(QListView):
     def update_manual_drag(self, global_pos: QPoint) -> None:
         item = self.tree_item_at_global(global_pos)
         self._drag_destination_item = item
+        self._drag_destination_root = None
+        self._drag_destination_dir_rel = None
+        if item is not None:
+            self._drag_destination_root = Path(item.data(0, CATALOG_ROOT_ROLE))
+            self._drag_destination_dir_rel = item.data(0, DIR_REL_ROLE) or ""
+            if self.main_window is not None:
+                self.main_window.tree.set_drag_hover_item(item)
+            return
         if self.main_window is not None:
-            self.main_window.tree.set_drag_hover_item(item)
+            self.main_window.tree.set_drag_hover_item(None)
+        record = self.folder_record_at_global(global_pos)
+        if record is not None:
+            self._drag_destination_root = record.catalog_root
+            self._drag_destination_dir_rel = record.dir_rel
 
     def finish_manual_drag(self, global_pos: QPoint) -> None:
         move_request: tuple["MainWindow", list[dict[str, str]], Path, str] | None = None
         try:
             self.update_manual_drag(global_pos)
-            if self.main_window is not None and self._drag_indexes and self._drag_destination_item is not None:
-                item = self._drag_destination_item
-                root = Path(item.data(0, CATALOG_ROOT_ROLE))
-                dir_rel = item.data(0, DIR_REL_ROLE)
+            if (
+                self.main_window is not None
+                and self._drag_payload
+                and self._drag_destination_root is not None
+                and self._drag_destination_dir_rel is not None
+            ):
                 payload = list(self._drag_payload)
                 if payload:
-                    move_request = (self.main_window, payload, root, dir_rel)
+                    move_request = (
+                        self.main_window,
+                        payload,
+                        self._drag_destination_root,
+                        self._drag_destination_dir_rel,
+                    )
         finally:
             self.cleanup_manual_drag()
         if move_request is not None:
@@ -742,6 +763,8 @@ class ThumbnailView(QListView):
         self._drag_indexes = []
         self._drag_payload = []
         self._drag_destination_item = None
+        self._drag_destination_root = None
+        self._drag_destination_dir_rel = None
         self._manual_drag_active = False
         self._drag_cursor_active = False
 
@@ -756,6 +779,21 @@ class ThumbnailView(QListView):
         if item is not None and self.main_window.is_virtual_tree_item(item):
             return None
         return item
+
+    def folder_record_at_global(self, global_pos: QPoint) -> DirectoryRecord | None:
+        viewport_pos = self.viewport().mapFromGlobal(global_pos)
+        if not self.viewport().rect().contains(viewport_pos):
+            return None
+        index = self.indexAt(viewport_pos)
+        if not index.isValid():
+            return None
+        model = self.model()
+        if not isinstance(model, ThumbnailModel) or index.row() >= len(model.images):
+            return None
+        record = model.images[index.row()]
+        if isinstance(record, DirectoryRecord):
+            return record
+        return None
 
     def drag_pixmap_for_indexes(self, indexes: list[QModelIndex]) -> QPixmap:
         return self.static_drag_pixmap(multiple=len(indexes) > 1)
@@ -1495,11 +1533,11 @@ class MainWindow(QMainWindow):
             show_error(self, "Create Directory", str(error))
             return
         self._swept_catalog_roots.discard(catalog.root)
-        self.current_catalog = catalog
-        self.current_dir_rel = new_dir_rel
+        self._pruned_catalog_roots.discard(catalog.root)
         self.rebuild_tree()
-        self.load_current_directory()
-        self.queue_directory_index(catalog, new_dir_rel)
+        if self.current_catalog is not None and self.current_catalog.root == catalog.root:
+            self.load_current_directory(preserve_selection=True)
+        self.queue_directory_index(catalog, new_dir_rel, interactive=False)
 
     def delete_directory(self, root: Path, dir_rel: str) -> None:
         catalog = self.workspace.catalog_for_root(root)
