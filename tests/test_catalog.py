@@ -9,13 +9,16 @@ from pathlib import Path
 from PIL import Image
 
 import marnwick.catalog as catalog_module
+import marnwick.safe_image as safe_image
 from marnwick.catalog import (
     DUPLICATE_DELETE_EXACT,
     DUPLICATE_DELETE_VERY_SIMILAR,
+    EXACT_IMAGE_HASH_HEX_LENGTH,
     MAX_LOG_BYTES,
     SIMILARITY_FEATURE_VERSION,
     TRASH_DIR_NAME,
     Catalog,
+    is_exact_image_hash,
     parse_tag_entry,
 )
 from marnwick.models import CatalogSettings, SortOrder
@@ -33,6 +36,10 @@ def make_palette_image(path: Path, size: tuple[int, int] = (80, 60)) -> None:
     image.save(path)
 
 
+def exact_hash(index: int) -> str:
+    return f"{index:0{EXACT_IMAGE_HASH_HEX_LENGTH}x}"
+
+
 def test_catalog_state_is_created_inside_catalog_root(tmp_path: Path) -> None:
     catalog_root = tmp_path / "photos"
     with Catalog(catalog_root, CatalogSettings(thumbnail_native_size=128)) as catalog:
@@ -40,6 +47,31 @@ def test_catalog_state_is_created_inside_catalog_root(tmp_path: Path) -> None:
         assert catalog.db_path.exists()
         assert catalog.settings.thumbnail_native_size == 128
         assert catalog.list_directories() == [""]
+
+
+def test_catalog_entry_paths_reject_state_directory(tmp_path: Path) -> None:
+    root = tmp_path / "catalog"
+    make_image(root / "image.jpg")
+
+    with Catalog(root) as catalog:
+        catalog.refresh()
+        state_db = catalog.db_path
+        for action in [
+            lambda: catalog.abs_path(".marnwick/catalog.sqlite3"),
+            lambda: catalog.move_images([".marnwick/catalog.sqlite3"], catalog, ""),
+            lambda: catalog.move_directories([".marnwick"], catalog, ""),
+            lambda: catalog.delete_images([".marnwick/catalog.sqlite3"]),
+            lambda: catalog.delete_directory(".marnwick"),
+        ]:
+            try:
+                action()
+            except ValueError as error:
+                assert "catalog state files" in str(error)
+            else:
+                raise AssertionError("catalog state path should be rejected")
+
+        assert state_db.exists()
+        assert not (root / "catalog.sqlite3").exists()
 
 
 def test_catalog_log_is_stored_inside_state_dir_and_limited(tmp_path: Path) -> None:
@@ -174,6 +206,26 @@ def test_refresh_pipeline_indexes_palette_mode_images(tmp_path: Path) -> None:
         assert not any("cannot write mode P as JPEG" in line for line in catalog.read_log_lines())
 
 
+def test_refresh_pipeline_does_not_queue_full_image_file_bytes(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "catalog"
+    for index in range(3):
+        make_image(root / f"image-{index}.jpg", (80, 60))
+
+    original_read_bytes = Path.read_bytes
+
+    def fail_for_catalog_images(path: Path) -> bytes:
+        if path.parent == root and path.suffix == ".jpg":
+            raise AssertionError(f"full image bytes were queued: {path}")
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", fail_for_catalog_images)
+
+    with Catalog(root) as catalog:
+        catalog.refresh()
+
+        assert len(catalog.list_images()) == 3
+
+
 def test_indexing_stores_thumbnail_as_file_not_database_blob(tmp_path: Path) -> None:
     root = tmp_path / "catalog"
     make_image(root / "set-a" / "wide.jpg", (640, 320))
@@ -193,6 +245,40 @@ def test_indexing_stores_thumbnail_as_file_not_database_blob(tmp_path: Path) -> 
         assert row["thumb_cache_key"]
         assert catalog.thumbnail_abs_path(row["thumb_rel_path"]).is_file()
         assert catalog.get_thumbnail_blob("set-a/wide.jpg") == record.thumb_blob
+
+
+def test_index_image_rejects_oversized_image(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "catalog"
+    make_image(root / "large.jpg", (20, 20))
+    monkeypatch.setattr(safe_image, "MAX_IMAGE_PIXELS", 100)
+
+    with Catalog(root) as catalog:
+        assert catalog.index_image("large.jpg") is None
+        assert catalog.get_image("large.jpg") is None
+        row = catalog._conn.execute(
+            "SELECT error FROM image_index_failures WHERE rel_path = ?",
+            ("large.jpg",),
+        ).fetchone()
+
+        assert row is not None
+        assert "pixel limit" in row["error"]
+
+
+def test_catalog_temporary_destination_uses_random_exclusive_file(tmp_path: Path) -> None:
+    root = tmp_path / "catalog"
+    with Catalog(root) as catalog:
+        first = catalog._temporary_destination(root / "image.jpg")
+        second = catalog._temporary_destination(root / "image.jpg")
+
+        try:
+            assert first != second
+            assert first.name.startswith(".image.jpg.")
+            assert first.name.endswith(".tmp")
+            assert first.is_file()
+            assert second.is_file()
+        finally:
+            first.unlink(missing_ok=True)
+            second.unlink(missing_ok=True)
 
 
 def test_thumbnail_repository_size_counts_thumbnail_files(tmp_path: Path) -> None:
@@ -310,7 +396,7 @@ def test_index_image_stores_hash_and_skips_unchanged_modified_time_without_decod
         ).fetchone()
         assert row["file_size_bytes"] == (root / "image.jpg").stat().st_size
         assert isinstance(row["image_hash"], str)
-        assert len(row["image_hash"]) == 8
+        assert is_exact_image_hash(row["image_hash"])
 
         def fail_if_decoded(path: Path) -> tuple[int, int, bytes, int, int]:
             raise AssertionError(f"unchanged image was decoded: {path}")
@@ -324,7 +410,7 @@ def test_index_image_stores_hash_and_skips_unchanged_modified_time_without_decod
         assert second.id == first.id
         assert second.mtime_ns == (root / "image.jpg").stat().st_mtime_ns
         assert isinstance(row["image_hash"], str)
-        assert len(row["image_hash"]) == 8
+        assert is_exact_image_hash(row["image_hash"])
 
 
 def test_complete_refresh_saves_find_hash_and_skip_check_reuses_it(
@@ -347,6 +433,59 @@ def test_complete_refresh_saves_find_hash_and_skip_check_reuses_it(
         monkeypatch.setattr(catalog, "index_image", fail_if_indexed)
 
         assert catalog.refresh(force=False) is False
+
+
+def test_directory_find_hash_uses_resolved_helper_paths(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "catalog"
+    root.mkdir()
+
+    with Catalog(root) as catalog:
+        monkeypatch.setattr(
+            catalog_module.shutil,
+            "which",
+            lambda name: { "find": "/bin/find", "md5sum": "/usr/bin/md5sum" }.get(name),
+        )
+        captured: dict[str, str] = {}
+
+        def fake_hash(
+            directory: Path,
+            cancel_check=None,  # type: ignore[no-untyped-def]
+            *,
+            find_bin: str,
+            md5_bin: str,
+        ) -> str:
+            captured["directory"] = str(directory)
+            captured["find_bin"] = find_bin
+            captured["md5_bin"] = md5_bin
+            return "abc123"
+
+        monkeypatch.setattr(catalog, "_directory_find_hash_subprocess", fake_hash)
+
+        assert catalog.directory_find_hash("") == "abc123"
+        assert captured == {
+            "directory": str(catalog.root),
+            "find_bin": "/bin/find",
+            "md5_bin": "/usr/bin/md5sum",
+        }
+
+
+def test_modified_after_find_uses_resolved_helper_path(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "catalog"
+    root.mkdir()
+
+    with Catalog(root) as catalog:
+        monkeypatch.setattr(catalog_module.shutil, "which", lambda name: "/bin/find" if name == "find" else None)
+        captured: list[list[str]] = []
+
+        def fake_run(command: list[str], cancel_check=None) -> bytes:  # type: ignore[no-untyped-def]
+            captured.append(command)
+            return b"./image.jpg\n"
+
+        monkeypatch.setattr(catalog, "_run_command_stdout", fake_run)
+
+        assert catalog.has_catalog_files_modified_after(0)
+        assert captured
+        assert captured[0][0] == "/bin/find"
 
 
 def test_directory_refresh_saves_hash_and_skips_when_unchanged(
@@ -507,6 +646,20 @@ def test_list_duplicate_images_returns_all_images_with_repeated_hashes(tmp_path:
         assert [record.rel_path for record in catalog.list_duplicate_images()] == ["one.jpg", "two.jpg"]
 
 
+def test_exact_duplicate_detection_ignores_legacy_crc32_collision(tmp_path: Path) -> None:
+    root = tmp_path / "catalog"
+    make_image(root / "red.jpg", (20, 20), (255, 0, 0))
+    make_image(root / "green.jpg", (20, 20), (0, 255, 0))
+
+    with Catalog(root) as catalog:
+        catalog.refresh()
+        catalog._conn.execute("UPDATE images SET image_hash = ?", ("deadbeef",))
+
+        assert catalog.list_duplicate_images() == []
+        assert catalog.duplicate_deletion_plan(DUPLICATE_DELETE_EXACT).delete_count == 0
+        assert catalog.duplicate_count_for_hash("deadbeef") == 0
+
+
 def test_list_duplicate_images_orders_by_hash_to_group_matches(tmp_path: Path) -> None:
     root = tmp_path / "catalog"
     for index, rel_path in enumerate(["a-b.jpg", "b-a.jpg", "c-b.jpg", "d-a.jpg"]):
@@ -514,11 +667,13 @@ def test_list_duplicate_images_orders_by_hash_to_group_matches(tmp_path: Path) -
 
     with Catalog(root) as catalog:
         catalog.refresh()
+        hash_a = exact_hash(1)
+        hash_b = exact_hash(2)
         for rel_path, image_hash in [
-            ("a-b.jpg", "hash-b"),
-            ("b-a.jpg", "hash-a"),
-            ("c-b.jpg", "hash-b"),
-            ("d-a.jpg", "hash-a"),
+            ("a-b.jpg", hash_b),
+            ("b-a.jpg", hash_a),
+            ("c-b.jpg", hash_b),
+            ("d-a.jpg", hash_a),
         ]:
             catalog._conn.execute(
                 "UPDATE images SET image_hash = ? WHERE rel_path = ?",
@@ -654,6 +809,7 @@ def test_delete_duplicate_images_keeps_best_ranked_exact_duplicate(tmp_path: Pat
     }
     with Catalog(root) as catalog:
         catalog.refresh()
+        duplicate_hash = exact_hash(3)
         for rel_path, (width, height, mtime_ns) in updates.items():
             catalog._conn.execute(
                 """
@@ -666,7 +822,7 @@ def test_delete_duplicate_images_keeps_best_ranked_exact_duplicate(tmp_path: Pat
                     modified_at_ns = ?
                 WHERE rel_path = ?
                 """,
-                ("same-hash", width, height, width / height, mtime_ns, mtime_ns, rel_path),
+                (duplicate_hash, width, height, width / height, mtime_ns, mtime_ns, rel_path),
             )
 
         plan = catalog.duplicate_deletion_plan(DUPLICATE_DELETE_EXACT)
@@ -1293,9 +1449,12 @@ def test_cross_filesystem_move_copies_then_wipes_source(tmp_path: Path, monkeypa
     dest_root = tmp_path / "dest"
     make_image(source_root / "set" / "image.jpg", (120, 90))
     shred_calls: list[list[str]] = []
+    original_replace = os.replace
 
     def fake_replace(source: Path, dest: Path) -> None:
-        raise OSError(errno.EXDEV, "Invalid cross-device link")
+        if Path(source) == source_root / "set" / "image.jpg":
+            raise OSError(errno.EXDEV, "Invalid cross-device link")
+        original_replace(source, dest)
 
     def fake_run(command: list[str], *, check: bool):  # type: ignore[no-untyped-def]
         shred_calls.append(command)
@@ -1312,11 +1471,47 @@ def test_cross_filesystem_move_copies_then_wipes_source(tmp_path: Path, monkeypa
         results = source.move_images(["set/image.jpg"], dest, "new-set", wipe_on_delete=True)
 
         assert results[0].dest_rel_path == "new-set/image.jpg"
-        assert shred_calls == [["shred", "-u", str(source_root / "set" / "image.jpg")]]
+        assert shred_calls == [["/usr/bin/shred", "-u", str(source_root / "set" / "image.jpg")]]
         assert not (source_root / "set" / "image.jpg").exists()
         assert (dest_root / "new-set" / "image.jpg").exists()
         assert source.get_image("set/image.jpg") is None
         assert dest.get_image("new-set/image.jpg") is not None
+
+
+def test_cross_filesystem_move_rolls_back_destination_on_delete_failure(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source_root = tmp_path / "source"
+    dest_root = tmp_path / "dest"
+    make_image(source_root / "set" / "image.jpg", (120, 90))
+    original_replace = os.replace
+
+    def fake_replace(source: Path, dest: Path) -> None:
+        if Path(source) == source_root / "set" / "image.jpg":
+            raise OSError(errno.EXDEV, "Invalid cross-device link")
+        original_replace(source, dest)
+
+    monkeypatch.setattr("marnwick.catalog.os.replace", fake_replace)
+
+    with Catalog(source_root) as source, Catalog(dest_root) as dest:
+        source.refresh()
+
+        def fail_delete(path: Path, *, wipe: bool) -> None:
+            raise OSError("simulated source delete failure")
+
+        source._delete_file = fail_delete  # type: ignore[method-assign]
+        try:
+            source.move_images(["set/image.jpg"], dest, "new-set")
+        except OSError as error:
+            assert "simulated source delete failure" in str(error)
+        else:
+            raise AssertionError("cross-filesystem move should surface source delete failure")
+
+        assert (source_root / "set" / "image.jpg").is_file()
+        assert not (dest_root / "new-set" / "image.jpg").exists()
+        assert source.get_image("set/image.jpg") is not None
+        assert dest.get_image("new-set/image.jpg") is None
 
 
 def test_delete_removes_files_and_database_rows(tmp_path: Path) -> None:
@@ -1338,6 +1533,33 @@ def test_delete_removes_files_and_database_rows(tmp_path: Path) -> None:
         assert not (root / "one.jpg").exists()
         assert not one_thumb_path.exists()
         assert catalog.list_images("") == []
+
+
+def test_delete_images_cleans_successful_rows_after_partial_failure(tmp_path: Path) -> None:
+    root = tmp_path / "catalog"
+    make_image(root / "one.jpg")
+    make_image(root / "two.jpg")
+
+    with Catalog(root) as catalog:
+        catalog.refresh()
+        original_delete_file = catalog._delete_file
+
+        def fail_second_delete(path: Path, *, wipe: bool) -> None:
+            if path.name == "two.jpg":
+                raise OSError("simulated delete failure")
+            original_delete_file(path, wipe=wipe)
+
+        catalog._delete_file = fail_second_delete  # type: ignore[method-assign]
+        try:
+            catalog.delete_images(["one.jpg", "two.jpg"])
+        except OSError as error:
+            assert "simulated delete failure" in str(error)
+        else:
+            raise AssertionError("delete_images should raise the first delete error")
+
+        assert not (root / "one.jpg").exists()
+        assert (root / "two.jpg").exists()
+        assert [record.rel_path for record in catalog.list_images(include_blobs=False)] == ["two.jpg"]
 
 
 def test_delete_images_chunks_thumbnail_lookup_for_sqlite_variable_limit(tmp_path: Path) -> None:
@@ -1437,7 +1659,7 @@ def test_delete_images_can_wipe_files(tmp_path: Path, monkeypatch) -> None:
         catalog.refresh()
 
         assert catalog.delete_images(["one.jpg"], wipe=True) == 1
-        assert shred_calls == [["shred", "-u", str(root / "one.jpg")]]
+        assert shred_calls == [["/usr/bin/shred", "-u", str(root / "one.jpg")]]
         assert not (root / "one.jpg").exists()
         assert catalog.get_image("one.jpg") is None
 

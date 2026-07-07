@@ -43,7 +43,8 @@ def bell_count(rng: random.Random) -> int:
 
 
 def build_tree_dirs(seed: str, target_file_count: int) -> dict[str, int]:
-    rng = random.Random(stable_int(seed, "tree"))
+    # Deterministic fixture generation, not security-sensitive randomness.
+    rng = random.Random(stable_int(seed, "tree"))  # nosec B311
     dirs: list[str] = []
     counts: dict[str, int] = {}
 
@@ -71,7 +72,8 @@ def build_tree_dirs(seed: str, target_file_count: int) -> dict[str, int]:
 
 
 def scaled_image_sizes(seed: str, total_count: int, target_bytes: int) -> list[int]:
-    rng = random.Random(stable_int(seed, "sizes"))
+    # Deterministic fixture generation, not security-sensitive randomness.
+    rng = random.Random(stable_int(seed, "sizes"))  # nosec B311
     weights = [max(0.45, min(1.75, rng.lognormvariate(-0.05, 0.32))) for _ in range(total_count)]
     total_weight = sum(weights)
     sizes = [
@@ -120,7 +122,8 @@ def deterministic_color(rng: random.Random) -> tuple[int, int, int, int]:
 
 
 def make_png_base(rel_path: str, seed: str) -> bytes:
-    rng = random.Random(stable_int(seed, rel_path, "image"))
+    # Deterministic fixture generation, not security-sensitive randomness.
+    rng = random.Random(stable_int(seed, rel_path, "image"))  # nosec B311
     width = rng.randrange(180, 421)
     height = rng.randrange(140, 321)
     background = (

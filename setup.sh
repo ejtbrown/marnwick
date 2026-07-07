@@ -17,7 +17,12 @@ fi
 
 "$PYTHON_BIN" -m venv "$VENV_DIR"
 "$VENV_DIR/bin/python" -m pip install --upgrade pip setuptools wheel
-"$VENV_DIR/bin/python" -m pip install -e "$ROOT_DIR[dev]"
+if [[ -f "$ROOT_DIR/requirements-dev.lock" ]]; then
+  "$VENV_DIR/bin/python" -m pip install --require-hashes -r "$ROOT_DIR/requirements-dev.lock"
+  "$VENV_DIR/bin/python" -m pip install --no-deps -e "$ROOT_DIR"
+else
+  "$VENV_DIR/bin/python" -m pip install -e "$ROOT_DIR[dev]"
+fi
 
 cat > "$ROOT_DIR/start.sh" <<'RUNNER'
 #!/usr/bin/env bash

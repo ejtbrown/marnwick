@@ -9,6 +9,8 @@ from time import monotonic, sleep
 
 from PIL import Image
 
+import marnwick.safe_image as safe_image
+
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("MARNWICK_DISABLE_CONFIG", "1")
 
@@ -50,6 +52,8 @@ from marnwick.ui import (  # noqa: E402
     metadata_text,
     EditCommandDialog,
     format_bytes,
+    parse_runtime_args,
+    read_debug_token_file,
 )
 
 
@@ -131,10 +135,10 @@ def find_virtual_tree_root(window: MainWindow):
 def test_debug_command_server_accepts_json_lines() -> None:
     qt_app = app()
     window = MainWindow()
-    server = DebugCommandServer(window, port=0)
+    server = DebugCommandServer(window, port=0, token="secret")
     client = socket.create_connection(("127.0.0.1", server.port()), timeout=2.0)
     try:
-        client.sendall(b'{"id":"ping-1","command":"ping"}\n')
+        client.sendall(b'{"id":"ping-1","token":"secret","command":"ping"}\n')
         response = read_debug_response(qt_app, client)
 
         assert response["id"] == "ping-1"
@@ -144,7 +148,7 @@ def test_debug_command_server_accepts_json_lines() -> None:
         assert result["message"] == "pong"
         assert result["protocol"] == 1
 
-        client.sendall(b'{"id":"status-1","command":"status"}\n')
+        client.sendall(b'{"id":"status-1","token":"secret","command":"status"}\n')
         response = read_debug_response(qt_app, client)
 
         assert response["id"] == "status-1"
@@ -162,6 +166,181 @@ def test_debug_command_server_accepts_json_lines() -> None:
         window.close()
         window.deleteLater()
         qt_app.processEvents()
+
+
+def test_debug_command_server_rejects_missing_token() -> None:
+    qt_app = app()
+    window = MainWindow()
+    server = DebugCommandServer(window, port=0, token="secret")
+    client = socket.create_connection(("127.0.0.1", server.port()), timeout=2.0)
+    try:
+        client.sendall(b'{"id":"ping-1","command":"ping"}\n')
+        response = read_debug_response(qt_app, client)
+
+        assert response["id"] == "ping-1"
+        assert response["ok"] is False
+        assert "debug token" in response["error"]
+    finally:
+        client.close()
+        server.server.close()
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        window.indexer.shutdown()
+        window.workspace.close()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_debug_command_server_rejects_non_string_token() -> None:
+    qt_app = app()
+    window = MainWindow()
+    server = DebugCommandServer(window, port=0, token="secret")
+    client = socket.create_connection(("127.0.0.1", server.port()), timeout=2.0)
+    try:
+        client.sendall(b'{"id":"ping-1","token":123,"command":"ping"}\n')
+        response = read_debug_response(qt_app, client)
+
+        assert response["id"] == "ping-1"
+        assert response["ok"] is False
+        assert "debug token" in response["error"]
+    finally:
+        client.close()
+        server.server.close()
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        window.indexer.shutdown()
+        window.workspace.close()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_debug_command_server_caps_line_size() -> None:
+    qt_app = app()
+    window = MainWindow()
+    server = DebugCommandServer(window, port=0, token="secret", max_line_bytes=16)
+    client = socket.create_connection(("127.0.0.1", server.port()), timeout=2.0)
+    try:
+        client.sendall(b"x" * 17)
+        response = read_debug_response(qt_app, client)
+
+        assert response["ok"] is False
+        assert response["error"] == "debug request too large"
+    finally:
+        client.close()
+        server.server.close()
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        window.indexer.shutdown()
+        window.workspace.close()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_debug_command_server_limits_connections() -> None:
+    qt_app = app()
+    window = MainWindow()
+    server = DebugCommandServer(window, port=0, token="secret", max_connections=1)
+    first = socket.create_connection(("127.0.0.1", server.port()), timeout=2.0)
+    second = socket.create_connection(("127.0.0.1", server.port()), timeout=2.0)
+    try:
+        deadline = monotonic() + 2.0
+        while len(server._buffers) < 1 and monotonic() < deadline:
+            qt_app.processEvents()
+            sleep(0.01)
+
+        response = read_debug_response(qt_app, second)
+
+        assert response["ok"] is False
+        assert response["error"] == "too many debug connections"
+        assert len(server._buffers) == 1
+    finally:
+        first.close()
+        second.close()
+        server.server.close()
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        window.indexer.shutdown()
+        window.workspace.close()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_debug_command_server_clamps_items_paging() -> None:
+    qt_app = app()
+    window = MainWindow()
+    window.model.set_images(
+        None,
+        [
+            ImageRecord(
+                id=index,
+                catalog_root=Path("/tmp/catalog"),
+                rel_path=f"image-{index}.jpg",
+                dir_rel="",
+                filename=f"image-{index}.jpg",
+                size_bytes=10,
+                mtime_ns=0,
+                width=8,
+                height=8,
+                aspect_ratio=1.0,
+                thumb_width=8,
+                thumb_height=8,
+            )
+            for index in range(5)
+        ],
+    )
+    server = DebugCommandServer(window, port=0, token="secret", max_page_size=2)
+    client = socket.create_connection(("127.0.0.1", server.port()), timeout=2.0)
+    try:
+        client.sendall(b'{"id":"items-1","token":"secret","command":"items","params":{"limit":50,"offset":-10}}\n')
+        response = read_debug_response(qt_app, client)
+
+        assert response["ok"] is True
+        result = response["result"]
+        assert isinstance(result, dict)
+        assert result["offset"] == 0
+        assert result["limit"] == 2
+        assert len(result["items"]) == 2
+    finally:
+        client.close()
+        server.server.close()
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        window.indexer.shutdown()
+        window.workspace.close()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_parse_runtime_args_rejects_command_line_debug_token() -> None:
+    try:
+        parse_runtime_args(["marnwick", "--debug-token", "secret"])
+    except SystemExit as error:
+        assert error.code == 2
+    else:
+        raise AssertionError("--debug-token should be rejected")
+
+
+def test_read_debug_token_file_requires_private_permissions(tmp_path: Path) -> None:
+    token_path = tmp_path / "debug-token"
+    token_path.write_text("secret\n", encoding="utf-8")
+    if os.name != "nt":
+        token_path.chmod(0o600)
+
+    assert read_debug_token_file(str(token_path)) == "secret"
+
+    if os.name != "nt":
+        token_path.chmod(0o644)
+        try:
+            read_debug_token_file(str(token_path))
+        except PermissionError as error:
+            assert "debug token file" in str(error)
+        else:
+            raise AssertionError("group/world-readable token file should be rejected")
 
 
 def test_edit_command_dialog_accepts_single_key_shortcuts() -> None:
@@ -626,6 +805,17 @@ def test_metadata_text_includes_file_and_exif_metadata(tmp_path: Path) -> None:
 
     assert "Dimensions: 20 x 10" in text
     assert "Orientation: 6" in text
+
+
+def test_metadata_text_reports_oversized_image_error(tmp_path: Path, monkeypatch) -> None:
+    path = tmp_path / "large.jpg"
+    Image.new("RGB", (20, 20), (120, 80, 40)).save(path)
+    monkeypatch.setattr(safe_image, "MAX_IMAGE_PIXELS", 100)
+
+    text = metadata_text(path)
+
+    assert "Metadata read error:" in text
+    assert "pixel limit" in text
 
 
 def test_copy_files_to_clipboard_sets_file_urls_and_gnome_payload(tmp_path: Path) -> None:
@@ -1911,6 +2101,37 @@ def test_move_payload_to_directory_rejects_cross_catalog_trash_drop(tmp_path: Pa
         assert not (dest_root / TRASH_DIR_NAME).exists()
         assert source.get_image("image.jpg") is not None
         assert dest.list_images(TRASH_DIR_NAME) == []
+    finally:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        window.indexer.shutdown()
+        window.workspace.close()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_move_payload_to_directory_ignores_forged_state_file_payload(tmp_path: Path) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    Image.new("RGB", (8, 8), (10, 20, 30)).save(root / "image.jpg")
+
+    window = MainWindow()
+    try:
+        catalog = window.workspace.open_catalog(root)
+        catalog.refresh()
+        db_path = catalog.db_path
+
+        window.move_payload_to_directory(
+            [{"catalog_root": str(catalog.root), "rel_path": ".marnwick/catalog.sqlite3", "kind": "image"}],
+            catalog.root,
+            "",
+        )
+
+        assert not window._move_payload_tasks
+        assert db_path.exists()
+        assert not (root / "catalog.sqlite3").exists()
     finally:
         window.progress_timer.stop()
         window.idle_timer.stop()

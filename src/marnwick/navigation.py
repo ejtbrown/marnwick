@@ -9,7 +9,8 @@ def build_random_order(items: Sequence[str], start_item: str, seed: int | None =
     if start_item not in items:
         raise ValueError("start_item must be present in items")
     remaining = [item for item in items if item != start_item]
-    rng = random.Random(seed)
+    # Deterministic UI shuffle, not security-sensitive randomness.
+    rng = random.Random(seed)  # nosec B311
     rng.shuffle(remaining)
     return [start_item, *remaining]
 
