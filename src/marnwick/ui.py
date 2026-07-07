@@ -4,8 +4,10 @@ import argparse
 import json
 from math import ceil, hypot
 import os
+import sys
 from collections import OrderedDict, defaultdict
 from collections.abc import Callable, Sequence
+from contextlib import suppress
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
@@ -102,6 +104,7 @@ from .image_ops import (
 from .indexer import ActionPriority, BackgroundIndexer, IndexTask, IndexTaskCancelled
 from .models import CatalogSettings, DirectoryRecord, ImageRecord, PaneRecord, SortOrder
 from .navigation import ImageNavigator
+from .safe_image import open_catalog_image
 from .workspace import Workspace
 
 CATALOG_ROOT_ROLE = Qt.ItemDataRole.UserRole
@@ -934,8 +937,13 @@ class DirectoryTree(QTreeWidget):
             return
         root = Path(item.data(0, CATALOG_ROOT_ROLE))
         dir_rel = item.data(0, DIR_REL_ROLE)
-        data = bytes(event.mimeData().data(ThumbnailModel.MIME_TYPE)).decode("utf-8")
-        self.window.move_payload_to_directory(json.loads(data), root, dir_rel)
+        try:
+            data = bytes(event.mimeData().data(ThumbnailModel.MIME_TYPE)).decode("utf-8")
+            payload = json.loads(data)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            event.ignore()
+            return
+        self.window.move_payload_to_directory(payload, root, dir_rel)
         event.acceptProposedAction()
 
     def set_drag_hover_item(self, item: QTreeWidgetItem | None) -> None:
@@ -2706,10 +2714,8 @@ class MainWindow(QMainWindow):
 
     def _wait_for_duplicate_delete_task(self, task: DuplicateDeleteTask) -> None:
         if not task.future.done():
-            try:
+            with suppress(Exception):
                 task.future.result()
-            except Exception:
-                pass
         self._settle_duplicate_delete_task()
 
     def _settle_duplicate_delete_task(self) -> None:
@@ -2804,10 +2810,8 @@ class MainWindow(QMainWindow):
 
     def _wait_for_move_payload_task(self, task: MovePayloadTask) -> None:
         if not task.future.done():
-            try:
+            with suppress(Exception):
                 task.future.result()
-            except Exception:
-                pass
         self._settle_move_payload_task()
 
     def _settle_move_payload_task(self) -> None:
@@ -3157,22 +3161,47 @@ class MainWindow(QMainWindow):
         self.load_current_directory()
         self.select_rel_path(rel_path)
 
-    def move_payload_to_directory(self, payload: list[dict[str, str]], dest_root: Path, dest_dir_rel: str) -> None:
+    def move_payload_to_directory(self, payload: object, dest_root: Path, dest_dir_rel: str) -> None:
         self._settle_move_payload_task()
         dest_catalog = self.workspace.catalog_for_root(dest_root)
         if dest_catalog is None:
             return
+        try:
+            dest_catalog.abs_path(dest_dir_rel) if dest_dir_rel else dest_catalog.root
+        except ValueError:
+            return
+        if not isinstance(payload, list):
+            return
         image_groups: dict[Path, list[str]] = defaultdict(list)
         directory_groups: dict[Path, list[str]] = defaultdict(list)
         for item in payload:
+            if not isinstance(item, dict):
+                continue
             try:
                 source_root = Path(item["catalog_root"]).resolve()
                 rel_path = item["rel_path"]
             except (KeyError, OSError):
                 continue
-            if self.workspace.catalog_for_root(source_root) is None:
+            if not isinstance(rel_path, str):
                 continue
-            group = directory_groups if item.get("kind") == "directory" else image_groups
+            source_catalog = self.workspace.catalog_for_root(source_root)
+            if source_catalog is None:
+                continue
+            kind = item.get("kind", "image")
+            if kind not in {"image", "directory"}:
+                continue
+            try:
+                source_path = source_catalog.abs_path(rel_path)
+            except ValueError:
+                continue
+            if kind == "directory":
+                if not rel_path or not source_path.is_dir():
+                    continue
+                group = directory_groups
+            else:
+                if not is_image_name(Path(rel_path).name) or not source_path.is_file():
+                    continue
+                group = image_groups
             group[source_root].append(rel_path)
         image_payload = {
             root: list(dict.fromkeys(rel_paths))
@@ -3337,10 +3366,8 @@ class MainWindow(QMainWindow):
             raise
         finally:
             for catalog in catalogs.values():
-                try:
+                with suppress(Exception):
                     catalog.close()
-                except Exception:
-                    pass
 
     def select_rel_path(self, rel_path: str) -> None:
         for row, record in enumerate(self.model.images):
@@ -4185,7 +4212,7 @@ def metadata_text(image_path: Path) -> str:
         lines.append(f"File stat error: {error}")
 
     try:
-        with Image.open(image_path) as image:
+        with open_catalog_image(image_path) as image:
             lines.append(f"Format: {image.format or 'unknown'}")
             lines.append(f"Dimensions: {image.width} x {image.height}")
             lines.append(f"Mode: {image.mode}")
@@ -5082,7 +5109,7 @@ class FullscreenViewer(QDialog):
         self._fit_pixmap()
 
     def render_operations_to_image(self, operations: list[EditOperation]) -> Image.Image:
-        with Image.open(self.current_path) as image:
+        with open_catalog_image(self.current_path) as image:
             edited = ImageOps.exif_transpose(image).copy()
             for operation in operations:
                 edited = apply_operation_to_image(edited, operation)
@@ -5385,8 +5412,25 @@ def parse_runtime_args(argv: list[str] | None = None) -> tuple[argparse.Namespac
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--codex-debug", action="store_true")
     parser.add_argument("--codex-debug-port", "--debug-port", dest="codex_debug_port", type=int, default=8675)
+    parser.add_argument("--codex-debug-token-file", "--debug-token-file", dest="codex_debug_token_file")
+    parser.add_argument("--codex-debug-token", "--debug-token", dest="deprecated_debug_token")
     args, remaining = parser.parse_known_args(raw_argv[1:])
+    if args.deprecated_debug_token is not None:
+        parser.error("--debug-token was removed; use MARNWICK_DEBUG_TOKEN or --debug-token-file")
     return args, [raw_argv[0], *remaining]
+
+
+def read_debug_token_file(path_value: str | None) -> str | None:
+    if not path_value:
+        return None
+    path = Path(path_value).expanduser()
+    stat_result = path.stat()
+    if os.name != "nt" and stat_result.st_mode & 0o077:
+        raise PermissionError(f"debug token file must not be readable by group or others: {path}")
+    token = path.read_text(encoding="utf-8").strip()
+    if not token:
+        raise ValueError("debug token file is empty")
+    return token
 
 
 def run(argv: list[str] | None = None) -> int:
@@ -5401,6 +5445,15 @@ def run(argv: list[str] | None = None) -> int:
     if runtime_args.codex_debug:
         from .debug import DebugCommandServer
 
-        window.debug_command_server = DebugCommandServer(window, port=runtime_args.codex_debug_port)
+        supplied_token = os.environ.get("MARNWICK_DEBUG_TOKEN") or read_debug_token_file(
+            runtime_args.codex_debug_token_file
+        )
+        window.debug_command_server = DebugCommandServer(
+            window,
+            port=runtime_args.codex_debug_port,
+            token=supplied_token,
+        )
+        if not supplied_token:
+            print(f"Marnwick debug token: {window.debug_command_server.token}", file=sys.stderr)
     window.show()
     return app.exec()

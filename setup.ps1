@@ -44,7 +44,13 @@ if (-not (Test-Path -LiteralPath $VenvPython)) {
 }
 
 & $VenvPython -m pip install --upgrade pip setuptools wheel
-& $VenvPython -m pip install -e "${RootDir}[dev]"
+$LockFile = Join-Path $RootDir "requirements-dev.lock"
+if (Test-Path -LiteralPath $LockFile) {
+    & $VenvPython -m pip install --require-hashes -r $LockFile
+    & $VenvPython -m pip install --no-deps -e $RootDir
+} else {
+    & $VenvPython -m pip install -e "${RootDir}[dev]"
+}
 
 $StartPs1 = Join-Path $RootDir "start.ps1"
 @'

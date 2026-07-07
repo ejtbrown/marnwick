@@ -6,6 +6,7 @@ from pathlib import Path
 
 from PIL import Image
 
+import marnwick.safe_image as safe_image
 from marnwick.catalog import Catalog
 from marnwick.image_ops import (
     EditOperation,
@@ -187,3 +188,55 @@ def test_save_image_without_preservation_updates_modified_time(tmp_path: Path) -
     save_image(path, Image.new("RGB", (40, 80), (20, 30, 40)))
 
     assert path.stat().st_mtime_ns != original_mtime_ns
+
+
+def test_save_image_failure_preserves_original_file(tmp_path: Path, monkeypatch) -> None:
+    path = tmp_path / "image.jpg"
+    make_image(path, (80, 40))
+    original_bytes = path.read_bytes()
+    original_save = Image.Image.save
+
+    def fail_after_partial_temp_write(self, fp, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if isinstance(fp, (str, Path)) and Path(fp).parent == tmp_path:
+            Path(fp).write_bytes(b"partial")
+            raise OSError("simulated save failure")
+        return original_save(self, fp, *args, **kwargs)
+
+    monkeypatch.setattr(Image.Image, "save", fail_after_partial_temp_write)
+
+    try:
+        save_image(path, Image.new("RGB", (40, 80), (20, 30, 40)))
+    except OSError as error:
+        assert "simulated save failure" in str(error)
+    else:
+        raise AssertionError("save_image should surface encoder failures")
+
+    assert path.read_bytes() == original_bytes
+    assert not list(tmp_path.glob(".image.jpg.*.tmp.jpg"))
+
+
+def test_save_image_does_not_use_old_predictable_temp_name(tmp_path: Path) -> None:
+    path = tmp_path / "image.jpg"
+    make_image(path, (80, 40))
+    guessed = tmp_path / f".image.jpg.{os.getpid()}.123456789.tmp.jpg"
+    guessed.write_bytes(b"sentinel")
+
+    save_image(path, Image.new("RGB", (40, 80), (20, 30, 40)))
+
+    assert guessed.read_bytes() == b"sentinel"
+
+
+def test_apply_operation_to_file_rejects_oversized_image(tmp_path: Path, monkeypatch) -> None:
+    path = tmp_path / "large.jpg"
+    make_image(path, (20, 20))
+    monkeypatch.setattr(safe_image, "MAX_IMAGE_PIXELS", 100)
+    original_bytes = path.read_bytes()
+
+    try:
+        apply_operation_to_file(path, EditOperation("rotate_left"))
+    except ValueError as error:
+        assert "pixel limit" in str(error)
+    else:
+        raise AssertionError("oversized image should be rejected")
+
+    assert path.read_bytes() == original_bytes

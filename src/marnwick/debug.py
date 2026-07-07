@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import secrets
 from time import monotonic
 from typing import TYPE_CHECKING
 
@@ -20,10 +21,30 @@ class DebugCommandServer(QObject):
     """JSON-lines control port for automated performance runs."""
 
     protocol_version = 1
+    max_line_bytes = 1024 * 1024
+    max_connections = 4
+    max_page_size = 1000
+    max_tail = 1000
 
-    def __init__(self, window: MainWindow, *, port: int = 8675, parent: QObject | None = None) -> None:
+    def __init__(
+        self,
+        window: MainWindow,
+        *,
+        port: int = 8675,
+        token: str | None = None,
+        max_line_bytes: int | None = None,
+        max_connections: int | None = None,
+        max_page_size: int | None = None,
+        max_tail: int | None = None,
+        parent: QObject | None = None,
+    ) -> None:
         super().__init__(parent or window)
         self.window = window
+        self.token = token or secrets.token_urlsafe(24)
+        self.max_line_bytes = max(1, int(max_line_bytes or self.max_line_bytes))
+        self.max_connections = max(1, int(max_connections or self.max_connections))
+        self.max_page_size = max(1, int(max_page_size or self.max_page_size))
+        self.max_tail = max(1, int(max_tail or self.max_tail))
         self.server = QTcpServer(self)
         self.server.newConnection.connect(self._accept_connections)
         self._buffers: dict[QTcpSocket, bytearray] = {}
@@ -38,6 +59,11 @@ class DebugCommandServer(QObject):
             socket = self.server.nextPendingConnection()
             if socket is None:
                 return
+            if len(self._buffers) >= self.max_connections:
+                self._write_response(socket, {"id": None, "ok": False, "error": "too many debug connections"})
+                socket.disconnectFromHost()
+                socket.deleteLater()
+                continue
             self._buffers[socket] = bytearray()
             socket.readyRead.connect(lambda socket=socket: self._read_socket(socket))
             socket.disconnected.connect(lambda socket=socket: self._drop_socket(socket))
@@ -52,6 +78,11 @@ class DebugCommandServer(QObject):
     def _read_socket(self, socket: QTcpSocket) -> None:
         buffer = self._buffers.setdefault(socket, bytearray())
         buffer.extend(bytes(socket.readAll()))
+        if len(buffer) > self.max_line_bytes:
+            self._write_response(socket, {"id": None, "ok": False, "error": "debug request too large"})
+            self._buffers.pop(socket, None)
+            socket.disconnectFromHost()
+            return
         while b"\n" in buffer:
             line, _, rest = buffer.partition(b"\n")
             buffer[:] = rest
@@ -69,6 +100,9 @@ class DebugCommandServer(QObject):
             command = request.get("command") or request.get("cmd")
             if not isinstance(command, str):
                 raise ValueError("request command must be a string")
+            provided_token = request.get("token")
+            if not isinstance(provided_token, str) or not secrets.compare_digest(provided_token, self.token):
+                raise PermissionError("invalid debug token")
             params = request.get("params") or {}
             if not isinstance(params, dict):
                 raise ValueError("request params must be an object")
@@ -101,6 +135,13 @@ class DebugCommandServer(QObject):
             QTimer.singleShot(0, QApplication.instance().quit)
             return {"quitting": True}
         raise ValueError(f"unknown command: {command}")
+
+    def _bounded_int(self, value: object, *, default: int, minimum: int, maximum: int) -> int:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            parsed = default
+        return max(minimum, min(maximum, parsed))
 
     def _status(self) -> dict[str, object]:
         current_catalog = self.window.current_catalog
@@ -189,8 +230,8 @@ class DebugCommandServer(QObject):
         prefix = params.get("prefix", "")
         if not isinstance(prefix, str):
             raise ValueError("prefix must be a string")
-        limit = int(params.get("limit", 500))
-        offset = int(params.get("offset", 0))
+        limit = self._bounded_int(params.get("limit"), default=500, minimum=0, maximum=self.max_page_size)
+        offset = self._bounded_int(params.get("offset"), default=0, minimum=0, maximum=10**9)
         directories = catalog.list_known_directories()
         if prefix:
             directories = [item for item in directories if item == prefix or item.startswith(f"{prefix}/")]
@@ -204,8 +245,8 @@ class DebugCommandServer(QObject):
         }
 
     def _items(self, params: dict[str, object]) -> dict[str, object]:
-        limit = int(params.get("limit", 500))
-        offset = int(params.get("offset", 0))
+        limit = self._bounded_int(params.get("limit"), default=500, minimum=0, maximum=self.max_page_size)
+        offset = self._bounded_int(params.get("offset"), default=0, minimum=0, maximum=10**9)
         rows = []
         for record in self.window.model.images[offset : offset + limit]:
             rows.append(
@@ -239,8 +280,8 @@ class DebugCommandServer(QObject):
         events = payload.get("events", [])
         if not isinstance(events, list):
             events = []
-        tail = int(params.get("tail", 100))
-        return {"root": str(root), "events": events[-tail:]}
+        tail = self._bounded_int(params.get("tail"), default=100, minimum=0, maximum=self.max_tail)
+        return {"root": str(root), "events": events[-tail:] if tail else []}
 
     def _catalog_for_params(self, params: dict[str, object], *, required: bool = True):
         root_value = params.get("root")

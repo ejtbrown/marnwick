@@ -15,6 +15,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+  "pip-tools>=7",
   "pytest>=8",
 ]
 

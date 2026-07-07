@@ -6,9 +6,13 @@ from functools import lru_cache
 import os
 from pathlib import Path
 import sys
+import tempfile
+import time
 from typing import Any
 
 from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageOps
+
+from .safe_image import open_catalog_image
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,7 +90,7 @@ def apply_operation_to_file(
     dest: Path | None = None,
     preserve_timestamp: bool = True,
 ) -> Path:
-    with Image.open(path) as image:
+    with open_catalog_image(path) as image:
         edited = apply_operation_to_image(image, operation)
     if preserve_timestamp:
         return save_image_preserving_timestamp(path, edited, dest=dest)
@@ -100,7 +104,18 @@ def save_image(path: Path, image: Image.Image, *, dest: Path | None = None) -> P
         save_kwargs.update({"quality": 95, "subsampling": 0})
         if image.mode not in {"RGB", "L"}:
             image = image.convert("RGB")
-    image.save(destination, **save_kwargs)
+    fd, temp_name = tempfile.mkstemp(
+        prefix=f".{destination.name}.",
+        suffix=f".tmp{destination.suffix}",
+        dir=destination.parent,
+    )
+    os.close(fd)
+    temp = Path(temp_name)
+    try:
+        image.save(temp, **save_kwargs)
+        os.replace(temp, destination)
+    finally:
+        temp.unlink(missing_ok=True)
     return destination
 
 
@@ -228,7 +243,7 @@ def preferred_file_timestamp_ns(path: Path) -> int:
 
 def image_created_timestamp_ns(path: Path) -> int | None:
     try:
-        with Image.open(path) as image:
+        with open_catalog_image(path) as image:
             exif = image.getexif()
             for tag_id in EXIF_DATE_TAGS:
                 value = exif.get(tag_id)

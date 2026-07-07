@@ -3,16 +3,19 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import socket
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
 
 
 class DebugClient:
-    def __init__(self, *, host: str, port: int, timeout: float = 30.0) -> None:
+    def __init__(self, *, host: str, port: int, token: str, timeout: float = 30.0) -> None:
         self.socket = socket.create_connection((host, port), timeout=timeout)
         self.socket.settimeout(timeout)
+        self.token = token
         self._next_id = 1
         self._buffer = b""
 
@@ -22,7 +25,7 @@ class DebugClient:
     def command(self, command: str, **params: object) -> Any:
         request_id = self._next_id
         self._next_id += 1
-        payload = {"id": request_id, "command": command, "params": params}
+        payload = {"id": request_id, "token": self.token, "command": command, "params": params}
         self.socket.sendall((json.dumps(payload, sort_keys=True) + "\n").encode("utf-8"))
         while b"\n" not in self._buffer:
             chunk = self.socket.recv(65536)
@@ -105,7 +108,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "phases": {},
         "navigations": [],
     }
-    client = DebugClient(host=args.host, port=args.port, timeout=args.socket_timeout)
+    client = DebugClient(host=args.host, port=args.port, token=debug_token_from_args(args), timeout=args.socket_timeout)
     try:
         ping = client.command("ping")
         report["ping"] = ping
@@ -177,7 +180,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("catalog", type=Path)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8675)
-    parser.add_argument("--output", type=Path, default=Path("/tmp/marnwick-debug-run.json"))
+    parser.add_argument("--token-file", type=Path)
+    parser.add_argument("--output", type=Path, default=Path(tempfile.gettempdir()) / "marnwick-debug-run.json")
     parser.add_argument("--navigation-count", type=int, default=24)
     parser.add_argument("--directory-limit", type=int, default=10000)
     parser.add_argument("--timing-tail", type=int, default=300)
@@ -189,6 +193,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--post-navigate-delay", type=float, default=0.05)
     parser.add_argument("--wait-directory-index", action="store_true")
     return parser.parse_args()
+
+
+def debug_token_from_args(args: argparse.Namespace) -> str:
+    token = os.environ.get("MARNWICK_DEBUG_TOKEN")
+    if args.token_file is not None:
+        path = args.token_file.expanduser()
+        stat_result = path.stat()
+        if os.name != "nt" and stat_result.st_mode & 0o077:
+            raise PermissionError(f"debug token file must not be readable by group or others: {path}")
+        token = path.read_text(encoding="utf-8").strip()
+    if not token:
+        raise RuntimeError("debug token is required via MARNWICK_DEBUG_TOKEN or --token-file")
+    return token
 
 
 def main() -> int:
