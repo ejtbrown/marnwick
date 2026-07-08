@@ -29,6 +29,7 @@ from marnwick.ui import (  # noqa: E402
     AppPreferencesDialog,
     DIALOG_STYLESHEET,
     DIR_REL_ROLE,
+    DeletePayloadResult,
     DirectoryPropertiesDialog,
     DuplicateDeleteTask,
     DuplicateListDialog,
@@ -110,6 +111,16 @@ def settle_duplicate_delete_task(window: MainWindow, qt_app: QApplication, *, ti
         sleep(0.01)
     window._settle_duplicate_delete_task()
     assert window._duplicate_delete_task is None
+
+
+def settle_delete_payload_task(window: MainWindow, qt_app: QApplication, *, timeout: float = 2.0) -> None:
+    deadline = monotonic() + timeout
+    while window._delete_payload_task is not None and monotonic() < deadline:
+        qt_app.processEvents()
+        window._settle_delete_payload_task()
+        sleep(0.01)
+    window._settle_delete_payload_task()
+    assert window._delete_payload_task is None
 
 
 def settle_move_payload_task(window: MainWindow, qt_app: QApplication, *, timeout: float = 2.0) -> None:
@@ -843,21 +854,38 @@ def test_fullscreen_delete_removes_current_image_and_advances(tmp_path: Path, mo
     Image.new("RGB", (8, 8), (10, 20, 30)).save(first)
     Image.new("RGB", (8, 8), (40, 50, 60)).save(second)
 
-    with Catalog(root) as catalog:
+    window = MainWindow()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
         catalog.refresh()
-        viewer = FullscreenViewer(catalog, ImageNavigator.sequential(["first.jpg", "second.jpg"], "first.jpg"))
+        window.current_catalog = catalog
+        window.current_dir_rel = ""
+        window.load_current_directory()
+        viewer = FullscreenViewer(catalog, ImageNavigator.sequential(["first.jpg", "second.jpg"], "first.jpg"), window)
         try:
             monkeypatch.setattr("marnwick.ui.ask_delete_files", lambda parent, count: True)
 
             viewer.delete_current_image()
 
+            assert viewer.navigator.order == ["second.jpg"]
+            assert [record.rel_path for record in window.model.images if isinstance(record, ImageRecord)] == ["second.jpg"]
+            settle_delete_payload_task(window, qt_app)
             assert not first.exists()
             assert viewer.navigator.current == "second.jpg"
             assert catalog.get_image("first.jpg") is None
         finally:
             viewer.close()
             viewer.deleteLater()
-            qt_app.processEvents()
+    finally:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        window.indexer.shutdown()
+        window.workspace.close()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
 
 
 def test_fullscreen_delete_only_image_keeps_last_viewed_reference(tmp_path: Path, monkeypatch) -> None:
@@ -867,21 +895,95 @@ def test_fullscreen_delete_only_image_keeps_last_viewed_reference(tmp_path: Path
     path = root / "only.jpg"
     Image.new("RGB", (8, 8), (10, 20, 30)).save(path)
 
-    with Catalog(root) as catalog:
+    window = MainWindow()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
         catalog.refresh()
-        viewer = FullscreenViewer(catalog, ImageNavigator.sequential(["only.jpg"], "only.jpg"))
+        window.current_catalog = catalog
+        window.current_dir_rel = ""
+        window.load_current_directory()
+        viewer = FullscreenViewer(catalog, ImageNavigator.sequential(["only.jpg"], "only.jpg"), window)
         try:
             monkeypatch.setattr("marnwick.ui.ask_delete_files", lambda parent, count: True)
 
             viewer.delete_current_image()
 
+            assert [record.rel_path for record in window.model.images if isinstance(record, ImageRecord)] == []
+            settle_delete_payload_task(window, qt_app)
             assert not path.exists()
             assert viewer.navigator.order == []
             assert viewer.last_viewed_rel_path == "only.jpg"
         finally:
             viewer.close()
             viewer.deleteLater()
-            qt_app.processEvents()
+    finally:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        window.indexer.shutdown()
+        window.workspace.close()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_delete_selected_returns_while_worker_is_busy_and_hides_thumbnail(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    Image.new("RGB", (8, 8), (10, 20, 30)).save(root / "one.jpg")
+    Image.new("RGB", (8, 8), (40, 50, 60)).save(root / "two.jpg")
+    started = Event()
+    release = Event()
+
+    window = MainWindow()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        catalog.refresh()
+        window.current_catalog = catalog
+        window.current_dir_rel = ""
+        window.load_current_directory()
+        select_thumbnail_rows(window, [0])
+        monkeypatch.setattr("marnwick.ui.ask_delete_files", lambda parent, count: True)
+
+        def slow_delete_worker(root_arg, rel_paths, _wipe, task):
+            started.set()
+            task.update(0, len(rel_paths), "waiting")
+            if not release.wait(timeout=1.0):
+                raise TimeoutError("delete worker was not allowed to finish")
+            task.mark_done()
+            return DeletePayloadResult(requested=len(rel_paths), deleted=0, affected_roots={root_arg})
+
+        monkeypatch.setattr(window, "_delete_images_worker", slow_delete_worker)
+
+        started_at = monotonic()
+        window.delete_selected()
+
+        assert monotonic() - started_at < 0.5
+        assert started.wait(timeout=1.0)
+        assert window._delete_payload_task is not None
+        assert not window._delete_payload_task.future.done()
+        assert [record.rel_path for record in window.model.images if isinstance(record, ImageRecord)] == ["two.jpg"]
+        window.load_current_directory()
+        assert [record.rel_path for record in window.model.images if isinstance(record, ImageRecord)] == ["two.jpg"]
+
+        release.set()
+        settle_delete_payload_task(window, qt_app)
+    finally:
+        release.set()
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        window.indexer.shutdown()
+        window.workspace.close()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
 
 
 def test_fullscreen_save_preserve_date_restores_original_modified_time(tmp_path: Path, monkeypatch) -> None:
@@ -1315,6 +1417,105 @@ def test_thumbnail_scroll_position_is_remembered_per_directory(tmp_path: Path) -
             sleep(0.01)
 
         assert scroll_bar.value() == saved_position
+    finally:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        window.indexer.shutdown()
+        window.workspace.close()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_select_rel_path_cancels_pending_thumbnail_scroll_restore(tmp_path: Path) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    for index in range(80):
+        Image.new("RGB", (8, 8), (index % 255, 20, 30)).save(root / f"image-{index:02d}.jpg")
+
+    window = MainWindow()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        catalog.refresh()
+        window.current_catalog = catalog
+        window.current_dir_rel = ""
+        window.set_thumbnail_size(2)
+        window.resize(520, 260)
+        window.show()
+        window.load_current_directory()
+
+        scroll_bar = window.thumbnail_view.verticalScrollBar()
+        deadline = monotonic() + 1.0
+        while scroll_bar.maximum() == 0 and monotonic() < deadline:
+            qt_app.processEvents()
+            sleep(0.01)
+        assert scroll_bar.maximum() > 0
+
+        scroll_bar.setValue(scroll_bar.maximum())
+        window.load_current_directory()
+        window.select_rel_path("image-00.jpg")
+        deadline = monotonic() + 0.2
+        while monotonic() < deadline:
+            qt_app.processEvents()
+            sleep(0.01)
+
+        assert window.selected_rel_paths() == ["image-00.jpg"]
+        assert scroll_bar.value() < scroll_bar.maximum() // 2
+    finally:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        window.indexer.shutdown()
+        window.workspace.close()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_fullscreen_navigation_syncs_thumbnail_scroll_to_current_image(tmp_path: Path) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    for index in range(80):
+        Image.new("RGB", (8, 8), (index % 255, 20, 30)).save(root / f"image-{index:02d}.jpg")
+
+    window = MainWindow()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        catalog.refresh()
+        window.current_catalog = catalog
+        window.current_dir_rel = ""
+        window.set_thumbnail_size(2)
+        window.resize(520, 260)
+        window.show()
+        window.load_current_directory()
+
+        scroll_bar = window.thumbnail_view.verticalScrollBar()
+        deadline = monotonic() + 1.0
+        while scroll_bar.maximum() == 0 and monotonic() < deadline:
+            qt_app.processEvents()
+            sleep(0.01)
+        assert scroll_bar.maximum() > 0
+
+        order = [f"image-{index:02d}.jpg" for index in range(80)]
+        viewer = FullscreenViewer(catalog, ImageNavigator.sequential(order, "image-00.jpg"), window)
+        try:
+            viewer.navigator.index = 70
+            viewer.load_current()
+            deadline = monotonic() + 0.2
+            while monotonic() < deadline:
+                qt_app.processEvents()
+                sleep(0.01)
+
+            assert window.selected_rel_paths() == ["image-70.jpg"]
+            assert scroll_bar.value() > 0
+        finally:
+            viewer.close()
+            viewer.deleteLater()
     finally:
         window.progress_timer.stop()
         window.idle_timer.stop()
@@ -2253,6 +2454,70 @@ def test_move_payload_to_directory_queues_multiple_moves_and_hides_thumbnails(
         release.set()
         settle_move_payload_task(window, qt_app)
         assert calls == 2
+    finally:
+        release.set()
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        window.indexer.shutdown()
+        window.workspace.close()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_move_payload_removal_keeps_thumbnail_scroll_anchored(tmp_path: Path, monkeypatch) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    (root / "target").mkdir(parents=True)
+    for index in range(80):
+        Image.new("RGB", (8, 8), (index % 255, 20, 30)).save(root / f"image-{index:02d}.jpg")
+    started = Event()
+    release = Event()
+
+    window = MainWindow()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        catalog.refresh()
+        window.current_catalog = catalog
+        window.current_dir_rel = ""
+        window.set_thumbnail_size(2)
+        window.resize(520, 260)
+        window.show()
+        window.load_current_directory()
+
+        scroll_bar = window.thumbnail_view.verticalScrollBar()
+        deadline = monotonic() + 1.0
+        while scroll_bar.maximum() == 0 and monotonic() < deadline:
+            qt_app.processEvents()
+            sleep(0.01)
+        assert scroll_bar.maximum() > 0
+        window.select_rel_path("image-70.jpg")
+        assert scroll_bar.value() > 0
+
+        def slow_move_worker(_image_groups, _directory_groups, _dest_root, _dest_dir_rel, _wipe_on_delete, task):
+            started.set()
+            task.update(0, 1, "waiting")
+            if not release.wait(timeout=1.0):
+                raise TimeoutError("move worker was not allowed to finish")
+            task.mark_done()
+            return MovePayloadResult(requested=1, moved=0, affected_roots={catalog.root})
+
+        monkeypatch.setattr(window, "_move_payload_worker", slow_move_worker)
+
+        window.move_payload_to_directory(
+            [{"catalog_root": str(catalog.root), "rel_path": "image-70.jpg"}],
+            catalog.root,
+            "target",
+        )
+
+        assert started.wait(timeout=1.0)
+        assert window.selected_rel_paths() == ["image-71.jpg"]
+        assert scroll_bar.value() > 0
+
+        release.set()
+        settle_move_payload_task(window, qt_app)
     finally:
         release.set()
         window.progress_timer.stop()

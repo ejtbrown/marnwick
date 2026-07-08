@@ -186,6 +186,22 @@ class DuplicateDeleteTask:
 
 
 @dataclass(slots=True)
+class DeletePayloadResult:
+    requested: int
+    deleted: int
+    affected_roots: set[Path]
+
+
+@dataclass(slots=True)
+class DeletePayloadTask:
+    root: Path
+    rel_paths: tuple[str, ...]
+    task: IndexTask
+    future: Future[DeletePayloadResult]
+    started_at: float
+
+
+@dataclass(slots=True)
 class MovePayloadResult:
     requested: int
     moved: int
@@ -1037,12 +1053,15 @@ class MainWindow(QMainWindow):
         self._virtual_view_tasks: dict[Future[VirtualViewResult], VirtualViewTask] = {}
         self._very_similar_cache: dict[tuple[Path, str, int], list[ImageRecord]] = {}
         self._duplicate_delete_task: DuplicateDeleteTask | None = None
+        self._delete_payload_tasks: list[DeletePayloadTask] = []
+        self._delete_payload_task: DeletePayloadTask | None = None
         self._move_payload_tasks: list[MovePayloadTask] = []
         self._move_payload_task: MovePayloadTask | None = None
         self._tree_build_task: TreeBuildTask | None = None
         self._pending_tree_rebuilds: dict[Path, tuple[Catalog, str]] = {}
         self._thumbnail_scroll_positions: dict[TreeStateKey, tuple[int, int]] = {}
         self._thumbnail_scroll_key: TreeStateKey | None = None
+        self._thumbnail_scroll_restore_generation = 0
         self._indexing_was_active = False
 
         self.tree = DirectoryTree(self)
@@ -1139,6 +1158,7 @@ class MainWindow(QMainWindow):
         self.idle_timer.stop()
         self._wait_for_pending_file_tasks_on_exit()
         self._cancel_active_duplicate_delete_task(wait=True)
+        self._cancel_active_delete_payload_task(wait=True)
         self._cancel_active_move_payload_task(wait=True)
         self.catalog_open_executor.shutdown(wait=False, cancel_futures=True)
         self.virtual_view_executor.shutdown(wait=False, cancel_futures=True)
@@ -1150,6 +1170,7 @@ class MainWindow(QMainWindow):
 
     def _wait_for_pending_file_tasks_on_exit(self) -> None:
         self._settle_duplicate_delete_task()
+        self._settle_delete_payload_task()
         self._settle_move_payload_task()
         if not self._has_pending_file_tasks():
             return
@@ -1157,12 +1178,12 @@ class MainWindow(QMainWindow):
             self.indexer.cancel_idle_tasks(catalog.root)
             self.indexer.cancel_directory_tasks(catalog.root)
         dialog = QDialog(self)
-        dialog.setWindowTitle("Finishing File Moves")
+        dialog.setWindowTitle("Finishing File Changes")
         dialog.setWindowIcon(load_app_icon())
         dialog.setStyleSheet(DIALOG_STYLESHEET)
         dialog.setWindowFlag(Qt.WindowType.WindowCloseButtonHint, False)
         layout = QVBoxLayout(dialog)
-        label = QLabel("Finishing pending file moves...")
+        label = QLabel("Finishing pending file changes...")
         label.setMinimumWidth(480)
         progress = QProgressBar()
         progress.setRange(0, 0)
@@ -1172,10 +1193,14 @@ class MainWindow(QMainWindow):
 
         def update() -> None:
             self._settle_duplicate_delete_task()
+            self._settle_delete_payload_task()
             self._settle_move_payload_task()
             active_move = self._active_move_payload_task()
+            active_delete_payload = self._active_delete_payload_task()
             active_duplicate = self._active_duplicate_delete_task()
             active_task = active_move.task if active_move is not None else None
+            if active_task is None and active_delete_payload is not None:
+                active_task = active_delete_payload.task
             if active_task is None and active_duplicate is not None:
                 active_task = active_duplicate.task
             if active_task is None:
@@ -1204,7 +1229,11 @@ class MainWindow(QMainWindow):
         timer.stop()
 
     def _has_pending_file_tasks(self) -> bool:
-        return self._has_pending_move_payload_tasks() or self._has_active_duplicate_delete_task()
+        return (
+            self._has_pending_move_payload_tasks()
+            or self._has_pending_delete_payload_tasks()
+            or self._has_active_duplicate_delete_task()
+        )
 
     def showEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         super().showEvent(event)
@@ -1367,6 +1396,7 @@ class MainWindow(QMainWindow):
             duplicate_view_selected
             and self.current_catalog is not None
             and self._duplicate_delete_task is None
+            and not self._has_pending_delete_payload_tasks()
             and not self._has_pending_move_payload_tasks()
             and self._active_virtual_view_task() is None
         )
@@ -1427,6 +1457,9 @@ class MainWindow(QMainWindow):
             return
         if self._duplicate_delete_task is not None:
             self._show_duplicate_delete_status(self._duplicate_delete_task.task.snapshot())
+            return
+        if self._has_pending_delete_payload_tasks():
+            self.progress_label.setText("Wait for pending deletes to finish")
             return
         if self._active_virtual_view_task() is not None:
             self.progress_label.setText("Wait for the virtual directory to finish building")
@@ -2332,7 +2365,8 @@ class MainWindow(QMainWindow):
                 include_previews=True,
                 include_filesystem_preview_fallback=False,
             )
-        self.model.set_images(self.current_catalog, [*directories, *images])
+        records = self._without_pending_delete_records(self.current_catalog.root, [*directories, *images])
+        self.model.set_images(self.current_catalog, records)
         self.refresh_thumbnail_layout()
         if preserve_selection:
             self._restore_thumbnail_selection(selection_keys, current_key)
@@ -2361,7 +2395,9 @@ class MainWindow(QMainWindow):
     def _restore_thumbnail_scroll_position(self, key: TreeStateKey | None) -> None:
         self._thumbnail_scroll_key = key
         vertical, horizontal = self._thumbnail_scroll_positions.get(key, (0, 0)) if key is not None else (0, 0)
-        self._set_thumbnail_scroll_position(key, vertical, horizontal, retries=5)
+        self._thumbnail_scroll_restore_generation += 1
+        generation = self._thumbnail_scroll_restore_generation
+        self._set_thumbnail_scroll_position(key, vertical, horizontal, retries=5, generation=generation)
 
     def _set_thumbnail_scroll_position(
         self,
@@ -2370,8 +2406,9 @@ class MainWindow(QMainWindow):
         horizontal: int,
         *,
         retries: int,
+        generation: int,
     ) -> None:
-        if key != self._thumbnail_scroll_key:
+        if key != self._thumbnail_scroll_key or generation != self._thumbnail_scroll_restore_generation:
             return
         vertical_bar = self.thumbnail_view.verticalScrollBar()
         horizontal_bar = self.thumbnail_view.horizontalScrollBar()
@@ -2384,8 +2421,18 @@ class MainWindow(QMainWindow):
         next_retries = retries - 1
         QTimer.singleShot(
             0,
-            partial(self._set_thumbnail_scroll_position, key, vertical, horizontal, retries=next_retries),
+            partial(
+                self._set_thumbnail_scroll_position,
+                key,
+                vertical,
+                horizontal,
+                retries=next_retries,
+                generation=generation,
+            ),
         )
+
+    def _cancel_thumbnail_scroll_restore(self) -> None:
+        self._thumbnail_scroll_restore_generation += 1
 
     def _shallow_child_directories(self, catalog: Catalog, dir_rel: str) -> list[DirectoryRecord]:
         if not catalog.directory_tree_cache_available():
@@ -2444,6 +2491,7 @@ class MainWindow(QMainWindow):
             return
         else:
             images = []
+        images = self._without_pending_delete_records(self.current_catalog.root, images)
         self.model.set_images(self.current_catalog, images)
         self.refresh_thumbnail_layout()
         if preserve_selection:
@@ -2455,6 +2503,29 @@ class MainWindow(QMainWindow):
         if isinstance(record, DirectoryRecord):
             return ("directory", record.dir_rel)
         return ("image", record.rel_path)
+
+    def _pending_delete_image_rels(self, root: Path) -> set[str]:
+        resolved_root = root.expanduser().resolve()
+        rel_paths: set[str] = set()
+        for delete_task in self._delete_payload_tasks:
+            if delete_task.root != resolved_root or delete_task.future.done():
+                continue
+            rel_paths.update(delete_task.rel_paths)
+        return rel_paths
+
+    def _without_pending_delete_records(
+        self,
+        root: Path,
+        records: Sequence[PaneRecord],
+    ) -> list[PaneRecord]:
+        pending = self._pending_delete_image_rels(root)
+        if not pending:
+            return list(records)
+        return [
+            record
+            for record in records
+            if not isinstance(record, ImageRecord) or record.rel_path not in pending
+        ]
 
     def _thumbnail_selection_keys(self) -> set[tuple[str, str]]:
         keys: set[tuple[str, str]] = set()
@@ -2506,7 +2577,10 @@ class MainWindow(QMainWindow):
         cache_key = self._very_similar_cache_key(catalog.root, self.current_sort, fingerprint)
         cached_images = self._very_similar_cache.get(cache_key)
         if cached_images is not None:
-            self.model.set_images(catalog, list(cached_images))
+            self.model.set_images(
+                catalog,
+                self._without_pending_delete_records(catalog.root, cached_images),
+            )
             self.refresh_thumbnail_layout()
             if preserve_selection:
                 self._restore_thumbnail_selection(selection_keys, current_key)
@@ -2653,7 +2727,10 @@ class MainWindow(QMainWindow):
             if current_fingerprint != result.fingerprint:
                 self.load_current_directory(preserve_selection=True)
                 continue
-            self.model.set_images(catalog, list(result.images))
+            self.model.set_images(
+                catalog,
+                self._without_pending_delete_records(catalog.root, result.images),
+            )
             self.refresh_thumbnail_layout()
             self._restore_thumbnail_selection(task.selection_keys, task.current_key)
             self._restore_thumbnail_scroll_position(task.scroll_key)
@@ -2778,6 +2855,107 @@ class MainWindow(QMainWindow):
             if snapshot.current:
                 detail = f"{detail}: {snapshot.current}"
         self.progress_label.setText(f"Moving duplicates to {TRASH_DIR_NAME}: {detail}")
+
+    def _cancel_active_delete_payload_task(self, *, wait: bool = False) -> None:
+        tasks = list(self._delete_payload_tasks)
+        if not tasks:
+            self._refresh_active_delete_payload_task()
+            return
+        for task in tasks:
+            task.task.cancel()
+        if wait:
+            for task in tasks:
+                self._wait_for_delete_payload_task(task)
+        else:
+            self._settle_delete_payload_task()
+        self._update_tools_menu_actions()
+
+    def _wait_for_delete_payload_task(self, task: DeletePayloadTask) -> None:
+        if not task.future.done():
+            with suppress(Exception):
+                task.future.result()
+        self._settle_delete_payload_task()
+
+    def _settle_delete_payload_task(self) -> None:
+        completed = [task for task in self._delete_payload_tasks if task.future.done()]
+        if not completed:
+            self._refresh_active_delete_payload_task()
+            return
+        self._update_tools_menu_actions()
+        last_result: DeletePayloadResult | None = None
+        last_error: BaseException | None = None
+        canceled = False
+        affected_roots: set[Path] = set()
+        for delete_task in completed:
+            self._delete_payload_tasks.remove(delete_task)
+            affected_roots.add(delete_task.root)
+            if delete_task.future.cancelled():
+                canceled = True
+                continue
+            try:
+                result = delete_task.future.result()
+            except IndexTaskCancelled:
+                canceled = True
+                continue
+            except Exception as error:
+                last_error = error
+                continue
+            affected_roots.update(result.affected_roots)
+            last_result = result
+        self._refresh_active_delete_payload_task()
+        self._update_tools_menu_actions()
+        if affected_roots:
+            self._refresh_after_file_delete(affected_roots)
+        if last_error is not None:
+            self.progress_bar.setRange(0, 1)
+            self.progress_bar.setValue(0)
+            self.progress_label.setText("Ready")
+            show_error(self, "Delete", str(last_error))
+            return
+        if last_result is not None:
+            self.progress_bar.setRange(0, max(last_result.requested, 1))
+            self.progress_bar.setValue(min(last_result.requested, max(last_result.requested, 1)))
+            self.progress_label.setText(f"Deleted {last_result.deleted} image(s)")
+            return
+        if canceled and not self._delete_payload_tasks:
+            self.progress_bar.setRange(0, 1)
+            self.progress_bar.setValue(0)
+            self.progress_label.setText("Ready")
+
+    def _refresh_after_file_delete(self, affected_roots: set[Path]) -> None:
+        for root in affected_roots:
+            resolved_root = root.expanduser().resolve()
+            self._swept_catalog_roots.discard(resolved_root)
+            self._pruned_catalog_roots.discard(resolved_root)
+            self._drop_very_similar_cache(resolved_root)
+        self.reload_tree_and_directory(preserve_tree_scroll=True)
+
+    def _active_delete_payload_task(self) -> DeletePayloadTask | None:
+        self._refresh_active_delete_payload_task()
+        return self._delete_payload_task
+
+    def _has_pending_delete_payload_tasks(self) -> bool:
+        self._refresh_active_delete_payload_task()
+        return bool(self._delete_payload_tasks)
+
+    def _refresh_active_delete_payload_task(self) -> None:
+        self._delete_payload_task = next(
+            (task for task in self._delete_payload_tasks if not task.future.done()),
+            None,
+        )
+
+    def _show_delete_payload_status(self, snapshot: IndexProgressSnapshot) -> None:
+        if snapshot.total is None:
+            self.progress_bar.setRange(0, 0)
+            detail = snapshot.current or "Preparing delete"
+        else:
+            total = max(snapshot.total, 1)
+            self.progress_bar.setRange(0, total)
+            self.progress_bar.setValue(min(snapshot.processed, total))
+            detail = f"{snapshot.processed}/{snapshot.total}"
+            if snapshot.current:
+                detail = f"{detail}: {snapshot.current}"
+        self.progress_label.setText(f"Deleting images: {detail}")
 
     def _cancel_active_move_payload_task(self, *, wait: bool = False) -> None:
         tasks = list(self._move_payload_tasks)
@@ -3033,11 +3211,88 @@ class MainWindow(QMainWindow):
             return
         if not ask_delete_files(self, len(rel_paths)):
             return
-        self.indexer.cancel_idle_tasks(self.current_catalog.root)
-        self.current_catalog.delete_images(rel_paths, wipe=self.wipe_on_delete_enabled())
-        self._drop_very_similar_cache(self.current_catalog.root)
-        self._pruned_catalog_roots.discard(self.current_catalog.root)
-        self.load_current_directory()
+        self.queue_delete_images(
+            self.current_catalog,
+            rel_paths,
+            wipe=self.wipe_on_delete_enabled(),
+            remove_from_current_view=True,
+        )
+
+    def queue_delete_images(
+        self,
+        catalog: Catalog,
+        rel_paths: Sequence[str],
+        *,
+        wipe: bool,
+        remove_from_current_view: bool,
+    ) -> None:
+        unique_rel_paths = list(dict.fromkeys(rel_paths))
+        if not unique_rel_paths:
+            return
+        root = catalog.root
+        self.indexer.cancel_idle_tasks(root)
+        self.indexer.cancel_directory_tasks(root)
+        self._swept_catalog_roots.discard(root)
+        self._pruned_catalog_roots.discard(root)
+        self._drop_very_similar_cache(root)
+        task, future = self.indexer.submit_action(
+            "Deleting images",
+            root,
+            None,
+            priority=ActionPriority.FILE_DELETE,
+            worker=lambda action_task: self._delete_images_worker(
+                root,
+                unique_rel_paths,
+                wipe,
+                action_task,
+            ),
+            key=f"delete:{root}:{monotonic()}",
+            interactive=True,
+            force_refresh=True,
+            preemptible=False,
+        )
+        delete_task = DeletePayloadTask(
+            root=root,
+            rel_paths=tuple(unique_rel_paths),
+            task=task,
+            future=future,
+            started_at=monotonic(),
+        )
+        self._delete_payload_tasks.append(delete_task)
+        self._refresh_active_delete_payload_task()
+        if remove_from_current_view:
+            self._remove_records_from_current_view(root, image_rels=set(unique_rel_paths))
+        if self._delete_payload_task is not None:
+            self._show_delete_payload_status(self._delete_payload_task.task.snapshot())
+        self._update_tools_menu_actions()
+
+    def _delete_images_worker(
+        self,
+        root: Path,
+        rel_paths: Sequence[str],
+        wipe: bool,
+        task: IndexTask,
+    ) -> DeletePayloadResult:
+        try:
+            with Catalog(root) as catalog:
+                deleted = catalog.delete_images(
+                    rel_paths,
+                    wipe=wipe,
+                    progress_callback=task.update,
+                    cancel_check=task.check_canceled,
+                )
+            task.mark_done()
+            return DeletePayloadResult(
+                requested=len(rel_paths),
+                deleted=deleted,
+                affected_roots={root.expanduser().resolve()},
+            )
+        except IndexTaskCancelled:
+            task.mark_canceled()
+            raise
+        except Exception as error:
+            task.mark_failed(error)
+            raise
 
     def _open_thumbnail_context_menu(self, pos) -> None:  # type: ignore[no-untyped-def]
         if self.current_catalog is None:
@@ -3271,26 +3526,11 @@ class MainWindow(QMainWindow):
         if self.current_catalog is None:
             return
         root = self.current_catalog.root
-        image_rels = set(image_payload.get(root, ()))
-        directory_rels = set(directory_payload.get(root, ()))
-        if not image_rels and not directory_rels:
-            return
-        filtered: list[PaneRecord] = []
-        changed = False
-        for record in self.model.images:
-            remove = False
-            if isinstance(record, ImageRecord):
-                remove = record.rel_path in image_rels
-            else:
-                remove = record.dir_rel in directory_rels
-            if remove:
-                changed = True
-                continue
-            filtered.append(record)
-        if not changed:
-            return
-        self.model.set_images(self.current_catalog, filtered)
-        self.update_selection_status()
+        self._remove_records_from_current_view(
+            root,
+            image_rels=set(image_payload.get(root, ())),
+            directory_rels=set(directory_payload.get(root, ())),
+        )
 
     def _move_payload_worker(
         self,
@@ -3369,18 +3609,91 @@ class MainWindow(QMainWindow):
                 with suppress(Exception):
                     catalog.close()
 
-    def select_rel_path(self, rel_path: str) -> None:
+    def _remove_records_from_current_view(
+        self,
+        root: Path,
+        *,
+        image_rels: set[str] | None = None,
+        directory_rels: set[str] | None = None,
+    ) -> None:
+        if self.current_catalog is None or self.current_catalog.root != root.expanduser().resolve():
+            return
+        image_rels = image_rels or set()
+        directory_rels = directory_rels or set()
+        if not image_rels and not directory_rels:
+            return
+        records = list(self.model.images)
+        remove_flags: list[bool] = []
+        filtered: list[PaneRecord] = []
+        removed_rows: list[int] = []
+        for row, record in enumerate(records):
+            remove = (
+                record.rel_path in image_rels
+                if isinstance(record, ImageRecord)
+                else record.dir_rel in directory_rels
+            )
+            remove_flags.append(remove)
+            if remove:
+                removed_rows.append(row)
+                continue
+            filtered.append(record)
+        if not removed_rows:
+            return
+        anchor_key = self._thumbnail_anchor_key_after_removal(records, remove_flags, removed_rows)
+        self.model.set_images(self.current_catalog, filtered)
+        self.refresh_thumbnail_layout()
+        if anchor_key is not None:
+            self._select_thumbnail_record_key(anchor_key)
+        else:
+            self.update_selection_status()
+            self._remember_thumbnail_scroll_position()
+
+    def _thumbnail_anchor_key_after_removal(
+        self,
+        records: Sequence[PaneRecord],
+        remove_flags: Sequence[bool],
+        removed_rows: Sequence[int],
+    ) -> tuple[str, str] | None:
+        current = self.thumbnail_view.currentIndex()
+        if current.isValid() and current.row() < len(records) and not remove_flags[current.row()]:
+            return self._thumbnail_record_key(records[current.row()])
+        start_row = min(removed_rows)
+        for row in range(start_row, len(records)):
+            if not remove_flags[row]:
+                return self._thumbnail_record_key(records[row])
+        for row in range(start_row - 1, -1, -1):
+            if not remove_flags[row]:
+                return self._thumbnail_record_key(records[row])
+        return None
+
+    def _select_thumbnail_record_key(self, key: tuple[str, str]) -> bool:
+        kind, rel_path = key
         for row, record in enumerate(self.model.images):
-            if record.rel_path != rel_path:
+            if self._thumbnail_record_key(record) != (kind, rel_path):
                 continue
             index = self.model.index(row, 0)
             selection = self.thumbnail_view.selectionModel()
             selection.clearSelection()
             selection.select(index, QItemSelectionModel.SelectionFlag.Select)
             self.thumbnail_view.setCurrentIndex(index)
+            self._cancel_thumbnail_scroll_restore()
             self.thumbnail_view.scrollTo(index, QListView.ScrollHint.PositionAtCenter)
             self.update_selection_status()
+            self._remember_thumbnail_scroll_position()
+            return True
+        return False
+
+    def select_rel_path(self, rel_path: str) -> None:
+        for row, record in enumerate(self.model.images):
+            if not isinstance(record, ImageRecord) or record.rel_path != rel_path:
+                continue
+            self._select_thumbnail_record_key(("image", rel_path))
             return
+
+    def sync_thumbnail_to_rel_path(self, catalog: Catalog, rel_path: str) -> None:
+        if self.current_catalog is None or self.current_catalog.root != catalog.root:
+            return
+        self.select_rel_path(rel_path)
 
     def queue_directory_index(
         self,
@@ -3400,6 +3713,8 @@ class MainWindow(QMainWindow):
         if self._has_active_catalog_open_tasks():
             return
         if self._has_active_duplicate_delete_task():
+            return
+        if self._has_pending_delete_payload_tasks():
             return
         if self._has_pending_move_payload_tasks():
             return
@@ -3431,6 +3746,7 @@ class MainWindow(QMainWindow):
             return
         self._settle_catalog_open_tasks()
         self._settle_duplicate_delete_task()
+        self._settle_delete_payload_task()
         self._settle_move_payload_task()
         self._settle_virtual_view_tasks()
         active_open_task = self._active_catalog_open_task()
@@ -3441,6 +3757,10 @@ class MainWindow(QMainWindow):
         active_delete_task = self._active_duplicate_delete_task()
         if active_delete_task is not None and self._task_is_running(active_delete_task.task, snapshots):
             self._show_duplicate_delete_status(active_delete_task.task.snapshot())
+            return
+        active_delete_payload_task = self._active_delete_payload_task()
+        if active_delete_payload_task is not None and self._task_is_running(active_delete_payload_task.task, snapshots):
+            self._show_delete_payload_status(active_delete_payload_task.task.snapshot())
             return
         active_move_task = self._active_move_payload_task()
         if active_move_task is not None and self._task_is_running(active_move_task.task, snapshots):
@@ -4668,7 +4988,16 @@ class FullscreenViewer(QDialog):
         rel_path = self.navigator.current
         if not self.run_with_visible_cursor(lambda: ask_delete_files(self, 1)):
             return
-        self.catalog.delete_images([rel_path], wipe=self.wipe_on_delete)
+        parent = self.parent()
+        if isinstance(parent, MainWindow):
+            parent.queue_delete_images(
+                self.catalog,
+                [rel_path],
+                wipe=self.wipe_on_delete,
+                remove_from_current_view=True,
+            )
+        else:
+            self.catalog.delete_images([rel_path], wipe=self.wipe_on_delete)
         old_index = self.navigator.index
         self.navigator.order = [item for item in self.navigator.order if item != rel_path]
         if not self.navigator.order:
@@ -4687,6 +5016,9 @@ class FullscreenViewer(QDialog):
         self.pan_drag_start = None
         self.pan_offset_at_drag_start = QPoint(0, 0)
         self.last_viewed_rel_path = self.navigator.current
+        parent = self.parent()
+        if isinstance(parent, MainWindow):
+            parent.sync_thumbnail_to_rel_path(self.catalog, self.last_viewed_rel_path)
         self.preview_image = None
         self.preview_image_current = False
         self.display_preview_image = None

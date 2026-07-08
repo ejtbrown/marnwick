@@ -2659,13 +2659,27 @@ class Catalog:
                 catalog._save_directory_tree_cache_safely()
         return results
 
-    def delete_images(self, rel_paths: Sequence[str], *, wipe: bool = False) -> int:
+    def delete_images(
+        self,
+        rel_paths: Sequence[str],
+        *,
+        wipe: bool = False,
+        progress_callback: ProgressCallback | None = None,
+        cancel_check: CancelCallback | None = None,
+    ) -> int:
         entries = [(rel_path, self.abs_path(rel_path)) for rel_path in rel_paths]
+        total = len(entries)
+        if progress_callback is not None:
+            progress_callback(0, total, ".")
         deleted = 0
         removed_rel_paths: list[str] = []
         affected_dirs: set[str] = set()
         first_error: OSError | None = None
-        for rel_path, path in entries:
+        for processed, (rel_path, path) in enumerate(entries):
+            if cancel_check is not None:
+                cancel_check()
+            if progress_callback is not None:
+                progress_callback(processed, total, rel_path)
             try:
                 if path.exists() and path.is_file():
                     self._delete_file(path, wipe=wipe)
@@ -2678,6 +2692,8 @@ class Catalog:
             except OSError as error:
                 if first_error is None:
                     first_error = error
+            if progress_callback is not None:
+                progress_callback(processed + 1, total, rel_path)
         if removed_rel_paths:
             self._delete_db_records(removed_rel_paths)
             self.update_hashes_after_targeted_move(affected_dirs)

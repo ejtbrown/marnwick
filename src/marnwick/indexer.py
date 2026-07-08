@@ -17,10 +17,11 @@ from .catalog import Catalog
 class ActionPriority(IntEnum):
     SELECTED_DIRECTORY_INDEX = 0
     FILE_MOVE_CROSS_CATALOG = 1
-    FILE_MOVE_WITHIN_CATALOG = 2
-    DIRECTORY_INVENTORY = 3
-    THUMBNAIL_INDEX = 4
-    PRUNE = 5
+    FILE_DELETE = 2
+    FILE_MOVE_WITHIN_CATALOG = 3
+    DIRECTORY_INVENTORY = 4
+    THUMBNAIL_INDEX = 5
+    PRUNE = 6
 
 
 @dataclass(frozen=True, slots=True)
