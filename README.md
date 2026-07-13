@@ -6,8 +6,10 @@ Each catalog keeps its metadata beside the photos in a `.marnwick` directory. Mo
 
 ## Features
 
-- Open and remember multiple photo catalogs.
-- Discover folder trees before all images finish indexing.
+- Become interactive with safe defaults while global configuration loads in the background; newer choices made in the open window take precedence over a late load.
+- Open and restore multiple photo catalogs without blocking the application window.
+- Keep cached folder rows visible, publish a bounded direct-filesystem preview as soon as directory reads complete, and replace filename placeholders with thumbnails individually.
+- Discover deeply nested folder trees independently of the currently selected folder, read the known inventory in bounded database pages, and build Qt tree items in short event-loop slices.
 - Browse folders and images in a sortable thumbnail grid with configurable columns.
 - Preview child folders using up to four indexed image thumbnails.
 - Sort thumbnail views by name, file size, modification date, or aspect ratio.
@@ -84,13 +86,14 @@ Verify the command-line entry point without opening the GUI:
 
 ## First use
 
-1. Choose **File > Open** and select an existing photo directory.
+1. Choose **File > Open** and select an existing photo directory. Catalog initialization runs in the background, and the status bar reports the open request without freezing the application window.
 2. Marnwick creates `<catalog>/.marnwick` and shows the root and any cached or immediately visible folders.
-3. Folder discovery and thumbnail indexing continue in the background. Large known folder trees are added in bounded pages so the window remains responsive. The status bar shows the active phase.
-4. Select a folder in the left tree. Child folders appear before indexed images in the right pane.
-5. Double-click an image for fullscreen viewing, or double-click a folder tile to enter it.
+3. Select a folder in the left tree. Marnwick keeps any cached child-folder rows visible, starts a bounded direct-filesystem preview, and gives that folder's indexing work priority over deep discovery and idle maintenance. As soon as the preview worker can enumerate entries, it publishes filename tiles without waiting for the complete index.
+4. Thumbnail files are read away from the UI thread and replace placeholders individually as they become available. Folder, tag, and exact-duplicate panes fetch bounded result pages and build compact lookup indexes in separate workers, while folder-tree database reads are paged and Qt item construction is time-sliced into bounded batches.
+5. Deep folder discovery continues independently in the background. The status bar reports folders found, images checked, the current path, and other active phases.
+6. Double-click an image for fullscreen viewing, or double-click a folder tile to enter it.
 
-You can open more catalogs with **File > Open** or manage remembered catalogs under **Tools > Preferences**.
+You can open more catalogs with **File > Open** or manage remembered catalogs under **Tools > Preferences**. Global configuration is read on a bounded background lane, so the window can open with safe defaults even if the configuration path is slow. A late configuration result does not overwrite newer window geometry, controls, or catalog choices made in that window. Remembered catalogs are then restored asynchronously. If several open requests overlap, every catalog that opens successfully is retained in the workspace, while the most recently requested successful catalog becomes active. A slow earlier request cannot take focus back from a newer successful request; if the newest request fails, Marnwick falls back to the newest earlier success. An unavailable remembered path remains configured for a later retry.
 
 ## Main controls
 
@@ -106,6 +109,10 @@ You can open more catalogs with **File > Open** or manage remembered catalogs un
 | Drag | Move selected images or folders to a physical folder tile or folder-tree item |
 
 Use the slider to choose the number of thumbnail columns and the sort menu to change ordering. Scroll positions and selections are remembered separately for each physical or virtual directory during the session.
+
+Physical-folder navigation is progressive. Marnwick checks only the selected folder's direct entries when deciding whether that folder needs reindexing, so a slow descendant tree does not hold up the selected pane. Neutral image placeholders remain usable as filename tiles while indexing runs, and completed thumbnails repaint in place. Rapid navigation assigns each pane load a new generation, cancels stale preemptible scans and queries, and ignores any obsolete result that completes late. Returning to a previously interrupted folder queues a current direct-folder scan instead of reusing the canceled task.
+
+Deep discovery walks descendants separately from the selected-pane load and commits its directory inventory in batches. The folder tree reads that inventory from SQLite in bounded pages and performs only a short batch of Qt item work per event-loop turn. If tree work for an older catalog is still pending, the current catalog takes priority; selecting an already visible directory does not wait for the full descendant tree to finish.
 
 Right-click an image tile for duplicate matches, deletion, or metadata. Right-click a folder tile for open, properties, deletion, or trash restore. The folder-tree context menu also provides directory creation and, at a catalog root, catalog preferences, tag definitions, and close.
 
@@ -125,15 +132,21 @@ Directory tiles remain grouped before image tiles. Directory “size” is the t
 | `Ctrl+C` | Copy the current file to the desktop clipboard |
 | `Delete` or `Backspace` | Delete the current image and advance |
 
-The edit menu provides rotate-left, rotate-right, vertical flip, horizontal flip, red-eye selection, crop selection, and clone/heal tools. Drag over the image to select a crop or red-eye region. In clone/heal mode, right-click to set the source, left-drag to paint, and use the mouse wheel to resize the brush. Navigation or closing prompts you to save, save while preserving filesystem dates, discard, or cancel pending edits. Saves preserve supported EXIF/GPS, ICC profiles, permissions, ownership, and extended attributes; edits are applied to every GIF frame or TIFF page instead of flattening the file. Marnwick refuses the save if the original changed after it was opened or if the encoder cannot preserve a multi-frame file's structure and timing.
+The edit menu provides rotate-left, rotate-right, vertical flip, horizontal flip, red-eye selection, crop selection, and clone/heal tools. Drag over the image to select a crop or red-eye region. In clone/heal mode, right-click to set the source, left-drag to paint, and use the mouse wheel to resize the brush. Navigation or closing prompts you to save, save while preserving filesystem dates, discard, or cancel pending edits. In the main application, choosing save queues image decoding, editing, encoding, validation, and atomic replacement on a dedicated background worker; you can continue navigating while the status bar reports the save. A static PNG uses the same non-modal worker path, shares metadata inspection and editing in one traversal, and uses fast lossless compression. It no longer opens an indeterminate “preserving frames and metadata” progress dialog. After a successful replacement, Marnwick submits a targeted reindex through the catalog action queue. That reindex decodes and hashes one stable open file descriptor, compares the resulting filesystem identity and SHA-256 hash with the proof of the exact committed object, and publishes the new record and thumbnail only if they match. It does not perform a separate preliminary full-file proof hash.
+
+Saves preserve supported EXIF/GPS with orientation normalized, ICC profiles, PNG text, JPEG/WebP/AVIF XMP, and—where the platform supports them—permissions, ownership, and extended attributes. Preserved PNG text and XMP are each limited to 4 MiB; JPEG's single-marker XMP limit is 65,504 bytes. Edits are applied to every GIF, APNG, animated WebP/AVIF, or TIFF frame/page instead of flattening the file, with supported timing, loop, disposal, and blend metadata checked after encoding. Marnwick refuses the save if the original changed after it was opened, the complete edit sequence exceeds the aggregate pixel budget, embedded metadata exceeds a preservation limit, the destination format cannot carry that metadata or sequence, or the encoder cannot reproduce supported metadata and multi-frame structure.
 
 ## Catalog organization and deletion
 
-Drag-and-drop moves, directory creation, deletion, restoration, duplicate cleanup, and edit saves are asynchronous and serialized through one protected action pipeline. Pending sources remain hidden when you navigate away and back. Successful moves preserve indexed metadata and tags; cross-catalog moves rebuild thumbnails when catalog thumbnail settings differ. Name collisions receive a numbered suffix such as `photo (1).jpg`, while a drop onto the existing parent is treated as a no-op.
+Drag-and-drop moves, directory creation, deletion, restoration, and duplicate cleanup are asynchronous and serialized through one prioritized, protected catalog-action pipeline. User mutations take precedence over selected-folder indexing, which in turn takes precedence over deep discovery and idle refresh or pruning. Pending sources remain hidden when you navigate away and back. Successful moves preserve indexed metadata and tags; cross-catalog moves rebuild thumbnails when catalog thumbnail settings differ. Name collisions receive a numbered suffix such as `photo (1).jpg`, while a drop onto the existing parent is treated as a no-op.
+
+Edit saves use a fixed four-worker encoding pool, with at most eight active or queued saves globally and at most one admitted save per catalog. A stalled codec or filesystem can therefore occupy one lane without blocking navigation or a save in another catalog. A second save in the same catalog is not admitted concurrently. Moves, directory deletion, and restoration are rejected while they overlap an image being saved, and duplicate cleanup waits for every save in that catalog; Marnwick asks you to retry those operations later. Catalog reconciliation returns to the protected action pipeline after atomic replacement. Deleting the same image is the exception: that intent is retained and deferred until a successful save and proof-aware reconciliation finish.
 
 Runtime move failures are compensated. Same-filesystem renames are rolled back when metadata updates fail. Cross-filesystem cleanup failures retain a complete destination recovery copy and refresh any remaining source instead of deleting the good copy.
 
-Destructive targets are atomically isolated under a private no-replace name before removal. Indexed images are content-verified, confirmed directories are identity-checked, and a new filesystem entry that reuses the original path is left untouched.
+Destructive targets are atomically isolated under a private no-replace name before removal. Image, source-directory, and destination-directory identities are captured before a confirmed or queued mutation and checked again by the worker that performs it. Indexed images are content-verified, confirmed directories are identity-checked, and a new filesystem entry that reuses the original path is left untouched. Edit saving also verifies the identity captured when the viewer loaded the image, then carries a content-and-filesystem proof tied to the exact encoded object through atomic replacement and catalog reconciliation.
+
+Once an image delete is queued, its path remains filtered from thumbnail results even if you change directories or catalogs and later return. Settlement refreshes the currently visible pane only when its catalog was affected; a later visit reads current catalog and filesystem state. If an identity check rejects the delete because the path was replaced, the replacement is preserved and a refreshed view can show it.
 
 There are two distinct deletion flows:
 
@@ -181,12 +194,30 @@ Global window and catalog-list preferences default to `~/.config/marnwick/config
 
 Application preferences include window geometry, remembered catalogs, thumbnail columns, sort order, and normal versus wipe deletion. Per-catalog preferences include saved thumbnail size and thumbnail-prune parallelism.
 
+## Responsiveness and resource bounds
+
+Marnwick treats UI responsiveness as part of correctness. Configuration and catalog loading, selected-folder and virtual queries, recursive discovery, thumbnail reads, viewer decoding and preview rendering, edit encoding, identity preflights, timing writes, and debug file reads run outside the Qt UI thread. Catalog-action writes remain serialized even when read-only work is concurrent. Edit encoding uses a bounded multi-lane pool but remains serialized per catalog.
+
+Work that feeds the interface has explicit bounds:
+
+- Initial configuration uses one read lane. Catalog opening uses eight daemon read lanes with at most eight admitted requests; superseded results cannot retake focus, and quitting does not wait for a read trapped on an unavailable mount.
+- The direct-filesystem pane preview scans for about 12 milliseconds and publishes at most 128 child folders and 400 image placeholders. It is a first paint, not the final inventory; progressive indexing and 200-record catalog pages replace it.
+- Folder-tree database reads use pages of at most 400 paths, and Qt tree construction yields after at most 400 items or roughly eight milliseconds of work. An automatic rebuild creates at most 4,096 directory items; child branches and long tag lists expose explicit load-more rows rather than allocating the entire known tree.
+- The thumbnail model exposes records in 400-row batches, limits pending reads, and applies only a small number of completed thumbnails per UI tick. A newer thumbnail generation can start while old reads unwind.
+- Decoded thumbnail inputs are limited to 32 MiB and 4096 pixels per dimension. The primary thumbnail pixmap cache is limited to 512 entries or 256 MiB, the delegate's scaled-pixmap cache to 512 entries or 128 MiB, and remembered pane state and Very Similar result caches have fixed entry limits.
+- Fullscreen decode, edit-preview rendering, and paged navigation use three process-wide pools rather than creating threads per viewer. Decode and preview each allow eight workers and 16 admitted tasks; paging allows four workers and eight admitted tasks. Closing a viewer cancels its queued work without shutting down the shared pools.
+- Pillow source decoding is limited by `MARNWICK_MAX_IMAGE_PIXELS`; the complete set of detached frames in one edit has the same aggregate pixel budget. Interactive edit-preview rasters are capped at 4096 pixels per dimension, and GIF movie input is capped at 128 MiB.
+- Catalog logs retain and read at most a 1 MiB tail, timing history retains 1,000 events, and the optional debug server caps connections, request work per event-loop turn, page and tail sizes, pending reads, file-read size, and queued response bytes.
+
 ## Current limitations and safety notes
 
 - Image and directory deletion is destructive; only items explicitly moved into `T-r-a-s-h` are restorable through Marnwick.
 - Edits atomically replace the original file after an explicit save. Marnwick refuses to replace a hard-linked image because doing so cannot preserve hard-link identity; copy or unlink it explicitly before editing. If an extremely rare rollback itself fails, the error identifies the retained recovery file rather than silently deleting displaced bytes.
 - Filesystem operations and one or two independent SQLite databases cannot form a single crash-atomic transaction. Runtime failures are compensated, but abrupt process or power loss can require **Tools > Refresh Catalog** to reconcile filesystem and catalog state. Keep independent backups of irreplaceable images.
-- Large physical and all virtual result builds run away from the UI thread, and thumbnail rows are exposed in batches, but a completed view still retains its records in memory. Exceptionally large result sets can therefore use substantial memory.
+- Physical, tag, and exact-duplicate views are database-paged. The Very Similar model exposes rows progressively, but its worker currently materializes the complete global similarity result before first publication; an exceptionally large similarity index can therefore still require substantial worker memory and time.
+- Automatic folder-tree construction is capped and child/tag reads are paged. Expanding many branches or repeatedly choosing load-more can still create many Qt items during a long session, but initial discovery no longer requires one item per known directory.
+- Cancellation is cooperative. Marnwick can cancel queued work, interrupt long SQLite queries, and ignore stale generations, but it cannot forcibly interrupt an operating-system filesystem call or native decoder already in progress. Fixed pools reserve several lanes for newer work, but enough independently stuck calls can occupy every lane and delay later catalog opens, previews, or viewer loads. Those obsolete calls are not allowed to publish stale UI state, and read-only daemon pools do not hold up process exit.
+- Image saves are mutually excluded within each catalog and share four encoding lanes globally. Four independently stalled codecs or filesystems can occupy all lanes and delay later saves, but the admission queue remains bounded and the status bar continues to report active work. Normal in-application close waits for admitted saves, proof-aware reconciliation, and dependent deletes to settle; forcibly terminating the process can interrupt that workflow.
 - Background freshness uses path, size, modification time, and metadata change time (including Win32 `ChangeTime`) so ordinary same-size edits are detected without rehashing every image. Filesystems that do not expose reliable change fields may require **Tools > Refresh Catalog**, which forces reindexing.
 - Catalog locking is advisory and relies on the underlying filesystem. Some network or synchronization filesystems may not provide reliable mutual exclusion.
 
@@ -199,6 +230,12 @@ Open **Tools > Logs** and look for the file's indexing error. Confirm that Pillo
 ### Thumbnails are missing or damaged
 
 Run **Tools > Prune Thumbnails**. Missing or corrupt cache files are validated and rebuilt from the originals; orphan files are removed after referenced rows are checked.
+
+### A newly opened folder shows placeholder tiles
+
+This is expected briefly for an unindexed folder. Cached rows remain visible immediately; as soon as the filesystem worker can enumerate the directory, filename tiles should appear, the status bar should report the selected folder's indexing progress, and thumbnails should replace the neutral placeholders individually. For a very large folder, Marnwick first shows a bounded filesystem preview while the complete result set loads in the background. Navigating away cancels stale work; navigating back starts a current direct-folder scan.
+
+If no progress appears, check **Tools > Logs** for decoder or permission errors, confirm the directory is still readable, and run **Tools > Refresh Catalog** to force reconciliation.
 
 ### The folder tree or image list is stale
 
@@ -275,12 +312,13 @@ The debug server listens only on localhost, requires a token, and caps connectio
 | --- | --- | --- |
 | Application and UI | [`src/marnwick/ui.py`](src/marnwick/ui.py) | Qt models, views, dialogs, fullscreen editing, drag-and-drop, task settlement, and configuration UI |
 | Catalog engine | [`src/marnwick/catalog.py`](src/marnwick/catalog.py) | SQLite schema, discovery, indexing, thumbnails, tags, duplicate detection, moves, deletion, trash, and repair |
-| Background actions | [`src/marnwick/indexer.py`](src/marnwick/indexer.py) | Prioritized serialized queue, cancellation, progress snapshots, and idle work |
-| Image editing | [`src/marnwick/image_ops.py`](src/marnwick/image_ops.py) | Edit operations, atomic saves, and filesystem-date handling |
+| Background actions | [`src/marnwick/indexer.py`](src/marnwick/indexer.py) | Prioritized bounded action workers, serialized protected mutations, cancellation, progress snapshots, selected-folder indexing, discovery, and idle work |
+| Image editing | [`src/marnwick/image_ops.py`](src/marnwick/image_ops.py) | Edit operations, format-aware encoding, atomic saves, and filesystem-date handling |
 | Image safety | [`src/marnwick/safe_image.py`](src/marnwick/safe_image.py) | Pillow pixel-limit enforcement |
 | Domain records | [`src/marnwick/models.py`](src/marnwick/models.py) | Sort orders, image/folder records, settings, and result objects |
 | Workspace | [`src/marnwick/workspace.py`](src/marnwick/workspace.py) | Identity and lifetime of open catalogs |
 | Global configuration | [`src/marnwick/config.py`](src/marnwick/config.py) | JSON configuration defaults, validation, loading, and saving |
+| Asynchronous utilities | [`src/marnwick/async_utils.py`](src/marnwick/async_utils.py) | Bounded daemon executors for abandonable reads, latest-only snapshots, atomic saves, and process-wide shared dialog/viewer pools |
 | Debug automation | [`src/marnwick/debug.py`](src/marnwick/debug.py) | Authenticated localhost JSON-lines protocol for performance runs |
 
-The UI owns one long-lived `Catalog` connection per open root. Worker-local catalog connections share the process's reentrant catalog lock. Expensive scans, large physical views, virtual queries, and file mutations run away from the UI thread; mutations pass through a single prioritized protected action pipeline so selected-folder indexing and user file operations take precedence over idle refresh and thumbnail pruning. SQLite uses WAL mode, foreign keys, a five-second contention timeout, and content-addressed files for large thumbnail payloads.
+The UI owns one long-lived writable `Catalog` connection per open root. Writable worker-local connections share the process's reentrant catalog lock; query-only workers can use short-lived read-only connections with bounded contention waits. Configuration and catalog initialization, thumbnail reads, expensive scans, tree pages, and physical or virtual page queries run away from the UI thread. The `BackgroundIndexer` has bounded read lanes plus a dedicated serialized lane for protected mutations; queued work is prioritized so explicit mutations outrank selected-folder indexing, which outranks deep discovery and idle refresh or pruning. Image encoding uses a bounded four-worker pool with per-catalog mutual exclusion at admission, then queues a targeted reconciliation on the protected catalog lane after atomic replacement. Reconciliation verifies the committed proof during its single stable decode/hash pass before publishing catalog state. SQLite uses WAL mode, foreign keys, bounded busy timeouts, and content-addressed files for large thumbnail payloads.

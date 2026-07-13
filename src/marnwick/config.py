@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import errno
 import json
+import math
 import os
 import stat
 import tempfile
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -16,6 +18,9 @@ DELETE_BEHAVIORS = {NORMAL_DELETE, WIPE_ON_DELETE}
 DEFAULT_THUMBNAIL_COLUMNS = 5
 MIN_THUMBNAIL_COLUMNS = 1
 MAX_THUMBNAIL_COLUMNS = 20
+MAX_CONFIG_BYTES = 1024 * 1024
+DEFAULT_CONFIG_LOCK_TIMEOUT = 1.0
+CONFIG_LOCK_POLL_INTERVAL = 0.02
 
 
 @dataclass(slots=True)
@@ -52,7 +57,7 @@ def default_config_path() -> Path:
 def load_config(path: Path | None = None) -> AppConfig:
     config_path = path or default_config_path()
     try:
-        raw = json.loads(config_path.read_text(encoding="utf-8"))
+        raw = _read_config_json(config_path)
     except (OSError, UnicodeError, json.JSONDecodeError):
         return AppConfig()
     if not isinstance(raw, dict):
@@ -82,10 +87,23 @@ def load_config(path: Path | None = None) -> AppConfig:
     )
 
 
-def save_config(config: AppConfig, path: Path | None = None) -> None:
+def save_config(
+    config: AppConfig,
+    path: Path | None = None,
+    *,
+    lock_timeout: float = DEFAULT_CONFIG_LOCK_TIMEOUT,
+) -> None:
+    """Atomically save *config*, waiting at most *lock_timeout* seconds.
+
+    A timeout raises :class:`TimeoutError` without changing either the config
+    file or the in-memory merge baseline.  Callers that want a shorter UI
+    deadline can pass a smaller non-negative finite timeout.
+    """
+
+    lock_timeout = _normalized_lock_timeout(lock_timeout)
     config_path = path or default_config_path()
     config_path.parent.mkdir(parents=True, exist_ok=True)
-    with _config_write_lock(config_path):
+    with _config_write_lock(config_path, timeout=lock_timeout):
         catalogs = _merge_catalog_edits(config, config_path)
         payload: dict[str, Any] = {
             "window": {
@@ -101,6 +119,12 @@ def save_config(config: AppConfig, path: Path | None = None) -> None:
             "thumbnail_size": config.thumbnail_size,
         }
         data = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
+        if len(data) > MAX_CONFIG_BYTES:
+            raise OSError(
+                errno.EFBIG,
+                f"configuration payload exceeds {MAX_CONFIG_BYTES} bytes",
+                config_path,
+            )
         mode = _config_file_mode(config_path)
         fd, temp_name = tempfile.mkstemp(
             prefix=f".{config_path.name}.",
@@ -179,9 +203,13 @@ def _thumbnail_columns_or_default(value: object) -> int:
 
 def _config_file_mode(path: Path) -> int:
     try:
-        return stat.S_IMODE(path.stat().st_mode)
-    except OSError:
+        fd, file_stat = _open_regular_single_link(path, "configuration file")
+    except FileNotFoundError:
         return 0o600
+    try:
+        return stat.S_IMODE(file_stat.st_mode)
+    finally:
+        os.close(fd)
 
 
 def _merge_catalog_edits(config: AppConfig, path: Path) -> list[str]:
@@ -208,7 +236,7 @@ def _merge_catalog_edits(config: AppConfig, path: Path) -> list[str]:
 
 def _read_catalogs_for_merge(path: Path) -> list[str] | None:
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        raw = _read_config_json(path)
     except (OSError, UnicodeError, json.JSONDecodeError):
         return None
     if not isinstance(raw, dict):
@@ -219,29 +247,114 @@ def _read_catalogs_for_merge(path: Path) -> list[str] | None:
     return list(dict.fromkeys(item for item in catalogs if isinstance(item, str)))
 
 
+def _read_config_json(path: Path) -> object:
+    fd, file_stat = _open_regular_single_link(path, "configuration file")
+    try:
+        if file_stat.st_size > MAX_CONFIG_BYTES:
+            raise OSError(errno.EFBIG, f"configuration file exceeds {MAX_CONFIG_BYTES} bytes", path)
+        remaining = MAX_CONFIG_BYTES + 1
+        chunks: list[bytes] = []
+        while remaining:
+            chunk = os.read(fd, min(64 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        data = b"".join(chunks)
+        if len(data) > MAX_CONFIG_BYTES:
+            raise OSError(errno.EFBIG, f"configuration file exceeds {MAX_CONFIG_BYTES} bytes", path)
+        return json.loads(data.decode("utf-8"))
+    finally:
+        os.close(fd)
+
+
+def _open_regular_single_link(path: Path, label: str) -> tuple[int, os.stat_result]:
+    path_stat = os.lstat(path)
+    if stat.S_ISLNK(path_stat.st_mode):
+        raise OSError(f"{label} must not be a symbolic link: {path}")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags)
+    try:
+        file_stat = os.fstat(fd)
+        _assert_regular_single_link(path, file_stat, label)
+        _assert_path_matches_fd(path, file_stat, label)
+        return fd, file_stat
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _assert_regular_single_link(
+    path: Path,
+    file_stat: os.stat_result,
+    label: str,
+) -> None:
+    if not stat.S_ISREG(file_stat.st_mode):
+        raise OSError(f"{label} must be a regular file: {path}")
+    if file_stat.st_nlink != 1:
+        raise OSError(f"{label} must not be hard-linked: {path}")
+
+
+def _assert_path_matches_fd(
+    path: Path,
+    file_stat: os.stat_result,
+    label: str,
+) -> None:
+    path_stat = os.lstat(path)
+    if stat.S_ISLNK(path_stat.st_mode):
+        raise OSError(f"{label} must not be a symbolic link: {path}")
+    if not stat.S_ISREG(path_stat.st_mode):
+        raise OSError(f"{label} must be a regular file: {path}")
+    if (path_stat.st_dev, path_stat.st_ino) != (file_stat.st_dev, file_stat.st_ino):
+        raise OSError(f"{label} changed while it was being opened: {path}")
+
+
+def _normalized_lock_timeout(timeout: float) -> float:
+    if isinstance(timeout, bool):
+        raise ValueError("configuration lock timeout must be a non-negative finite number")
+    try:
+        normalized = float(timeout)
+    except (TypeError, ValueError) as error:
+        raise ValueError("configuration lock timeout must be a non-negative finite number") from error
+    if normalized < 0 or not math.isfinite(normalized):
+        raise ValueError("configuration lock timeout must be a non-negative finite number")
+    return normalized
+
+
 @contextmanager
-def _config_write_lock(path: Path) -> Iterator[None]:
+def _config_write_lock(
+    path: Path,
+    *,
+    timeout: float = DEFAULT_CONFIG_LOCK_TIMEOUT,
+) -> Iterator[None]:
+    timeout = _normalized_lock_timeout(timeout)
     lock_path = path.with_name(f"{path.name}.lock")
-    if lock_path.is_symlink():
+    try:
+        lock_path_stat = os.lstat(lock_path)
+    except FileNotFoundError:
+        lock_path_stat = None
+    if lock_path_stat is not None and stat.S_ISLNK(lock_path_stat.st_mode):
         raise OSError(f"configuration lock must not be a symbolic link: {lock_path}")
-    flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+    flags = (
+        os.O_CREAT
+        | os.O_RDWR
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
     fd = os.open(lock_path, flags, 0o600)
     locked = False
     try:
-        if os.fstat(fd).st_nlink > 1:
-            raise OSError(f"configuration lock must not be hard-linked: {lock_path}")
-        if os.name == "nt":
-            import msvcrt
-
-            if os.fstat(fd).st_size == 0:
-                os.write(fd, b"\0")
-            os.lseek(fd, 0, os.SEEK_SET)
-            msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
-        else:
-            import fcntl
-
-            fcntl.flock(fd, fcntl.LOCK_EX)
+        lock_stat = os.fstat(fd)
+        _assert_regular_single_link(lock_path, lock_stat, "configuration lock")
+        _assert_path_matches_fd(lock_path, lock_stat, "configuration lock")
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o600)
+        _acquire_config_lock(fd, lock_path, timeout)
         locked = True
+        # A replaced lock pathname would let another process acquire a
+        # different inode and defeat serialization.  Refuse to write in that
+        # case even though this descriptor itself remains locked.
+        _assert_path_matches_fd(lock_path, lock_stat, "configuration lock")
         yield
     finally:
         try:
@@ -256,6 +369,35 @@ def _config_write_lock(path: Path) -> Iterator[None]:
                 fcntl.flock(fd, fcntl.LOCK_UN)
         finally:
             os.close(fd)
+
+
+def _acquire_config_lock(fd: int, lock_path: Path, timeout: float) -> None:
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                if os.fstat(fd).st_size == 0:
+                    os.write(fd, b"\0")
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except OSError as error:
+            if error.errno == errno.EINTR:
+                continue
+            if error.errno not in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
+                raise
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"timed out waiting for configuration lock: {lock_path}"
+                ) from error
+            time.sleep(min(CONFIG_LOCK_POLL_INTERVAL, remaining))
 
 
 def _fsync_directory(directory: Path) -> None:

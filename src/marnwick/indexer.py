@@ -8,18 +8,33 @@ from concurrent.futures import Future
 from dataclasses import dataclass, field
 from enum import IntEnum
 from pathlib import Path
-from threading import Condition, Event, Lock, Thread
+from threading import Condition, Event, Lock, Thread, get_ident
 from time import monotonic, sleep
 from typing import Generic, TypeVar
 
-from .catalog import Catalog
+from .catalog import Catalog, CatalogStorageIdentity
+
+
+def _lexical_task_root(root: Path) -> Path:
+    """Normalize an already-canonical catalog key without filesystem I/O.
+
+    UI callers pass ``Catalog.root``, which was resolved when the catalog was
+    opened on a worker. Re-resolving it for every queue/cancel operation can
+    block the GUI on a disconnected mount and adds no identity information.
+    ``Catalog`` still performs canonical/security validation when work starts
+    on the action thread.
+    """
+
+    return root.expanduser().absolute()
 
 
 class ActionPriority(IntEnum):
-    SELECTED_DIRECTORY_INDEX = 0
-    FILE_MOVE_CROSS_CATALOG = 1
-    FILE_DELETE = 2
-    FILE_MOVE_WITHIN_CATALOG = 3
+    # Explicit protected mutations must not starve behind a stream of rapid
+    # folder selections. They remain serialized by the single action lane.
+    FILE_MOVE_CROSS_CATALOG = 0
+    FILE_DELETE = 1
+    FILE_MOVE_WITHIN_CATALOG = 2
+    SELECTED_DIRECTORY_INDEX = 3
     DIRECTORY_INVENTORY = 4
     THUMBNAIL_INDEX = 5
     PRUNE = 6
@@ -56,15 +71,19 @@ class IndexTask:
         force_refresh: bool = False,
         priority: ActionPriority = ActionPriority.THUMBNAIL_INDEX,
         preemptible: bool = True,
+        expected_root_identity: tuple[int, int] | None = None,
+        expected_storage_identity: CatalogStorageIdentity | None = None,
     ) -> None:
         self.label = label
-        self.root = root.expanduser().resolve()
+        self.root = _lexical_task_root(root)
         self.dir_rel = dir_rel
         self.interactive = interactive
         self.idle_sleep_seconds = idle_sleep_seconds
         self.force_refresh = force_refresh
         self.priority = priority
         self.preemptible = preemptible
+        self.expected_root_identity = expected_root_identity
+        self.expected_storage_identity = expected_storage_identity
         self.started_at = monotonic()
         self._processed = 0
         self._total: int | None = None
@@ -180,7 +199,14 @@ class QueuedAction(Generic[ResultT]):
 
 
 class BackgroundIndexer:
-    """Runs catalog work through one prioritized non-UI action pipeline."""
+    """Runs catalog work through a bounded prioritized non-UI pipeline.
+
+    Preemptible indexing reads may use several daemon lanes so a native call
+    stuck on an obsolete filesystem cannot hold the selected directory behind
+    it.  Protected mutations are still admitted one at a time; they may pass a
+    canceled-but-stuck read because every mutation revalidates its captured
+    filesystem identity before touching data.
+    """
 
     def __init__(self, max_workers: int | None = 1, *, idle_sleep_seconds: float = 0.08) -> None:
         self._idle_sleep_seconds = idle_sleep_seconds
@@ -189,21 +215,59 @@ class BackgroundIndexer:
         self._queue: list[QueuedAction[object]] = []
         self._tasks: dict[str, IndexTask] = {}
         self._actions: dict[IndexTask, QueuedAction[object]] = {}
-        self._completed: deque[IndexProgressSnapshot] = deque()
-        self._running: QueuedAction[object] | None = None
+        # Settlement callers retain their IndexTask objects; this queue is a
+        # durable notification aid, bounded against unattended/rapid churn.
+        self._completed: deque[IndexProgressSnapshot] = deque(maxlen=4096)
+        self._running: dict[int, QueuedAction[object]] = {}
         self._shutdown = False
         worker_count = max(1, int(max_workers or 1))
-        # The action pipeline is intentionally serialized; extra workers would
-        # make priority/preemption semantics ambiguous for filesystem moves.
-        self._workers = [
-            Thread(target=self._worker_loop, name=f"marnwick-action-{index}", daemon=True)
-            for index in range(min(worker_count, 1))
-        ]
+        self._read_worker_count = worker_count
+        if worker_count == 1:
+            # Preserve strict single-lane behavior for callers that explicitly
+            # request it (and for deterministic unit workflows).
+            self._workers = [
+                Thread(
+                    target=self._worker_loop,
+                    args=(None,),
+                    name="marnwick-action-0",
+                    daemon=True,
+                )
+            ]
+        else:
+            # A protected mutation must never sit behind every read lane being
+            # trapped in an unavailable mount or native decoder. It gets one
+            # dedicated serial lane; read/index work remains bounded by the
+            # caller's requested worker count.
+            self._workers = [
+                Thread(
+                    target=self._worker_loop,
+                    args=(False,),
+                    name=f"marnwick-action-read-{index}",
+                    daemon=True,
+                )
+                for index in range(worker_count)
+            ]
+            self._workers.append(
+                Thread(
+                    target=self._worker_loop,
+                    args=(True,),
+                    name="marnwick-action-protected",
+                    daemon=True,
+                )
+            )
         for worker in self._workers:
             worker.start()
 
-    def refresh_catalog(self, root: Path, *, interactive: bool = False, force: bool = False) -> IndexTask:
-        root = root.expanduser().resolve()
+    def refresh_catalog(
+        self,
+        root: Path,
+        *,
+        interactive: bool = False,
+        force: bool = False,
+        expected_root_identity: tuple[int, int] | None = None,
+        expected_storage_identity: CatalogStorageIdentity | None = None,
+    ) -> IndexTask:
+        root = _lexical_task_root(root)
         label = f"Refreshing catalog {root.name or root}"
         key = f"catalog-force:{root}" if force else f"catalog:{root}"
         return self._submit_unique(
@@ -216,12 +280,21 @@ class BackgroundIndexer:
                 idle_sleep_seconds=self._idle_sleep_seconds,
                 force_refresh=force,
                 priority=ActionPriority.THUMBNAIL_INDEX,
+                expected_root_identity=expected_root_identity,
+                expected_storage_identity=expected_storage_identity,
             ),
             self._refresh_catalog,
         )
 
-    def discover_directories(self, root: Path, *, interactive: bool = True) -> IndexTask:
-        root = root.expanduser().resolve()
+    def discover_directories(
+        self,
+        root: Path,
+        *,
+        interactive: bool = True,
+        expected_root_identity: tuple[int, int] | None = None,
+        expected_storage_identity: CatalogStorageIdentity | None = None,
+    ) -> IndexTask:
+        root = _lexical_task_root(root)
         label = f"Discovering folders {root.name or root}"
         key = f"discover:{root}"
         return self._submit_unique(
@@ -233,12 +306,22 @@ class BackgroundIndexer:
                 interactive=interactive,
                 idle_sleep_seconds=self._idle_sleep_seconds,
                 priority=ActionPriority.DIRECTORY_INVENTORY,
+                expected_root_identity=expected_root_identity,
+                expected_storage_identity=expected_storage_identity,
             ),
             self._discover_directories,
         )
 
-    def prune_thumbnails(self, root: Path, *, interactive: bool = False, force: bool = False) -> IndexTask:
-        root = root.expanduser().resolve()
+    def prune_thumbnails(
+        self,
+        root: Path,
+        *,
+        interactive: bool = False,
+        force: bool = False,
+        expected_root_identity: tuple[int, int] | None = None,
+        expected_storage_identity: CatalogStorageIdentity | None = None,
+    ) -> IndexTask:
+        root = _lexical_task_root(root)
         label = f"Pruning thumbnails {root.name or root}"
         key = f"thumbnail-prune-force:{root}" if force else f"thumbnail-prune:{root}"
         return self._submit_unique(
@@ -251,6 +334,8 @@ class BackgroundIndexer:
                 idle_sleep_seconds=self._idle_sleep_seconds,
                 force_refresh=force,
                 priority=ActionPriority.PRUNE,
+                expected_root_identity=expected_root_identity,
+                expected_storage_identity=expected_storage_identity,
             ),
             self._prune_thumbnails,
         )
@@ -262,8 +347,10 @@ class BackgroundIndexer:
         *,
         interactive: bool = True,
         force: bool = False,
+        expected_root_identity: tuple[int, int] | None = None,
+        expected_storage_identity: CatalogStorageIdentity | None = None,
     ) -> IndexTask:
-        root = root.expanduser().resolve()
+        root = _lexical_task_root(root)
         directory_label = dir_rel or root.name or str(root)
         label = f"Indexing {directory_label}"
         key = f"directory-force:{root}:{dir_rel}" if force else f"directory:{root}:{dir_rel}"
@@ -282,6 +369,8 @@ class BackgroundIndexer:
                 idle_sleep_seconds=self._idle_sleep_seconds,
                 force_refresh=force,
                 priority=priority,
+                expected_root_identity=expected_root_identity,
+                expected_storage_identity=expected_storage_identity,
             ),
             self._refresh_directory,
         )
@@ -298,8 +387,10 @@ class BackgroundIndexer:
         interactive: bool = True,
         force_refresh: bool = False,
         preemptible: bool = True,
+        expected_root_identity: tuple[int, int] | None = None,
+        expected_storage_identity: CatalogStorageIdentity | None = None,
     ) -> tuple[IndexTask, Future[ResultT]]:
-        root = root.expanduser().resolve()
+        root = _lexical_task_root(root)
         task = IndexTask(
             label,
             root,
@@ -309,6 +400,8 @@ class BackgroundIndexer:
             force_refresh=force_refresh,
             priority=priority,
             preemptible=preemptible,
+            expected_root_identity=expected_root_identity,
+            expected_storage_identity=expected_storage_identity,
         )
         action_key = key or f"custom:{next(self._sequence)}:{label}:{root}:{dir_rel or ''}"
         future: Future[ResultT] = ActionFuture(preemptible=preemptible)
@@ -328,16 +421,14 @@ class BackgroundIndexer:
             self._actions[task] = action  # type: ignore[assignment]
             heapq.heappush(self._queue, action)  # type: ignore[arg-type]
             self._preempt_running_if_needed(action)
-            self._condition.notify()
+            self._condition.notify_all()
         return task, future
 
     def active_snapshots(self) -> list[IndexProgressSnapshot]:
         with self._condition:
-            running = self._running
-        if running is None:
-            return []
-        snapshot = running.task.snapshot()
-        return [] if snapshot.done else [snapshot]
+            running = tuple(self._running.values())
+        snapshots = [action.task.snapshot() for action in running]
+        return [snapshot for snapshot in snapshots if not snapshot.done]
 
     def drain_completed_snapshots(self) -> list[IndexProgressSnapshot]:
         """Return task completions not yet observed by a settlement poll.
@@ -356,7 +447,7 @@ class BackgroundIndexer:
             return any(not task.snapshot().done for task in self._actions)
 
     def cancel_idle_tasks(self, root: Path | None = None) -> None:
-        resolved_root = root.expanduser().resolve() if root is not None else None
+        resolved_root = _lexical_task_root(root) if root is not None else None
         with self._condition:
             actions = list(self._actions.values())
         for action in actions:
@@ -368,10 +459,11 @@ class BackgroundIndexer:
             ):
                 task.cancel()
         with self._condition:
-            self._condition.notify()
+            self._discard_canceled_queued_locked()
+            self._condition.notify_all()
 
     def cancel_directory_tasks(self, root: Path, *, keep_dir_rel: str | None = None) -> None:
-        resolved_root = root.expanduser().resolve()
+        resolved_root = _lexical_task_root(root)
         with self._condition:
             actions = list(self._actions.values())
         for action in actions:
@@ -384,7 +476,8 @@ class BackgroundIndexer:
                 continue
             task.cancel()
         with self._condition:
-            self._condition.notify()
+            self._discard_canceled_queued_locked()
+            self._condition.notify_all()
 
     def shutdown(self) -> None:
         with self._condition:
@@ -398,9 +491,19 @@ class BackgroundIndexer:
             if action.preemptible:
                 action.task.cancel()
         with self._condition:
+            self._discard_canceled_queued_locked()
             self._condition.notify_all()
+            # Mutations are the only work that must survive shutdown.  Wait
+            # for accepted protected actions, but never join a daemon lane
+            # that is stuck in canceled read-only/native filesystem work.
+            while any(not action.preemptible for action in self._actions.values()):
+                self._condition.wait(timeout=0.05)
+        join_deadline = monotonic() + 0.1
         for worker in self._workers:
-            worker.join()
+            remaining = join_deadline - monotonic()
+            if remaining <= 0:
+                break
+            worker.join(timeout=remaining)
 
     def _submit_unique(
         self,
@@ -416,7 +519,15 @@ class BackgroundIndexer:
                 and not existing.snapshot().done
                 and not existing.cancellation_requested()
             ):
-                return existing
+                # A directory first queued as background/open-time work must
+                # not keep its low priority after the user selects it. Replace
+                # that task so it can preempt discovery and other idle scans.
+                if task.interactive and (
+                    not existing.interactive or task.priority < existing.priority
+                ):
+                    existing.cancel()
+                else:
+                    return existing
             if task.interactive:
                 for existing_action in list(self._actions.values()):
                     existing_task = existing_action.task
@@ -431,6 +542,7 @@ class BackgroundIndexer:
                         and existing_task.priority == ActionPriority.SELECTED_DIRECTORY_INDEX
                     ):
                         existing_task.cancel()
+            self._discard_canceled_queued_locked()
             future: Future[None] = Future()
             task.bind_future(future)  # type: ignore[arg-type]
             action = QueuedAction(
@@ -446,36 +558,83 @@ class BackgroundIndexer:
             self._actions[task] = action  # type: ignore[assignment]
             heapq.heappush(self._queue, action)  # type: ignore[arg-type]
             self._preempt_running_if_needed(action)
-            self._condition.notify()
+            self._condition.notify_all()
             return task
 
     def _preempt_running_if_needed(self, action: QueuedAction[object]) -> None:
-        running = self._running
-        if running is None:
-            return
-        if not running.preemptible:
-            return
-        if action.priority < running.priority:
-            running.task.cancel()
+        for running in tuple(self._running.values()):
+            if running.preemptible and action.priority < running.priority:
+                running.task.cancel()
 
-    def _worker_loop(self) -> None:
+    def _discard_canceled_queued_locked(self) -> None:
+        """Remove canceled queued work immediately instead of draining it later."""
+        if not self._queue:
+            return
+        retained: list[QueuedAction[object]] = []
+        discarded: list[QueuedAction[object]] = []
+        for action in self._queue:
+            if action.future.cancelled() or action.task.snapshot().canceled:
+                discarded.append(action)
+            else:
+                retained.append(action)
+        if not discarded:
+            return
+        self._queue = retained
+        heapq.heapify(self._queue)
+        for action in discarded:
+            if self._tasks.get(action.key) is action.task:
+                self._tasks.pop(action.key, None)
+            self._actions.pop(action.task, None)
+            self._completed.append(action.task.snapshot())
+
+    def _worker_loop(self, protected_only: bool | None) -> None:
+        worker_id = get_ident()
         while True:
             with self._condition:
-                while not self._shutdown and not self._queue:
+                action = self._pop_eligible_action_locked(protected_only)
+                while action is None:
+                    if self._shutdown and not self._queue:
+                        return
                     self._condition.wait()
-                if self._shutdown and not self._queue:
-                    return
-                action = heapq.heappop(self._queue)
-                self._running = action
+                    action = self._pop_eligible_action_locked(protected_only)
+                self._running[worker_id] = action
             self._run_action(action)
             with self._condition:
-                if self._running is action:
-                    self._running = None
+                if self._running.get(worker_id) is action:
+                    self._running.pop(worker_id, None)
                 if self._tasks.get(action.key) is action.task:
                     self._tasks.pop(action.key, None)
                 self._actions.pop(action.task, None)
                 self._completed.append(action.task.snapshot())
                 self._condition.notify_all()
+
+    def _pop_eligible_action_locked(
+        self,
+        protected_only: bool | None,
+    ) -> QueuedAction[object] | None:
+        """Pop the highest-priority action allowed by mutation serialization."""
+
+        if not self._queue:
+            return None
+        protected_running = any(
+            not running.preemptible for running in self._running.values()
+        )
+        if protected_running and protected_only is not True:
+            return None
+        if protected_only is None:
+            # Strict one-worker mode retains global priority ordering.
+            return heapq.heappop(self._queue)
+        candidates = [
+            action
+            for action in self._queue
+            if (not action.preemptible) == protected_only
+        ]
+        if not candidates:
+            return None
+        action = min(candidates)
+        self._queue.remove(action)
+        heapq.heapify(self._queue)
+        return action
 
     def _raise_if_shutdown(self) -> None:
         if self._shutdown:
@@ -515,67 +674,86 @@ class BackgroundIndexer:
 
     def _refresh_catalog(self, task: IndexTask) -> None:
         try:
-            with Catalog(task.root) as catalog:
+            with Catalog.open_writer(
+                task.root,
+                expected_root_identity=task.expected_root_identity,
+                expected_storage_identity=task.expected_storage_identity,
+            ) as catalog:
                 catalog.refresh(
                     self._progress_callback(task),
                     task.check_canceled,
                     force=task.force_refresh,
                 )
-            task.mark_done()
         except IndexTaskCancelled:
-            task.mark_canceled()
+            # _run_action owns the terminal task/future transition.  Let the
+            # original cancellation reach it so IndexTask.wait() observes the
+            # same outcome as a custom action instead of a false success.
+            raise
         except Exception as error:
             self._log_task_error(task, error)
-            task.mark_failed(error)
+            raise
 
     def _refresh_directory(self, task: IndexTask) -> None:
         try:
-            with Catalog(task.root) as catalog:
+            with Catalog.open_writer(
+                task.root,
+                expected_root_identity=task.expected_root_identity,
+                expected_storage_identity=task.expected_storage_identity,
+            ) as catalog:
                 catalog.refresh_directory(
                     task.dir_rel or "",
                     self._progress_callback(task),
                     task.check_canceled,
                     force=task.force_refresh,
                 )
-            task.mark_done()
         except IndexTaskCancelled:
-            task.mark_canceled()
+            raise
         except Exception as error:
             self._log_task_error(task, error)
-            task.mark_failed(error)
+            raise
 
     def _discover_directories(self, task: IndexTask) -> None:
         try:
-            with Catalog(task.root) as catalog:
+            with Catalog.open_writer(
+                task.root,
+                expected_root_identity=task.expected_root_identity,
+                expected_storage_identity=task.expected_storage_identity,
+            ) as catalog:
                 catalog.discover_directories(
                     self._progress_callback(task),
                     task.check_canceled,
                 )
-            task.mark_done()
         except IndexTaskCancelled:
-            task.mark_canceled()
+            raise
         except Exception as error:
             self._log_task_error(task, error)
-            task.mark_failed(error)
+            raise
 
     def _prune_thumbnails(self, task: IndexTask) -> None:
         try:
-            with Catalog(task.root) as catalog:
+            with Catalog.open_writer(
+                task.root,
+                expected_root_identity=task.expected_root_identity,
+                expected_storage_identity=task.expected_storage_identity,
+            ) as catalog:
                 catalog.prune_thumbnails(
                     self._progress_callback(task),
                     task.check_canceled,
                     workers=None if task.interactive else 1,
                 )
-            task.mark_done()
         except IndexTaskCancelled:
-            task.mark_canceled()
+            raise
         except Exception as error:
             self._log_task_error(task, error)
-            task.mark_failed(error)
+            raise
 
     def _log_task_error(self, task: IndexTask, error: BaseException) -> None:
         try:
-            with Catalog(task.root) as catalog:
+            with Catalog.open_writer(
+                task.root,
+                expected_root_identity=task.expected_root_identity,
+                expected_storage_identity=task.expected_storage_identity,
+            ) as catalog:
                 catalog.append_log(f"{task.label} failed: {error}", level="ERROR")
         except Exception:
             return
