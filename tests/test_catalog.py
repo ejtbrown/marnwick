@@ -4,9 +4,13 @@ import errno
 import json
 import os
 import sqlite3
+import subprocess
+import sys
+import time
 from pathlib import Path
 
 from PIL import Image
+import pytest
 
 import marnwick.catalog as catalog_module
 import marnwick.safe_image as safe_image
@@ -18,6 +22,7 @@ from marnwick.catalog import (
     SIMILARITY_FEATURE_VERSION,
     TRASH_DIR_NAME,
     Catalog,
+    CatalogRefreshUnstableError,
     is_exact_image_hash,
     parse_tag_entry,
 )
@@ -101,6 +106,58 @@ def test_discover_directories_remembers_tree_without_indexing_images(tmp_path: P
         assert catalog.list_known_directories() == ["", "one", "one/two"]
         assert catalog.list_images("one/two") == []
         assert any("Folder discovery complete" in line for line in catalog.read_log_lines())
+
+
+def test_known_directories_support_deterministic_paging(tmp_path: Path) -> None:
+    root = tmp_path / "catalog"
+    for rel_path in ("Beta", "alpha/nested", "alpha/second"):
+        (root / rel_path).mkdir(parents=True)
+
+    with Catalog(root) as catalog:
+        catalog.discover_directories()
+        all_directories = catalog.list_known_directories()
+
+        assert catalog.known_directory_count() == len(all_directories)
+        assert [
+            *catalog.list_known_directories(limit=2, offset=0),
+            *catalog.list_known_directories(limit=2, offset=2),
+            *catalog.list_known_directories(limit=2, offset=4),
+        ] == all_directories
+
+
+def test_directory_parent_index_migration_backfills_existing_rows(tmp_path: Path) -> None:
+    root = tmp_path / "catalog"
+    state = root / ".marnwick"
+    state.mkdir(parents=True)
+    connection = sqlite3.connect(state / "catalog.sqlite3")
+    connection.execute(
+        """
+        CREATE TABLE directories (
+            dir_rel TEXT PRIMARY KEY,
+            scanned_at_ns INTEGER NOT NULL,
+            find_hash TEXT,
+            hash_at_ns INTEGER NOT NULL DEFAULT 0,
+            find_hash_complete INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
+    connection.execute(
+        "INSERT INTO directories(dir_rel, scanned_at_ns) VALUES ('album/child', 1)"
+    )
+    connection.commit()
+    connection.close()
+
+    with Catalog(root) as catalog:
+        parents = {
+            str(row["dir_rel"]): str(row["parent_dir_rel"])
+            for row in catalog._conn.execute(
+                "SELECT dir_rel, parent_dir_rel FROM directories ORDER BY dir_rel"
+            )
+        }
+
+        assert parents == {"": "", "album": "", "album/child": "album"}
+        assert catalog._direct_child_directories("") == ["album"]
+        assert catalog._direct_child_directories("album") == ["album/child"]
 
 
 def test_discover_directories_writes_nested_tree_cache(tmp_path: Path) -> None:
@@ -573,7 +630,7 @@ def test_refresh_continues_after_single_file_indexing_error(tmp_path: Path, monk
         )
 
 
-def test_unchanged_indexing_failure_is_skipped_until_file_changes(tmp_path: Path) -> None:
+def test_forced_refresh_retries_unchanged_indexing_failure(tmp_path: Path) -> None:
     root = tmp_path / "catalog"
     bad_path = root / "bad.jpg"
     bad_path.parent.mkdir(parents=True)
@@ -594,7 +651,7 @@ def test_unchanged_indexing_failure_is_skipped_until_file_changes(tmp_path: Path
         assert catalog.refresh_directory("", force=True)
         second_log_count = sum("Indexing error for bad.jpg" in line for line in catalog.read_log_lines())
 
-        assert second_log_count == first_log_count
+        assert second_log_count == first_log_count + 1
 
         make_image(bad_path, (32, 24), (20, 40, 80))
         os.utime(bad_path, ns=(bad_path.stat().st_atime_ns, bad_path.stat().st_mtime_ns + 1_000_000))
@@ -1449,19 +1506,19 @@ def test_cross_filesystem_move_copies_then_wipes_source(tmp_path: Path, monkeypa
     dest_root = tmp_path / "dest"
     make_image(source_root / "set" / "image.jpg", (120, 90))
     shred_calls: list[list[str]] = []
-    original_replace = os.replace
+    original_rename_noreplace = catalog_module._rename_noreplace
 
-    def fake_replace(source: Path, dest: Path) -> None:
+    def fake_rename_noreplace(source: Path, dest: Path) -> None:
         if Path(source) == source_root / "set" / "image.jpg":
             raise OSError(errno.EXDEV, "Invalid cross-device link")
-        original_replace(source, dest)
+        original_rename_noreplace(source, dest)
 
     def fake_run(command: list[str], *, check: bool):  # type: ignore[no-untyped-def]
         shred_calls.append(command)
         Path(command[-1]).unlink()
         return object()
 
-    monkeypatch.setattr("marnwick.catalog.os.replace", fake_replace)
+    monkeypatch.setattr(catalog_module, "_rename_noreplace", fake_rename_noreplace)
     monkeypatch.setattr("marnwick.catalog.subprocess.run", fake_run)
     monkeypatch.setattr("marnwick.catalog.shutil.which", lambda name: "/usr/bin/shred" if name == "shred" else None)
 
@@ -1478,21 +1535,21 @@ def test_cross_filesystem_move_copies_then_wipes_source(tmp_path: Path, monkeypa
         assert dest.get_image("new-set/image.jpg") is not None
 
 
-def test_cross_filesystem_move_rolls_back_destination_on_delete_failure(
+def test_cross_filesystem_move_preserves_recovery_copy_on_delete_failure(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
     source_root = tmp_path / "source"
     dest_root = tmp_path / "dest"
     make_image(source_root / "set" / "image.jpg", (120, 90))
-    original_replace = os.replace
+    original_rename_noreplace = catalog_module._rename_noreplace
 
-    def fake_replace(source: Path, dest: Path) -> None:
+    def fake_rename_noreplace(source: Path, dest: Path) -> None:
         if Path(source) == source_root / "set" / "image.jpg":
             raise OSError(errno.EXDEV, "Invalid cross-device link")
-        original_replace(source, dest)
+        original_rename_noreplace(source, dest)
 
-    monkeypatch.setattr("marnwick.catalog.os.replace", fake_replace)
+    monkeypatch.setattr(catalog_module, "_rename_noreplace", fake_rename_noreplace)
 
     with Catalog(source_root) as source, Catalog(dest_root) as dest:
         source.refresh()
@@ -1509,9 +1566,9 @@ def test_cross_filesystem_move_rolls_back_destination_on_delete_failure(
             raise AssertionError("cross-filesystem move should surface source delete failure")
 
         assert (source_root / "set" / "image.jpg").is_file()
-        assert not (dest_root / "new-set" / "image.jpg").exists()
+        assert (dest_root / "new-set" / "image.jpg").exists()
         assert source.get_image("set/image.jpg") is not None
-        assert dest.get_image("new-set/image.jpg") is None
+        assert dest.get_image("new-set/image.jpg") is not None
 
 
 def test_delete_removes_files_and_database_rows(tmp_path: Path) -> None:
@@ -1545,7 +1602,7 @@ def test_delete_images_cleans_successful_rows_after_partial_failure(tmp_path: Pa
         original_delete_file = catalog._delete_file
 
         def fail_second_delete(path: Path, *, wipe: bool) -> None:
-            if path.name == "two.jpg":
+            if path.name.startswith(".two.jpg."):
                 raise OSError("simulated delete failure")
             original_delete_file(path, wipe=wipe)
 
@@ -1560,6 +1617,30 @@ def test_delete_images_cleans_successful_rows_after_partial_failure(tmp_path: Pa
         assert not (root / "one.jpg").exists()
         assert (root / "two.jpg").exists()
         assert [record.rel_path for record in catalog.list_images(include_blobs=False)] == ["two.jpg"]
+
+
+def test_delete_images_cancellation_finalizes_already_deleted_rows(tmp_path: Path) -> None:
+    root = tmp_path / "catalog"
+    make_image(root / "one.jpg")
+    make_image(root / "two.jpg")
+
+    with Catalog(root) as catalog:
+        catalog.refresh()
+        checks = 0
+
+        def cancel_before_second() -> None:
+            nonlocal checks
+            checks += 1
+            if checks >= 4:
+                raise RuntimeError("cancelled")
+
+        with pytest.raises(RuntimeError, match="cancelled"):
+            catalog.delete_images(["one.jpg", "two.jpg"], cancel_check=cancel_before_second)
+
+        assert not (root / "one.jpg").exists()
+        assert catalog.get_image("one.jpg") is None
+        assert (root / "two.jpg").is_file()
+        assert catalog.get_image("two.jpg") is not None
 
 
 def test_delete_images_chunks_thumbnail_lookup_for_sqlite_variable_limit(tmp_path: Path) -> None:
@@ -1659,7 +1740,12 @@ def test_delete_images_can_wipe_files(tmp_path: Path, monkeypatch) -> None:
         catalog.refresh()
 
         assert catalog.delete_images(["one.jpg"], wipe=True) == 1
-        assert shred_calls == [["/usr/bin/shred", "-u", str(root / "one.jpg")]]
+        assert len(shred_calls) == 1
+        assert shred_calls[0][:2] == ["/usr/bin/shred", "-u"]
+        quarantined = Path(shred_calls[0][-1])
+        assert quarantined.parent == root
+        assert quarantined.name.startswith(".one.jpg.")
+        assert quarantined.name.endswith(".marnwick-delete")
         assert not (root / "one.jpg").exists()
         assert catalog.get_image("one.jpg") is None
 
@@ -1681,6 +1767,748 @@ def test_delete_images_with_wipe_falls_back_when_shred_is_unavailable(tmp_path: 
         assert not (root / "one.jpg").exists()
         assert catalog.get_image("one.jpg") is None
         assert any("shred is unavailable" in line for line in catalog.read_log_lines())
+
+
+def test_catalog_rejects_symlinked_state_directory(tmp_path: Path) -> None:
+    root = tmp_path / "catalog"
+    external = tmp_path / "external-state"
+    root.mkdir()
+    external.mkdir()
+    (root / ".marnwick").symlink_to(external, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="symbolic link"):
+        Catalog(root)
+
+    assert list(external.iterdir()) == []
+
+
+def test_mutations_reject_stale_internal_symlink_substitution(tmp_path: Path) -> None:
+    root = tmp_path / "catalog"
+    make_image(root / "a.jpg", color=(10, 20, 30))
+    make_image(root / "b.jpg", color=(90, 80, 70))
+
+    with Catalog(root) as catalog:
+        catalog.refresh()
+        (root / "a.jpg").unlink()
+        (root / "a.jpg").symlink_to("b.jpg")
+
+        with pytest.raises(ValueError, match="symbolic link"):
+            catalog.delete_images(["a.jpg"])
+        with pytest.raises(ValueError, match="symbolic link"):
+            catalog.move_images(["a.jpg"], catalog, "elsewhere")
+
+        assert (root / "b.jpg").is_file()
+        assert catalog.get_image("b.jpg") is not None
+
+
+def test_directory_tree_cache_handles_more_than_1100_levels(tmp_path: Path) -> None:
+    root = tmp_path / "catalog"
+    deep_rel = "/".join(f"d{index}" for index in range(1101))
+
+    with Catalog(root) as catalog:
+        catalog.save_directory_tree_cache([deep_rel])
+
+        assert catalog.list_cached_directories()[-1] == deep_rel
+        assert catalog.list_cached_child_directory_rels("") == ["d0"]
+        assert catalog.list_cached_child_directory_rels("d0/d1") == ["d0/d1/d2"]
+        payload = json.loads(catalog.directory_tree_cache_path.read_text(encoding="utf-8"))
+        assert payload["version"] == 2
+
+
+def test_similarity_tree_query_handles_degenerate_depth_iteratively(tmp_path: Path) -> None:
+    root_node = catalog_module.HammingBKTreeNode(0)
+    node = root_node
+    for index in range(1200):
+        child = catalog_module.HammingBKTreeNode(index % 2)
+        node.children[1] = child
+        node = child
+
+    with Catalog(tmp_path / "catalog") as catalog:
+        assert catalog._bk_tree_query(root_node, 0, 64) == []
+
+
+def test_directory_pane_work_count_includes_deep_descendants_without_python_scan(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "catalog"
+    make_image(root / "album" / "direct.jpg")
+    make_image(root / "album" / "child" / "nested.jpg")
+
+    with Catalog(root) as catalog:
+        catalog.refresh()
+        monkeypatch.setattr(
+            catalog,
+            "_direct_child_directories",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("Python scan used")),
+        )
+
+        # Two indexed images in the subtree plus one directly visible child
+        # folder. The nested image contributes aggregation work even though it
+        # is not itself a visible row in this pane.
+        assert catalog.directory_pane_record_count("album") == 3
+
+
+def test_invalid_utf8_directory_tree_cache_is_ignored(tmp_path: Path) -> None:
+    root = tmp_path / "catalog"
+    with Catalog(root) as catalog:
+        catalog.directory_tree_cache_path.write_bytes(b"\xff\xfe\xfd")
+
+        assert catalog.list_cached_directories() == []
+        assert not catalog.directory_tree_cache_available()
+
+
+def test_same_parent_moves_are_no_ops(tmp_path: Path) -> None:
+    root = tmp_path / "catalog"
+    make_image(root / "album" / "a.jpg")
+    make_image(root / "album" / "child" / "b.jpg")
+
+    with Catalog(root) as catalog:
+        catalog.refresh()
+
+        assert catalog.move_images(["album/a.jpg"], catalog, "album") == []
+        assert catalog.move_directories(["album/child"], catalog, "album") == []
+        assert (root / "album" / "a.jpg").is_file()
+        assert (root / "album" / "child" / "b.jpg").is_file()
+        assert not (root / "album" / "a (1).jpg").exists()
+        assert not (root / "album" / "child (1)").exists()
+
+
+def test_wipe_unlinks_only_selected_hard_link(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "catalog"
+    make_image(root / "a.jpg", color=(10, 20, 30))
+    os.link(root / "a.jpg", root / "b.jpg")
+
+    def fail_run(*args, **kwargs):  # type: ignore[no-untyped-def]
+        raise AssertionError("shred must not alter a multiply-linked inode")
+
+    monkeypatch.setattr(catalog_module.subprocess, "run", fail_run)
+    monkeypatch.setattr(catalog_module.shutil, "which", lambda name: "/usr/bin/shred")
+
+    with Catalog(root) as catalog:
+        catalog.refresh()
+        before = (root / "b.jpg").read_bytes()
+
+        assert catalog.delete_images(["a.jpg"], wipe=True) == 1
+
+        assert not (root / "a.jpg").exists()
+        assert (root / "b.jpg").read_bytes() == before
+
+
+def test_corrupt_thumbnail_cache_file_is_rebuilt_by_background_refresh(tmp_path: Path) -> None:
+    root = tmp_path / "catalog"
+    make_image(root / "a.jpg")
+
+    with Catalog(root) as catalog:
+        catalog.refresh()
+        row = catalog._conn.execute(
+            "SELECT thumb_rel_path FROM images WHERE rel_path = ?",
+            ("a.jpg",),
+        ).fetchone()
+        thumb_path = catalog.thumbnail_abs_path(str(row["thumb_rel_path"]))
+        thumb_path.write_bytes(b"corrupt")
+
+        blob = catalog.get_thumbnail_blob("a.jpg")
+
+        assert blob is None
+        assert not thumb_path.exists()
+
+        catalog.refresh_directory("")
+
+        blob = catalog.get_thumbnail_blob("a.jpg")
+        assert blob
+        with Image.open(thumb_path) as image:
+            image.verify()
+
+
+def test_foreground_thumbnail_read_does_not_decode_with_pillow(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "catalog"
+    make_image(root / "a.jpg")
+
+    with Catalog(root) as catalog:
+        catalog.refresh()
+
+        def fail_full_validation(_data: bytes) -> bool:
+            raise AssertionError("foreground thumbnail read performed a full Pillow decode")
+
+        monkeypatch.setattr(catalog, "_thumbnail_blob_is_valid", fail_full_validation)
+
+        assert catalog.get_thumbnail_blob("a.jpg")
+
+
+def test_failed_reindex_retains_last_good_row_and_tags(tmp_path: Path) -> None:
+    root = tmp_path / "catalog"
+    image_path = root / "a.jpg"
+    make_image(image_path)
+
+    with Catalog(root) as catalog:
+        catalog.refresh()
+        catalog.set_image_tags("a.jpg", ["Keep"], replace=True)
+        image_path.write_bytes(b"new corrupt image bytes")
+
+        catalog.refresh_directory("", force=True)
+
+        assert catalog.get_image("a.jpg", include_blob=False) is not None
+        assert catalog.get_image_tags("a.jpg") == ["Keep"]
+        assert catalog._image_index_failure_exists("a.jpg")
+
+
+def test_catalog_refresh_retries_when_tree_changes_during_scan(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "catalog"
+    image_path = root / "a.jpg"
+    make_image(image_path)
+
+    with Catalog(root) as catalog:
+        original_refresh = catalog._refresh_catalog_tree
+        calls = 0
+
+        def changing_refresh(progress, cancel_check, *, force):  # type: ignore[no-untyped-def]
+            nonlocal calls
+            result = original_refresh(progress, cancel_check, force=force)
+            calls += 1
+            if calls == 1:
+                image_path.unlink()
+            return result
+
+        monkeypatch.setattr(catalog, "_refresh_catalog_tree", changing_refresh)
+
+        catalog.refresh(force=True)
+
+        assert calls >= 2
+        assert catalog.get_image("a.jpg") is None
+        assert catalog.catalog_refresh_is_current()
+
+
+def test_catalog_refresh_raises_when_every_stability_attempt_changes(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "catalog"
+    with Catalog(root) as catalog:
+        hashes = iter(f"hash-{index}" for index in range(4))
+        monkeypatch.setattr(catalog, "directory_find_hash", lambda *_args, **_kwargs: next(hashes))
+        monkeypatch.setattr(catalog, "_refresh_catalog_tree", lambda *_args, **_kwargs: True)
+
+        with pytest.raises(CatalogRefreshUnstableError, match="changed throughout"):
+            catalog.refresh(force=True)
+
+        assert catalog.stored_catalog_find_hash() is None
+        assert not catalog.stored_directory_find_hash("")[1]
+
+
+def test_stale_nonforced_refresh_reuses_initial_hash_for_stability_check(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "catalog"
+    with Catalog(root) as catalog:
+        catalog._remember_directory("")
+        catalog.save_directory_find_hash("", complete=True, find_hash="old")
+        catalog._save_catalog_find_hash_value("old")
+        hash_calls = 0
+
+        def current_hash(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+            nonlocal hash_calls
+            hash_calls += 1
+            return "new"
+
+        monkeypatch.setattr(catalog, "directory_find_hash", current_hash)
+        monkeypatch.setattr(catalog, "_refresh_catalog_tree", lambda *_args, **_kwargs: True)
+
+        assert catalog.refresh(force=False)
+        assert hash_calls == 2
+
+
+def test_discovery_prunes_nested_catalog_state_directories(tmp_path: Path) -> None:
+    root = tmp_path / "catalog"
+    (root / "inner" / ".marnwick" / "thumbnails").mkdir(parents=True)
+    (root / "inner" / "photos").mkdir()
+
+    with Catalog(root) as catalog:
+        catalog.discover_directories()
+
+        known = catalog.list_known_directories()
+        assert "inner" in known
+        assert "inner/photos" in known
+        assert not any(".marnwick" in Path(item).parts for item in known)
+
+
+def test_intra_trash_move_preserves_original_restore_path(tmp_path: Path) -> None:
+    root = tmp_path / "catalog"
+    make_image(root / "album" / "a.jpg")
+
+    with Catalog(root) as catalog:
+        catalog.refresh()
+        catalog.move_images(["album/a.jpg"], catalog, TRASH_DIR_NAME)
+        catalog.create_directory(TRASH_DIR_NAME, "sub")
+        moved = catalog.move_images(
+            [f"{TRASH_DIR_NAME}/a.jpg"],
+            catalog,
+            f"{TRASH_DIR_NAME}/sub",
+        )
+
+        restored = catalog.restore_image_from_trash(moved[0].dest_rel_path)
+
+        assert restored.dest_rel_path == "album/a.jpg"
+        assert (root / "album" / "a.jpg").is_file()
+
+
+def test_cross_catalog_transfer_replaces_stale_destination_tags(tmp_path: Path) -> None:
+    source_root = tmp_path / "source"
+    dest_root = tmp_path / "dest"
+    make_image(source_root / "a.jpg", color=(10, 20, 30))
+    make_image(dest_root / "a.jpg", color=(90, 80, 70))
+
+    with Catalog(source_root) as source, Catalog(dest_root) as dest:
+        source.refresh()
+        dest.refresh()
+        source.set_image_tags("a.jpg", ["New"], replace=True)
+        dest.set_image_tags("a.jpg", ["Old"], replace=True)
+        (dest_root / "a.jpg").unlink()
+
+        source.move_images(["a.jpg"], dest)
+
+        assert dest.get_image_tags("a.jpg") == ["New"]
+
+
+def test_cross_filesystem_directory_copy_preserves_symlinks(tmp_path: Path, monkeypatch) -> None:
+    source_root = tmp_path / "source"
+    dest_root = tmp_path / "dest"
+    make_image(source_root / "set" / "image.jpg")
+    (source_root / "set" / "alias.jpg").symlink_to("image.jpg")
+    original_rename_noreplace = catalog_module._rename_noreplace
+
+    def cross_device_for_source(source: Path, dest: Path) -> None:
+        if Path(source) == source_root / "set":
+            raise OSError(errno.EXDEV, "cross-device")
+        original_rename_noreplace(source, dest)
+
+    monkeypatch.setattr(catalog_module, "_rename_noreplace", cross_device_for_source)
+
+    with Catalog(source_root) as source, Catalog(dest_root) as dest:
+        source.refresh()
+        source.move_directories(["set"], dest)
+
+        assert (dest_root / "set" / "alias.jpg").is_symlink()
+        assert (dest_root / "set" / "alias.jpg").read_bytes() == (dest_root / "set" / "image.jpg").read_bytes()
+
+
+def test_same_filesystem_move_rolls_back_file_on_database_failure(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "catalog"
+    make_image(root / "source" / "a.jpg")
+    (root / "dest").mkdir()
+
+    with Catalog(root) as catalog:
+        catalog.refresh()
+
+        def fail_db_move(*args, **kwargs):  # type: ignore[no-untyped-def]
+            raise sqlite3.IntegrityError("simulated database failure")
+
+        monkeypatch.setattr(catalog, "_move_db_record_in_place", fail_db_move)
+
+        with pytest.raises(sqlite3.IntegrityError):
+            catalog.move_images(["source/a.jpg"], catalog, "dest")
+
+        assert (root / "source" / "a.jpg").is_file()
+        assert not (root / "dest" / "a.jpg").exists()
+        assert catalog.get_image("source/a.jpg") is not None
+
+
+def test_reserved_trash_name_cannot_be_created_as_ordinary_directory(tmp_path: Path) -> None:
+    with Catalog(tmp_path / "catalog") as catalog:
+        with pytest.raises(ValueError):
+            catalog.create_directory("", TRASH_DIR_NAME)
+
+
+def test_very_similar_grouping_honors_cancellation(tmp_path: Path) -> None:
+    root = tmp_path / "catalog"
+    for index in range(6):
+        make_image(root / f"{index}.jpg", color=(index * 10, 20, 30))
+
+    with Catalog(root) as catalog:
+        catalog.refresh()
+        checks = 0
+
+        def cancel() -> None:
+            nonlocal checks
+            checks += 1
+            if checks >= 3:
+                raise RuntimeError("cancelled")
+
+        with pytest.raises(RuntimeError, match="cancelled"):
+            catalog.very_similar_image_groups(cancel_check=cancel)
+
+
+def test_orphan_thumbnail_pruning_honors_cancellation(tmp_path: Path) -> None:
+    root = tmp_path / "catalog"
+    with Catalog(root) as catalog:
+        orphan = catalog.thumbnail_dir / "96" / "aa" / "orphan.jpg"
+        orphan.parent.mkdir(parents=True)
+        orphan.write_bytes(b"orphan")
+
+        def cancel() -> None:
+            raise RuntimeError("cancelled")
+
+        with pytest.raises(RuntimeError, match="cancelled"):
+            catalog._prune_orphan_thumbnail_files(cancel_check=cancel)
+
+        assert orphan.exists()
+
+
+def test_transient_directory_entry_error_does_not_prune_last_good_row(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "catalog"
+    image_path = root / "a.jpg"
+    make_image(image_path)
+
+    class UncertainEntry:
+        name = "a.jpg"
+        path = str(image_path)
+
+        def is_dir(self, *, follow_symlinks: bool) -> bool:
+            return False
+
+        def is_file(self, *, follow_symlinks: bool) -> bool:
+            raise PermissionError("transient stat failure")
+
+    class Scan:
+        def __enter__(self):  # type: ignore[no-untyped-def]
+            return iter([UncertainEntry()])
+
+        def __exit__(self, *args):  # type: ignore[no-untyped-def]
+            return None
+
+    with Catalog(root) as catalog:
+        catalog.refresh()
+        catalog.set_image_tags("a.jpg", ["Keep"], replace=True)
+        monkeypatch.setattr(catalog_module.os, "scandir", lambda path: Scan())
+
+        catalog._refresh_directory_contents("", None, None, prune_missing_children=True)
+
+        assert catalog.get_image("a.jpg") is not None
+        assert catalog.get_image_tags("a.jpg") == ["Keep"]
+
+
+def test_refresh_removes_failure_record_for_deleted_file(tmp_path: Path) -> None:
+    root = tmp_path / "catalog"
+    bad_path = root / "bad.jpg"
+    bad_path.parent.mkdir(parents=True)
+    bad_path.write_bytes(b"bad image")
+
+    with Catalog(root) as catalog:
+        catalog.refresh_directory("")
+        assert catalog._image_index_failure_exists("bad.jpg")
+        bad_path.unlink()
+
+        catalog.refresh_directory("", force=True)
+
+        assert not catalog._image_index_failure_exists("bad.jpg")
+
+
+def test_cross_filesystem_directory_cleanup_failure_keeps_complete_destination(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source_root = tmp_path / "source"
+    dest_root = tmp_path / "dest"
+    make_image(source_root / "set" / "a.jpg")
+    original_rename_noreplace = catalog_module._rename_noreplace
+    original_rmtree = catalog_module.shutil.rmtree
+
+    def cross_device_for_source(source: Path, dest: Path) -> None:
+        if Path(source) == source_root / "set":
+            raise OSError(errno.EXDEV, "cross-device")
+        original_rename_noreplace(source, dest)
+
+    def fail_source_cleanup(path: Path, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if Path(path) == source_root / "set":
+            raise OSError("simulated cleanup failure")
+        return original_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(catalog_module, "_rename_noreplace", cross_device_for_source)
+    monkeypatch.setattr(catalog_module.shutil, "rmtree", fail_source_cleanup)
+
+    with Catalog(source_root) as source, Catalog(dest_root) as dest:
+        source.refresh()
+
+        with pytest.raises(OSError, match="cleanup failure"):
+            source.move_directories(["set"], dest)
+
+        assert (source_root / "set" / "a.jpg").is_file()
+        assert (dest_root / "set" / "a.jpg").is_file()
+        assert source.get_image("set/a.jpg") is not None
+        assert dest.get_image("set/a.jpg") is not None
+
+
+def test_duplicate_cleanup_finalizes_hashes_after_partial_error(tmp_path: Path) -> None:
+    root = tmp_path / "catalog"
+    for name in ("a.jpg", "b.jpg", "c.jpg"):
+        make_image(root / name)
+
+    with Catalog(root) as catalog:
+        catalog.refresh()
+
+        def stop_after_first_move(processed: int, total: int | None, current: str) -> None:
+            if processed == 1 and current.startswith(f"{TRASH_DIR_NAME}/"):
+                raise RuntimeError("stop")
+
+        with pytest.raises(RuntimeError, match="stop"):
+            catalog.move_duplicate_images_to_trash(
+                DUPLICATE_DELETE_EXACT,
+                progress_callback=stop_after_first_move,
+            )
+
+        assert len(catalog.list_images(TRASH_DIR_NAME, include_blobs=False)) == 1
+        assert catalog.directory_hash_matches("")
+
+
+def test_secure_delete_failure_is_reported_without_pruning_database_row(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "catalog"
+    make_image(root / "a.jpg")
+
+    def fail_shred(command: list[str], *, check: bool):  # type: ignore[no-untyped-def]
+        raise catalog_module.subprocess.CalledProcessError(1, command)
+
+    monkeypatch.setattr(catalog_module.shutil, "which", lambda name: "/usr/bin/shred")
+    monkeypatch.setattr(catalog_module.subprocess, "run", fail_shred)
+
+    with Catalog(root) as catalog:
+        catalog.refresh()
+
+        with pytest.raises(OSError, match="secure deletion failed"):
+            catalog.delete_images(["a.jpg"], wipe=True)
+
+        assert (root / "a.jpg").is_file()
+        assert catalog.get_image("a.jpg") is not None
+
+
+def test_directory_aspect_sort_uses_batched_descendant_image_aggregate(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "catalog"
+    make_image(root / "wide" / "a.jpg", size=(200, 100))
+    make_image(root / "wide" / "nested" / "b.jpg", size=(400, 100))
+    make_image(root / "square" / "a.jpg", size=(100, 100))
+
+    with Catalog(root) as catalog:
+        catalog.refresh()
+        monkeypatch.setattr(
+            catalog,
+            "_indexed_image_size_under",
+            lambda dir_rel: (_ for _ in ()).throw(AssertionError("N+1 aggregate query")),
+        )
+
+        records = catalog.list_child_directories(
+            "",
+            SortOrder.ASPECT_ASC,
+            include_previews=False,
+        )
+
+        assert [record.dir_rel for record in records] == ["square", "wide"]
+        assert records[0].aspect_ratio == pytest.approx(1.0)
+        assert records[1].aspect_ratio == pytest.approx(3.0)
+        assert records[0].size_bytes == (root / "square" / "a.jpg").stat().st_size
+        assert records[1].size_bytes == (
+            (root / "wide" / "a.jpg").stat().st_size
+            + (root / "wide" / "nested" / "b.jpg").stat().st_size
+        )
+
+
+def test_catalog_lock_is_reentrant_in_process_and_exclusive_across_processes(tmp_path: Path) -> None:
+    root = tmp_path / "catalog"
+    first = Catalog(root)
+    second = Catalog(root)
+    try:
+        script = """
+import sys
+from pathlib import Path
+from marnwick.catalog import Catalog
+try:
+    Catalog(Path(sys.argv[1]))
+except RuntimeError as error:
+    print(error)
+    raise SystemExit(23)
+raise SystemExit(0)
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", script, str(root)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        assert result.returncode == 23
+        assert "already open in another Marnwick process" in result.stdout
+    finally:
+        second.close()
+        first.close()
+
+    with Catalog(root):
+        pass
+
+
+@pytest.mark.parametrize(
+    ("entry_name", "directory"),
+    [
+        ("catalog.sqlite3", False),
+        ("catalog.sqlite3-wal", False),
+        ("catalog.sqlite3-shm", False),
+        ("marnwick.log", False),
+        ("directory-tree.json", False),
+        ("thumbnails", True),
+        ("catalog.lock", False),
+    ],
+)
+def test_catalog_rejects_symlinked_individual_state_entries(
+    tmp_path: Path,
+    entry_name: str,
+    directory: bool,
+) -> None:
+    root = tmp_path / entry_name.replace(".", "-")
+    state = root / ".marnwick"
+    state.mkdir(parents=True)
+    external = tmp_path / f"external-{entry_name.replace('.', '-')}"
+    if directory:
+        external.mkdir()
+    else:
+        external.write_bytes(b"unchanged")
+    (state / entry_name).symlink_to(external, target_is_directory=directory)
+
+    with pytest.raises(ValueError, match="symbolic link"):
+        Catalog(root)
+
+    if not directory:
+        assert external.read_bytes() == b"unchanged"
+
+
+def test_catalog_rejects_hard_linked_state_file(tmp_path: Path) -> None:
+    root = tmp_path / "catalog"
+    state = root / ".marnwick"
+    state.mkdir(parents=True)
+    unrelated = tmp_path / "unrelated.log"
+    unrelated.write_bytes(b"unchanged")
+    os.link(unrelated, state / "marnwick.log")
+
+    with pytest.raises(ValueError, match="must not be hard-linked"):
+        Catalog(root)
+
+    assert unrelated.read_bytes() == b"unchanged"
+
+
+def test_append_log_is_nonfatal_and_does_not_follow_replaced_symlink(tmp_path: Path) -> None:
+    root = tmp_path / "catalog"
+    external = tmp_path / "external.log"
+    external.write_text("unchanged", encoding="utf-8")
+
+    with Catalog(root) as catalog:
+        catalog.log_path.unlink(missing_ok=True)
+        catalog.log_path.symlink_to(external)
+
+        catalog.append_log("must not escape")
+
+        assert external.read_text(encoding="utf-8") == "unchanged"
+
+
+def test_index_pipeline_propagates_thumbnail_writer_failure_without_deadlock(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "catalog"
+    rel_paths = [f"{index}.jpg" for index in range(8)]
+    for rel_path in rel_paths:
+        make_image(root / rel_path)
+
+    with Catalog(root) as catalog:
+        def fail_write(thumb_rel_path: str, thumb_blob: bytes) -> None:
+            raise OSError("simulated thumbnail disk failure")
+
+        monkeypatch.setattr(catalog, "_write_thumbnail_rel_file", fail_write)
+        started = time.monotonic()
+
+        with pytest.raises(OSError, match="thumbnail disk failure"):
+            catalog.index_images_pipeline(rel_paths)
+
+        assert time.monotonic() - started < 5
+
+
+def test_same_size_same_mtime_content_change_is_detected_via_ctime(tmp_path: Path) -> None:
+    root = tmp_path / "catalog"
+    image_path = root / "a.bmp"
+    make_image(image_path, size=(20, 20), color=(10, 20, 30))
+
+    with Catalog(root) as catalog:
+        catalog.refresh()
+        before = catalog.get_image("a.bmp", include_blob=False)
+        assert before is not None
+        original_stat = image_path.stat()
+        with Image.open(image_path) as image:
+            changed = image.copy()
+        changed.putpixel((0, 0), (200, 100, 50))
+        changed.save(image_path)
+        assert image_path.stat().st_size == original_stat.st_size
+        os.utime(image_path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+        changed_stat = image_path.stat()
+        assert changed_stat.st_mtime_ns == original_stat.st_mtime_ns
+        assert changed_stat.st_ctime_ns != original_stat.st_ctime_ns
+
+        assert catalog.refresh(force=False)
+        after = catalog.get_image("a.bmp", include_blob=False)
+
+        assert after is not None
+        assert after.image_hash != before.image_hash
+
+
+def test_windows_change_time_is_unix_ns_and_closes_full_width_handle(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "catalog"
+    root.mkdir()
+    path = root / "a.jpg"
+    make_image(path)
+    handle = 0x1_0000_1234
+    change_ticks = 116_444_736_000_000_000 + 17_000_000_000_000_000
+    closed: list[int] = []
+
+    class FakeFunction:
+        def __init__(self, callback):  # type: ignore[no-untyped-def]
+            self.callback = callback
+            self.argtypes = None
+            self.restype = None
+
+        def __call__(self, *args):  # type: ignore[no-untyped-def]
+            return self.callback(*args)
+
+    def fill_info(_handle, _kind, output, _size):  # type: ignore[no-untyped-def]
+        info = catalog_module.ctypes.cast(
+            output,
+            catalog_module.ctypes.POINTER(catalog_module._WindowsFileBasicInfo),
+        ).contents
+        info.change_time = change_ticks
+        return 1
+
+    class FakeKernel32:
+        CreateFileW = FakeFunction(lambda *_args: handle)
+        GetFileInformationByHandleEx = FakeFunction(fill_info)
+        CloseHandle = FakeFunction(lambda value: closed.append(value) or 1)
+
+    monkeypatch.setattr(catalog_module.sys, "platform", "win32")
+    monkeypatch.setattr(catalog_module.ctypes, "WinDLL", lambda *_args, **_kwargs: FakeKernel32(), raising=False)
+
+    with Catalog(root) as catalog:
+        assert catalog._path_change_time_ns(path, path.stat()) == 1_700_000_000_000_000_000
+
+    assert catalog_module.ctypes.sizeof(catalog_module._WindowsFileBasicInfo) == 40
+    assert closed == [handle]
 
 
 def test_create_delete_directory_and_summary(tmp_path: Path) -> None:
@@ -1738,6 +2566,48 @@ def test_delete_directory_treats_like_wildcards_as_literal_names(tmp_path: Path)
         assert axb_thumb_path.is_file()
 
 
+def test_delete_directory_refuses_replacement_after_confirmation(tmp_path: Path) -> None:
+    root = tmp_path / "catalog"
+    make_image(root / "album" / "original.jpg")
+
+    with Catalog(root) as catalog:
+        catalog.refresh()
+        expected_identity = catalog.directory_identity("album")
+        (root / "album").rename(root / "original-album")
+        make_image(root / "album" / "replacement.jpg", color=(200, 10, 20))
+
+        with pytest.raises(OSError, match="changed after deletion was confirmed"):
+            catalog.delete_directory("album", expected_identity=expected_identity)
+
+        assert (root / "album" / "replacement.jpg").is_file()
+        assert (root / "original-album" / "original.jpg").is_file()
+
+
+def test_delete_directory_restores_quarantine_when_recursive_delete_fails(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "catalog"
+    make_image(root / "album" / "original.jpg")
+    original_rmtree = catalog_module.shutil.rmtree
+
+    def fail_quarantine(path: Path, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if Path(path).name.endswith(".marnwick-delete-dir"):
+            raise OSError("simulated recursive delete failure")
+        return original_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(catalog_module.shutil, "rmtree", fail_quarantine)
+    with Catalog(root) as catalog:
+        catalog.refresh()
+
+        with pytest.raises(OSError, match="simulated recursive delete failure"):
+            catalog.delete_directory("album")
+
+        assert (root / "album" / "original.jpg").is_file()
+        assert catalog.get_image("album/original.jpg") is not None
+        assert not list(root.glob(".album.*.marnwick-delete-dir"))
+
+
 def test_list_images_supports_limit_and_offset_for_large_directories(tmp_path: Path) -> None:
     root = tmp_path / "catalog"
     for index in range(10):
@@ -1748,3 +2618,121 @@ def test_list_images_supports_limit_and_offset_for_large_directories(tmp_path: P
         page = catalog.list_images("set", SortOrder.NAME_ASC, limit=3, offset=4)
 
         assert [record.filename for record in page] == ["04.jpg", "05.jpg", "06.jpg"]
+
+
+def test_move_never_overwrites_destination_created_after_name_selection(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "catalog"
+    make_image(root / "source" / "a.jpg", color=(10, 20, 30))
+    (root / "dest").mkdir()
+    original_rename = catalog_module._rename_noreplace
+    raced = False
+
+    def create_racing_destination(source: Path, destination: Path) -> None:
+        nonlocal raced
+        if not raced:
+            raced = True
+            destination.write_bytes(b"do not overwrite")
+        original_rename(source, destination)
+
+    monkeypatch.setattr(catalog_module, "_rename_noreplace", create_racing_destination)
+    with Catalog(root) as catalog:
+        catalog.refresh()
+
+        result = catalog.move_images(["source/a.jpg"], catalog, "dest")
+
+        assert (root / "dest" / "a.jpg").read_bytes() == b"do not overwrite"
+        assert result[0].dest_rel_path == "dest/a (1).jpg"
+        assert (root / "dest" / "a (1).jpg").is_file()
+
+
+def test_delete_refuses_image_replaced_since_indexing(tmp_path: Path) -> None:
+    root = tmp_path / "catalog"
+    path = root / "image.jpg"
+    replacement = root / "replacement.jpg"
+    make_image(path, color=(10, 20, 30))
+    make_image(replacement, color=(200, 20, 30))
+
+    with Catalog(root) as catalog:
+        catalog.refresh()
+        replacement_bytes = replacement.read_bytes()
+        os.replace(replacement, path)
+
+        with pytest.raises(OSError, match="changed since it was indexed"):
+            catalog.delete_images(["image.jpg"])
+
+        assert path.read_bytes() == replacement_bytes
+        assert catalog.get_image("image.jpg") is not None
+
+
+def test_delete_preserves_file_recreated_after_atomic_quarantine(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "catalog"
+    path = root / "image.jpg"
+    make_image(path, color=(10, 20, 30))
+    recreated_bytes = b"new file at reused path"
+    original_rename = catalog_module._rename_noreplace
+
+    def recreate_after_rename(source: Path, destination: Path) -> None:
+        original_rename(source, destination)
+        if source == path and destination.name.endswith(".marnwick-delete"):
+            path.write_bytes(recreated_bytes)
+
+    monkeypatch.setattr(catalog_module, "_rename_noreplace", recreate_after_rename)
+
+    with Catalog(root) as catalog:
+        catalog.refresh()
+
+        assert catalog.delete_images(["image.jpg"]) == 1
+
+        assert path.read_bytes() == recreated_bytes
+        assert catalog.get_image("image.jpg") is None
+
+
+def test_directory_no_replace_fallback_fails_closed_without_atomic_primitive(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    source.mkdir()
+    monkeypatch.setattr(catalog_module.sys, "platform", "unsupported-posix")
+
+    with pytest.raises(OSError) as raised:
+        catalog_module._rename_noreplace(source, destination)
+
+    assert raised.value.errno == errno.ENOTSUP
+    assert source.is_dir()
+    assert not destination.exists()
+
+
+def test_cross_catalog_transfer_failure_restores_source_row_and_tags(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source_root = tmp_path / "source"
+    destination_root = tmp_path / "destination"
+    make_image(source_root / "a.jpg")
+    destination_root.mkdir()
+    with Catalog(source_root) as source, Catalog(destination_root) as destination:
+        source.refresh()
+        source.set_image_tags("a.jpg", ["Keep"], replace=True)
+        original_delete = source._delete_db_records
+
+        def delete_then_fail(rel_paths) -> None:  # type: ignore[no-untyped-def]
+            original_delete(rel_paths)
+            raise sqlite3.OperationalError("injected source cleanup failure")
+
+        monkeypatch.setattr(source, "_delete_db_records", delete_then_fail)
+
+        with pytest.raises(sqlite3.OperationalError, match="injected"):
+            source.move_images(["a.jpg"], destination, "")
+
+        assert (source_root / "a.jpg").is_file()
+        assert source.get_image("a.jpg", include_blob=False) is not None
+        assert source.get_image_tags("a.jpg") == ["Keep"]
+        assert destination.get_image("a.jpg", include_blob=False) is None

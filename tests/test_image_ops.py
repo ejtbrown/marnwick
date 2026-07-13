@@ -1,21 +1,30 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime
 import os
 from pathlib import Path
+import stat
 
-from PIL import Image
+from PIL import Image, ImageDraw
+import pytest
 
 import marnwick.safe_image as safe_image
+import marnwick.image_ops as image_ops
 from marnwick.catalog import Catalog
 from marnwick.image_ops import (
     EditOperation,
+    HardLinkSaveError,
+    MultiFrameSaveError,
+    UnsafeImageSaveError,
     apply_operation_to_file,
     apply_operation_to_image,
+    apply_operations_to_file,
     clone_heal_brush_in_place,
     image_created_timestamp_ns,
     save_image,
     save_image_preserving_file_dates,
+    snapshot_image_file_identity,
 )
 
 
@@ -224,6 +233,508 @@ def test_save_image_does_not_use_old_predictable_temp_name(tmp_path: Path) -> No
     save_image(path, Image.new("RGB", (40, 80), (20, 30, 40)))
 
     assert guessed.read_bytes() == b"sentinel"
+
+
+def test_save_image_preserves_permission_mode_and_extended_attributes(tmp_path: Path) -> None:
+    path = tmp_path / "image.jpg"
+    make_image(path, (80, 40))
+    path.chmod(0o640)
+    xattr_name = "user.marnwick-test"
+    xattr_value = b"kept"
+    if not all(hasattr(os, name) for name in ("setxattr", "getxattr")):
+        pytest.skip("extended attributes are unavailable")
+    try:
+        os.setxattr(path, xattr_name, xattr_value)
+    except OSError as error:
+        pytest.skip(f"extended attributes are unavailable: {error}")
+    original_stat = path.stat()
+
+    save_image(path, Image.new("RGB", (40, 80), (20, 30, 40)))
+
+    saved_stat = path.stat()
+    assert stat.S_IMODE(saved_stat.st_mode) == 0o640
+    assert saved_stat.st_uid == original_stat.st_uid
+    assert saved_stat.st_gid == original_stat.st_gid
+    assert os.getxattr(path, xattr_name) == xattr_value
+
+
+def test_save_image_preserves_exif_gps_and_icc_metadata(tmp_path: Path) -> None:
+    path = tmp_path / "image.jpg"
+    image = Image.new("RGB", (80, 40), (100, 50, 20))
+    exif = image.getexif()
+    exif[274] = 6
+    exif[36867] = "2020:01:02 03:04:05"
+    exif[34853] = {1: "N", 2: (41.0, 52.0, 30.0)}
+    icc_profile = b"marnwick-test-icc-profile"
+    image.save(path, exif=exif, icc_profile=icc_profile)
+
+    save_image(path, Image.new("RGB", (40, 80), (20, 30, 40)))
+
+    with Image.open(path) as saved:
+        saved_exif = saved.getexif()
+        assert saved_exif.get(274) is None
+        assert saved_exif.get(36867) == "2020:01:02 03:04:05"
+        assert saved_exif.get_ifd(34853)[1] == "N"
+        assert saved_exif.get_ifd(34853)[2] == (41.0, 52.0, 30.0)
+        assert saved.info["icc_profile"] == icc_profile
+
+
+def test_save_image_refuses_to_break_hard_link_identity(tmp_path: Path) -> None:
+    path = tmp_path / "image.jpg"
+    linked = tmp_path / "linked.jpg"
+    make_image(path, (80, 40))
+    os.link(path, linked)
+    original_bytes = path.read_bytes()
+    original_inode = path.stat().st_ino
+
+    with pytest.raises(HardLinkSaveError, match="hard-linked"):
+        save_image(path, Image.new("RGB", (40, 80), (20, 30, 40)))
+
+    assert path.read_bytes() == original_bytes
+    assert linked.read_bytes() == original_bytes
+    assert path.stat().st_ino == linked.stat().st_ino == original_inode
+
+
+def test_single_frame_save_refuses_to_collapse_animation(tmp_path: Path) -> None:
+    path = tmp_path / "animated.gif"
+    first = Image.new("RGB", (20, 10), (255, 0, 0))
+    second = Image.new("RGB", (20, 10), (0, 0, 255))
+    first.save(path, save_all=True, append_images=[second], duration=[80, 120], loop=2)
+    original_bytes = path.read_bytes()
+
+    with pytest.raises(MultiFrameSaveError, match="collapse 2 frames/pages"):
+        save_image(path, Image.new("RGB", (10, 20), (20, 30, 40)))
+
+    assert path.read_bytes() == original_bytes
+
+
+def test_apply_operations_to_file_preserves_all_animation_frames(tmp_path: Path) -> None:
+    path = tmp_path / "animated.gif"
+    first = Image.new("RGB", (20, 10), (255, 0, 0))
+    second = Image.new("RGB", (20, 10), (0, 0, 255))
+    first.save(path, save_all=True, append_images=[second], duration=[80, 120], loop=2)
+
+    apply_operations_to_file(
+        path,
+        [EditOperation("rotate_right")],
+        preserve_timestamp=False,
+    )
+
+    with Image.open(path) as saved:
+        assert saved.n_frames == 2
+        assert saved.info["loop"] == 2
+        sizes: list[tuple[int, int]] = []
+        durations: list[int] = []
+        for frame_index in range(saved.n_frames):
+            saved.seek(frame_index)
+            sizes.append(saved.size)
+            durations.append(saved.info["duration"])
+        assert sizes == [(10, 20), (10, 20)]
+        assert durations == [80, 120]
+
+
+def test_apply_operations_to_file_preserves_all_tiff_pages_and_dates(tmp_path: Path) -> None:
+    path = tmp_path / "pages.tiff"
+    first = Image.new("RGB", (20, 10), (255, 0, 0))
+    second = Image.new("RGB", (20, 10), (0, 0, 255))
+    first.save(path, save_all=True, append_images=[second], compression="tiff_lzw")
+    original_mtime_ns = 946_684_800_123_456_789
+    os.utime(path, ns=(original_mtime_ns, original_mtime_ns))
+
+    apply_operations_to_file(
+        path,
+        [EditOperation("rotate_left")],
+        preserve_file_dates=True,
+    )
+
+    assert path.stat().st_mtime_ns == original_mtime_ns
+    with Image.open(path) as saved:
+        assert saved.n_frames == 2
+        for frame_index in range(saved.n_frames):
+            saved.seek(frame_index)
+            assert saved.size == (10, 20)
+
+
+def test_expected_identity_rejects_replaced_image_before_edit(tmp_path: Path) -> None:
+    path = tmp_path / "image.png"
+    replacement = tmp_path / "replacement.png"
+    make_image(path, color=(255, 0, 0))
+    identity = snapshot_image_file_identity(path)
+    make_image(replacement, color=(0, 0, 255))
+    os.replace(replacement, path)
+    replacement_bytes = path.read_bytes()
+
+    with pytest.raises(UnsafeImageSaveError, match="changed after it was opened"):
+        apply_operations_to_file(
+            path,
+            [EditOperation("rotate_left")],
+            preserve_timestamp=False,
+            expected_identity=identity,
+        )
+
+    assert path.read_bytes() == replacement_bytes
+
+
+def test_expected_identity_includes_content_for_same_inode_changes(tmp_path: Path) -> None:
+    path = tmp_path / "image.png"
+    make_image(path, color=(255, 0, 0))
+    original_identity = snapshot_image_file_identity(path)
+    original_inode = path.stat().st_ino
+    changed = bytearray(path.read_bytes())
+    changed[-12] ^= 0x01
+    path.write_bytes(changed)
+    os.utime(path, ns=(original_identity.modified_ns, original_identity.modified_ns))
+    current_identity = snapshot_image_file_identity(path)
+    assert path.stat().st_ino == original_inode
+
+    # Model a filesystem whose ctime does not expose the in-place write. The
+    # digest must still distinguish the file shown in the preview from the
+    # bytes now at that same inode, size, and timestamp.
+    expected = replace(
+        original_identity,
+        modified_ns=current_identity.modified_ns,
+        changed_ns=current_identity.changed_ns,
+    )
+    with pytest.raises(UnsafeImageSaveError, match="changed after it was opened"):
+        apply_operations_to_file(
+            path,
+            [EditOperation("flip_horizontal")],
+            preserve_timestamp=False,
+            expected_identity=expected,
+        )
+
+    assert path.read_bytes() == bytes(changed)
+
+
+def test_atomic_edit_does_not_overwrite_change_in_final_commit_race(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    path = tmp_path / "image.png"
+    make_image(path, color=(255, 0, 0))
+    original_inode = path.stat().st_ino
+    original_mtime_ns = path.stat().st_mtime_ns
+    original_exchange = image_ops._linux_renameat2
+    externally_changed: list[bytes] = []
+
+    def exchange_after_external_write(source: Path, destination: Path, flags: int) -> bool:
+        if flags == 2 and destination == path and not externally_changed:
+            changed = bytearray(path.read_bytes())
+            changed[-12] ^= 0x01
+            path.write_bytes(changed)
+            os.utime(path, ns=(original_mtime_ns, original_mtime_ns))
+            externally_changed.append(bytes(changed))
+            assert path.stat().st_ino == original_inode
+        return original_exchange(source, destination, flags)
+
+    monkeypatch.setattr(image_ops, "_linux_renameat2", exchange_after_external_write)
+
+    with pytest.raises(UnsafeImageSaveError, match="destination changed during save"):
+        save_image(path, Image.new("RGB", (20, 40), (0, 255, 0)))
+
+    assert path.stat().st_ino == original_inode
+    assert path.read_bytes() == externally_changed[0]
+
+
+def test_atomic_edit_rolls_back_if_destination_becomes_hard_linked(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    path = tmp_path / "image.png"
+    linked = tmp_path / "linked.png"
+    make_image(path, color=(255, 0, 0))
+    original_bytes = path.read_bytes()
+    original_exchange = image_ops._linux_renameat2
+    linked_during_commit = False
+
+    def exchange_after_hard_link(source: Path, destination: Path, flags: int) -> bool:
+        nonlocal linked_during_commit
+        if flags == 2 and destination == path and not linked_during_commit:
+            os.link(destination, linked)
+            linked_during_commit = True
+        return original_exchange(source, destination, flags)
+
+    monkeypatch.setattr(image_ops, "_linux_renameat2", exchange_after_hard_link)
+
+    with pytest.raises(UnsafeImageSaveError, match="destination changed during save|became hard-linked"):
+        save_image(path, Image.new("RGB", (20, 40), (0, 255, 0)))
+
+    assert path.read_bytes() == original_bytes
+    assert linked.read_bytes() == original_bytes
+    assert path.stat().st_ino == linked.stat().st_ino
+
+
+def test_save_refuses_destination_replaced_while_metadata_is_read(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    path = tmp_path / "image.png"
+    replacement = tmp_path / "replacement.png"
+    make_image(path, color=(255, 0, 0))
+    make_image(replacement, color=(0, 0, 255))
+    replacement_bytes = replacement.read_bytes()
+    original_snapshot_xattrs = image_ops._snapshot_xattrs
+    replaced = False
+
+    def replace_before_metadata(path_arg: Path):  # type: ignore[no-untyped-def]
+        nonlocal replaced
+        if not replaced:
+            replaced = True
+            os.replace(replacement, path)
+        return original_snapshot_xattrs(path_arg)
+
+    monkeypatch.setattr(image_ops, "_snapshot_xattrs", replace_before_metadata)
+
+    with pytest.raises(UnsafeImageSaveError, match="metadata was being read"):
+        save_image(path, Image.new("RGB", (20, 40), (0, 255, 0)))
+
+    assert path.read_bytes() == replacement_bytes
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="named pipes are unavailable")
+def test_identity_snapshot_rejects_named_pipe_without_blocking(tmp_path: Path) -> None:
+    path = tmp_path / "image.png"
+    os.mkfifo(path)
+
+    with pytest.raises(UnsafeImageSaveError, match="non-file image path"):
+        snapshot_image_file_identity(path)
+
+
+def _emulate_replace_file_with_backup(
+    replaced: Path,
+    replacement: Path,
+    backup: Path,
+) -> bool:
+    os.replace(replaced, backup)
+    os.replace(replacement, replaced)
+    return True
+
+
+def test_windows_atomic_replace_rolls_back_a_changed_destination(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    path = tmp_path / "image.png"
+    temp = tmp_path / ".encoded.png"
+    external = tmp_path / "external.png"
+    make_image(path, color=(255, 0, 0))
+    make_image(temp, color=(0, 255, 0))
+    make_image(external, color=(0, 0, 255))
+    metadata = image_ops._destination_file_metadata(path, path)
+    encoded_bytes = temp.read_bytes()
+    external_bytes = external.read_bytes()
+    first_call = True
+
+    def replace_after_external_change(
+        replaced: Path,
+        replacement: Path,
+        backup: Path,
+    ) -> bool:
+        nonlocal first_call
+        if first_call:
+            first_call = False
+            os.replace(external, replaced)
+        return _emulate_replace_file_with_backup(replaced, replacement, backup)
+
+    monkeypatch.setattr(image_ops, "_linux_renameat2", lambda *_args: False)
+    monkeypatch.setattr(image_ops, "_windows_replace_file_supported", lambda: True)
+    monkeypatch.setattr(
+        image_ops,
+        "_windows_replace_file_with_backup",
+        replace_after_external_change,
+    )
+
+    with pytest.raises(UnsafeImageSaveError, match="destination changed during save"):
+        image_ops._atomic_replace_verified(
+            temp,
+            path,
+            metadata,
+            source_path=path,
+            expected_source_identity=None,
+        )
+
+    assert path.read_bytes() == external_bytes
+    assert temp.read_bytes() == encoded_bytes
+    assert not list(tmp_path.glob(".image.png.*.recovery"))
+
+
+def test_windows_atomic_replace_keeps_recovery_copy_when_rollback_fails(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    path = tmp_path / "image.png"
+    temp = tmp_path / ".encoded.png"
+    external = tmp_path / "external.png"
+    make_image(path, color=(255, 0, 0))
+    make_image(temp, color=(0, 255, 0))
+    make_image(external, color=(0, 0, 255))
+    metadata = image_ops._destination_file_metadata(path, path)
+    encoded_bytes = temp.read_bytes()
+    external_bytes = external.read_bytes()
+    call_count = 0
+
+    def fail_rollback(
+        replaced: Path,
+        replacement: Path,
+        backup: Path,
+    ) -> bool:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            os.replace(external, replaced)
+            return _emulate_replace_file_with_backup(replaced, replacement, backup)
+        raise OSError("simulated rollback failure")
+
+    monkeypatch.setattr(image_ops, "_linux_renameat2", lambda *_args: False)
+    monkeypatch.setattr(image_ops, "_windows_replace_file_supported", lambda: True)
+    monkeypatch.setattr(image_ops, "_windows_replace_file_with_backup", fail_rollback)
+
+    with pytest.raises(
+        image_ops._AtomicReplaceRollbackError,
+        match="displaced file was preserved",
+    ):
+        image_ops._atomic_replace_verified(
+            temp,
+            path,
+            metadata,
+            source_path=path,
+            expected_source_identity=None,
+        )
+
+    recovery_files = list(tmp_path.glob(".image.png.*.recovery"))
+    assert path.read_bytes() == encoded_bytes
+    assert len(recovery_files) == 1
+    assert recovery_files[0].read_bytes() == external_bytes
+
+
+def test_in_place_expected_identity_is_not_rehashed_before_atomic_exchange(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    path = tmp_path / "image.png"
+    make_image(path, color=(255, 0, 0))
+    expected = snapshot_image_file_identity(path)
+    real_snapshot = image_ops.snapshot_image_file_identity
+    snapshot_calls = 0
+
+    def count_snapshot(candidate: Path):  # type: ignore[no-untyped-def]
+        nonlocal snapshot_calls
+        snapshot_calls += 1
+        return real_snapshot(candidate)
+
+    monkeypatch.setattr(image_ops, "snapshot_image_file_identity", count_snapshot)
+
+    apply_operations_to_file(
+        path,
+        [EditOperation("rotate_left")],
+        preserve_timestamp=False,
+        expected_identity=expected,
+    )
+
+    # One read validates the preview identity before decoding. The second
+    # validates the displaced file after the atomic exchange; there is no
+    # redundant full-file read in between.
+    assert snapshot_calls == 2
+
+
+def test_file_edit_matches_exif_transposed_preview(tmp_path: Path) -> None:
+    path = tmp_path / "oriented.png"
+    source = Image.new("RGB", (3, 2))
+    source.putdata(
+        [
+            (255, 0, 0),
+            (0, 255, 0),
+            (0, 0, 255),
+            (255, 255, 0),
+            (255, 0, 255),
+            (0, 255, 255),
+        ]
+    )
+    exif = source.getexif()
+    exif[274] = 6
+    source.save(path, exif=exif)
+    with Image.open(path) as opened:
+        preview = apply_operation_to_image(opened, EditOperation("rotate_left")).convert("RGB")
+
+    apply_operations_to_file(
+        path,
+        [EditOperation("rotate_left")],
+        preserve_timestamp=False,
+    )
+
+    with Image.open(path) as saved:
+        assert saved.getexif().get(274) is None
+        assert saved.size == preview.size
+        assert saved.convert("RGB").tobytes() == preview.tobytes()
+
+
+def test_transparent_gif_edit_preserves_frames_timing_and_disposal(tmp_path: Path) -> None:
+    path = tmp_path / "transparent.gif"
+    frames: list[Image.Image] = []
+    for x in (1, 5, 9):
+        frame = Image.new("RGBA", (16, 8), (0, 0, 0, 0))
+        ImageDraw.Draw(frame).rectangle((x, 2, x + 2, 4), fill=(255, 0, 0, 255))
+        frames.append(frame)
+    frames[0].save(
+        path,
+        save_all=True,
+        append_images=frames[1:],
+        duration=[70, 110, 150],
+        loop=3,
+        disposal=[2, 2, 2],
+        transparency=0,
+        optimize=False,
+    )
+
+    apply_operations_to_file(
+        path,
+        [EditOperation("rotate_right")],
+        preserve_timestamp=False,
+    )
+
+    with Image.open(path) as saved:
+        assert saved.n_frames == 3
+        assert saved.info["loop"] == 3
+        durations: list[int] = []
+        disposals: list[int] = []
+        alpha_boxes: list[tuple[int, int, int, int] | None] = []
+        for frame_index in range(saved.n_frames):
+            saved.seek(frame_index)
+            durations.append(saved.info["duration"])
+            disposals.append(saved.disposal_method)
+            alpha_boxes.append(saved.convert("RGBA").getchannel("A").getbbox())
+        assert durations == [70, 110, 150]
+        assert disposals == [2, 2, 2]
+        assert len(set(alpha_boxes)) == 3
+
+
+def test_animation_encoder_collapse_fails_without_replacing_original(tmp_path: Path) -> None:
+    path = tmp_path / "transparent.gif"
+    frames: list[Image.Image] = []
+    for x in (9, 10, 11):
+        frame = Image.new("RGBA", (16, 8), (0, 0, 0, 0))
+        ImageDraw.Draw(frame).rectangle((x, 2, x + 1, 3), fill=(255, 0, 0, 255))
+        frames.append(frame)
+    frames[0].save(
+        path,
+        save_all=True,
+        append_images=frames[1:],
+        duration=[70, 110, 150],
+        loop=3,
+        disposal=[2, 2, 2],
+        transparency=0,
+        optimize=False,
+    )
+    original_bytes = path.read_bytes()
+
+    with pytest.raises(MultiFrameSaveError, match="preserve all 3 frames/pages"):
+        apply_operations_to_file(
+            path,
+            [EditOperation("crop", {"left": 0, "top": 0, "right": 8, "bottom": 8})],
+            preserve_timestamp=False,
+        )
+
+    assert path.read_bytes() == original_bytes
 
 
 def test_apply_operation_to_file_rejects_oversized_image(tmp_path: Path, monkeypatch) -> None:

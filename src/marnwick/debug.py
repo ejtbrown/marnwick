@@ -139,7 +139,7 @@ class DebugCommandServer(QObject):
     def _bounded_int(self, value: object, *, default: int, minimum: int, maximum: int) -> int:
         try:
             parsed = int(value)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             parsed = default
         return max(minimum, min(maximum, parsed))
 
@@ -163,8 +163,8 @@ class DebugCommandServer(QObject):
             if tree_task is None
             else {
                 "root": str(tree_task.catalog.root),
-                "index": tree_task.index,
-                "total": len(tree_task.directories),
+                "index": tree_task.processed,
+                "total": tree_task.total,
                 "reason": tree_task.reason,
             },
             "pending_tree_rebuilds": len(self.window._pending_tree_rebuilds),
@@ -212,8 +212,13 @@ class DebugCommandServer(QObject):
         dir_rel_value = params.get("dir_rel", "")
         if not isinstance(dir_rel_value, str):
             raise ValueError("dir_rel must be a string")
-        if dir_rel_value and dir_rel_value not in set(catalog.list_known_directories()):
-            raise ValueError(f"unknown directory: {dir_rel_value}")
+        if dir_rel_value:
+            try:
+                directory = catalog.mutation_path(dir_rel_value)
+            except (OSError, ValueError) as error:
+                raise ValueError(f"unknown directory: {dir_rel_value}") from error
+            if not directory.is_dir():
+                raise ValueError(f"unknown directory: {dir_rel_value}")
         idle_task = self.window._idle_index_tasks.get(catalog.root)
         if idle_task is not None and not idle_task.snapshot().done:
             self.window._resume_idle_refresh_roots.add(catalog.root)
@@ -232,16 +237,25 @@ class DebugCommandServer(QObject):
             raise ValueError("prefix must be a string")
         limit = self._bounded_int(params.get("limit"), default=500, minimum=0, maximum=self.max_page_size)
         offset = self._bounded_int(params.get("offset"), default=0, minimum=0, maximum=10**9)
-        directories = catalog.list_known_directories()
         if prefix:
-            directories = [item for item in directories if item == prefix or item.startswith(f"{prefix}/")]
-        total = len(directories)
+            # Prefix filtering is debug-only. The unfiltered path uses bounded
+            # SQL paging so large inventories do not freeze the GUI thread.
+            directories = [
+                item
+                for item in catalog.list_known_directories()
+                if item == prefix or item.startswith(f"{prefix}/")
+            ]
+            total = len(directories)
+            page = directories[offset : offset + limit]
+        else:
+            total = catalog.known_directory_count()
+            page = catalog.list_known_directories(limit=limit, offset=offset)
         return {
             "root": str(catalog.root),
             "offset": offset,
             "limit": limit,
             "total": total,
-            "directories": directories[offset : offset + limit],
+            "directories": page,
         }
 
     def _items(self, params: dict[str, object]) -> dict[str, object]:

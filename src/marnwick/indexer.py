@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import heapq
 import itertools
+from collections import deque
 from collections.abc import Callable
 from concurrent.futures import Future
 from dataclasses import dataclass, field
@@ -54,6 +55,7 @@ class IndexTask:
         idle_sleep_seconds: float,
         force_refresh: bool = False,
         priority: ActionPriority = ActionPriority.THUMBNAIL_INDEX,
+        preemptible: bool = True,
     ) -> None:
         self.label = label
         self.root = root.expanduser().resolve()
@@ -62,6 +64,7 @@ class IndexTask:
         self.idle_sleep_seconds = idle_sleep_seconds
         self.force_refresh = force_refresh
         self.priority = priority
+        self.preemptible = preemptible
         self.started_at = monotonic()
         self._processed = 0
         self._total: int | None = None
@@ -100,10 +103,16 @@ class IndexTask:
             self._error = str(error)
         self._done_event.set()
 
-    def cancel(self) -> None:
+    def cancel(self) -> bool:
+        if not self.preemptible:
+            return False
         self._cancel_event.set()
         if self._future is not None and self._future.cancel():
             self.mark_canceled()
+        return True
+
+    def cancellation_requested(self) -> bool:
+        return self._cancel_event.is_set()
 
     def check_canceled(self) -> None:
         if self._cancel_event.is_set():
@@ -111,10 +120,11 @@ class IndexTask:
 
     def cooperate(self) -> None:
         self.check_canceled()
-        if self.interactive:
-            sleep(0)
-        else:
-            sleep(self.idle_sleep_seconds)
+        # Yield to the UI and other Python threads without imposing a fixed
+        # delay for every image.  The previous idle sleep accumulated to hours
+        # on large catalogs even though the worker was otherwise ready to make
+        # progress.
+        sleep(0)
         self.check_canceled()
 
     def snapshot(self) -> IndexProgressSnapshot:
@@ -145,6 +155,19 @@ ResultT = TypeVar("ResultT")
 ActionWorker = Callable[[IndexTask], ResultT]
 
 
+class ActionFuture(Future[ResultT]):
+    """A future that cannot bypass a protected action's cancellation policy."""
+
+    def __init__(self, *, preemptible: bool) -> None:
+        super().__init__()
+        self._preemptible = preemptible
+
+    def cancel(self) -> bool:
+        if not self._preemptible:
+            return False
+        return super().cancel()
+
+
 @dataclass(order=True, slots=True)
 class QueuedAction(Generic[ResultT]):
     priority: int
@@ -165,6 +188,8 @@ class BackgroundIndexer:
         self._sequence = itertools.count()
         self._queue: list[QueuedAction[object]] = []
         self._tasks: dict[str, IndexTask] = {}
+        self._actions: dict[IndexTask, QueuedAction[object]] = {}
+        self._completed: deque[IndexProgressSnapshot] = deque()
         self._running: QueuedAction[object] | None = None
         self._shutdown = False
         worker_count = max(1, int(max_workers or 1))
@@ -283,9 +308,10 @@ class BackgroundIndexer:
             idle_sleep_seconds=self._idle_sleep_seconds,
             force_refresh=force_refresh,
             priority=priority,
+            preemptible=preemptible,
         )
         action_key = key or f"custom:{next(self._sequence)}:{label}:{root}:{dir_rel or ''}"
-        future: Future[ResultT] = Future()
+        future: Future[ResultT] = ActionFuture(preemptible=preemptible)
         task.bind_future(future)  # type: ignore[arg-type]
         action = QueuedAction(
             int(priority),
@@ -297,7 +323,9 @@ class BackgroundIndexer:
             preemptible=preemptible,
         )
         with self._condition:
+            self._raise_if_shutdown()
             self._tasks[action_key] = task
+            self._actions[task] = action  # type: ignore[assignment]
             heapq.heappush(self._queue, action)  # type: ignore[arg-type]
             self._preempt_running_if_needed(action)
             self._condition.notify()
@@ -311,18 +339,33 @@ class BackgroundIndexer:
         snapshot = running.task.snapshot()
         return [] if snapshot.done else [snapshot]
 
+    def drain_completed_snapshots(self) -> list[IndexProgressSnapshot]:
+        """Return task completions not yet observed by a settlement poll.
+
+        Completion is recorded independently of the running-task snapshot, so
+        a task that starts and finishes between two UI timer ticks cannot be
+        missed.  Reading active snapshots does not consume these events.
+        """
+        with self._condition:
+            snapshots = list(self._completed)
+            self._completed.clear()
+        return snapshots
+
     def has_active_tasks(self) -> bool:
         with self._condition:
-            if self._running is not None and not self._running.task.snapshot().done:
-                return True
-            return any(not task.snapshot().done for task in self._tasks.values())
+            return any(not task.snapshot().done for task in self._actions)
 
     def cancel_idle_tasks(self, root: Path | None = None) -> None:
         resolved_root = root.expanduser().resolve() if root is not None else None
         with self._condition:
-            tasks = list(self._tasks.values())
-        for task in tasks:
-            if not task.interactive and (resolved_root is None or task.root == resolved_root):
+            actions = list(self._actions.values())
+        for action in actions:
+            task = action.task
+            if (
+                action.preemptible
+                and not task.interactive
+                and (resolved_root is None or task.root == resolved_root)
+            ):
                 task.cancel()
         with self._condition:
             self._condition.notify()
@@ -330,8 +373,11 @@ class BackgroundIndexer:
     def cancel_directory_tasks(self, root: Path, *, keep_dir_rel: str | None = None) -> None:
         resolved_root = root.expanduser().resolve()
         with self._condition:
-            tasks = list(self._tasks.values())
-        for task in tasks:
+            actions = list(self._actions.values())
+        for action in actions:
+            task = action.task
+            if not action.preemptible:
+                continue
             if task.root != resolved_root or task.dir_rel is None:
                 continue
             if keep_dir_rel is not None and task.dir_rel == keep_dir_rel:
@@ -343,12 +389,18 @@ class BackgroundIndexer:
     def shutdown(self) -> None:
         with self._condition:
             self._shutdown = True
-            tasks = list(self._tasks.values())
+            actions = list(self._actions.values())
             self._condition.notify_all()
-        for task in tasks:
-            task.cancel()
+        # Background reads should stop promptly.  Accepted filesystem
+        # mutations are deliberately allowed to finish so shutdown cannot
+        # strand a half-applied move or delete.
+        for action in actions:
+            if action.preemptible:
+                action.task.cancel()
+        with self._condition:
+            self._condition.notify_all()
         for worker in self._workers:
-            worker.join(timeout=1.0)
+            worker.join()
 
     def _submit_unique(
         self,
@@ -357,19 +409,26 @@ class BackgroundIndexer:
         worker: Callable[[IndexTask], None],
     ) -> IndexTask:
         with self._condition:
+            self._raise_if_shutdown()
             existing = self._tasks.get(key)
-            if existing is not None and not existing.snapshot().done:
+            if (
+                existing is not None
+                and not existing.snapshot().done
+                and not existing.cancellation_requested()
+            ):
                 return existing
             if task.interactive:
-                for existing_key, existing_task in list(self._tasks.items()):
-                    if existing_key == key:
+                for existing_action in list(self._actions.values()):
+                    existing_task = existing_action.task
+                    if existing_task is existing or existing_task is task:
+                        continue
+                    if not existing_action.preemptible:
                         continue
                     if not existing_task.interactive:
                         existing_task.cancel()
                     elif (
-                        task.dir_rel is not None
-                        and existing_task.dir_rel is not None
-                        and existing_task.root == task.root
+                        task.priority == ActionPriority.SELECTED_DIRECTORY_INDEX
+                        and existing_task.priority == ActionPriority.SELECTED_DIRECTORY_INDEX
                     ):
                         existing_task.cancel()
             future: Future[None] = Future()
@@ -384,6 +443,7 @@ class BackgroundIndexer:
                 preemptible=True,
             )
             self._tasks[key] = task
+            self._actions[task] = action  # type: ignore[assignment]
             heapq.heappush(self._queue, action)  # type: ignore[arg-type]
             self._preempt_running_if_needed(action)
             self._condition.notify()
@@ -411,8 +471,15 @@ class BackgroundIndexer:
             with self._condition:
                 if self._running is action:
                     self._running = None
-                self._tasks.pop(action.key, None)
+                if self._tasks.get(action.key) is action.task:
+                    self._tasks.pop(action.key, None)
+                self._actions.pop(action.task, None)
+                self._completed.append(action.task.snapshot())
                 self._condition.notify_all()
+
+    def _raise_if_shutdown(self) -> None:
+        if self._shutdown:
+            raise RuntimeError("BackgroundIndexer has been shut down")
 
     def _run_action(self, action: QueuedAction[object]) -> None:
         task = action.task
