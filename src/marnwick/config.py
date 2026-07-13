@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import errno
 import json
 import os
+import stat
+import tempfile
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 NORMAL_DELETE = "normal_delete"
 WIPE_ON_DELETE = "wipe_on_delete"
@@ -30,6 +34,11 @@ class AppConfig:
     thumbnail_size: int = DEFAULT_THUMBNAIL_COLUMNS
     delete_behavior: str = NORMAL_DELETE
     sort_order: str = "name"
+    # A load-time baseline allows save_config() to merge catalog-list edits
+    # made by separate Marnwick processes without resurrecting removals or
+    # discarding unrelated additions.  Hand-constructed configs retain the
+    # traditional exact-overwrite behavior.
+    _loaded_catalogs: tuple[str, ...] | None = field(default=None, repr=False, compare=False)
 
 
 def default_config_path() -> Path:
@@ -44,7 +53,7 @@ def load_config(path: Path | None = None) -> AppConfig:
     config_path = path or default_config_path()
     try:
         raw = json.loads(config_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, UnicodeError, json.JSONDecodeError):
         return AppConfig()
     if not isinstance(raw, dict):
         return AppConfig()
@@ -52,39 +61,71 @@ def load_config(path: Path | None = None) -> AppConfig:
     if not isinstance(window_raw, dict):
         window_raw = {}
     catalogs_raw = raw.get("catalogs", [])
-    catalogs = [str(item) for item in catalogs_raw if isinstance(item, str)]
+    catalogs = (
+        list(dict.fromkeys(item for item in catalogs_raw if isinstance(item, str)))
+        if isinstance(catalogs_raw, list)
+        else []
+    )
     return AppConfig(
         window=WindowConfig(
             x=_optional_int(window_raw.get("x")),
             y=_optional_int(window_raw.get("y")),
             width=max(200, _int_or_default(window_raw.get("width"), 1200)),
             height=max(200, _int_or_default(window_raw.get("height"), 800)),
-            maximized=bool(window_raw.get("maximized", False)),
+            maximized=_bool_or_default(window_raw.get("maximized"), False),
         ),
         catalogs=catalogs,
         thumbnail_size=_thumbnail_columns_or_default(raw.get("thumbnail_size")),
         delete_behavior=_delete_behavior_or_default(raw.get("delete_behavior")),
-        sort_order=str(raw.get("sort_order", "name")),
+        sort_order=_string_or_default(raw.get("sort_order"), "name"),
+        _loaded_catalogs=tuple(catalogs),
     )
 
 
 def save_config(config: AppConfig, path: Path | None = None) -> None:
     config_path = path or default_config_path()
     config_path.parent.mkdir(parents=True, exist_ok=True)
-    payload: dict[str, Any] = {
-        "window": {
-            "x": config.window.x,
-            "y": config.window.y,
-            "width": config.window.width,
-            "height": config.window.height,
-            "maximized": config.window.maximized,
-        },
-        "catalogs": config.catalogs,
-        "delete_behavior": config.delete_behavior,
-        "sort_order": config.sort_order,
-        "thumbnail_size": config.thumbnail_size,
-    }
-    config_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    with _config_write_lock(config_path):
+        catalogs = _merge_catalog_edits(config, config_path)
+        payload: dict[str, Any] = {
+            "window": {
+                "x": config.window.x,
+                "y": config.window.y,
+                "width": config.window.width,
+                "height": config.window.height,
+                "maximized": config.window.maximized,
+            },
+            "catalogs": catalogs,
+            "delete_behavior": config.delete_behavior,
+            "sort_order": config.sort_order,
+            "thumbnail_size": config.thumbnail_size,
+        }
+        data = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
+        mode = _config_file_mode(config_path)
+        fd, temp_name = tempfile.mkstemp(
+            prefix=f".{config_path.name}.",
+            suffix=".tmp",
+            dir=config_path.parent,
+        )
+        temp_path = Path(temp_name)
+        try:
+            if hasattr(os, "fchmod"):
+                os.fchmod(fd, mode)
+            else:
+                os.chmod(temp_path, mode)
+            with os.fdopen(fd, "wb") as handle:
+                fd = -1
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_path, config_path)
+            _fsync_directory(config_path.parent)
+            config.catalogs = catalogs
+            config._loaded_catalogs = tuple(catalogs)
+        finally:
+            if fd >= 0:
+                os.close(fd)
+            temp_path.unlink(missing_ok=True)
 
 
 def config_disabled() -> bool:
@@ -94,17 +135,29 @@ def config_disabled() -> bool:
 def _optional_int(value: object) -> int | None:
     if value is None:
         return None
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return None
     try:
         return int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
 
 
 def _int_or_default(value: object, default: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return default
     try:
         return int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return default
+
+
+def _bool_or_default(value: object, default: bool) -> bool:
+    return value if isinstance(value, bool) else default
+
+
+def _string_or_default(value: object, default: str) -> str:
+    return value if isinstance(value, str) else default
 
 
 def _delete_behavior_or_default(value: object) -> str:
@@ -122,3 +175,101 @@ def _thumbnail_columns_or_default(value: object) -> int:
         # values into an approximate column count for the default right pane.
         return max(MIN_THUMBNAIL_COLUMNS, min(MAX_THUMBNAIL_COLUMNS, round(960 / integer)))
     return DEFAULT_THUMBNAIL_COLUMNS
+
+
+def _config_file_mode(path: Path) -> int:
+    try:
+        return stat.S_IMODE(path.stat().st_mode)
+    except OSError:
+        return 0o600
+
+
+def _merge_catalog_edits(config: AppConfig, path: Path) -> list[str]:
+    desired = list(dict.fromkeys(config.catalogs))
+    baseline = config._loaded_catalogs
+    if baseline is None:
+        return desired
+    latest = _read_catalogs_for_merge(path)
+    if latest is None:
+        # A concurrent partial/corrupt file must not make an otherwise
+        # unchanged process erase every remembered catalog on its next save.
+        latest = list(baseline)
+    baseline_set = set(baseline)
+    desired_set = set(desired)
+    removed = baseline_set - desired_set
+    merged = [item for item in latest if item not in removed]
+    merged_set = set(merged)
+    for item in desired:
+        if item not in baseline_set and item not in merged_set:
+            merged.append(item)
+            merged_set.add(item)
+    return merged
+
+
+def _read_catalogs_for_merge(path: Path) -> list[str] | None:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    catalogs = raw.get("catalogs", [])
+    if not isinstance(catalogs, list):
+        return None
+    return list(dict.fromkeys(item for item in catalogs if isinstance(item, str)))
+
+
+@contextmanager
+def _config_write_lock(path: Path) -> Iterator[None]:
+    lock_path = path.with_name(f"{path.name}.lock")
+    if lock_path.is_symlink():
+        raise OSError(f"configuration lock must not be a symbolic link: {lock_path}")
+    flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(lock_path, flags, 0o600)
+    locked = False
+    try:
+        if os.fstat(fd).st_nlink > 1:
+            raise OSError(f"configuration lock must not be hard-linked: {lock_path}")
+        if os.name == "nt":
+            import msvcrt
+
+            if os.fstat(fd).st_size == 0:
+                os.write(fd, b"\0")
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        locked = True
+        yield
+    finally:
+        try:
+            if locked and os.name == "nt":
+                import msvcrt
+
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+            elif locked:
+                import fcntl
+
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
+def _fsync_directory(directory: Path) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    try:
+        fd = os.open(directory, flags)
+    except OSError as error:
+        if error.errno in {errno.EACCES, errno.EINVAL, errno.ENOTSUP, errno.EPERM}:
+            return
+        raise
+    try:
+        os.fsync(fd)
+    except OSError as error:
+        if error.errno not in {errno.EBADF, errno.EINVAL, errno.ENOTSUP}:
+            raise
+    finally:
+        os.close(fd)
