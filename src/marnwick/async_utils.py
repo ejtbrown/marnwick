@@ -118,6 +118,13 @@ class AbandonableThreadPoolExecutor:
         with self._lock:
             return self._pending
 
+    @property
+    def worker_count(self) -> int:
+        """Return the number of workers that have not finished shutdown."""
+
+        with self._lock:
+            return len(self._threads)
+
     def _item_finished(self) -> None:
         with self._lock:
             self._pending -= 1
@@ -197,6 +204,148 @@ class AtomicSaveThreadPoolExecutor(AbandonableThreadPoolExecutor):
     preserve the original until one atomic replacement and must tolerate exit
     at every point before or after that replacement.
     """
+
+
+class RolloverThreadPoolExecutor:
+    """Bounded read pool that can abandon a finite number of stuck epochs.
+
+    Cancellation cannot interrupt every filesystem or codec call. A fixed
+    pool therefore eventually starves after enough obsolete generations get
+    trapped in native code. This wrapper replaces a saturated/stale active
+    pool while retaining a strict process-lifetime thread bound: at most
+    ``max_retired + 1`` underlying pools can exist at once. Completed retired
+    pools are reaped and make their rollover slot reusable.
+
+    If every retirement slot still contains a blocked worker, another
+    saturated submission raises :class:`ExecutorSaturatedError`. That fixed
+    backpressure is deliberate: a temporarily unavailable read is preferable
+    to exceeding the executor's process-wide thread cap.
+
+    Automatic rollover preserves already-admitted work in the retired epoch.
+    Generation owners remain responsible for canceling work they know is
+    stale; saturation alone must not silently discard an independent catalog
+    open or user-action preflight that is still valid.
+
+    Only abandonable, generation-guarded read work belongs here. Mutations
+    must continue using an executor whose workers are always joined.
+    """
+
+    def __init__(
+        self,
+        max_workers: int,
+        *,
+        thread_name_prefix: str = "",
+        max_pending: int | None = None,
+        max_retired: int = 1,
+    ) -> None:
+        if max_retired < 0:
+            raise ValueError("max_retired must be non-negative")
+        self._max_workers = int(max_workers)
+        self._max_pending = max_pending
+        self._max_retired = int(max_retired)
+        self._thread_name_prefix = thread_name_prefix
+        self._lock = threading.Lock()
+        self._retired: list[AbandonableThreadPoolExecutor] = []
+        self._shutdown = False
+        self._active = self._new_executor()
+
+    def _new_executor(self) -> AbandonableThreadPoolExecutor:
+        return AbandonableThreadPoolExecutor(
+            self._max_workers,
+            max_pending=self._max_pending,
+            thread_name_prefix=self._thread_name_prefix,
+        )
+
+    def _reap_retired_locked(self) -> None:
+        self._retired = [
+            executor
+            for executor in self._retired
+            if executor.pending_count > 0 or executor.worker_count > 0
+        ]
+
+    def rollover(
+        self,
+        *,
+        cancel_futures: bool = True,
+        expected_active: AbandonableThreadPoolExecutor | None = None,
+    ) -> bool:
+        """Ensure a stale active epoch is replaced when a slot is available.
+
+        When ``expected_active`` is supplied, a concurrent caller that already
+        replaced that exact epoch satisfies the request. This prevents two
+        submissions that observe the same saturation from retiring both the
+        stale epoch and its fresh replacement.
+        """
+
+        with self._lock:
+            if self._shutdown:
+                return False
+            if expected_active is not None and self._active is not expected_active:
+                return True
+            self._reap_retired_locked()
+            if len(self._retired) >= self._max_retired:
+                return False
+            retired = self._active
+            self._active = self._new_executor()
+            self._retired.append(retired)
+        retired.shutdown(wait=False, cancel_futures=cancel_futures)
+        return True
+
+    def submit(
+        self,
+        function: Callable[..., ResultT],
+        /,
+        *args: object,
+        **kwargs: object,
+    ) -> Future[ResultT]:
+        try:
+            # Keep the active snapshot stable through admission. Underlying
+            # submission only takes its own short bookkeeping lock; no user
+            # function or future callback runs synchronously here.
+            with self._lock:
+                if self._shutdown:
+                    raise RuntimeError("cannot schedule new futures after shutdown")
+                active = self._active
+                return active.submit(function, *args, **kwargs)
+        except ExecutorSaturatedError:
+            if not self.rollover(
+                cancel_futures=False,
+                expected_active=active,
+            ):
+                raise
+        with self._lock:
+            if self._shutdown:
+                raise RuntimeError("cannot schedule new futures after shutdown")
+            active = self._active
+        return active.submit(function, *args, **kwargs)
+
+    @property
+    def pending_count(self) -> int:
+        with self._lock:
+            self._reap_retired_locked()
+            executors = (self._active, *self._retired)
+            return sum(executor.pending_count for executor in executors)
+
+    @property
+    def retired_count(self) -> int:
+        with self._lock:
+            self._reap_retired_locked()
+            return len(self._retired)
+
+    @property
+    def maximum_worker_threads(self) -> int:
+        return self._max_workers * (self._max_retired + 1)
+
+    def shutdown(self, wait: bool = True, *, cancel_futures: bool = False) -> None:
+        with self._lock:
+            self._shutdown = True
+            executors = (self._active, *self._retired)
+            self._retired.clear()
+        for executor in executors:
+            executor.shutdown(wait=False, cancel_futures=cancel_futures)
+        if wait:
+            for executor in executors:
+                executor.shutdown(wait=True, cancel_futures=False)
 
 
 class LatestOnlyThreadPoolExecutor:

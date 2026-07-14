@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import heapq
+import hashlib
 import itertools
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from concurrent.futures import Future
 from dataclasses import dataclass, field
 from enum import IntEnum
@@ -221,7 +222,13 @@ class BackgroundIndexer:
         self._running: dict[int, QueuedAction[object]] = {}
         self._shutdown = False
         worker_count = max(1, int(max_workers or 1))
+        self._base_read_worker_count = worker_count
         self._read_worker_count = worker_count
+        # Canceled reads may be trapped in native filesystem/codec calls. A
+        # bounded reserve lets the newest selected directory start while
+        # preserving a hard process-wide cap (plus one protected lane).
+        self._max_read_worker_count = worker_count if worker_count == 1 else worker_count * 2
+        self._read_worker_sequence = itertools.count(worker_count)
         if worker_count == 1:
             # Preserve strict single-lane behavior for callers that explicitly
             # request it (and for deterministic unit workflows).
@@ -375,6 +382,116 @@ class BackgroundIndexer:
             self._refresh_directory,
         )
 
+    def refresh_subtree(
+        self,
+        root: Path,
+        dir_rel: str,
+        *,
+        interactive: bool = False,
+        expected_root_identity: tuple[int, int] | None = None,
+        expected_storage_identity: CatalogStorageIdentity | None = None,
+    ) -> IndexTask:
+        """Reconcile one moved subtree recursively without blocking its move."""
+
+        root = _lexical_task_root(root)
+        directory_label = dir_rel or root.name or str(root)
+        return self._submit_unique(
+            f"subtree:{root}:{dir_rel}",
+            IndexTask(
+                f"Reconciling {directory_label}",
+                root,
+                dir_rel,
+                interactive=interactive,
+                idle_sleep_seconds=self._idle_sleep_seconds,
+                force_refresh=False,
+                priority=ActionPriority.THUMBNAIL_INDEX,
+                expected_root_identity=expected_root_identity,
+                expected_storage_identity=expected_storage_identity,
+            ),
+            self._refresh_subtree,
+        )
+
+    def reconcile_image(
+        self,
+        root: Path,
+        rel_path: str,
+        *,
+        interactive: bool = False,
+        expected_root_identity: tuple[int, int] | None = None,
+        expected_storage_identity: CatalogStorageIdentity | None = None,
+    ) -> IndexTask:
+        """Reindex one moved image without scanning its containing directory."""
+
+        root = _lexical_task_root(root)
+        dir_rel = Path(rel_path).parent.as_posix()
+        if dir_rel == ".":
+            dir_rel = ""
+        return self._submit_unique(
+            f"moved-image:{root}:{rel_path}",
+            IndexTask(
+                f"Reconciling {Path(rel_path).name}",
+                root,
+                dir_rel,
+                interactive=interactive,
+                idle_sleep_seconds=self._idle_sleep_seconds,
+                force_refresh=True,
+                priority=ActionPriority.THUMBNAIL_INDEX,
+                expected_root_identity=expected_root_identity,
+                expected_storage_identity=expected_storage_identity,
+            ),
+            lambda task: self._reconcile_image(task, rel_path),
+        )
+
+    def reconcile_images(
+        self,
+        root: Path,
+        rel_paths: Sequence[str],
+        *,
+        interactive: bool = False,
+        completion_callback: Callable[[str], None] | None = None,
+        expected_root_identity: tuple[int, int] | None = None,
+        expected_storage_identity: CatalogStorageIdentity | None = None,
+    ) -> IndexTask:
+        """Reindex moved images in one bounded task and one catalog session.
+
+        Keeping the exact paths in one pipeline avoids one queued task and one
+        writer open per moved file.  The pipeline publishes progress only after
+        an image's database row and thumbnail are visible, so UI callers can
+        progressively repaint ``snapshot.current`` as ``processed`` advances.
+        """
+
+        root = _lexical_task_root(root)
+        ordered_rel_paths = tuple(dict.fromkeys(rel_paths))
+        batch_digest = hashlib.blake2b(digest_size=16)
+        for rel_path in ordered_rel_paths:
+            batch_digest.update(rel_path.encode("utf-8", errors="surrogatepass"))
+            batch_digest.update(b"\0")
+        count = len(ordered_rel_paths)
+        label = (
+            f"Reconciling {Path(ordered_rel_paths[0]).name}"
+            if count == 1
+            else f"Reconciling {count} moved images"
+        )
+        return self._submit_unique(
+            f"moved-images:{root}:{batch_digest.hexdigest()}:{id(completion_callback)}",
+            IndexTask(
+                label,
+                root,
+                None,
+                interactive=interactive,
+                idle_sleep_seconds=self._idle_sleep_seconds,
+                force_refresh=True,
+                priority=ActionPriority.THUMBNAIL_INDEX,
+                expected_root_identity=expected_root_identity,
+                expected_storage_identity=expected_storage_identity,
+            ),
+            lambda task: self._reconcile_images(
+                task,
+                ordered_rel_paths,
+                completion_callback,
+            ),
+        )
+
     def submit_action(
         self,
         label: str,
@@ -421,6 +538,7 @@ class BackgroundIndexer:
             self._actions[task] = action  # type: ignore[assignment]
             heapq.heappush(self._queue, action)  # type: ignore[arg-type]
             self._preempt_running_if_needed(action)
+            self._maybe_expand_read_workers_locked(action)
             self._condition.notify_all()
         return task, future
 
@@ -558,6 +676,7 @@ class BackgroundIndexer:
             self._actions[task] = action  # type: ignore[assignment]
             heapq.heappush(self._queue, action)  # type: ignore[arg-type]
             self._preempt_running_if_needed(action)
+            self._maybe_expand_read_workers_locked(action)  # type: ignore[arg-type]
             self._condition.notify_all()
             return task
 
@@ -565,6 +684,39 @@ class BackgroundIndexer:
         for running in tuple(self._running.values()):
             if running.preemptible and action.priority < running.priority:
                 running.task.cancel()
+
+    def _maybe_expand_read_workers_locked(
+        self,
+        action: QueuedAction[object],
+    ) -> None:
+        """Spend one bounded escape lane when canceled native reads fill the pool."""
+
+        if (
+            self._base_read_worker_count == 1
+            or not action.preemptible
+            or not action.task.interactive
+            or self._read_worker_count >= self._max_read_worker_count
+        ):
+            return
+        running_reads = [
+            running
+            for running in self._running.values()
+            if running.preemptible
+        ]
+        if len(running_reads) < self._read_worker_count:
+            return
+        if not any(running.task.cancellation_requested() for running in running_reads):
+            return
+        worker_index = next(self._read_worker_sequence)
+        worker = Thread(
+            target=self._worker_loop,
+            args=(False,),
+            name=f"marnwick-action-read-reserve-{worker_index}",
+            daemon=True,
+        )
+        self._read_worker_count += 1
+        self._workers.append(worker)
+        worker.start()
 
     def _discard_canceled_queued_locked(self) -> None:
         """Remove canceled queued work immediately instead of draining it later."""
@@ -705,6 +857,74 @@ class BackgroundIndexer:
                     self._progress_callback(task),
                     task.check_canceled,
                     force=task.force_refresh,
+                )
+        except IndexTaskCancelled:
+            raise
+        except Exception as error:
+            self._log_task_error(task, error)
+            raise
+
+    def _refresh_subtree(self, task: IndexTask) -> None:
+        try:
+            with Catalog.open_writer(
+                task.root,
+                expected_root_identity=task.expected_root_identity,
+                expected_storage_identity=task.expected_storage_identity,
+            ) as catalog:
+                catalog.refresh_subtree(
+                    task.dir_rel or "",
+                    self._progress_callback(task),
+                    task.check_canceled,
+                )
+        except IndexTaskCancelled:
+            raise
+        except Exception as error:
+            self._log_task_error(task, error)
+            raise
+
+    def _reconcile_image(self, task: IndexTask, rel_path: str) -> None:
+        try:
+            with Catalog.open_writer(
+                task.root,
+                expected_root_identity=task.expected_root_identity,
+                expected_storage_identity=task.expected_storage_identity,
+            ) as catalog:
+                task.update(0, 1, rel_path)
+                catalog.index_image(
+                    rel_path,
+                    task.check_canceled,
+                    force=True,
+                )
+                task.update(1, 1, rel_path)
+        except IndexTaskCancelled:
+            raise
+        except Exception as error:
+            self._log_task_error(task, error)
+            raise
+
+    def _reconcile_images(
+        self,
+        task: IndexTask,
+        rel_paths: Sequence[str],
+        completion_callback: Callable[[str], None] | None,
+    ) -> None:
+        try:
+            total = len(rel_paths)
+            task.update(0, total, "")
+            task.check_canceled()
+            if not rel_paths:
+                return
+            with Catalog.open_writer(
+                task.root,
+                expected_root_identity=task.expected_root_identity,
+                expected_storage_identity=task.expected_storage_identity,
+            ) as catalog:
+                catalog.index_images_pipeline(
+                    rel_paths,
+                    self._progress_callback(task),
+                    task.check_canceled,
+                    force=True,
+                    completion_callback=completion_callback,
                 )
         except IndexTaskCancelled:
             raise

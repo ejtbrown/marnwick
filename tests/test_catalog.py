@@ -33,6 +33,14 @@ from marnwick.catalog import (
 from marnwick.models import CatalogSettings, SortOrder
 
 
+def project_python_env() -> dict[str, str]:
+    env = dict(os.environ)
+    source_root = str(Path(__file__).resolve().parents[1] / "src")
+    existing = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = source_root if not existing else f"{source_root}{os.pathsep}{existing}"
+    return env
+
+
 def make_image(path: Path, size: tuple[int, int] = (80, 60), color: tuple[int, int, int] = (80, 120, 180)) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     Image.new("RGB", size, color).save(path)
@@ -1303,6 +1311,9 @@ def test_duplicate_matches_for_image_include_trash_paths(tmp_path: Path) -> None
         catalog.refresh()
         catalog.move_duplicate_images_to_trash(DUPLICATE_DELETE_EXACT)
         catalog.move_images(["near-b.jpg"], catalog, "T-r-a-s-h")
+        # Moves intentionally leave content-derived rows pending; the UI queues
+        # these exact reconciliations immediately after commit.
+        catalog.refresh_directory(TRASH_DIR_NAME, force=True)
         catalog._conn.execute(
             "UPDATE images SET similarity_feature_version = 0 WHERE rel_path NOT IN (?, ?)",
             ("near-a.jpg", "T-r-a-s-h/near-b.jpg"),
@@ -1762,7 +1773,7 @@ def test_parse_tag_entry_handles_commas_quotes_and_duplicates() -> None:
     ]
 
 
-def test_same_catalog_move_updates_database_record_without_rebuilding_thumbnail(tmp_path: Path) -> None:
+def test_same_catalog_move_keeps_row_pending_until_exact_reconciliation(tmp_path: Path) -> None:
     root = tmp_path / "catalog"
     make_image(root / "incoming" / "image.jpg", (100, 80))
 
@@ -1788,8 +1799,17 @@ def test_same_catalog_move_updates_database_record_without_rebuilding_thumbnail(
         assert (root / "sorted" / "image.jpg").exists()
         assert after is not None
         assert after.id == before.id
-        assert after.thumb_blob == before.thumb_blob
-        assert after_row["thumb_rel_path"] == before_row["thumb_rel_path"]
+        assert after.thumb_blob is None
+        assert after.image_hash is None
+        assert after_row["thumb_rel_path"] is None
+        reconciled = catalog.index_image("sorted/image.jpg", force=True)
+        reconciled_row = catalog._conn.execute(
+            "SELECT thumb_rel_path FROM images WHERE rel_path = ?",
+            ("sorted/image.jpg",),
+        ).fetchone()
+        assert reconciled is not None
+        assert reconciled.thumb_blob == before.thumb_blob
+        assert reconciled_row["thumb_rel_path"] == before_row["thumb_rel_path"]
         assert not catalog.directory_hash_matches("incoming")
         assert not catalog.catalog_refresh_is_current()
         assert catalog.refresh_directory("incoming", force=False)
@@ -1830,7 +1850,7 @@ def test_same_catalog_directory_move_treats_like_wildcards_as_literal_names(tmp_
         assert catalog.get_image_tags("axb/nested/image.jpg") == ["Keep"]
 
 
-def test_cross_catalog_move_purges_source_and_preserves_tags_and_thumbnail(tmp_path: Path) -> None:
+def test_cross_catalog_move_purges_source_and_rebuilds_pending_thumbnail(tmp_path: Path) -> None:
     source_root = tmp_path / "source"
     dest_root = tmp_path / "dest"
     make_image(source_root / "set" / "image.jpg", (120, 90))
@@ -1858,11 +1878,20 @@ def test_cross_catalog_move_purges_source_and_preserves_tags_and_thumbnail(tmp_p
 
         assert source.get_image("set/image.jpg") is None
         assert moved is not None
-        assert moved.thumb_blob == before.thumb_blob
-        assert dest.thumbnail_abs_path(dest_thumb_row["thumb_rel_path"]).is_file()
+        assert moved.thumb_blob is None
+        assert moved.image_hash is None
+        assert dest_thumb_row["thumb_rel_path"] is None
         assert not source_thumb_path.exists()
         assert dest.get_image_tags("new-set/image.jpg") == ["Keep"]
         assert (dest_root / "new-set" / "image.jpg").exists()
+        reconciled = dest.index_image("new-set/image.jpg", force=True)
+        dest_thumb_row = dest._conn.execute(
+            "SELECT thumb_rel_path FROM images WHERE rel_path = ?",
+            ("new-set/image.jpg",),
+        ).fetchone()
+        assert reconciled is not None
+        assert reconciled.thumb_blob == before.thumb_blob
+        assert dest.thumbnail_abs_path(dest_thumb_row["thumb_rel_path"]).is_file()
         assert not source.catalog_refresh_is_current()
         assert not dest.catalog_refresh_is_current()
         assert source.refresh_directory("set", force=False)
@@ -1884,6 +1913,7 @@ def test_cross_catalog_move_rebuilds_thumbnail_for_destination_native_size(tmp_p
         dest.refresh()
 
         results = source.move_images(["set/image.jpg"], dest, "new-set")
+        assert dest.index_image(results[0].dest_rel_path, force=True) is not None
         row = dest._conn.execute(
             """
             SELECT thumb_rel_path, thumb_size_px, thumb_width, thumb_height
@@ -1926,10 +1956,20 @@ def test_same_catalog_directory_move_rewrites_nested_database_records(tmp_path: 
         assert (root / "sorted" / "set" / "nested" / "image.jpg").exists()
         assert after is not None
         assert after.id == before.id
-        assert after.thumb_blob == before.thumb_blob
-        assert after_row["thumb_rel_path"] == before_row["thumb_rel_path"]
+        assert after.thumb_blob is None
+        assert after.image_hash is None
+        assert after_row["thumb_rel_path"] is None
+        assert catalog.refresh_subtree("sorted/set")
+        reconciled = catalog.get_image("sorted/set/nested/image.jpg")
+        reconciled_row = catalog._conn.execute(
+            "SELECT thumb_rel_path FROM images WHERE rel_path = ?",
+            ("sorted/set/nested/image.jpg",),
+        ).fetchone()
+        assert reconciled is not None
+        assert reconciled.thumb_blob == before.thumb_blob
+        assert reconciled_row["thumb_rel_path"] == before_row["thumb_rel_path"]
         assert not catalog.catalog_refresh_is_current()
-        assert catalog.refresh_directory("sorted/set", force=False)
+        catalog.refresh_directory("sorted/set", force=False)
         assert catalog.directory_entry_hash_matches("sorted/set")
 
 
@@ -1962,15 +2002,25 @@ def test_cross_catalog_directory_move_preserves_nested_tags_and_thumbnails(tmp_p
         assert results[0].dest_rel_path == "target/set"
         assert source.get_image("set/nested/image.jpg") is None
         assert moved is not None
-        assert moved.thumb_blob == before.thumb_blob
-        assert dest.thumbnail_abs_path(dest_thumb_row["thumb_rel_path"]).is_file()
+        assert moved.thumb_blob is None
+        assert moved.image_hash is None
+        assert dest_thumb_row["thumb_rel_path"] is None
         assert not source_thumb_path.exists()
         assert dest.get_image_tags("target/set/nested/image.jpg") == ["Keep"]
         assert (dest_root / "target" / "set" / "nested" / "image.jpg").exists()
+        assert dest.refresh_subtree("target/set")
+        reconciled = dest.get_image("target/set/nested/image.jpg")
+        dest_thumb_row = dest._conn.execute(
+            "SELECT thumb_rel_path FROM images WHERE rel_path = ?",
+            ("target/set/nested/image.jpg",),
+        ).fetchone()
+        assert reconciled is not None
+        assert reconciled.thumb_blob == before.thumb_blob
+        assert dest.thumbnail_abs_path(dest_thumb_row["thumb_rel_path"]).is_file()
         assert not source.catalog_refresh_is_current()
         assert not dest.catalog_refresh_is_current()
         assert source.refresh_directory("", force=False)
-        assert dest.refresh_directory("target/set", force=False)
+        dest.refresh_directory("target/set", force=False)
         assert source.directory_entry_hash_matches("")
         assert dest.directory_entry_hash_matches("target/set")
 
@@ -1988,6 +2038,7 @@ def test_cross_catalog_directory_move_rebuilds_thumbnail_for_destination_native_
         dest.refresh()
 
         source.move_directories(["set"], dest, "target")
+        assert dest.refresh_subtree("target/set")
         row = dest._conn.execute(
             """
             SELECT thumb_rel_path, thumb_size_px, thumb_width, thumb_height
@@ -2053,7 +2104,12 @@ def test_cross_filesystem_move_copies_then_wipes_source(tmp_path: Path, monkeypa
         assert results[0].dest_rel_path == "new-set/image.jpg"
         assert len(shred_calls) == 1
         assert shred_calls[0][:2] == ["/usr/bin/shred", "-u"]
-        assert Path(shred_calls[0][-1]).name.endswith(".marnwick-move-source")
+        quarantined = Path(shred_calls[0][-1])
+        assert quarantined.name == "image.jpg"
+        assert quarantined.parent.name.startswith(
+            catalog_module.PRIVATE_QUARANTINE_DIR_PREFIX
+        )
+        assert quarantined.parent.name.endswith(".marnwick-move-source")
         assert not (source_root / "set" / "image.jpg").exists()
         assert (dest_root / "new-set" / "image.jpg").exists()
         assert source.get_image("set/image.jpg") is None
@@ -2089,6 +2145,78 @@ def test_cross_filesystem_move_preserves_recovery_copy_on_delete_failure(
         assert dest.get_image("new-set/image.jpg") is not None
 
 
+def test_cross_filesystem_cleanup_privately_renames_pinned_source(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source_root = tmp_path / "source"
+    dest_root = tmp_path / "dest"
+    source_path = source_root / "image.jpg"
+    make_image(source_path, (120, 90))
+    force_cross_device_move(monkeypatch, source_path)
+
+    with Catalog(source_root) as source, Catalog(dest_root) as dest:
+        source.refresh()
+
+        def public_quarantine_must_not_run(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+            raise AssertionError(
+                "an open cross-filesystem source must use its reserved private rename"
+            )
+
+        monkeypatch.setattr(
+            source,
+            "_quarantine_catalog_entry",
+            public_quarantine_must_not_run,
+        )
+
+        result = source.move_images(["image.jpg"], dest)
+
+        assert result[0].dest_rel_path == "image.jpg"
+        assert not source_path.exists()
+        assert (dest_root / "image.jpg").is_file()
+        assert not list(
+            source_root.glob(f"{catalog_module.PRIVATE_QUARANTINE_DIR_PREFIX}*")
+        )
+
+
+def test_cross_filesystem_cleanup_uses_portable_quarantine_when_private_unsupported(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source_root = tmp_path / "source"
+    dest_root = tmp_path / "dest"
+    source_path = source_root / "image.jpg"
+    make_image(source_path, (120, 90))
+    force_cross_device_move(monkeypatch, source_path)
+
+    with Catalog(source_root) as source, Catalog(dest_root) as dest:
+        source.refresh()
+        public_calls = 0
+        portable_quarantine = source._quarantine_catalog_entry
+
+        def private_unavailable(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+            raise OSError(errno.ENOTSUP, "descriptor-relative rename unavailable")
+
+        def capture_portable(*args, **kwargs):  # type: ignore[no-untyped-def]
+            nonlocal public_calls
+            public_calls += 1
+            return portable_quarantine(*args, **kwargs)
+
+        monkeypatch.setattr(
+            source,
+            "_private_quarantine_catalog_entry",
+            private_unavailable,
+        )
+        monkeypatch.setattr(source, "_quarantine_catalog_entry", capture_portable)
+
+        result = source.move_images(["image.jpg"], dest)
+
+        assert result[0].dest_rel_path == "image.jpg"
+        assert public_calls == 1
+        assert not source_path.exists()
+        assert (dest_root / "image.jpg").is_file()
+
+
 def test_cross_filesystem_move_pins_destination_through_source_destruction(
     tmp_path: Path,
     monkeypatch,
@@ -2112,14 +2240,14 @@ def test_cross_filesystem_move_pins_destination_through_source_destruction(
 
         monkeypatch.setattr(source, "_delete_file", replace_destination_after_source_delete)
 
-        with pytest.raises(OSError, match="destination changed after source cleanup"):
+        with pytest.raises(OSError, match="destination changed during source cleanup"):
             source.move_images(["image.png"], dest)
 
         recoveries = list(dest_root.glob(".image.png.*.marnwick-move-recovery"))
-        assert not source_path.exists()
+        assert source_path.read_bytes() == original_bytes
         assert destination_path.read_bytes() != original_bytes
-        assert len(recoveries) == 1
-        assert recoveries[0].read_bytes() == original_bytes
+        assert recoveries == []
+        assert source.get_image("image.png") is not None
 
 
 def test_delete_removes_files_and_database_rows(tmp_path: Path) -> None:
@@ -2311,6 +2439,7 @@ if not started.wait(timeout=3):
         capture_output=True,
         text=True,
         timeout=5,
+        env=project_python_env(),
     )
 
     assert result.returncode == 0, result.stderr
@@ -2703,10 +2832,120 @@ def test_same_filesystem_move_rolls_back_file_on_database_failure(tmp_path: Path
         assert catalog.get_image("source/a.jpg") is not None
 
 
+def test_failed_image_rollback_race_keeps_database_aligned_with_both_files(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "catalog"
+    source_path = root / "source" / "a.bmp"
+    destination_path = root / "dest" / "a.bmp"
+    make_image(source_path, (32, 24), (220, 10, 10))
+    (root / "dest").mkdir()
+    original_bytes = source_path.read_bytes()
+
+    with Catalog(root) as catalog:
+        catalog.refresh()
+        catalog.set_image_tags("source/a.bmp", ["Keep"], replace=True)
+        real_rename = catalog._rename_catalog_entry_noreplace
+
+        def race_rollback(
+            rename_source: Path,
+            rename_destination: Path,
+            **kwargs,
+        ) -> None:  # type: ignore[no-untyped-def]
+            if Path(rename_source) == destination_path and Path(rename_destination) == source_path:
+                make_image(source_path, (32, 24), (10, 10, 220))
+            real_rename(rename_source, rename_destination, **kwargs)
+
+        def fail_db_move(*_args, **_kwargs) -> None:  # type: ignore[no-untyped-def]
+            raise sqlite3.IntegrityError("simulated database failure")
+
+        monkeypatch.setattr(catalog, "_rename_catalog_entry_noreplace", race_rollback)
+        monkeypatch.setattr(catalog, "_move_db_record_in_place", fail_db_move)
+
+        with pytest.raises(sqlite3.IntegrityError) as raised:
+            catalog.move_images(["source/a.bmp"], catalog, "dest")
+
+        assert any("filesystem rollback lost a race" in note for note in raised.value.__notes__)
+        assert destination_path.read_bytes() == original_bytes
+        assert source_path.read_bytes() != original_bytes
+        destination_record = catalog.get_image("dest/a.bmp", include_blob=False)
+        source_record = catalog.get_image("source/a.bmp", include_blob=False)
+        assert destination_record is not None
+        assert source_record is not None
+        assert destination_record.image_hash == hashlib.sha256(original_bytes).hexdigest()
+        assert source_record.image_hash == hashlib.sha256(source_path.read_bytes()).hexdigest()
+        assert catalog.get_image_tags("dest/a.bmp") == ["Keep"]
+        assert catalog.get_image_tags("source/a.bmp") == []
+
+
+def test_failed_directory_rollback_race_keeps_database_aligned_with_both_trees(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "catalog"
+    source_path = root / "source" / "album"
+    destination_path = root / "dest" / "album"
+    make_image(source_path / "original.bmp", (32, 24), (220, 10, 10))
+    (root / "dest").mkdir()
+
+    with Catalog(root) as catalog:
+        catalog.refresh()
+        catalog.set_image_tags("source/album/original.bmp", ["Keep"], replace=True)
+        real_rename = catalog._rename_catalog_entry_noreplace
+
+        def race_rollback(
+            rename_source: Path,
+            rename_destination: Path,
+            **kwargs,
+        ) -> None:  # type: ignore[no-untyped-def]
+            if Path(rename_source) == destination_path and Path(rename_destination) == source_path:
+                make_image(source_path / "successor.bmp", (32, 24), (10, 10, 220))
+            real_rename(rename_source, rename_destination, **kwargs)
+
+        def fail_db_move(*_args, **_kwargs) -> None:  # type: ignore[no-untyped-def]
+            raise sqlite3.IntegrityError("simulated directory database failure")
+
+        monkeypatch.setattr(catalog, "_rename_catalog_entry_noreplace", race_rollback)
+        monkeypatch.setattr(catalog, "_move_directory_records_in_place", fail_db_move)
+
+        with pytest.raises(sqlite3.IntegrityError) as raised:
+            catalog.move_directories(["source/album"], catalog, "dest")
+
+        assert any("filesystem rollback lost a race" in note for note in raised.value.__notes__)
+        assert (destination_path / "original.bmp").is_file()
+        assert (source_path / "successor.bmp").is_file()
+        assert catalog.get_image("dest/album/original.bmp", include_blob=False) is not None
+        assert catalog.get_image("source/album/successor.bmp", include_blob=False) is not None
+        assert catalog.get_image("source/album/original.bmp", include_blob=False) is None
+        assert catalog.get_image_tags("dest/album/original.bmp") == ["Keep"]
+        assert catalog.get_image_tags("source/album/successor.bmp") == []
+
+
 def test_reserved_trash_name_cannot_be_created_as_ordinary_directory(tmp_path: Path) -> None:
     with Catalog(tmp_path / "catalog") as catalog:
         with pytest.raises(ValueError):
             catalog.create_directory("", TRASH_DIR_NAME)
+
+
+@pytest.mark.parametrize(
+    "reserved_name",
+    (
+        ".marnwick",
+        ".marnwick-private-user",
+        f".album.{('a' * 24)}.marnwick-move-source-dir",
+    ),
+)
+def test_internal_artifact_names_cannot_be_created_as_directories(
+    tmp_path: Path,
+    reserved_name: str,
+) -> None:
+    root = tmp_path / "catalog"
+    with Catalog(root) as catalog:
+        with pytest.raises(ValueError):
+            catalog.create_directory("", reserved_name)
+        if reserved_name != ".marnwick":
+            assert not (root / reserved_name).exists()
 
 
 def test_very_similar_grouping_honors_cancellation(tmp_path: Path) -> None:
@@ -2828,7 +3067,7 @@ def test_cross_filesystem_directory_cleanup_failure_keeps_complete_destination(
         assert dest.get_image("set/a.jpg") is not None
 
 
-def test_cross_filesystem_directory_move_pins_recovery_through_source_destruction(
+def test_cross_filesystem_directory_move_rolls_back_destination_race_at_cleanup_boundary(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -2838,29 +3077,122 @@ def test_cross_filesystem_directory_move_pins_recovery_through_source_destructio
     destination_path = dest_root / "set"
     make_image(source_path / "a.png", color=(10, 20, 30))
     original_bytes = (source_path / "a.png").read_bytes()
-    original_rmtree = catalog_module.shutil.rmtree
-
-    def replace_destination_after_source_delete(path: Path, *args, **kwargs):  # type: ignore[no-untyped-def]
-        result = original_rmtree(path, *args, **kwargs)
-        if Path(path).name.endswith(".marnwick-move-source-dir"):
-            original_rmtree(destination_path)
-            make_image(destination_path / "a.png", color=(220, 20, 20))
-        return result
-
     force_cross_device_move(monkeypatch, source_path)
-    monkeypatch.setattr(catalog_module.shutil, "rmtree", replace_destination_after_source_delete)
 
     with Catalog(source_root) as source, Catalog(dest_root) as dest:
         source.refresh()
+        real_proof = Catalog._directory_copy_proof
+        raced = False
 
-        with pytest.raises(OSError, match="destination directory changed after source cleanup"):
+        def replace_after_final_destination_proof(
+            self: Catalog,
+            path: Path,
+            *args,
+            **kwargs,
+        ):  # type: ignore[no-untyped-def]
+            nonlocal raced
+            result = real_proof(self, path, *args, **kwargs)
+            if kwargs.get("phase") == "Verifying published destination" and not raced:
+                raced = True
+                catalog_module.shutil.rmtree(destination_path)
+                make_image(destination_path / "a.png", color=(220, 20, 20))
+            return result
+
+        monkeypatch.setattr(
+            Catalog,
+            "_directory_copy_proof",
+            replace_after_final_destination_proof,
+        )
+
+        with pytest.raises(OSError, match="destination changed at the source cleanup boundary"):
             source.move_directories(["set"], dest)
 
-        recoveries = list(dest_root.glob(".set.*.marnwick-move-recovery-dir"))
-        assert not source_path.exists()
+        assert raced
+        assert (source_path / "a.png").read_bytes() == original_bytes
         assert (destination_path / "a.png").read_bytes() != original_bytes
-        assert len(recoveries) == 1
-        assert (recoveries[0] / "a.png").read_bytes() == original_bytes
+        assert not list(dest_root.glob(".set.*.marnwick-move-recovery-dir"))
+        assert source.get_image("set/a.png") is not None
+        successor = dest.get_image("set/a.png", include_blob=False)
+        assert successor is not None
+        assert successor.image_hash != source.get_image("set/a.png", include_blob=False).image_hash
+
+
+def test_cross_filesystem_directory_move_reports_entry_progress_with_bounded_proofs(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source_root = tmp_path / "source"
+    dest_root = tmp_path / "dest"
+    source_path = source_root / "set"
+    for index in range(80):
+        (source_path / f"dir-{index:03d}").mkdir(parents=True)
+    make_image(source_path / "a.png")
+    force_cross_device_move(monkeypatch, source_path)
+
+    with Catalog(source_root) as source, Catalog(dest_root) as dest:
+        source.refresh()
+        real_proof = Catalog._directory_copy_proof
+        proof_calls = 0
+        progress_details: list[str] = []
+
+        def count_proof(self: Catalog, *args, **kwargs):  # type: ignore[no-untyped-def]
+            nonlocal proof_calls
+            proof_calls += 1
+            return real_proof(self, *args, **kwargs)
+
+        monkeypatch.setattr(Catalog, "_directory_copy_proof", count_proof)
+        source.move_directories(
+            ["set"],
+            dest,
+            progress_callback=lambda _done, _total, current: progress_details.append(current),
+        )
+
+        assert proof_calls <= 5
+        assert any("Verifying source: 64 entries" in detail for detail in progress_details)
+        assert any("Copying: 64 entries" in detail for detail in progress_details)
+        assert any("Flushing copy" in detail for detail in progress_details)
+        assert not list(dest_root.glob(".set.*.marnwick-move-recovery-dir"))
+
+
+def test_cross_filesystem_directory_copy_observes_cancellation_between_entries(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source_root = tmp_path / "source"
+    dest_root = tmp_path / "dest"
+    source_path = source_root / "set"
+    for index in range(20):
+        (source_path / f"dir-{index:03d}").mkdir(parents=True)
+    force_cross_device_move(monkeypatch, source_path)
+
+    with Catalog(source_root) as source, Catalog(dest_root) as dest:
+        copy_started = False
+        checks_after_copy_started = 0
+
+        def progress(_done: int, _total: int | None, current: str) -> None:
+            nonlocal copy_started
+            if "Copying: starting" in current:
+                copy_started = True
+
+        def cancel_check() -> None:
+            nonlocal checks_after_copy_started
+            if not copy_started:
+                return
+            checks_after_copy_started += 1
+            if checks_after_copy_started >= 3:
+                raise RuntimeError("cancel deep copy")
+
+        with pytest.raises(RuntimeError, match="cancel deep copy"):
+            source.move_directories(
+                ["set"],
+                dest,
+                progress_callback=progress,
+                cancel_check=cancel_check,
+            )
+
+        assert source_path.is_dir()
+        assert not (dest_root / "set").exists()
+        assert not list(dest_root.glob(f"{catalog_module.PRIVATE_QUARANTINE_DIR_PREFIX}*"))
 
 
 def test_duplicate_cleanup_finalizes_hashes_after_partial_error(tmp_path: Path) -> None:
@@ -2956,9 +3288,11 @@ def test_shred_timeout_returns_without_waiting_for_wedged_child(
 
 
 @pytest.mark.skipif(os.name == "nt", reason="descriptor-relative mutation is POSIX-only")
+@pytest.mark.parametrize("reject_noreplace", [False, True])
 def test_delete_rolls_back_if_ancestor_is_swapped_after_parent_is_pinned(
     tmp_path: Path,
     monkeypatch,
+    reject_noreplace: bool,
 ) -> None:
     root = tmp_path / "catalog"
     outside = tmp_path / "outside"
@@ -2982,6 +3316,8 @@ def test_delete_rolls_back_if_ancestor_is_swapped_after_parent_is_pinned(
             swapped = True
             (root / "album").rename(root / "album-detached")
             (root / "album").symlink_to(outside, target_is_directory=True)
+        if reject_noreplace:
+            raise OSError(errno.EINVAL, "mount rejected RENAME_NOREPLACE")
         real_rename_at(source_fd, source_name, destination_fd, destination_name)
 
     monkeypatch.setattr(catalog_module, "_rename_noreplace_at", swap_ancestor_after_pin)
@@ -3051,6 +3387,7 @@ raise SystemExit(0)
             check=False,
             capture_output=True,
             text=True,
+            env=project_python_env(),
         )
 
         assert result.returncode == 23
@@ -3496,6 +3833,54 @@ def test_create_delete_directory_and_summary(tmp_path: Path) -> None:
         assert "set" not in catalog.list_known_directories()
 
 
+def test_wipe_directory_skips_symlinked_files_and_leaves_target_untouched(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "catalog"
+    directory = root / "album"
+    directory.mkdir(parents=True)
+    external = tmp_path / "external.bin"
+    external.write_bytes(b"do not overwrite")
+    try:
+        (directory / "alias.bin").symlink_to(external)
+    except OSError as error:
+        pytest.skip(f"symlinks unavailable: {error}")
+
+    with Catalog(root) as catalog:
+        catalog.remember_directory("album")
+        catalog.delete_directory("album", wipe=True)
+
+    assert external.read_bytes() == b"do not overwrite"
+    assert not directory.exists()
+
+
+@pytest.mark.parametrize("refresh_method", ("refresh_directory", "refresh_subtree"))
+def test_targeted_refresh_rejects_directory_symlink_substitution(
+    tmp_path: Path,
+    refresh_method: str,
+) -> None:
+    root = tmp_path / "catalog"
+    album = root / "album"
+    make_image(album / "original.png", color=(10, 20, 30))
+    external = tmp_path / "external"
+    make_image(external / "outside.png", color=(30, 20, 10))
+
+    with Catalog(root) as catalog:
+        catalog.refresh()
+        displaced = tmp_path / "displaced-album"
+        album.rename(displaced)
+        try:
+            album.symlink_to(external, target_is_directory=True)
+        except OSError as error:
+            pytest.skip(f"symlinks unavailable: {error}")
+
+        with pytest.raises(ValueError, match="symbolic link"):
+            getattr(catalog, refresh_method)("album")
+
+        assert catalog.get_image("album/outside.png") is None
+        assert (external / "outside.png").is_file()
+
+
 def test_delete_directory_treats_like_wildcards_as_literal_names(tmp_path: Path) -> None:
     root = tmp_path / "catalog"
     make_image(root / "a_b" / "image.jpg", (100, 80), (20, 20, 20))
@@ -3584,6 +3969,11 @@ def test_move_never_overwrites_destination_created_after_name_selection(
     original_rename = Catalog._rename_catalog_entry_noreplace
     raced = False
 
+    def reject_rename_noreplace(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        raise OSError(errno.EINVAL, "mount rejected RENAME_NOREPLACE")
+
+    monkeypatch.setattr(catalog_module, "_rename_noreplace_at", reject_rename_noreplace)
+
     def create_racing_destination(
         self: Catalog,
         source: Path,
@@ -3605,6 +3995,840 @@ def test_move_never_overwrites_destination_created_after_name_selection(
         assert (root / "dest" / "a.jpg").read_bytes() == b"do not overwrite"
         assert result[0].dest_rel_path == "dest/a (1).jpg"
         assert (root / "dest" / "a (1).jpg").is_file()
+
+
+def test_noreplace_fallback_retains_wrong_link_if_source_swaps_during_publication(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "catalog"
+    source = root / "source" / "image.jpg"
+    retained_original = root / "source" / "original-retained.jpg"
+    replacement = root / "replacement.jpg"
+    destination = root / "dest" / "image.jpg"
+    make_image(source, color=(10, 20, 30))
+    make_image(replacement, color=(220, 20, 30))
+    destination.parent.mkdir(parents=True)
+    original_bytes = source.read_bytes()
+    replacement_bytes = replacement.read_bytes()
+
+    def reject_rename_noreplace(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        raise OSError(errno.EINVAL, "mount rejected RENAME_NOREPLACE")
+
+    real_link = catalog_module.os.link
+    swapped = False
+
+    def swap_before_link(source_name, destination_name, *args, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal swapped
+        if source_name == source.name and destination_name == destination.name:
+            swapped = True
+            source.rename(retained_original)
+            replacement.rename(source)
+        return real_link(source_name, destination_name, *args, **kwargs)
+
+    monkeypatch.setattr(catalog_module, "_rename_noreplace_at", reject_rename_noreplace)
+    monkeypatch.setattr(catalog_module.os, "link", swap_before_link)
+    with Catalog(root) as catalog:
+        expected = catalog.file_identity("source/image.jpg")
+
+        with pytest.raises(OSError, match="wrong destination identity"):
+            catalog._rename_catalog_entry_noreplace(
+                source,
+                destination,
+                expected_source_identity=expected,
+            )
+
+        assert swapped
+        assert retained_original.read_bytes() == original_bytes
+        assert source.read_bytes() == replacement_bytes
+        # Rollback cannot safely check then unlink a public name: another
+        # successor could replace it between those calls. Retain the extra
+        # published link and report the failure without deleting either inode.
+        assert destination.read_bytes() == replacement_bytes
+        assert destination.stat().st_ino == source.stat().st_ino
+
+
+def test_reserved_directory_fallback_restores_source_swapped_during_rename(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "catalog"
+    source = root / "album"
+    retained_original = root / "album-original-retained"
+    destination = root / "moved"
+    make_image(source / "original.jpg", color=(10, 20, 30))
+    original_bytes = (source / "original.jpg").read_bytes()
+    replacement_bytes = Image.new("RGB", (8, 8), (220, 20, 30))
+    replacement_path = tmp_path / "replacement.png"
+    replacement_bytes.save(replacement_path)
+    replacement_payload = replacement_path.read_bytes()
+
+    def reject_rename_noreplace(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        raise OSError(errno.EINVAL, "mount rejected RENAME_NOREPLACE")
+
+    real_rename = catalog_module.os.rename
+    swapped = False
+
+    def swap_before_reserved_rename(source_name, destination_name, *args, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal swapped
+        if not swapped and source_name == source.name and destination_name == destination.name:
+            swapped = True
+            real_rename(source, retained_original)
+            source.mkdir()
+            (source / "replacement.png").write_bytes(replacement_payload)
+        return real_rename(source_name, destination_name, *args, **kwargs)
+
+    monkeypatch.setattr(catalog_module, "_rename_noreplace_at", reject_rename_noreplace)
+    monkeypatch.setattr(catalog_module.os, "rename", swap_before_reserved_rename)
+    with Catalog(root) as catalog:
+        expected = catalog.directory_identity("album")
+
+        with pytest.raises(OSError, match="replacement was restored"):
+            catalog._rename_catalog_entry_noreplace(
+                source,
+                destination,
+                expected_source_identity=expected,
+            )
+
+        assert swapped
+        assert (retained_original / "original.jpg").read_bytes() == original_bytes
+        assert (source / "replacement.png").read_bytes() == replacement_payload
+        assert not destination.exists()
+
+
+def test_exclusive_copy_publication_never_clobbers_raced_destination(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = tmp_path / "private-source"
+    destination = tmp_path / "destination"
+    source.write_bytes(b"source bytes")
+    destination.write_bytes(b"raced destination")
+
+    monkeypatch.setattr(
+        catalog_module,
+        "_rename_noreplace",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            OSError(errno.EINVAL, "mount rejected RENAME_NOREPLACE")
+        ),
+    )
+    monkeypatch.setattr(
+        catalog_module.os,
+        "link",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            OSError(errno.ENOTSUP, "hard links unavailable")
+        ),
+    )
+
+    with pytest.raises(FileExistsError):
+        catalog_module._publish_private_file_noreplace(source, destination)
+
+    assert source.read_bytes() == b"source bytes"
+    assert destination.read_bytes() == b"raced destination"
+
+
+def test_private_file_publication_isolates_source_swapped_before_hard_link(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = tmp_path / "private-source"
+    retained_original = tmp_path / "private-source-original"
+    replacement = tmp_path / "replacement"
+    destination = tmp_path / "destination"
+    source.write_bytes(b"original private bytes")
+    replacement.write_bytes(b"replacement private bytes")
+
+    monkeypatch.setattr(
+        catalog_module,
+        "_rename_noreplace",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            OSError(errno.EINVAL, "mount rejected RENAME_NOREPLACE")
+        ),
+    )
+    real_link = catalog_module.os.link
+    swapped = False
+
+    def swap_source_before_link(source_name, destination_name, *args, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal swapped
+        if not swapped and Path(source_name) == source and Path(destination_name) == destination:
+            swapped = True
+            source.rename(retained_original)
+            replacement.rename(source)
+        return real_link(source_name, destination_name, *args, **kwargs)
+
+    monkeypatch.setattr(catalog_module.os, "link", swap_source_before_link)
+
+    with pytest.raises(OSError, match="source changed before hard-link publication"):
+        catalog_module._publish_private_file_noreplace(source, destination)
+
+    recoveries = list(
+        tmp_path.glob(f"{catalog_module.PRIVATE_QUARANTINE_DIR_PREFIX}*publication-recovery")
+    )
+    assert swapped
+    assert retained_original.read_bytes() == b"original private bytes"
+    assert source.read_bytes() == b"replacement private bytes"
+    assert not destination.exists()
+    assert len(recoveries) == 1
+    assert (recoveries[0] / destination.name).read_bytes() == b"replacement private bytes"
+
+
+def test_private_file_publication_never_unlinks_destination_raced_during_isolation(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = tmp_path / "private-source"
+    retained_original = tmp_path / "private-source-original"
+    replacement = tmp_path / "replacement"
+    destination = tmp_path / "destination"
+    published_retained = tmp_path / "wrong-publication-retained"
+    raced_destination = tmp_path / "raced-destination"
+    source.write_bytes(b"original private bytes")
+    replacement.write_bytes(b"replacement private bytes")
+    raced_destination.write_bytes(b"raced public bytes")
+
+    monkeypatch.setattr(
+        catalog_module,
+        "_rename_noreplace",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            OSError(errno.EINVAL, "mount rejected RENAME_NOREPLACE")
+        ),
+    )
+    real_link = catalog_module.os.link
+    real_rename = catalog_module.os.rename
+    source_swapped = False
+    destination_swapped = False
+
+    def swap_source_before_link(source_name, destination_name, *args, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal source_swapped
+        if (
+            not source_swapped
+            and Path(source_name) == source
+            and Path(destination_name) == destination
+        ):
+            source_swapped = True
+            real_rename(source, retained_original)
+            real_rename(replacement, source)
+        return real_link(source_name, destination_name, *args, **kwargs)
+
+    def swap_destination_before_isolation(source_name, destination_name, *args, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal destination_swapped
+        if not destination_swapped and Path(source_name) == destination:
+            destination_swapped = True
+            real_rename(destination, published_retained)
+            real_rename(raced_destination, destination)
+        return real_rename(source_name, destination_name, *args, **kwargs)
+
+    monkeypatch.setattr(catalog_module.os, "link", swap_source_before_link)
+    monkeypatch.setattr(catalog_module.os, "rename", swap_destination_before_isolation)
+
+    with pytest.raises(OSError, match="destination changed during publication"):
+        catalog_module._publish_private_file_noreplace(source, destination)
+
+    recoveries = list(
+        tmp_path.glob(f"{catalog_module.PRIVATE_QUARANTINE_DIR_PREFIX}*publication-recovery")
+    )
+    assert source_swapped and destination_swapped
+    assert retained_original.read_bytes() == b"original private bytes"
+    assert source.read_bytes() == b"replacement private bytes"
+    assert published_retained.read_bytes() == b"replacement private bytes"
+    assert destination.read_bytes() == b"raced public bytes"
+    assert len(recoveries) == 1
+    assert (recoveries[0] / destination.name).read_bytes() == b"raced public bytes"
+    assert (recoveries[0] / "published-inode-recovery").read_bytes() == (
+        b"replacement private bytes"
+    )
+
+
+def test_private_directory_publication_isolates_source_swapped_during_reserved_rename(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = tmp_path / "private-source"
+    retained_original = tmp_path / "private-source-original"
+    destination = tmp_path / "destination"
+    source.mkdir()
+    (source / "original").write_bytes(b"original tree bytes")
+
+    monkeypatch.setattr(
+        catalog_module,
+        "_rename_noreplace",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            OSError(errno.EINVAL, "mount rejected RENAME_NOREPLACE")
+        ),
+    )
+    real_rename = catalog_module.os.rename
+    swapped = False
+
+    def swap_source_before_rename(source_name, destination_name, *args, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal swapped
+        if not swapped and Path(source_name) == source and Path(destination_name) == destination:
+            swapped = True
+            real_rename(source, retained_original)
+            source.mkdir()
+            (source / "replacement").write_bytes(b"replacement tree bytes")
+        return real_rename(source_name, destination_name, *args, **kwargs)
+
+    monkeypatch.setattr(catalog_module.os, "rename", swap_source_before_rename)
+
+    with pytest.raises(OSError, match="source changed during reserved rename"):
+        catalog_module._publish_private_directory_noreplace(source, destination)
+
+    recoveries = list(
+        tmp_path.glob(f"{catalog_module.PRIVATE_QUARANTINE_DIR_PREFIX}*publication-recovery")
+    )
+    assert swapped
+    assert (retained_original / "original").read_bytes() == b"original tree bytes"
+    assert not source.exists()
+    assert not destination.exists()
+    assert len(recoveries) == 1
+    assert (recoveries[0] / destination.name / "replacement").read_bytes() == (
+        b"replacement tree bytes"
+    )
+
+
+def test_private_file_publication_rejects_zero_length_write_progress(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = tmp_path / "private-source"
+    destination = tmp_path / "destination"
+    source.write_bytes(b"source bytes")
+    monkeypatch.setattr(
+        catalog_module,
+        "_rename_noreplace",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            OSError(errno.EINVAL, "mount rejected RENAME_NOREPLACE")
+        ),
+    )
+    monkeypatch.setattr(
+        catalog_module.os,
+        "link",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            OSError(errno.ENOTSUP, "hard links unavailable")
+        ),
+    )
+    monkeypatch.setattr(catalog_module.os, "write", lambda *_args, **_kwargs: 0)
+
+    with pytest.raises(OSError, match="made no write progress"):
+        catalog_module._publish_private_file_noreplace(source, destination)
+
+    assert source.read_bytes() == b"source bytes"
+    assert not destination.exists()
+
+
+def test_hard_link_fallback_retains_publication_when_private_setup_fails(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source_dir = tmp_path / "source"
+    destination_dir = tmp_path / "destination"
+    source_dir.mkdir()
+    destination_dir.mkdir()
+    source = source_dir / "image.jpg"
+    destination = destination_dir / "image.jpg"
+    source.write_bytes(b"source bytes")
+    source_stat = source.stat()
+    real_mkdir = catalog_module.os.mkdir
+
+    def fail_private_reservation(path, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if str(path).startswith(catalog_module.PRIVATE_QUARANTINE_DIR_PREFIX):
+            raise OSError("simulated private reservation failure")
+        return real_mkdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(catalog_module.os, "mkdir", fail_private_reservation)
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    source_fd = os.open(source_dir, directory_flags)
+    destination_fd = os.open(destination_dir, directory_flags)
+    try:
+        with pytest.raises(OSError, match="private reservation failure"):
+            Catalog._link_isolate_regular_file_noreplace_at(
+                source_fd,
+                source.name,
+                destination_fd,
+                destination.name,
+                expected_source_identity=(source_stat.st_dev, source_stat.st_ino),
+            )
+    finally:
+        os.close(destination_fd)
+        os.close(source_fd)
+
+    assert source.read_bytes() == b"source bytes"
+    assert destination.read_bytes() == b"source bytes"
+    assert destination.stat().st_ino == source.stat().st_ino
+
+
+def test_exclusive_publication_detects_same_size_source_mutation(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = tmp_path / "private-source"
+    destination = tmp_path / "destination"
+    source.write_bytes(b"original source bytes")
+    source_stat = source.stat()
+    changed_bytes = b"changed! source bytes"
+    assert len(changed_bytes) == source_stat.st_size
+
+    monkeypatch.setattr(
+        catalog_module,
+        "_rename_noreplace",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            OSError(errno.EINVAL, "mount rejected RENAME_NOREPLACE")
+        ),
+    )
+    monkeypatch.setattr(
+        catalog_module.os,
+        "link",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            OSError(errno.ENOTSUP, "hard links unavailable")
+        ),
+    )
+    real_read = catalog_module.os.read
+    mutated = False
+
+    def mutate_after_source_read(fd: int, size: int) -> bytes:
+        nonlocal mutated
+        data = real_read(fd, size)
+        if data and not mutated:
+            mutated = True
+            source.write_bytes(changed_bytes)
+            os.utime(
+                source,
+                ns=(source_stat.st_atime_ns, source_stat.st_mtime_ns),
+            )
+        return data
+
+    monkeypatch.setattr(catalog_module.os, "read", mutate_after_source_read)
+
+    with pytest.raises(OSError, match="private file changed during exclusive publication"):
+        catalog_module._publish_private_file_noreplace(source, destination)
+
+    assert mutated
+    assert source.read_bytes() == changed_bytes
+    assert source.stat().st_size == source_stat.st_size
+    assert source.stat().st_mtime_ns == source_stat.st_mtime_ns
+    assert not destination.exists()
+
+
+def test_file_copy_retains_temp_replacement_detected_before_publication(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "catalog"
+    source = root / "source.jpg"
+    destination = root / "target" / "destination.jpg"
+    replacement = tmp_path / "file-replacement"
+    retained_copy = root / "target" / ".original-temp-retained"
+    make_image(source, color=(10, 20, 30))
+    destination.parent.mkdir()
+    replacement.write_bytes(b"replacement bytes")
+    source_bytes = source.read_bytes()
+    original_publish = catalog_module._publish_private_file_noreplace
+    temp_path: Path | None = None
+
+    def replace_before_publish(temp: Path, publish_destination: Path, **kwargs) -> None:  # type: ignore[no-untyped-def]
+        nonlocal temp_path
+        temp_path = temp
+        temp.rename(retained_copy)
+        replacement.rename(temp)
+        original_publish(temp, publish_destination, **kwargs)
+
+    monkeypatch.setattr(catalog_module, "_publish_private_file_noreplace", replace_before_publish)
+    with Catalog(root) as catalog:
+        with pytest.raises(OSError, match="source changed before publication"):
+            catalog._copy_file_to_destination(source, destination)
+
+    recoveries = list(
+        destination.parent.glob(
+            f"{catalog_module.PRIVATE_QUARANTINE_DIR_PREFIX}*cleanup-recovery"
+        )
+    )
+    assert temp_path is not None and not temp_path.exists()
+    assert retained_copy.read_bytes() == source_bytes
+    assert not destination.exists()
+    assert len(recoveries) == 1
+    assert next(recoveries[0].iterdir()).read_bytes() == b"replacement bytes"
+
+
+def test_file_copy_retains_temp_replacement_created_after_publication(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "catalog"
+    source = root / "source.jpg"
+    destination = root / "target" / "destination.jpg"
+    replacement = tmp_path / "file-replacement"
+    retained_copy = root / "target" / ".original-temp-retained"
+    make_image(source, color=(10, 20, 30))
+    destination.parent.mkdir()
+    replacement.write_bytes(b"replacement bytes")
+    source_bytes = source.read_bytes()
+    original_publish = catalog_module._publish_private_file_noreplace
+
+    monkeypatch.setattr(
+        catalog_module,
+        "_rename_noreplace",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            OSError(errno.EINVAL, "mount rejected RENAME_NOREPLACE")
+        ),
+    )
+
+    def replace_after_publish(temp: Path, publish_destination: Path, **kwargs):  # type: ignore[no-untyped-def]
+        published_identity = original_publish(temp, publish_destination, **kwargs)
+        temp.rename(retained_copy)
+        replacement.rename(temp)
+        return published_identity
+
+    monkeypatch.setattr(catalog_module, "_publish_private_file_noreplace", replace_after_publish)
+    with Catalog(root) as catalog:
+        catalog._copy_file_to_destination(source, destination)
+
+    recoveries = list(
+        destination.parent.glob(
+            f"{catalog_module.PRIVATE_QUARANTINE_DIR_PREFIX}*cleanup-recovery"
+        )
+    )
+    assert destination.read_bytes() == source_bytes
+    assert retained_copy.read_bytes() == source_bytes
+    assert len(recoveries) == 1
+    assert next(recoveries[0].iterdir()).read_bytes() == b"replacement bytes"
+
+
+def test_directory_copy_retains_temp_replacement_detected_before_publication(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "catalog"
+    source = root / "source"
+    destination = root / "target" / "destination"
+    replacement = tmp_path / "directory-replacement"
+    retained_copy = root / "target" / ".original-temp-retained"
+    make_image(source / "image.jpg", color=(10, 20, 30))
+    destination.parent.mkdir()
+    replacement.mkdir()
+    (replacement / "replacement").write_bytes(b"replacement tree bytes")
+    source_bytes = (source / "image.jpg").read_bytes()
+    original_publish = catalog_module._publish_private_directory_noreplace
+    temp_path: Path | None = None
+
+    def replace_before_publish(temp: Path, publish_destination: Path, **kwargs) -> None:  # type: ignore[no-untyped-def]
+        nonlocal temp_path
+        temp_path = temp
+        temp.rename(retained_copy)
+        replacement.rename(temp)
+        original_publish(temp, publish_destination, **kwargs)
+
+    monkeypatch.setattr(
+        catalog_module,
+        "_publish_private_directory_noreplace",
+        replace_before_publish,
+    )
+    with Catalog(root) as catalog:
+        with pytest.raises(OSError, match="source changed before publication"):
+            catalog._copy_directory_to_destination(source, destination)
+
+    recoveries = list(
+        destination.parent.glob(
+            f"{catalog_module.PRIVATE_QUARANTINE_DIR_PREFIX}*cleanup-recovery"
+        )
+    )
+    assert temp_path is not None and not temp_path.exists()
+    assert (retained_copy / "image.jpg").read_bytes() == source_bytes
+    assert not destination.exists()
+    assert len(recoveries) == 1
+    assert (next(recoveries[0].iterdir()) / "replacement").read_bytes() == (
+        b"replacement tree bytes"
+    )
+
+
+def test_directory_copy_retains_temp_replacement_created_after_publication(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "catalog"
+    source = root / "source"
+    destination = root / "target" / "destination"
+    replacement = tmp_path / "directory-replacement"
+    make_image(source / "image.jpg", color=(10, 20, 30))
+    destination.parent.mkdir()
+    replacement.mkdir()
+    (replacement / "replacement").write_bytes(b"replacement tree bytes")
+    source_bytes = (source / "image.jpg").read_bytes()
+    original_publish = catalog_module._publish_private_directory_noreplace
+
+    monkeypatch.setattr(
+        catalog_module,
+        "_rename_noreplace",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            OSError(errno.EINVAL, "mount rejected RENAME_NOREPLACE")
+        ),
+    )
+
+    def replace_after_publish(temp: Path, publish_destination: Path, **kwargs) -> None:  # type: ignore[no-untyped-def]
+        original_publish(temp, publish_destination, **kwargs)
+        replacement.rename(temp)
+
+    monkeypatch.setattr(
+        catalog_module,
+        "_publish_private_directory_noreplace",
+        replace_after_publish,
+    )
+    with Catalog(root) as catalog:
+        catalog._copy_directory_to_destination(source, destination)
+
+    recoveries = list(
+        destination.parent.glob(
+            f"{catalog_module.PRIVATE_QUARANTINE_DIR_PREFIX}*cleanup-recovery"
+        )
+    )
+    assert (destination / "image.jpg").read_bytes() == source_bytes
+    assert len(recoveries) == 1
+    assert (next(recoveries[0].iterdir()) / "replacement").read_bytes() == (
+        b"replacement tree bytes"
+    )
+
+
+def test_private_recovery_directories_are_excluded_from_catalog_scans(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "catalog"
+    make_image(root / "visible" / "image.jpg", color=(10, 20, 30))
+    recovery = root / f"{catalog_module.PRIVATE_QUARANTINE_DIR_PREFIX}recovery"
+    make_image(recovery / "not-a-catalog-image.jpg", color=(220, 20, 30))
+
+    with Catalog(root) as catalog:
+        catalog.refresh()
+        initial_hash = catalog.directory_find_hash("")
+
+        assert recovery.name not in catalog.list_directories()
+        assert recovery.name not in catalog.list_filesystem_child_directory_rels("")
+        assert catalog.get_image(f"{recovery.name}/not-a-catalog-image.jpg") is None
+        with pytest.raises(ValueError, match="not image catalog entries"):
+            catalog.mutation_path(f"{recovery.name}/not-a-catalog-image.jpg")
+
+        (recovery / "not-a-catalog-image.jpg").write_bytes(b"changed recovery bytes")
+        assert catalog.directory_find_hash("") == initial_hash
+
+
+@pytest.mark.parametrize("hard_links_available", [True, False])
+def test_delete_falls_back_when_mount_rejects_rename_noreplace(
+    tmp_path: Path,
+    monkeypatch,
+    hard_links_available: bool,
+) -> None:
+    root = tmp_path / "catalog"
+    path = root / "image.jpg"
+    make_image(path, color=(10, 20, 30))
+
+    def reject_rename_noreplace(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        raise OSError(errno.EINVAL, "mount rejected RENAME_NOREPLACE")
+
+    monkeypatch.setattr(catalog_module, "_rename_noreplace_at", reject_rename_noreplace)
+    if not hard_links_available:
+        monkeypatch.setattr(
+            catalog_module.os,
+            "link",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                OSError(errno.ENOTSUP, "hard links unavailable")
+            ),
+        )
+    with Catalog(root) as catalog:
+        catalog.refresh()
+        expected = catalog.file_identities(["image.jpg"])
+
+        assert catalog.delete_images(
+            ["image.jpg"],
+            expected_identities=expected,
+        ) == 1
+
+        assert not path.exists()
+        assert catalog.get_image("image.jpg", include_blob=False) is None
+        assert not list(root.glob(f"{catalog_module.PRIVATE_QUARANTINE_DIR_PREFIX}*"))
+
+
+def test_directory_delete_falls_back_when_mount_rejects_rename_noreplace(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "catalog"
+    make_image(root / "album" / "nested" / "image.jpg", color=(10, 20, 30))
+
+    def reject_rename_noreplace(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        raise OSError(errno.EINVAL, "mount rejected RENAME_NOREPLACE")
+
+    monkeypatch.setattr(catalog_module, "_rename_noreplace_at", reject_rename_noreplace)
+    with Catalog(root) as catalog:
+        catalog.refresh()
+        expected = catalog.directory_identity("album")
+
+        catalog.delete_directory("album", expected_identity=expected)
+
+        assert not (root / "album").exists()
+        assert catalog.get_image("album/nested/image.jpg", include_blob=False) is None
+
+
+def test_cross_catalog_directory_copy_and_cleanup_fall_back_without_noreplace(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source_root = tmp_path / "source"
+    destination_root = tmp_path / "destination"
+    source_directory = source_root / "album"
+    source_image = source_directory / "nested" / "image.jpg"
+    make_image(source_image, color=(10, 20, 30))
+    (destination_root / "target").mkdir(parents=True)
+    source_bytes = source_image.read_bytes()
+
+    def reject_rename_noreplace(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        raise OSError(errno.EINVAL, "mount rejected RENAME_NOREPLACE")
+
+    monkeypatch.setattr(catalog_module, "_rename_noreplace_at", reject_rename_noreplace)
+    monkeypatch.setattr(catalog_module, "_rename_noreplace", reject_rename_noreplace)
+    original_catalog_rename = Catalog._rename_catalog_entry_noreplace
+
+    with Catalog(source_root) as source, Catalog(destination_root) as destination:
+        source.refresh()
+        source.set_image_tags("album/nested/image.jpg", ["Keep"], replace=True)
+        expected = {"album": source.directory_identity("album")}
+
+        def force_verified_copy(
+            catalog: Catalog,
+            move_source: Path,
+            move_destination: Path,
+            **kwargs,
+        ) -> None:  # type: ignore[no-untyped-def]
+            if move_source == source_directory and kwargs.get("dest_catalog") is destination:
+                raise OSError(errno.EXDEV, "force cross-filesystem copy path")
+            original_catalog_rename(
+                catalog,
+                move_source,
+                move_destination,
+                **kwargs,
+            )
+
+        monkeypatch.setattr(Catalog, "_rename_catalog_entry_noreplace", force_verified_copy)
+
+        result = source.move_directories(
+            ["album"],
+            destination,
+            "target",
+            expected_identities=expected,
+        )
+
+        destination_image = destination_root / "target" / "album" / "nested" / "image.jpg"
+        assert result[0].dest_rel_path == "target/album"
+        assert not source_directory.exists()
+        assert destination_image.read_bytes() == source_bytes
+        assert source.get_image("album/nested/image.jpg", include_blob=False) is None
+        assert destination.get_image_tags("target/album/nested/image.jpg") == ["Keep"]
+        assert not list(
+            source_root.glob(f"{catalog_module.PRIVATE_QUARANTINE_DIR_PREFIX}*")
+        )
+
+
+def test_same_filesystem_cross_catalog_move_uses_hardlink_fallback(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source_root = tmp_path / "source"
+    destination_root = tmp_path / "destination"
+    source_path = source_root / "image.jpg"
+    make_image(source_path, color=(10, 20, 30))
+    (destination_root / "target").mkdir(parents=True)
+    source_stat = source_path.stat()
+
+    def reject_rename_noreplace(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        raise OSError(errno.EINVAL, "mount rejected RENAME_NOREPLACE")
+
+    monkeypatch.setattr(catalog_module, "_rename_noreplace_at", reject_rename_noreplace)
+    with Catalog(source_root) as source, Catalog(destination_root) as destination:
+        source.refresh()
+        source.set_image_tags("image.jpg", ["Keep"], replace=True)
+        expected = source.file_identities(["image.jpg"])
+
+        result = source.move_images(
+            ["image.jpg"],
+            destination,
+            "target",
+            expected_identities=expected,
+        )
+
+        destination_path = destination_root / "target" / "image.jpg"
+        destination_stat = destination_path.stat()
+        assert result[0].dest_rel_path == "target/image.jpg"
+        assert not source_path.exists()
+        assert (destination_stat.st_dev, destination_stat.st_ino) == (
+            source_stat.st_dev,
+            source_stat.st_ino,
+        )
+        assert source.get_image("image.jpg", include_blob=False) is None
+        assert destination.get_image_tags("target/image.jpg") == ["Keep"]
+
+
+@pytest.mark.parametrize("hard_links_available", [True, False])
+def test_cross_catalog_copy_publication_and_cleanup_fall_back_without_noreplace(
+    tmp_path: Path,
+    monkeypatch,
+    hard_links_available: bool,
+) -> None:
+    source_root = tmp_path / "source"
+    destination_root = tmp_path / "destination"
+    source_path = source_root / "image.jpg"
+    make_image(source_path, color=(10, 20, 30))
+    (destination_root / "target").mkdir(parents=True)
+    source_bytes = source_path.read_bytes()
+
+    def reject_rename_noreplace(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        raise OSError(errno.EINVAL, "mount rejected RENAME_NOREPLACE")
+
+    monkeypatch.setattr(catalog_module, "_rename_noreplace_at", reject_rename_noreplace)
+    monkeypatch.setattr(catalog_module, "_rename_noreplace", reject_rename_noreplace)
+    if not hard_links_available:
+        monkeypatch.setattr(
+            catalog_module.os,
+            "link",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                OSError(errno.ENOTSUP, "hard links unavailable")
+            ),
+        )
+    original_catalog_rename = Catalog._rename_catalog_entry_noreplace
+
+    with Catalog(source_root) as source, Catalog(destination_root) as destination:
+        source.refresh()
+        source.set_image_tags("image.jpg", ["Keep"], replace=True)
+        expected = source.file_identities(["image.jpg"])
+
+        def force_verified_copy(
+            catalog: Catalog,
+            move_source: Path,
+            move_destination: Path,
+            **kwargs,
+        ) -> None:  # type: ignore[no-untyped-def]
+            if move_source == source_path and kwargs.get("dest_catalog") is destination:
+                raise OSError(errno.EXDEV, "force cross-filesystem copy path")
+            original_catalog_rename(
+                catalog,
+                move_source,
+                move_destination,
+                **kwargs,
+            )
+
+        monkeypatch.setattr(Catalog, "_rename_catalog_entry_noreplace", force_verified_copy)
+
+        result = source.move_images(
+            ["image.jpg"],
+            destination,
+            "target",
+            expected_identities=expected,
+        )
+
+        assert result[0].dest_rel_path == "target/image.jpg"
+        assert not source_path.exists()
+        assert (destination_root / "target" / "image.jpg").read_bytes() == source_bytes
+        assert source.get_image("image.jpg", include_blob=False) is None
+        assert destination.get_image_tags("target/image.jpg") == ["Keep"]
+        assert not list(
+            source_root.glob(f"{catalog_module.PRIVATE_QUARANTINE_DIR_PREFIX}*")
+        )
 
 
 def test_delete_refuses_image_replaced_since_indexing(tmp_path: Path) -> None:
@@ -3809,6 +5033,456 @@ def test_queued_trash_restore_rejects_replaced_image(tmp_path: Path) -> None:
         assert not (root / "album" / "image.png").exists()
 
 
+def test_same_filesystem_move_rejects_same_inode_rewrite_before_pinned_rename(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "catalog"
+    source_path = root / "image.bmp"
+    (root / "target").mkdir(parents=True)
+    make_image(source_path, (32, 24), (220, 10, 10))
+
+    with Catalog(root) as catalog:
+        catalog.refresh()
+        expected = catalog.file_identity("image.bmp")
+        original = catalog.get_image("image.bmp", include_blob=False)
+        assert original is not None
+        original_bytes = source_path.read_bytes()
+        original_stat = source_path.stat()
+        real_rename = Catalog._rename_catalog_entry_noreplace
+        raced = False
+
+        def rewrite_before_pinned_rename(
+            self: Catalog,
+            source: Path,
+            destination: Path,
+            **kwargs,
+        ) -> None:  # type: ignore[no-untyped-def]
+            nonlocal raced
+            if source == source_path and not raced:
+                raced = True
+                make_image(source_path, (32, 24), (10, 10, 220))
+                assert source_path.stat().st_size == original_stat.st_size
+                os.utime(source_path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+            real_rename(self, source, destination, **kwargs)
+
+        monkeypatch.setattr(Catalog, "_rename_catalog_entry_noreplace", rewrite_before_pinned_rename)
+
+        with pytest.raises(OSError, match="source changed before rename"):
+            catalog.move_images(
+                ["image.bmp"],
+                catalog,
+                "target",
+                expected_identities={"image.bmp": expected},
+            )
+
+        assert raced
+        assert source_path.is_file()
+        assert source_path.read_bytes() != original_bytes
+        assert not (root / "target" / "image.bmp").exists()
+        retained = catalog.get_image("image.bmp", include_blob=False)
+        assert retained is not None
+        assert retained.image_hash == original.image_hash
+
+
+def test_unindexed_delete_rejects_same_inode_rewrite_before_quarantine(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "catalog"
+    source_path = root / "image.bmp"
+    make_image(source_path, (32, 24), (220, 10, 10))
+
+    with Catalog(root) as catalog:
+        expected = catalog.file_identity("image.bmp")
+        original_bytes = source_path.read_bytes()
+        original_stat = source_path.stat()
+        real_rename = Catalog._rename_catalog_entry_noreplace
+        raced = False
+
+        def rewrite_before_quarantine(
+            self: Catalog,
+            source: Path,
+            destination: Path,
+            **kwargs,
+        ) -> None:  # type: ignore[no-untyped-def]
+            nonlocal raced
+            if source == source_path and not raced:
+                raced = True
+                make_image(source_path, (32, 24), (10, 10, 220))
+                assert source_path.stat().st_size == original_stat.st_size
+                os.utime(source_path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+            real_rename(self, source, destination, **kwargs)
+
+        monkeypatch.setattr(Catalog, "_rename_catalog_entry_noreplace", rewrite_before_quarantine)
+
+        with pytest.raises(OSError, match="source changed before rename"):
+            catalog.delete_images(
+                ["image.bmp"],
+                expected_identities={"image.bmp": expected},
+            )
+
+        assert raced
+        assert source_path.is_file()
+        assert source_path.read_bytes() != original_bytes
+        assert catalog.get_image("image.bmp") is None
+
+
+@pytest.mark.skipif(os.name == "nt", reason="descriptor-relative rename hook is POSIX-only")
+def test_unindexed_delete_restores_content_race_inside_quarantine_rename(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "catalog"
+    source_path = root / "image.bmp"
+    make_image(source_path, (32, 24), (220, 10, 10))
+
+    with Catalog(root) as catalog:
+        expected = catalog.file_identity("image.bmp")
+        original_bytes = source_path.read_bytes()
+        original_stat = source_path.stat()
+        real_rename_at = catalog_module._rename_noreplace_at
+        raced = False
+
+        def rewrite_inside_rename(
+            source_fd: int,
+            source_name: str,
+            destination_fd: int,
+            destination_name: str,
+        ) -> None:
+            nonlocal raced
+            if source_name == "image.bmp" and not raced:
+                raced = True
+                make_image(source_path, (32, 24), (10, 10, 220))
+                assert source_path.stat().st_size == original_stat.st_size
+                os.utime(source_path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+            real_rename_at(source_fd, source_name, destination_fd, destination_name)
+
+        monkeypatch.setattr(catalog_module, "_rename_noreplace_at", rewrite_inside_rename)
+
+        with pytest.raises(OSError, match="changed since it was indexed"):
+            catalog.delete_images(
+                ["image.bmp"],
+                expected_identities={"image.bmp": expected},
+            )
+
+        assert raced
+        assert source_path.is_file()
+        assert source_path.read_bytes() != original_bytes
+        assert catalog.get_image("image.bmp") is None
+
+
+@pytest.mark.skipif(os.name == "nt", reason="descriptor-relative rename hook is POSIX-only")
+def test_same_filesystem_move_invalidates_content_race_inside_rename(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "catalog"
+    source_path = root / "image.bmp"
+    destination_path = root / "target" / "image.bmp"
+    destination_path.parent.mkdir(parents=True)
+    make_image(source_path, (32, 24), (220, 10, 10))
+
+    with Catalog(root) as catalog:
+        catalog.refresh()
+        expected = catalog.file_identity("image.bmp")
+        original = catalog.get_image("image.bmp", include_blob=False)
+        assert original is not None
+        original_bytes = source_path.read_bytes()
+        original_stat = source_path.stat()
+        real_rename_at = catalog_module._rename_noreplace_at
+        raced = False
+
+        def rewrite_inside_rename(
+            source_fd: int,
+            source_name: str,
+            destination_fd: int,
+            destination_name: str,
+        ) -> None:
+            nonlocal raced
+            if source_name == "image.bmp" and not raced:
+                raced = True
+                make_image(source_path, (32, 24), (10, 10, 220))
+                assert source_path.stat().st_size == original_stat.st_size
+                os.utime(source_path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+            real_rename_at(source_fd, source_name, destination_fd, destination_name)
+
+        monkeypatch.setattr(catalog_module, "_rename_noreplace_at", rewrite_inside_rename)
+
+        result = catalog.move_images(
+            ["image.bmp"],
+            catalog,
+            "target",
+            expected_identities={"image.bmp": expected},
+        )
+
+        assert result[0].dest_rel_path == "target/image.bmp"
+        assert raced
+        assert not source_path.exists()
+        assert destination_path.read_bytes() != original_bytes
+        pending = catalog.get_image("target/image.bmp", include_blob=False)
+        assert pending is not None
+        assert pending.image_hash is None
+        reconciled = catalog.index_image("target/image.bmp", force=True)
+        assert reconciled is not None
+        assert reconciled.image_hash != original.image_hash
+
+
+def test_cross_filesystem_rejected_rewrite_leaves_no_public_destination(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source_root = tmp_path / "source"
+    destination_root = tmp_path / "destination"
+    source_path = source_root / "image.bmp"
+    destination_root.mkdir()
+    make_image(source_path, (32, 24), (220, 10, 10))
+
+    with Catalog(source_root) as source, Catalog(destination_root) as destination:
+        source.refresh()
+        expected = source.file_identity("image.bmp")
+        original_stat = source_path.stat()
+        real_copy = Catalog._copy_file_to_destination
+
+        def force_cross_device(*_args, **_kwargs) -> None:  # type: ignore[no-untyped-def]
+            raise OSError(errno.EXDEV, "forced cross-device move")
+
+        def rewrite_before_copy(
+            self: Catalog,
+            copy_source: Path,
+            copy_destination: Path,
+            **kwargs,
+        ):  # type: ignore[no-untyped-def]
+            make_image(copy_source, (32, 24), (10, 10, 220))
+            assert copy_source.stat().st_size == original_stat.st_size
+            os.utime(copy_source, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+            return real_copy(self, copy_source, copy_destination, **kwargs)
+
+        monkeypatch.setattr(Catalog, "_rename_catalog_entry_noreplace", force_cross_device)
+        monkeypatch.setattr(Catalog, "_copy_file_to_destination", rewrite_before_copy)
+
+        with pytest.raises(OSError, match="changed before cross-filesystem copy"):
+            source.move_images(
+                ["image.bmp"],
+                destination,
+                expected_identities={"image.bmp": expected},
+            )
+
+        assert source_path.is_file()
+        assert not (destination_root / "image.bmp").exists()
+        assert destination.get_image("image.bmp") is None
+
+
+def test_directory_move_invalidates_and_reconciles_changed_descendant(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "catalog"
+    image_path = root / "album" / "image.bmp"
+    (root / "target").mkdir(parents=True)
+    make_image(image_path, (32, 24), (220, 10, 10))
+
+    with Catalog(root) as catalog:
+        catalog.refresh()
+        original = catalog.get_image("album/image.bmp", include_blob=False)
+        assert original is not None
+        original_stat = image_path.stat()
+        make_image(image_path, (32, 24), (10, 10, 220))
+        assert image_path.stat().st_size == original_stat.st_size
+        os.utime(image_path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+
+        moved = catalog.move_directories(["album"], catalog, "target")
+
+        assert moved[0].dest_rel_path == "target/album"
+        pending = catalog.get_image("target/album/image.bmp", include_blob=False)
+        assert pending is not None
+        assert pending.image_hash is None
+        assert pending.width == 0
+        assert pending.height == 0
+        assert catalog.refresh_subtree("target/album")
+        reconciled = catalog.get_image("target/album/image.bmp", include_blob=False)
+        assert reconciled is not None
+        assert reconciled.image_hash is not None
+        assert reconciled.image_hash != original.image_hash
+        assert (reconciled.width, reconciled.height) == (32, 24)
+
+
+def test_cross_catalog_directory_move_defers_content_reads_and_preserves_tags(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source_root = tmp_path / "source"
+    destination_root = tmp_path / "destination"
+    image_path = source_root / "album" / "image.bmp"
+    destination_root.mkdir()
+    make_image(image_path, (32, 24), (220, 10, 10))
+
+    with Catalog(source_root) as source, Catalog(destination_root) as destination:
+        source.refresh()
+        source.set_image_tags("album/image.bmp", ["kept"])
+        original = source.get_image("album/image.bmp", include_blob=False)
+        assert original is not None
+        hash_reads: list[Path] = []
+        real_hash = Catalog._stable_regular_file_hash
+
+        def record_hash(self: Catalog, path: Path, *args, **kwargs):  # type: ignore[no-untyped-def]
+            hash_reads.append(path)
+            return real_hash(self, path, *args, **kwargs)
+
+        monkeypatch.setattr(Catalog, "_stable_regular_file_hash", record_hash)
+        moved = source.move_directories(["album"], destination)
+
+        assert moved[0].dest_rel_path == "album"
+        # A same-filesystem directory rename is metadata-only; transferring
+        # catalog ownership must not synchronously re-read each image.
+        assert hash_reads == []
+        pending = destination.get_image("album/image.bmp", include_blob=False)
+        assert pending is not None
+        assert pending.image_hash is None
+        assert destination.get_image_tags("album/image.bmp") == ["kept"]
+        assert source.get_image("album/image.bmp") is None
+        assert destination.refresh_subtree("album")
+        reconciled = destination.get_image("album/image.bmp", include_blob=False)
+        assert reconciled is not None
+        assert reconciled.image_hash == original.image_hash
+        assert destination.get_image_tags("album/image.bmp") == ["kept"]
+
+
+def test_cross_catalog_image_move_defers_content_reads_and_preserves_tags(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source_root = tmp_path / "source"
+    destination_root = tmp_path / "destination"
+    image_path = source_root / "image.bmp"
+    destination_root.mkdir()
+    make_image(image_path, (32, 24), (220, 10, 10))
+
+    with Catalog(source_root) as source, Catalog(destination_root) as destination:
+        source.refresh()
+        source.set_image_tags("image.bmp", ["kept"])
+        original = source.get_image("image.bmp", include_blob=False)
+        assert original is not None
+        hash_reads: list[Path] = []
+        real_hash = Catalog._stable_regular_file_hash
+
+        def record_hash(self: Catalog, path: Path, *args, **kwargs):  # type: ignore[no-untyped-def]
+            hash_reads.append(path)
+            return real_hash(self, path, *args, **kwargs)
+
+        monkeypatch.setattr(Catalog, "_stable_regular_file_hash", record_hash)
+        moved = source.move_images(["image.bmp"], destination)
+
+        assert moved[0].dest_rel_path == "image.bmp"
+        assert hash_reads == []
+        pending = destination.get_image("image.bmp", include_blob=False)
+        assert pending is not None
+        assert pending.image_hash is None
+        assert destination.get_image_tags("image.bmp") == ["kept"]
+        assert source.get_image("image.bmp") is None
+        reconciled = destination.index_image("image.bmp", force=True)
+        assert reconciled is not None
+        assert reconciled.image_hash == original.image_hash
+        assert destination.get_image_tags("image.bmp") == ["kept"]
+
+
+def test_stale_image_row_does_not_decode_or_hash_before_same_filesystem_move(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source_root = tmp_path / "source"
+    destination_root = tmp_path / "destination"
+    image_path = source_root / "image.bmp"
+    make_image(image_path, (32, 24), (220, 10, 10))
+
+    with Catalog(source_root) as source, Catalog(destination_root) as destination:
+        source.refresh()
+        source.set_image_tags("image.bmp", ["kept"])
+        indexed = source.get_image("image.bmp", include_blob=False)
+        assert indexed is not None
+        make_image(image_path, (32, 24), (10, 10, 220))
+        assert image_path.stat().st_size == indexed.size_bytes
+        assert source.file_identity("image.bmp")[5] != indexed.ctime_ns
+
+        def forbid_content_read(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+            raise AssertionError("move hot path must not decode or hash stale image bytes")
+
+        monkeypatch.setattr(Catalog, "index_image", forbid_content_read)
+        monkeypatch.setattr(Catalog, "_stable_regular_file_hash", forbid_content_read)
+        moved = source.move_images(["image.bmp"], destination)
+
+        assert moved[0].dest_rel_path == "image.bmp"
+        assert not image_path.exists()
+        pending = destination.get_image("image.bmp", include_blob=False)
+        assert pending is not None
+        assert pending.image_hash is None
+        assert destination.get_image_tags("image.bmp") == ["kept"]
+
+
+def test_catalog_traversal_ignores_and_prunes_owned_mutation_artifacts(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "catalog"
+    make_image(root / "normal.png", color=(10, 20, 30))
+    make_image(root / "crash" / "inside.png", color=(20, 30, 40))
+
+    subprocess_hash_calls = 0
+    real_subprocess_hash = Catalog._directory_find_hash_subprocess
+
+    def record_subprocess_hash(self: Catalog, *args, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal subprocess_hash_calls
+        subprocess_hash_calls += 1
+        return real_subprocess_hash(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        Catalog,
+        "_directory_find_hash_subprocess",
+        record_subprocess_hash,
+    )
+
+    with Catalog(root) as catalog:
+        catalog.refresh()
+        baseline_entry_hash = catalog.directory_entry_find_hash("")
+        baseline_find_hash = catalog.directory_find_hash("")
+        cutoff_ns = time.time_ns()
+        time.sleep(0.01)
+        rejected = root / f".crash.{('a' * 24)}.marnwick-rejected-move-dir"
+        atomic_temp = root / ".photo.png.abcdefgh.tmp.png"
+        make_image(atomic_temp, color=(30, 40, 50))
+        uppercase_atomic_temp = root / ".photo.PNG.abc_def0.tmp.PNG"
+        make_image(uppercase_atomic_temp, color=(35, 45, 55))
+        retained_recovery = root / f".album.{('b' * 24)}.marnwick-move-recovery-dir"
+        make_image(retained_recovery / "recovery.png", color=(40, 50, 60))
+
+        assert catalog_module.is_marnwick_internal_artifact_name(atomic_temp.name)
+        assert catalog_module.is_marnwick_internal_artifact_name(uppercase_atomic_temp.name)
+        assert catalog_module.is_marnwick_internal_artifact_name(retained_recovery.name)
+        assert catalog.directory_entry_find_hash("") == baseline_entry_hash
+        assert catalog.directory_find_hash("") == baseline_find_hash
+        assert not catalog.has_catalog_files_modified_after(cutoff_ns)
+        catalog.discover_directories()
+        assert all(
+            "marnwick-move-recovery-dir" not in value
+            for value in catalog.list_known_directories()
+        )
+
+        (root / "crash").rename(rejected)
+        assert catalog_module.is_marnwick_internal_artifact_name(rejected.name)
+        assert catalog.directory_entry_find_hash("") != baseline_entry_hash
+        assert catalog.directory_find_hash("") != baseline_find_hash
+        catalog.refresh(force=True)
+
+        assert catalog.get_image("crash/inside.png") is None
+        assert catalog.get_image(atomic_temp.name) is None
+        assert catalog.get_image(uppercase_atomic_temp.name) is None
+        known = catalog.list_known_directories()
+        assert all("marnwick-rejected-move-dir" not in value for value in known)
+        assert all("marnwick-move-recovery-dir" not in value for value in known)
+        assert catalog.list_images("", include_blobs=False)[0].rel_path == "normal.png"
+        if all(catalog_module.shutil.which(name) for name in ("find", "md5sum", "sort")):
+            assert subprocess_hash_calls > 0
+
+
 def test_cross_filesystem_move_keeps_replaced_source_and_verified_destination(
     tmp_path: Path,
     monkeypatch,
@@ -3839,6 +5513,167 @@ def test_cross_filesystem_move_keeps_replaced_source_and_verified_destination(
         assert destination.get_image("image.png", include_blob=False) is not None
 
 
+def test_cross_filesystem_publication_race_cannot_bless_destination_successor(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source_root = tmp_path / "source"
+    destination_root = tmp_path / "destination"
+    source_path = source_root / "image.png"
+    destination_path = destination_root / "image.png"
+    make_image(source_path, color=(10, 20, 30))
+    source_bytes = source_path.read_bytes()
+    force_cross_device_move(monkeypatch, source_path)
+    real_publish = catalog_module._publish_private_file_noreplace
+    raced = False
+
+    def replace_immediately_after_publish(
+        staging: Path,
+        destination: Path,
+        **kwargs,
+    ):  # type: ignore[no-untyped-def]
+        nonlocal raced
+        published_identity = real_publish(staging, destination, **kwargs)
+        make_image(destination_root / "successor.png", color=(220, 20, 20))
+        os.replace(destination_root / "successor.png", destination)
+        raced = True
+        return published_identity
+
+    monkeypatch.setattr(
+        catalog_module,
+        "_publish_private_file_noreplace",
+        replace_immediately_after_publish,
+    )
+    with Catalog(source_root) as source, Catalog(destination_root) as destination:
+        source.refresh()
+
+        with pytest.raises(OSError, match="destination changed after staged publication"):
+            source.move_images(["image.png"], destination)
+
+        assert raced
+        assert source_path.read_bytes() == source_bytes
+        assert destination_path.read_bytes() != source_bytes
+        assert source.get_image("image.png", include_blob=False) is not None
+        assert destination.get_image("image.png", include_blob=False) is None
+
+
+def test_cross_filesystem_file_move_uses_four_bounded_content_passes(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source_root = tmp_path / "source"
+    destination_root = tmp_path / "destination"
+    source_path = source_root / "image.png"
+    make_image(source_path, color=(10, 20, 30))
+    force_cross_device_move(monkeypatch, source_path)
+
+    with Catalog(source_root) as source, Catalog(destination_root) as destination:
+        source.refresh()
+        stable_hash_paths: list[Path] = []
+        pinned_hash_paths: list[Path] = []
+        pinned_identity_paths: list[Path] = []
+        real_stable_hash = Catalog._stable_regular_file_hash
+        real_pinned_hash = Catalog._open_pinned_regular_file_hash
+        real_pinned_identity = Catalog._open_pinned_regular_file_identity
+
+        def record_stable_hash(self: Catalog, path: Path, *args, **kwargs):  # type: ignore[no-untyped-def]
+            stable_hash_paths.append(path)
+            return real_stable_hash(self, path, *args, **kwargs)
+
+        def record_pinned_hash(self: Catalog, path: Path, *args, **kwargs):  # type: ignore[no-untyped-def]
+            pinned_hash_paths.append(path)
+            return real_pinned_hash(self, path, *args, **kwargs)
+
+        def record_pinned_identity(self: Catalog, path: Path, *args, **kwargs):  # type: ignore[no-untyped-def]
+            pinned_identity_paths.append(path)
+            return real_pinned_identity(self, path, *args, **kwargs)
+
+        monkeypatch.setattr(Catalog, "_stable_regular_file_hash", record_stable_hash)
+        monkeypatch.setattr(Catalog, "_open_pinned_regular_file_hash", record_pinned_hash)
+        monkeypatch.setattr(Catalog, "_open_pinned_regular_file_identity", record_pinned_identity)
+        monkeypatch.setattr(
+            catalog_module.shutil,
+            "copy2",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("ordinary file move must use the streaming digest copy")
+            ),
+        )
+
+        moved = source.move_images(["image.png"], destination)
+
+        assert moved[0].dest_rel_path == "image.png"
+        # One streaming source copy is performed directly, followed by exactly
+        # one staging verification, one public-destination proof, and one pinned
+        # source verification at the destructive boundary.
+        assert len(stable_hash_paths) == 1
+        assert stable_hash_paths[0].name.startswith(".image.png.")
+        assert pinned_hash_paths == [destination_root / "image.png", source_path]
+        assert pinned_identity_paths == [destination_root / "image.png"]
+
+
+def test_cross_filesystem_file_move_reports_and_cancels_within_content_passes(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source_root = tmp_path / "source"
+    destination_root = tmp_path / "destination"
+    source_path = source_root / "image.png"
+    make_image(source_path, color=(10, 20, 30))
+    force_cross_device_move(monkeypatch, source_path)
+
+    with Catalog(source_root) as source, Catalog(destination_root) as destination:
+        source.refresh()
+        details: list[str] = []
+
+        source.move_images(
+            ["image.png"],
+            destination,
+            progress_callback=lambda _done, _total, detail: details.append(detail),
+        )
+
+        byte_phases = {
+            detail.split(": ", 2)[1]
+            for detail in details
+            if " / " in detail and " bytes" in detail
+        }
+        assert {
+            "Copying",
+            "Verifying staged copy",
+            "Verifying published copy",
+            "Rechecking source before removal",
+        } <= byte_phases
+
+    canceled_root = tmp_path / "canceled-source"
+    canceled_destination_root = tmp_path / "canceled-destination"
+    canceled_path = canceled_root / "image.png"
+    make_image(canceled_path, color=(20, 30, 40))
+    force_cross_device_move(monkeypatch, canceled_path)
+    should_cancel = False
+
+    def record_until_verification(_done: int, _total: int | None, detail: str) -> None:
+        nonlocal should_cancel
+        if "Verifying staged copy:" in detail:
+            should_cancel = True
+
+    def cancel_check() -> None:
+        if should_cancel:
+            raise RuntimeError("move canceled")
+
+    with Catalog(canceled_root) as source, Catalog(canceled_destination_root) as destination:
+        source.refresh()
+
+        with pytest.raises(RuntimeError, match="move canceled"):
+            source.move_images(
+                ["image.png"],
+                destination,
+                progress_callback=record_until_verification,
+                cancel_check=cancel_check,
+            )
+
+        assert canceled_path.is_file()
+        assert not (canceled_destination_root / "image.png").exists()
+
+
 def test_cross_catalog_move_reindexes_replaced_source_content_and_preserves_tags(
     tmp_path: Path,
 ) -> None:
@@ -3856,6 +5691,9 @@ def test_cross_catalog_move_reindexes_replaced_source_content_and_preserves_tags
         result = source.move_images(["image.png"], destination)[0]
         moved = destination.get_image(result.dest_rel_path, include_blob=False)
 
+        assert moved is not None
+        assert moved.image_hash is None
+        moved = destination.index_image(result.dest_rel_path, force=True)
         assert moved is not None
         assert moved.image_hash != old_hash
         assert moved.image_hash == hashlib.sha256(
@@ -4213,7 +6051,9 @@ def test_set_based_directory_record_move_keeps_failure_rows_and_tags(
         catalog._conn.set_trace_callback(None)
         assert result.dest_rel_path == "target/set"
         assert catalog.get_image_tags("target/set/nested/good.png") == ["Keep"]
-        assert catalog._image_index_failure_exists("target/set/nested/bad.png")
+        # Content-derived failures are invalidated with thumbnails/hashes and
+        # recreated by the exact subtree reconciliation.
+        assert not catalog._image_index_failure_exists("target/set/nested/bad.png")
         assert not catalog._image_index_failure_exists("set/nested/bad.png")
         normalized = [" ".join(statement.upper().split()) for statement in statements]
         assert sum(
@@ -4229,6 +6069,8 @@ def test_set_based_directory_record_move_keeps_failure_rows_and_tags(
             statement.startswith("UPDATE IMAGE_INDEX_FAILURES SET")
             for statement in normalized
         ) == 1
+        assert catalog.refresh_subtree("target/set")
+        assert catalog._image_index_failure_exists("target/set/nested/bad.png")
 
 
 def test_subtree_record_mutations_keep_case_distinct_sibling(

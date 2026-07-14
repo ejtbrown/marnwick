@@ -58,6 +58,11 @@ class ImageRecord:
     thumb_height: int
     thumb_blob: bytes | None = None
     image_hash: str | None = None
+    ctime_ns: int = 0
+    # Exact filesystem identity captured by a direct inventory. Database-only
+    # records leave this unset and use their indexed content hash when a
+    # destructive action must prove that the displayed incarnation is current.
+    file_identity: tuple[int, int, int, int, int, int] | None = None
 
     @property
     def absolute_path(self) -> Path:

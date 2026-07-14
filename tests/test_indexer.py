@@ -43,6 +43,116 @@ def test_background_indexer_refreshes_directory_and_reports_completion(tmp_path:
         indexer.shutdown()
 
 
+def test_moved_image_batch_uses_one_writer_and_reports_each_published_path(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "catalog"
+    first_published = Event()
+    release_batch = Event()
+    opened = 0
+    calls: list[tuple[tuple[str, ...], bool]] = []
+    completed: list[str] = []
+
+    class StreamingCatalog:
+        @classmethod
+        def open_writer(cls, _root: Path, **_kwargs: object) -> "StreamingCatalog":
+            nonlocal opened
+            opened += 1
+            return cls()
+
+        def __enter__(self) -> "StreamingCatalog":
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def index_images_pipeline(  # type: ignore[no-untyped-def]
+            self,
+            rel_paths,
+            progress,
+            cancel_check,
+            *,
+            force: bool = False,
+            completion_callback=None,
+        ) -> None:
+            paths = tuple(rel_paths)
+            calls.append((paths, force))
+            for processed, rel_path in enumerate(paths, 1):
+                cancel_check()
+                if completion_callback is not None:
+                    completion_callback(rel_path)
+                progress(processed, len(paths), rel_path)
+                if processed == 1:
+                    first_published.set()
+                    assert release_batch.wait(timeout=5)
+
+        def append_log(self, _message: str, *, level: str = "INFO") -> None:
+            del level
+
+    monkeypatch.setattr("marnwick.indexer.Catalog", StreamingCatalog)
+    indexer = BackgroundIndexer(max_workers=1)
+    try:
+        task = indexer.reconcile_images(
+            root,
+            ("one.jpg", "nested/two.jpg", "one.jpg"),
+            completion_callback=completed.append,
+        )
+        assert first_published.wait(timeout=2)
+
+        snapshot = task.snapshot()
+        assert snapshot.processed == 1
+        assert snapshot.total == 2
+        assert snapshot.current == "one.jpg"
+
+        release_batch.set()
+        task.wait(timeout=5)
+        snapshot = task.snapshot()
+        assert snapshot.done
+        assert snapshot.processed == 2
+        assert snapshot.current == "nested/two.jpg"
+        assert opened == 1
+        assert calls == [(("one.jpg", "nested/two.jpg"), True)]
+        assert completed == ["one.jpg", "nested/two.jpg"]
+    finally:
+        release_batch.set()
+        indexer.shutdown()
+
+
+def test_moved_image_batch_rebuilds_placeholders_without_losing_tags(tmp_path: Path) -> None:
+    root = tmp_path / "catalog"
+    make_image(root / "one.jpg")
+    make_image(root / "nested" / "two.jpg")
+    with Catalog(root) as catalog:
+        catalog.refresh()
+        catalog.set_image_tags("one.jpg", ["favorite"], replace=True)
+        catalog.set_image_tags("nested/two.jpg", ["trip"], replace=True)
+        catalog._invalidate_image_record("one.jpg")
+        catalog._invalidate_image_record("nested/two.jpg")
+        assert catalog.get_image("one.jpg").image_hash is None
+        assert catalog.get_image("nested/two.jpg").image_hash is None
+
+    indexer = BackgroundIndexer(max_workers=1)
+    completed: list[str] = []
+    try:
+        task = indexer.reconcile_images(
+            root,
+            ("one.jpg", "nested/two.jpg"),
+            completion_callback=completed.append,
+        )
+        task.wait(timeout=5)
+        assert task.snapshot().processed == 2
+    finally:
+        indexer.shutdown()
+
+    with Catalog(root) as catalog:
+        assert catalog.get_image("one.jpg").image_hash is not None
+        assert catalog.get_image("nested/two.jpg").image_hash is not None
+        assert catalog.get_image_tags("one.jpg") == ["favorite"]
+        assert catalog.get_image_tags("nested/two.jpg") == ["trip"]
+    assert sorted(completed) == ["nested/two.jpg", "one.jpg"]
+
+
 def test_background_indexer_discovers_directories_without_indexing_images(tmp_path: Path) -> None:
     root = tmp_path / "catalog"
     make_image(root / "set" / "nested" / "one.jpg")
@@ -900,6 +1010,60 @@ def test_blocked_obsolete_read_does_not_starve_selected_work_or_mutation(
         assert obsolete.cancellation_requested()
     finally:
         release_obsolete.set()
+        indexer.shutdown()
+
+
+def test_canceled_reads_filling_pool_use_bounded_escape_lane_for_latest_selection(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "catalog"
+    root.mkdir()
+    release_reads = Event()
+    all_started = Event()
+    latest_finished = Event()
+    started_count = 0
+    started_lock = Lock()
+
+    def blocked_read(_task) -> None:  # type: ignore[no-untyped-def]
+        nonlocal started_count
+        with started_lock:
+            started_count += 1
+            if started_count == 4:
+                all_started.set()
+        release_reads.wait(timeout=5)
+
+    indexer = BackgroundIndexer(max_workers=4)
+    try:
+        for index in range(4):
+            indexer.submit_action(
+                f"stale selected directory {index}",
+                root,
+                f"stale-{index}",
+                priority=ActionPriority.SELECTED_DIRECTORY_INDEX,
+                worker=blocked_read,
+                interactive=True,
+            )
+        assert all_started.wait(timeout=2)
+        indexer.cancel_directory_tasks(root)
+
+        latest, latest_future = indexer.submit_action(
+            "latest selected directory",
+            root,
+            "healthy",
+            priority=ActionPriority.SELECTED_DIRECTORY_INDEX,
+            worker=lambda _task: latest_finished.set(),
+            interactive=True,
+        )
+
+        assert latest_finished.wait(timeout=2)
+        latest_future.result(timeout=2)
+        assert latest.snapshot().done
+        # Four base reads, at most four bounded reserves, and one protected
+        # mutation lane. The first healthy replacement needs only one reserve.
+        assert len(indexer._workers) <= 9  # noqa: SLF001
+        assert indexer._read_worker_count == 5  # noqa: SLF001
+    finally:
+        release_reads.set()
         indexer.shutdown()
 
 

@@ -68,6 +68,8 @@ VIDEO_EXTENSIONS = {
 
 ProgressCallback = Callable[[int, int | None, str], None]
 CancelCallback = Callable[[], None]
+MutationDetailCallback = Callable[[str], None]
+ImageCompletionCallback = Callable[[str], None]
 DirectoryIdentity = tuple[int, int, int, int]
 CatalogFileIdentity = tuple[int, int, int, int, int, int]
 CatalogFileProof = tuple[int, int, int, int, int, str]
@@ -77,6 +79,7 @@ SCAN_PROGRESS_INTERVAL = 64
 DISCOVERY_WRITE_BATCH_SIZE = 512
 DIRECTORY_RECORD_TRANSFER_BATCH_SIZE = 256
 HASH_CHUNK_SIZE = 1024 * 1024
+MUTATION_BYTE_PROGRESS_INTERVAL = 8 * HASH_CHUNK_SIZE
 SHRED_TIMEOUT_SECONDS = 15.0
 SHUTIL_RMTREE_AVOIDS_SYMLINK_ATTACKS = bool(
     getattr(shutil.rmtree, "avoids_symlink_attacks", False)
@@ -110,10 +113,165 @@ DUPLICATE_DELETE_EXACT = "exact"
 DUPLICATE_DELETE_VERY_SIMILAR = "very_similar"
 TRASH_DIR_NAME = "T-r-a-s-h"
 CATALOG_LOCK_FILE_NAME = "catalog.lock"
+PRIVATE_QUARANTINE_DIR_PREFIX = ".marnwick-private-"
+
+_NOREPLACE_UNAVAILABLE_ERRNOS = frozenset(
+    {
+        errno.EINVAL,
+        errno.ENOSYS,
+        errno.ENOTSUP,
+        getattr(errno, "EOPNOTSUPP", errno.ENOTSUP),
+    }
+)
+_HARD_LINK_UNAVAILABLE_ERRNOS = frozenset(
+    {
+        errno.EACCES,
+        errno.EINVAL,
+        errno.ENOSYS,
+        errno.ENOTSUP,
+        errno.EPERM,
+        getattr(errno, "EOPNOTSUPP", errno.ENOTSUP),
+    }
+)
 
 _CATALOG_LOCK_MUTEX = threading.RLock()
 _CATALOG_LOCK_PID = os.getpid()
 _CATALOG_LOCKS: dict[str, tuple[int, int]] = {}
+
+
+def _report_mutation_byte_progress(
+    callback: MutationDetailCallback | None,
+    phase: str,
+    completed: int,
+    total: int,
+    last_reported: int,
+) -> int:
+    """Report bounded byte progress without flooding the UI event queue."""
+
+    if callback is None:
+        return last_reported
+    if (
+        last_reported < 0
+        or completed == total
+        or completed - last_reported >= MUTATION_BYTE_PROGRESS_INTERVAL
+    ):
+        if completed != last_reported:
+            callback(f"{phase}: {completed:,} / {total:,} bytes")
+        return completed
+    return last_reported
+
+
+def _is_tempfile_random_token(value: str) -> bool:
+    return len(value) == 8 and all(
+        character in "abcdefghijklmnopqrstuvwxyz0123456789_"
+        for character in value
+    )
+
+
+def _is_quarantine_random_token(value: str) -> bool:
+    return len(value) == 24 and all(
+        character in "0123456789abcdef" for character in value
+    )
+
+
+def is_marnwick_internal_artifact_name(name: str) -> bool:
+    """Recognize mutation/save artifacts that must never enter the catalog.
+
+    Tokens are validated rather than filtering broad suffixes so an ordinary
+    user-owned dot directory is not hidden merely because its name happens to
+    contain a Marnwick-looking word.
+    """
+
+    if name == ".marnwick" or name.startswith(PRIVATE_QUARANTINE_DIR_PREFIX):
+        return True
+    if not name.startswith("."):
+        return False
+    quarantine_suffixes = (
+        ".marnwick-delete",
+        ".marnwick-delete-dir",
+        ".marnwick-move-source",
+        ".marnwick-move-source-dir",
+        ".marnwick-rejected-move",
+        ".marnwick-rejected-move-dir",
+    )
+    temporary_suffixes = (
+        ".marnwick-move-recovery",
+        ".marnwick-move-recovery-dir",
+        ".marnwick-shred-recovery",
+        ".recovery",
+        ".tmp",
+    )
+    for suffix in (*quarantine_suffixes, *temporary_suffixes):
+        if not name.endswith(suffix):
+            continue
+        stem = name[1 : -len(suffix)]
+        _base, separator, token = stem.rpartition(".")
+        if not separator or not token:
+            return False
+        if suffix in quarantine_suffixes:
+            return _is_quarantine_random_token(token)
+        return _is_tempfile_random_token(token) or _is_quarantine_random_token(token)
+
+    # Atomic image saves preserve the real image extension after `.tmp`, for
+    # example `.photo.png.ab12cd34.tmp.png`.
+    marker = name.rfind(".tmp")
+    if marker < 0:
+        return False
+    image_suffix = name[marker + len(".tmp") :]
+    if not image_suffix or not is_image_name(f"image{image_suffix}"):
+        return False
+    base_and_token = name[1:marker]
+    destination_name, separator, token = base_and_token.rpartition(".")
+    return (
+        bool(separator)
+        and destination_name.endswith(image_suffix)
+        and _is_tempfile_random_token(token)
+    )
+
+
+def _is_internal_catalog_directory_name(name: str) -> bool:
+    # Kept as a private compatibility alias for existing traversal call sites.
+    # The predicate intentionally covers files too where those scans iterate
+    # every direct entry.
+    return is_marnwick_internal_artifact_name(name)
+
+
+def _find_internal_artifact_match_args() -> list[str]:
+    """Return GNU-find predicates equivalent to the owned-artifact matcher."""
+
+    quarantine_token = r"[0-9a-f]{24}"
+    temporary_token = rf"([a-z0-9_]{{8}}|{quarantine_token})"
+    quarantine_regex = (
+        rf".*/\.[^/]+\.{quarantine_token}\.marnwick-"
+        r"(delete(-dir)?|move-source(-dir)?|rejected-move(-dir)?)"
+    )
+    temporary_regex = (
+        rf".*/\.[^/]+\.{temporary_token}\."
+        r"(marnwick-move-recovery(-dir)?|marnwick-shred-recovery|recovery|tmp)"
+    )
+    atomic_image_regex = "(" + "|".join(
+        rf".*/\.[^/]+\.{extension.removeprefix('.')}\."
+        rf"[a-z0-9_]{{8}}\.tmp\.{extension.removeprefix('.')}"
+        for extension in sorted(IMAGE_EXTENSIONS)
+    ) + ")"
+    return [
+        "(",
+        "-name",
+        ".marnwick",
+        "-o",
+        "-name",
+        f"{PRIVATE_QUARANTINE_DIR_PREFIX}*",
+        "-o",
+        "-regex",
+        quarantine_regex,
+        "-o",
+        "-regex",
+        temporary_regex,
+        "-o",
+        "-iregex",
+        atomic_image_regex,
+        ")",
+    ]
 
 
 class _WindowsFileBasicInfo(ctypes.Structure):
@@ -229,6 +387,526 @@ def _rename_noreplace_at(
         "atomic descriptor-relative no-replace rename is unavailable",
         destination_name,
     )
+
+
+def _noreplace_is_unavailable(error: OSError) -> bool:
+    return error.errno in _NOREPLACE_UNAVAILABLE_ERRNOS
+
+
+def _isolate_wrong_file_publication(
+    source: Path,
+    destination: Path,
+    published_identity: tuple[int, int],
+) -> Path:
+    """Remove our wrong public link without unlinking a raced successor.
+
+    Rename the public name into a mode-0700 private directory, then inspect the
+    moved inode. If the destination raced again, restore that successor with an
+    atomic hard link and retain the isolated name as recovery. The published
+    inode is never blindly unlinked through a check/use race.
+    """
+
+    private_dir = Path(
+        tempfile.mkdtemp(
+            prefix=PRIVATE_QUARANTINE_DIR_PREFIX,
+            suffix=".publication-recovery",
+            dir=destination.parent,
+        )
+    )
+    isolated = private_dir / destination.name
+    try:
+        os.rename(destination, isolated)
+        isolated_stat = isolated.lstat()
+        isolated_identity = (
+            int(isolated_stat.st_dev),
+            int(isolated_stat.st_ino),
+        )
+        if isolated_identity == published_identity:
+            return isolated
+
+        # A successor occupied the public name before isolation. Restore it
+        # without clobbering another racer and keep the private recovery link.
+        try:
+            os.link(isolated, destination, follow_symlinks=False)
+        except OSError as restore_error:
+            raise OSError(
+                f"raced destination retained for recovery at {isolated}"
+            ) from restore_error
+        restored = destination.lstat()
+        if (int(restored.st_dev), int(restored.st_ino)) != isolated_identity:
+            raise OSError(f"raced destination recovery has the wrong identity: {isolated}")
+        # Preserve the inode that our failed publication linked even if the
+        # caller later removes its private source pathname.
+        try:
+            current_source = source.lstat()
+        except OSError:
+            pass
+        else:
+            if (
+                int(current_source.st_dev),
+                int(current_source.st_ino),
+            ) == published_identity:
+                with suppress(OSError):
+                    os.link(
+                        source,
+                        private_dir / "published-inode-recovery",
+                        follow_symlinks=False,
+                    )
+        raise OSError(
+            f"destination changed during publication; recovery retained at {isolated}"
+        )
+    except BaseException:
+        with suppress(OSError):
+            private_dir.rmdir()
+        raise
+
+
+def _isolate_wrong_directory_publication(
+    destination: Path,
+    published_identity: tuple[int, int],
+) -> Path:
+    """Move a wrongly published private tree out of the public namespace.
+
+    The recovery parent is exclusively created and inaccessible to unrelated
+    users.  Renaming into it cannot clobber a concurrent catalog entry.  If
+    the public name changed again before the rename, retain that successor in
+    recovery too rather than recursively deleting an object we did not move.
+    """
+
+    private_dir = Path(
+        tempfile.mkdtemp(
+            prefix=PRIVATE_QUARANTINE_DIR_PREFIX,
+            suffix=".publication-recovery",
+            dir=destination.parent,
+        )
+    )
+    isolated = private_dir / destination.name
+    try:
+        os.rename(destination, isolated)
+        isolated_stat = isolated.lstat()
+        isolated_identity = (
+            int(isolated_stat.st_dev),
+            int(isolated_stat.st_ino),
+        )
+        if isolated_identity != published_identity:
+            raise OSError(
+                f"destination changed during directory publication; raced entry "
+                f"retained at {isolated}"
+            )
+        return isolated
+    except BaseException:
+        with suppress(OSError):
+            private_dir.rmdir()
+        raise
+
+
+def _cleanup_private_temp_if_identity(
+    path: Path,
+    expected_identity: tuple[int, int],
+    *,
+    directory: bool,
+    remove_directory_tree: bool = True,
+) -> Path | None:
+    """Remove only the private temp object originally reserved by Marnwick.
+
+    There is no portable unlink-if-inode syscall.  Move the current pathname
+    into an exclusively created private directory first, then inspect it.  An
+    unexpected successor is retained there for recovery; the expected object
+    can be deleted without a remaining public check/use race.
+    """
+
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return None
+    private_dir = Path(
+        tempfile.mkdtemp(
+            prefix=PRIVATE_QUARANTINE_DIR_PREFIX,
+            suffix=".cleanup-recovery",
+            dir=path.parent,
+        )
+    )
+    isolated = private_dir / path.name
+    try:
+        try:
+            os.rename(path, isolated)
+        except FileNotFoundError:
+            private_dir.rmdir()
+            return None
+        isolated_stat = isolated.lstat()
+        isolated_identity = (
+            int(isolated_stat.st_dev),
+            int(isolated_stat.st_ino),
+        )
+        expected_kind = (
+            stat_module.S_ISDIR(isolated_stat.st_mode)
+            if directory
+            else stat_module.S_ISREG(isolated_stat.st_mode)
+        )
+        if isolated_identity != expected_identity or not expected_kind:
+            return isolated
+        if directory:
+            if remove_directory_tree:
+                shutil.rmtree(isolated)
+            else:
+                try:
+                    isolated.rmdir()
+                except OSError as error:
+                    if error.errno in {errno.ENOTEMPTY, errno.EEXIST}:
+                        return isolated
+                    raise
+        else:
+            isolated.unlink()
+        private_dir.rmdir()
+        return None
+    except BaseException:
+        with suppress(OSError):
+            private_dir.rmdir()
+        raise
+
+
+def _publish_private_file_noreplace(
+    source: Path,
+    destination: Path,
+    *,
+    expected_source_identity: Sequence[int] | None = None,
+    cancel_check: CancelCallback | None = None,
+    detail_callback: MutationDetailCallback | None = None,
+) -> CatalogObjectIdentity:
+    """Publish a caller-owned private file without clobbering another name.
+
+    The fast path remains the platform's atomic no-replace rename.  Some
+    otherwise fully functional NFS/CIFS/FUSE mounts reject RENAME_NOREPLACE.
+    A hard link is also an atomic no-clobber publication for a regular file.
+    Filesystems without hard links use an O_EXCL reservation and copy through
+    the retained descriptor, verifying the pathname before reporting success.
+    The caller keeps ``source`` until this function succeeds.
+    """
+
+    source_stat = source.lstat()
+    if not stat_module.S_ISREG(source_stat.st_mode):
+        raise OSError(
+            errno.ENOTSUP,
+            "private file publication requires a regular file",
+            source,
+        )
+    source_identity = (int(source_stat.st_dev), int(source_stat.st_ino))
+    if expected_source_identity is not None and source_identity != (
+        int(expected_source_identity[0]),
+        int(expected_source_identity[1]),
+    ):
+        raise OSError(f"private file publication source changed before publication: {source}")
+
+    try:
+        _rename_noreplace(source, destination)
+    except OSError as rename_error:
+        if not _noreplace_is_unavailable(rename_error):
+            raise
+    else:
+        published_stat = destination.lstat()
+        published_identity = (
+            int(published_stat.st_dev),
+            int(published_stat.st_ino),
+        )
+        if published_identity != source_identity:
+            recovery = _isolate_wrong_file_publication(
+                source,
+                destination,
+                published_identity,
+            )
+            raise OSError(
+                "private file publication source changed during rename; "
+                f"recovery retained at {recovery}"
+            )
+        return published_identity
+    try:
+        os.link(source, destination, follow_symlinks=False)
+    except OSError as link_error:
+        if link_error.errno == errno.EEXIST:
+            raise
+        if link_error.errno not in _HARD_LINK_UNAVAILABLE_ERRNOS:
+            raise
+    else:
+        published_stat = destination.lstat()
+        published_identity = (
+            int(published_stat.st_dev),
+            int(published_stat.st_ino),
+        )
+        if published_identity != source_identity:
+            # The private source name was replaced before link publication.
+            # Atomically isolate whichever inode is currently public before
+            # inspecting it; never check one pathname object and unlink a
+            # successor that raced into its place.
+            recovery = _isolate_wrong_file_publication(
+                source,
+                destination,
+                published_identity,
+            )
+            raise OSError(
+                "private file publication source changed before hard-link publication; "
+                f"recovery retained at {recovery}"
+            )
+        return published_identity
+
+    source_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    destination_flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    if hasattr(os, "O_NOFOLLOW"):
+        source_flags |= os.O_NOFOLLOW
+        destination_flags |= os.O_NOFOLLOW
+    source_fd = os.open(source, source_flags)
+    destination_fd = -1
+    reserved_identity: tuple[int, int] | None = None
+    source_version = (
+        int(source_stat.st_dev),
+        int(source_stat.st_ino),
+        int(source_stat.st_nlink),
+        int(source_stat.st_size),
+        int(source_stat.st_mtime_ns),
+        int(source_stat.st_ctime_ns),
+    )
+    try:
+        opened_source = os.fstat(source_fd)
+        if (
+            int(opened_source.st_dev),
+            int(opened_source.st_ino),
+            int(opened_source.st_nlink),
+            int(opened_source.st_size),
+            int(opened_source.st_mtime_ns),
+            int(opened_source.st_ctime_ns),
+        ) != source_version:
+            raise OSError(f"private publication source changed: {source}")
+        destination_fd = os.open(
+            destination,
+            destination_flags,
+            stat_module.S_IMODE(source_stat.st_mode),
+        )
+        opened_destination = os.fstat(destination_fd)
+        reserved_identity = (
+            int(opened_destination.st_dev),
+            int(opened_destination.st_ino),
+        )
+        copied_digest = hashlib.sha256()
+        copied_bytes = 0
+        copy_progress = _report_mutation_byte_progress(
+            detail_callback,
+            "Publishing with exclusive copy",
+            0,
+            int(opened_source.st_size),
+            -1,
+        )
+        while True:
+            if cancel_check is not None:
+                cancel_check()
+            chunk = os.read(source_fd, HASH_CHUNK_SIZE)
+            if not chunk:
+                break
+            copied_digest.update(chunk)
+            view = memoryview(chunk)
+            while view:
+                written = os.write(destination_fd, view)
+                if written <= 0:
+                    raise OSError("private file publication made no write progress")
+                view = view[written:]
+            copied_bytes += len(chunk)
+            copy_progress = _report_mutation_byte_progress(
+                detail_callback,
+                "Publishing with exclusive copy",
+                copied_bytes,
+                int(opened_source.st_size),
+                copy_progress,
+            )
+        with suppress(OSError):
+            os.fchmod(destination_fd, stat_module.S_IMODE(source_stat.st_mode))
+        with suppress(OSError):
+            os.utime(
+                destination_fd,
+                ns=(source_stat.st_atime_ns, source_stat.st_mtime_ns),
+            )
+        os.fsync(destination_fd)
+        source_after_copy = os.fstat(source_fd)
+        os.lseek(source_fd, 0, os.SEEK_SET)
+        verified_digest = hashlib.sha256()
+        verified_bytes = 0
+        verification_progress = _report_mutation_byte_progress(
+            detail_callback,
+            "Rechecking exclusive publication source",
+            0,
+            int(source_after_copy.st_size),
+            -1,
+        )
+        while True:
+            if cancel_check is not None:
+                cancel_check()
+            chunk = os.read(source_fd, HASH_CHUNK_SIZE)
+            if not chunk:
+                break
+            verified_digest.update(chunk)
+            verified_bytes += len(chunk)
+            verification_progress = _report_mutation_byte_progress(
+                detail_callback,
+                "Rechecking exclusive publication source",
+                verified_bytes,
+                int(source_after_copy.st_size),
+                verification_progress,
+            )
+        final_source = os.fstat(source_fd)
+        final_destination = os.fstat(destination_fd)
+        named_destination = destination.lstat()
+        source_after_copy_version = (
+            int(source_after_copy.st_dev),
+            int(source_after_copy.st_ino),
+            int(source_after_copy.st_nlink),
+            int(source_after_copy.st_size),
+            int(source_after_copy.st_mtime_ns),
+            int(source_after_copy.st_ctime_ns),
+        )
+        final_source_version = (
+            int(final_source.st_dev),
+            int(final_source.st_ino),
+            int(final_source.st_nlink),
+            int(final_source.st_size),
+            int(final_source.st_mtime_ns),
+            int(final_source.st_ctime_ns),
+        )
+        if (
+            source_after_copy_version != source_version
+            or final_source_version != source_after_copy_version
+            or copied_digest.digest() != verified_digest.digest()
+            or final_destination.st_size != source_stat.st_size
+            or final_destination.st_mtime_ns != source_stat.st_mtime_ns
+            or (named_destination.st_dev, named_destination.st_ino)
+            != reserved_identity
+        ):
+            raise OSError("private file changed during exclusive publication")
+    except BaseException as error:
+        if reserved_identity is not None:
+            try:
+                recovery = _cleanup_private_temp_if_identity(
+                    destination,
+                    reserved_identity,
+                    directory=False,
+                )
+            except OSError as cleanup_error:
+                error.add_note(
+                    f"failed to clean private publication reservation: {cleanup_error}"
+                )
+            else:
+                if recovery is not None:
+                    error.add_note(
+                        f"raced destination retained for recovery at {recovery}"
+                    )
+        raise
+    finally:
+        if destination_fd >= 0:
+            os.close(destination_fd)
+        os.close(source_fd)
+    if reserved_identity is None:
+        raise OSError("private file publication did not establish a destination identity")
+    return reserved_identity
+
+
+def _publish_private_directory_noreplace(
+    source: Path,
+    destination: Path,
+    *,
+    expected_source_identity: Sequence[int] | None = None,
+) -> None:
+    """Publish a private tree by atomically replacing our empty reservation.
+
+    POSIX rename may replace an empty directory but cannot replace one that a
+    racer populated.  An exclusive mkdir therefore provides the no-clobber
+    reservation without exposing a partially copied tree or walking it twice.
+    """
+
+    source_stat = source.lstat()
+    if not stat_module.S_ISDIR(source_stat.st_mode):
+        raise OSError(
+            errno.ENOTSUP,
+            "private directory publication requires a directory",
+            source,
+        )
+    source_identity = (int(source_stat.st_dev), int(source_stat.st_ino))
+    if expected_source_identity is not None and source_identity != (
+        int(expected_source_identity[0]),
+        int(expected_source_identity[1]),
+    ):
+        raise OSError(
+            f"private directory publication source changed before publication: {source}"
+        )
+
+    try:
+        _rename_noreplace(source, destination)
+    except OSError as rename_error:
+        if not _noreplace_is_unavailable(rename_error):
+            raise
+    else:
+        published_stat = destination.lstat()
+        published_identity = (
+            int(published_stat.st_dev),
+            int(published_stat.st_ino),
+        )
+        if published_identity != source_identity:
+            recovery = _isolate_wrong_directory_publication(
+                destination,
+                published_identity,
+            )
+            raise OSError(
+                "private directory publication source changed during rename; "
+                f"recovery retained at {recovery}"
+            )
+        return
+    destination.mkdir(mode=0o700)
+    reserved_stat = destination.lstat()
+    reserved_identity = (
+        int(reserved_stat.st_dev),
+        int(reserved_stat.st_ino),
+    )
+    try:
+        os.rename(source, destination)
+        published_stat = destination.lstat()
+        published_identity = (
+            int(published_stat.st_dev),
+            int(published_stat.st_ino),
+        )
+        if published_identity != source_identity:
+            recovery = _isolate_wrong_directory_publication(
+                destination,
+                published_identity,
+            )
+            raise OSError(
+                "private directory publication source changed during reserved rename; "
+                f"recovery retained at {recovery}"
+            )
+    except BaseException as error:
+        try:
+            recovery = _cleanup_private_temp_if_identity(
+                destination,
+                reserved_identity,
+                directory=True,
+                remove_directory_tree=False,
+            )
+        except OSError as cleanup_error:
+            error.add_note(
+                f"failed to clean private directory publication reservation: {cleanup_error}"
+            )
+        else:
+            if recovery is not None:
+                error.add_note(
+                    f"raced destination retained for recovery at {recovery}"
+                )
+        if isinstance(error, OSError) and error.errno in {
+            errno.EEXIST,
+            errno.EISDIR,
+            errno.ENOTDIR,
+            errno.ENOTEMPTY,
+        }:
+            raise FileExistsError(errno.EEXIST, os.strerror(errno.EEXIST), destination) from error
+        raise
 
 
 def _run_shred_bounded(command: Sequence[str]) -> None:
@@ -536,11 +1214,12 @@ class _DirectoryContentScanResult:
 class _FileCopyProof:
     source_identity: CatalogFileIdentity
     content_hash: str
+    destination_identity: CatalogFileIdentity
 
 
 @dataclass(frozen=True, slots=True)
 class _DirectoryCopyProof:
-    source_root_identity: tuple[int, int, int, int, int]
+    source_root_identity: tuple[int, int, int, int, int, int]
     source_identity_hash: str
     content_hash: str
 
@@ -1110,7 +1789,6 @@ class Catalog:
             relative_parts = directory.relative_to(self.root).parts
         except ValueError as error:
             raise ValueError("catalog directory is outside the catalog root") from error
-        self._validate_catalog_entry_parts(relative_parts)
         flags = (
             os.O_RDONLY
             | os.O_DIRECTORY
@@ -1150,6 +1828,446 @@ class Catalog:
         except (OSError, ValueError):
             return False
 
+    def _entry_stat_matches_expected_identity(
+        self,
+        path: Path,
+        entry_stat: os.stat_result,
+        expected: Sequence[int],
+    ) -> bool:
+        """Compare the strongest identity shape supplied by a mutation caller."""
+
+        if stat_module.S_ISREG(entry_stat.st_mode) and len(expected) >= 6:
+            current = (
+                int(entry_stat.st_dev),
+                int(entry_stat.st_ino),
+                int(entry_stat.st_nlink),
+                int(entry_stat.st_size),
+                int(entry_stat.st_mtime_ns),
+                self._path_change_time_ns(path, entry_stat),
+            )
+            return current == tuple(int(value) for value in expected[:6])
+        if stat_module.S_ISDIR(entry_stat.st_mode):
+            if len(expected) >= 6:
+                current = (
+                    int(entry_stat.st_dev),
+                    int(entry_stat.st_ino),
+                    int(entry_stat.st_nlink),
+                    int(entry_stat.st_size),
+                    int(entry_stat.st_mtime_ns),
+                    self._path_change_time_ns(path, entry_stat),
+                )
+                return current == tuple(int(value) for value in expected[:6])
+            if len(expected) >= 4:
+                current = (
+                    int(entry_stat.st_dev),
+                    int(entry_stat.st_ino),
+                    int(entry_stat.st_mtime_ns),
+                    self._path_change_time_ns(path, entry_stat),
+                )
+                return current == tuple(int(value) for value in expected[:4])
+        return (
+            int(entry_stat.st_dev),
+            int(entry_stat.st_ino),
+        ) == (
+            int(expected[0]),
+            int(expected[1]),
+        )
+
+    def _directory_identity_for_path(self, path: Path) -> DirectoryIdentity:
+        directory_stat = path.lstat()
+        if not stat_module.S_ISDIR(directory_stat.st_mode):
+            raise FileNotFoundError(path)
+        return (
+            int(directory_stat.st_dev),
+            int(directory_stat.st_ino),
+            int(directory_stat.st_mtime_ns),
+            self._path_change_time_ns(path, directory_stat),
+        )
+
+    @staticmethod
+    def _link_isolate_regular_file_noreplace_at(
+        source_dir_fd: int,
+        source_name: str,
+        destination_dir_fd: int,
+        destination_name: str,
+        *,
+        expected_source_identity: Sequence[int] | None,
+    ) -> None:
+        """Move one regular-file name using atomic link publication.
+
+        This is the safe same-filesystem fallback when a mount rejects
+        RENAME_NOREPLACE.  The destination hard link is published atomically;
+        the source name is then moved into a mode-0700 private directory before
+        it is unlinked.  If another process replaces the source between those
+        operations, that replacement is restored and the captured inode stays
+        published at the destination.
+        """
+
+        source_stat = os.stat(
+            source_name,
+            dir_fd=source_dir_fd,
+            follow_symlinks=False,
+        )
+        if not stat_module.S_ISREG(source_stat.st_mode):
+            raise OSError(
+                errno.ENOTSUP,
+                "portable no-replace fallback supports regular files only",
+                source_name,
+            )
+        source_object_identity = (
+            int(source_stat.st_dev),
+            int(source_stat.st_ino),
+        )
+        if expected_source_identity is not None:
+            expected = tuple(int(value) for value in expected_source_identity)
+            if len(expected) >= 6:
+                current = (
+                    int(source_stat.st_dev),
+                    int(source_stat.st_ino),
+                    int(source_stat.st_nlink),
+                    int(source_stat.st_size),
+                    int(source_stat.st_mtime_ns),
+                    int(source_stat.st_ctime_ns),
+                )
+                matches = current == expected[:6]
+            else:
+                matches = source_object_identity == expected[:2]
+            if not matches:
+                raise OSError(
+                    f"mutation source changed before fallback rename: {source_name}"
+                )
+
+        try:
+            os.link(
+                source_name,
+                destination_name,
+                src_dir_fd=source_dir_fd,
+                dst_dir_fd=destination_dir_fd,
+                follow_symlinks=False,
+            )
+        except OSError as error:
+            if error.errno in _HARD_LINK_UNAVAILABLE_ERRNOS:
+                raise OSError(
+                    errno.ENOTSUP,
+                    "atomic hard-link publication is unavailable",
+                    destination_name,
+                ) from error
+            raise
+        private_name = ""
+        private_fd = -1
+        isolated = False
+        isolated_identity: tuple[int, int] | None = None
+        published_identity: tuple[int, int] | None = None
+        try:
+            published_stat = os.stat(
+                destination_name,
+                dir_fd=destination_dir_fd,
+                follow_symlinks=False,
+            )
+            published_identity = (
+                int(published_stat.st_dev),
+                int(published_stat.st_ino),
+            )
+            if published_identity != source_object_identity:
+                raise OSError("fallback publication produced the wrong destination identity")
+            for _ in range(128):
+                candidate = f"{PRIVATE_QUARANTINE_DIR_PREFIX}{secrets.token_hex(12)}"
+                try:
+                    os.mkdir(candidate, mode=0o700, dir_fd=source_dir_fd)
+                except FileExistsError:
+                    continue
+                private_name = candidate
+                break
+            if not private_name:
+                raise FileExistsError("could not reserve a private rename directory")
+            private_flags = (
+                os.O_RDONLY
+                | os.O_DIRECTORY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+            )
+            private_fd = os.open(private_name, private_flags, dir_fd=source_dir_fd)
+            os.rename(
+                source_name,
+                "entry",
+                src_dir_fd=source_dir_fd,
+                dst_dir_fd=private_fd,
+            )
+            isolated = True
+            isolated_stat = os.stat(
+                "entry",
+                dir_fd=private_fd,
+                follow_symlinks=False,
+            )
+            isolated_identity = (
+                int(isolated_stat.st_dev),
+                int(isolated_stat.st_ino),
+            )
+            # Validate the public recovery name before dropping either private
+            # inode.  A raced destination replacement is never unlinked here.
+            current_destination = os.stat(
+                destination_name,
+                dir_fd=destination_dir_fd,
+                follow_symlinks=False,
+            )
+            if (
+                int(current_destination.st_dev),
+                int(current_destination.st_ino),
+            ) != source_object_identity:
+                raise OSError("fallback destination changed during publication")
+
+            if isolated_identity != source_object_identity:
+                # The captured source was replaced after link publication.
+                # Put that successor back without clobbering another name;
+                # the captured inode remains safely published at destination.
+                os.link(
+                    "entry",
+                    source_name,
+                    src_dir_fd=private_fd,
+                    dst_dir_fd=source_dir_fd,
+                    follow_symlinks=False,
+                )
+                restored = os.stat(
+                    source_name,
+                    dir_fd=source_dir_fd,
+                    follow_symlinks=False,
+                )
+                if (int(restored.st_dev), int(restored.st_ino)) != isolated_identity:
+                    raise OSError("raced source replacement could not be restored safely")
+            os.unlink("entry", dir_fd=private_fd)
+            isolated = False
+        except BaseException as error:
+            # Best-effort rollback never overwrites a concurrent pathname. If
+            # restoration is impossible, retain the captured inode at the
+            # destination or the raced inode in the private directory.
+            if isolated and private_fd >= 0 and isolated_identity is not None:
+                try:
+                    os.link(
+                        "entry",
+                        source_name,
+                        src_dir_fd=private_fd,
+                        dst_dir_fd=source_dir_fd,
+                        follow_symlinks=False,
+                    )
+                except OSError:
+                    pass
+                else:
+                    with suppress(OSError):
+                        os.unlink("entry", dir_fd=private_fd)
+                    isolated = False
+            # Once a public hard link exists, never check its identity and
+            # then unlink by name during rollback: a successor can replace it
+            # between those syscalls. Retaining an extra link on an error is
+            # preferable to deleting an unrelated catalog entry.
+            raise error
+        finally:
+            if private_fd >= 0:
+                os.close(private_fd)
+            if private_name:
+                with suppress(OSError):
+                    os.rmdir(private_name, dir_fd=source_dir_fd)
+
+    @staticmethod
+    def _reserve_rename_directory_noreplace_at(
+        source_dir_fd: int,
+        source_name: str,
+        destination_dir_fd: int,
+        destination_name: str,
+        *,
+        expected_source_identity: Sequence[int] | None,
+    ) -> None:
+        """Rename a directory over an exclusively-created empty reservation."""
+
+        source_stat = os.stat(
+            source_name,
+            dir_fd=source_dir_fd,
+            follow_symlinks=False,
+        )
+        if not stat_module.S_ISDIR(source_stat.st_mode):
+            raise OSError(
+                errno.ENOTSUP,
+                "reserved no-replace fallback supports directories only",
+                source_name,
+            )
+        source_object = (int(source_stat.st_dev), int(source_stat.st_ino))
+        if expected_source_identity is not None:
+            expected = tuple(int(value) for value in expected_source_identity)
+            if len(expected) >= 6:
+                current = (
+                    int(source_stat.st_dev),
+                    int(source_stat.st_ino),
+                    int(source_stat.st_nlink),
+                    int(source_stat.st_size),
+                    int(source_stat.st_mtime_ns),
+                    int(source_stat.st_ctime_ns),
+                )
+                matches = current == expected[:6]
+            elif len(expected) >= 4:
+                current = (
+                    int(source_stat.st_dev),
+                    int(source_stat.st_ino),
+                    int(source_stat.st_mtime_ns),
+                    int(source_stat.st_ctime_ns),
+                )
+                matches = current == expected[:4]
+            else:
+                matches = source_object == expected[:2]
+            if not matches:
+                raise OSError(
+                    f"mutation source changed before reserved rename: {source_name}"
+                )
+        os.mkdir(destination_name, mode=0o700, dir_fd=destination_dir_fd)
+        reservation = os.stat(
+            destination_name,
+            dir_fd=destination_dir_fd,
+            follow_symlinks=False,
+        )
+        reservation_object = (
+            int(reservation.st_dev),
+            int(reservation.st_ino),
+        )
+        try:
+            current_source = os.stat(
+                source_name,
+                dir_fd=source_dir_fd,
+                follow_symlinks=False,
+            )
+            current_matches = (
+                int(current_source.st_dev),
+                int(current_source.st_ino),
+            ) == source_object
+            if expected_source_identity is not None:
+                expected = tuple(int(value) for value in expected_source_identity)
+                if len(expected) >= 6:
+                    current_matches = (
+                        int(current_source.st_dev),
+                        int(current_source.st_ino),
+                        int(current_source.st_nlink),
+                        int(current_source.st_size),
+                        int(current_source.st_mtime_ns),
+                        int(current_source.st_ctime_ns),
+                    ) == expected[:6]
+                elif len(expected) >= 4:
+                    current_matches = (
+                        int(current_source.st_dev),
+                        int(current_source.st_ino),
+                        int(current_source.st_mtime_ns),
+                        int(current_source.st_ctime_ns),
+                    ) == expected[:4]
+            if not current_matches:
+                raise OSError(f"mutation source changed before reserved rename: {source_name}")
+            os.rename(
+                source_name,
+                destination_name,
+                src_dir_fd=source_dir_fd,
+                dst_dir_fd=destination_dir_fd,
+            )
+            published = os.stat(
+                destination_name,
+                dir_fd=destination_dir_fd,
+                follow_symlinks=False,
+            )
+            published_object = (int(published.st_dev), int(published.st_ino))
+            if published_object != source_object:
+                # The source pathname was replaced after our last stat. Move
+                # that successor back through another exclusive empty-dir
+                # reservation; never overwrite a name concurrently recreated
+                # at the source. The originally selected directory was not
+                # moved by this syscall.
+                try:
+                    os.mkdir(source_name, mode=0o700, dir_fd=source_dir_fd)
+                except OSError as restore_reservation_error:
+                    raise OSError(
+                        f"directory source changed during reserved rename; replacement retained "
+                        f"at destination {destination_name}"
+                    ) from restore_reservation_error
+                source_reservation = os.stat(
+                    source_name,
+                    dir_fd=source_dir_fd,
+                    follow_symlinks=False,
+                )
+                source_reservation_object = (
+                    int(source_reservation.st_dev),
+                    int(source_reservation.st_ino),
+                )
+                try:
+                    current_destination = os.stat(
+                        destination_name,
+                        dir_fd=destination_dir_fd,
+                        follow_symlinks=False,
+                    )
+                    if (
+                        int(current_destination.st_dev),
+                        int(current_destination.st_ino),
+                    ) != published_object:
+                        raise OSError(
+                            "raced directory replacement changed again before restoration"
+                        )
+                    os.rename(
+                        destination_name,
+                        source_name,
+                        src_dir_fd=destination_dir_fd,
+                        dst_dir_fd=source_dir_fd,
+                    )
+                    restored = os.stat(
+                        source_name,
+                        dir_fd=source_dir_fd,
+                        follow_symlinks=False,
+                    )
+                    if (int(restored.st_dev), int(restored.st_ino)) != published_object:
+                        raise OSError("raced directory replacement restored with the wrong identity")
+                except BaseException as restore_error:
+                    try:
+                        current_source = os.stat(
+                            source_name,
+                            dir_fd=source_dir_fd,
+                            follow_symlinks=False,
+                        )
+                    except OSError:
+                        pass
+                    else:
+                        if (
+                            int(current_source.st_dev),
+                            int(current_source.st_ino),
+                        ) == source_reservation_object:
+                            with suppress(OSError):
+                                os.rmdir(source_name, dir_fd=source_dir_fd)
+                    raise OSError(
+                        f"directory source changed during reserved rename; replacement retained "
+                        f"at destination {destination_name}"
+                    ) from restore_error
+                raise OSError(
+                    "directory source changed during reserved rename; replacement was restored"
+                )
+        except BaseException as error:
+            try:
+                current_destination = os.stat(
+                    destination_name,
+                    dir_fd=destination_dir_fd,
+                    follow_symlinks=False,
+                )
+            except OSError:
+                pass
+            else:
+                if (
+                    int(current_destination.st_dev),
+                    int(current_destination.st_ino),
+                ) == reservation_object:
+                    with suppress(OSError):
+                        os.rmdir(destination_name, dir_fd=destination_dir_fd)
+            if isinstance(error, OSError) and error.errno in {
+                errno.EEXIST,
+                errno.EISDIR,
+                errno.ENOTDIR,
+                errno.ENOTEMPTY,
+            }:
+                raise FileExistsError(
+                    errno.EEXIST,
+                    os.strerror(errno.EEXIST),
+                    destination_name,
+                ) from error
+            raise
+
     def _rename_catalog_entry_noreplace(
         self,
         source: Path,
@@ -1162,6 +2280,14 @@ class Catalog:
 
         destination_owner = self if dest_catalog is None else dest_catalog
         if os.name == "nt" or not hasattr(os, "O_DIRECTORY"):
+            if expected_source_identity is not None:
+                source_stat = source.lstat()
+                if not self._entry_stat_matches_expected_identity(
+                    source,
+                    source_stat,
+                    expected_source_identity,
+                ):
+                    raise OSError(f"mutation source changed before rename: {source}")
             _rename_noreplace(source, destination)
             return
         with self._open_catalog_directory_fd(source.parent) as source_fd:
@@ -1176,20 +2302,45 @@ class Catalog:
                     dir_fd=source_fd,
                     follow_symlinks=False,
                 )
-                if expected_source_identity is not None and (
+                source_object_identity = (
                     int(source_stat.st_dev),
                     int(source_stat.st_ino),
-                ) != (
-                    int(expected_source_identity[0]),
-                    int(expected_source_identity[1]),
+                )
+                if (
+                    expected_source_identity is not None
+                    and not self._entry_stat_matches_expected_identity(
+                        source,
+                        source_stat,
+                        expected_source_identity,
+                    )
                 ):
                     raise OSError(f"mutation source changed before rename: {source}")
-                _rename_noreplace_at(
-                    source_fd,
-                    source.name,
-                    destination_fd,
-                    destination.name,
-                )
+                try:
+                    _rename_noreplace_at(
+                        source_fd,
+                        source.name,
+                        destination_fd,
+                        destination.name,
+                    )
+                except OSError as error:
+                    if not _noreplace_is_unavailable(error):
+                        raise
+                    if stat_module.S_ISDIR(source_stat.st_mode):
+                        self._reserve_rename_directory_noreplace_at(
+                            source_fd,
+                            source.name,
+                            destination_fd,
+                            destination.name,
+                            expected_source_identity=expected_source_identity,
+                        )
+                    else:
+                        self._link_isolate_regular_file_noreplace_at(
+                            source_fd,
+                            source.name,
+                            destination_fd,
+                            destination.name,
+                            expected_source_identity=expected_source_identity,
+                        )
                 try:
                     moved_stat = os.stat(
                         destination.name,
@@ -1211,12 +2362,32 @@ class Catalog:
                         )
                 except BaseException as validation_error:
                     try:
-                        _rename_noreplace_at(
-                            destination_fd,
-                            destination.name,
-                            source_fd,
-                            source.name,
-                        )
+                        try:
+                            _rename_noreplace_at(
+                                destination_fd,
+                                destination.name,
+                                source_fd,
+                                source.name,
+                            )
+                        except OSError as rollback_rename_error:
+                            if not _noreplace_is_unavailable(rollback_rename_error):
+                                raise
+                            if stat_module.S_ISDIR(source_stat.st_mode):
+                                self._reserve_rename_directory_noreplace_at(
+                                    destination_fd,
+                                    destination.name,
+                                    source_fd,
+                                    source.name,
+                                    expected_source_identity=source_object_identity,
+                                )
+                            else:
+                                self._link_isolate_regular_file_noreplace_at(
+                                    destination_fd,
+                                    destination.name,
+                                    source_fd,
+                                    source.name,
+                                    expected_source_identity=source_object_identity,
+                                )
                     except OSError as rollback_error:
                         raise OSError(
                             f"rename validation failed; entry was retained at {destination}"
@@ -2049,7 +3220,7 @@ class Catalog:
         both recursive subtree walks and an unbounded sort/materialization for
         directories containing very many files.
         """
-        directory = self.abs_path(dir_rel) if dir_rel else self.root
+        directory = self._mutation_path(dir_rel) if dir_rel else self.root
         digest_sum = 0
         digest_xor = 0
         count = 0
@@ -2058,7 +3229,7 @@ class Catalog:
             for entry in entries:
                 if cancel_check is not None:
                     cancel_check()
-                if entry.name == ".marnwick":
+                if _is_internal_catalog_directory_name(entry.name):
                     continue
                 value, _ = self._directory_entry_hash_value(entry)
                 digest_sum = (digest_sum + value) % modulus
@@ -2192,10 +3363,9 @@ class Catalog:
             command = [
                 find_bin,
                 ".",
-                "-type",
-                "d",
-                "-name",
-                ".marnwick",
+                "-regextype",
+                "posix-extended",
+                *_find_internal_artifact_match_args(),
                 "-prune",
                 "-o",
                 "-type",
@@ -2223,7 +3393,7 @@ class Catalog:
         return self.directory_find_hash("", cancel_check)
 
     def directory_find_hash(self, dir_rel: str, cancel_check: CancelCallback | None = None) -> str:
-        directory = self.abs_path(dir_rel) if dir_rel else self.root
+        directory = self._mutation_path(dir_rel) if dir_rel else self.root
         find_bin = shutil.which("find")
         md5_bin = shutil.which("md5sum")
         sort_bin = shutil.which("sort")
@@ -2246,6 +3416,17 @@ class Catalog:
                 display_path = "."
             else:
                 display_path = f"./{path.relative_to(directory).as_posix()}"
+            if path.is_dir():
+                # Directory mtimes/ctimes are an aggregate of child-name
+                # changes, including private mutation artifacts intentionally
+                # pruned above. Paths already encode every catalog-visible
+                # directory, so hashing those aggregate timestamps both
+                # duplicates information and lets ignored artifacts perturb
+                # freshness.
+                digest.update(b"D ")
+                digest.update(display_path.encode("utf-8", errors="surrogateescape"))
+                digest.update(b"\n")
+                continue
             try:
                 path_stat = path.stat()
                 modified = path_stat.st_mtime_ns
@@ -2362,16 +3543,20 @@ class Catalog:
 
     def mutation_path(self, rel_path: str, *, allow_missing_leaf: bool = False) -> Path:
         """Resolve the exact non-symlink catalog entry intended for mutation."""
+        if any(is_marnwick_internal_artifact_name(part) for part in Path(rel_path).parts):
+            raise ValueError("catalog recovery files are not image catalog entries")
         return self._mutation_path(rel_path, allow_missing_leaf=allow_missing_leaf)
 
     def _validate_catalog_entry_parts(self, parts: Sequence[str]) -> None:
-        if parts and parts[0] == ".marnwick":
+        if any(is_marnwick_internal_artifact_name(part) for part in parts):
             raise ValueError("catalog state files are not image catalog entries")
 
     def list_directories(self) -> list[str]:
         directories = [""]
         for dirpath, dirnames, _ in os.walk(self.root):
-            dirnames[:] = [name for name in dirnames if name != ".marnwick"]
+            dirnames[:] = [
+                name for name in dirnames if not _is_internal_catalog_directory_name(name)
+            ]
             current = Path(dirpath)
             if current == self.root:
                 continue
@@ -2751,7 +3936,7 @@ class Catalog:
         try:
             with os.scandir(directory) as entries:
                 for entry in entries:
-                    if entry.name == ".marnwick":
+                    if _is_internal_catalog_directory_name(entry.name):
                         continue
                     try:
                         if entry.is_dir(follow_symlinks=False):
@@ -2981,7 +4166,11 @@ class Catalog:
         force: bool = False,
         directory_prepared: bool = False,
     ) -> _DirectoryContentScanResult:
-        dir_path = self.abs_path(dir_rel) if dir_rel else self.root
+        try:
+            dir_path = self._mutation_path(dir_rel) if dir_rel else self.root
+        except FileNotFoundError:
+            self._delete_directory_records(dir_rel)
+            return _DirectoryContentScanResult(0, None, True)
         if not dir_path.is_dir():
             self._delete_directory_records(dir_rel)
             return _DirectoryContentScanResult(0, None, True)
@@ -3030,7 +4219,7 @@ class Catalog:
                     for entry in entries:
                         if cancel_check is not None:
                             cancel_check()
-                        if entry.name == ".marnwick":
+                        if _is_internal_catalog_directory_name(entry.name):
                             continue
                         scanned += 1
                         value, entry_stat = self._directory_entry_hash_value(entry)
@@ -3206,6 +4395,7 @@ class Catalog:
         *,
         force: bool = False,
         directories_prepared: bool = False,
+        completion_callback: ImageCompletionCallback | None = None,
     ) -> None:
         self._assert_writable()
         image_queue: queue.Queue[ImageReadJob | ImageSkipJob | object] = queue.Queue(maxsize=INDEX_QUEUE_DEPTH)
@@ -3227,6 +4417,12 @@ class Catalog:
             with processed_lock:
                 processed += 1
                 current_processed = processed
+            # This can be called by either pipeline consumer thread.  Keep the
+            # callback after publication/deletion and require callers to make
+            # their handoff thread-safe; it is an exact completion signal, not
+            # an input-prefix watermark.
+            if completion_callback is not None:
+                completion_callback(rel_path)
             if progress is not None:
                 progress(current_processed, total, rel_path)
 
@@ -3707,7 +4903,11 @@ class Catalog:
         force: bool = True,
     ) -> bool:
         self._assert_writable()
-        dir_path = self.abs_path(dir_rel) if dir_rel else self.root
+        try:
+            dir_path = self._mutation_path(dir_rel) if dir_rel else self.root
+        except FileNotFoundError:
+            self._delete_directory_records(dir_rel)
+            return False
         if not dir_path.is_dir():
             self._delete_directory_records(dir_rel)
             return False
@@ -3754,6 +4954,105 @@ class Catalog:
         if progress is not None:
             progress(1, 1, "Directory scan complete")
         return True
+
+    def refresh_subtree(
+        self,
+        dir_rel: str,
+        progress: ProgressCallback | None = None,
+        cancel_check: CancelCallback | None = None,
+    ) -> bool:
+        """Stream a targeted recursive reconciliation from one directory.
+
+        This deliberately avoids the catalog-wide before/after tree hashes.
+        It is used after a directory move, where descendant content rows were
+        invalidated synchronously and the UI should regain thumbnails as each
+        directory is reached rather than wait for a whole-catalog refresh.
+        """
+
+        self._assert_writable()
+        try:
+            start_path = self._mutation_path(dir_rel) if dir_rel else self.root
+        except FileNotFoundError:
+            self._delete_directory_records(dir_rel)
+            return False
+        if not start_path.is_dir():
+            self._delete_directory_records(dir_rel)
+            return False
+        pending_table = f"subtree_pending_{threading.get_ident()}_{time.time_ns()}"
+        with self._db_lock:
+            self._conn.execute(
+                f"CREATE TEMP TABLE {pending_table}(seq INTEGER PRIMARY KEY AUTOINCREMENT, dir_rel TEXT UNIQUE)"
+            )
+            self._conn.execute(
+                f"INSERT INTO {pending_table}(dir_rel) VALUES (?)",
+                (dir_rel,),
+            )
+        processed = 0
+        total = 1
+        changed = False
+        if progress is not None:
+            progress(0, total, dir_rel or ".")
+        try:
+            while True:
+                if cancel_check is not None:
+                    cancel_check()
+                with self._db_lock:
+                    pending = self._conn.execute(
+                        f"SELECT seq, dir_rel FROM {pending_table} ORDER BY seq DESC LIMIT 1"
+                    ).fetchone()
+                    if pending is not None:
+                        self._conn.execute(
+                            f"DELETE FROM {pending_table} WHERE seq = ?",
+                            (int(pending["seq"]),),
+                        )
+                if pending is None:
+                    break
+                current_rel = str(pending["dir_rel"])
+                if progress is not None:
+                    progress(processed, total, current_rel or ".")
+                scan_result = self._refresh_directory_contents(
+                    current_rel,
+                    None,
+                    cancel_check,
+                    prune_missing_children=True,
+                    force=False,
+                    directory_prepared=True,
+                )
+                if scan_result.entry_hash is not None:
+                    self.save_directory_entry_hash(
+                        current_rel,
+                        scan_result.entry_hash,
+                        remember_directory=False,
+                    )
+                with self._db_lock:
+                    self._conn.execute(
+                        f"""
+                        INSERT OR IGNORE INTO {pending_table}(dir_rel)
+                        SELECT dir_rel
+                        FROM directories
+                        WHERE parent_dir_rel = ? AND dir_rel != ?
+                        ORDER BY dir_rel COLLATE NOCASE DESC
+                        """,
+                        (current_rel, current_rel),
+                    )
+                    pending_count = int(
+                        self._conn.execute(
+                            f"SELECT COUNT(*) AS count FROM {pending_table}"
+                        ).fetchone()["count"]
+                    )
+                processed += 1
+                total = max(total, processed + pending_count)
+                changed = True
+                if progress is not None:
+                    progress(processed, total, current_rel or ".")
+        finally:
+            with self._db_lock:
+                self._conn.execute(f"DROP TABLE IF EXISTS {pending_table}")
+        self._invalidate_refresh_hashes()
+        self._save_directory_tree_cache_safely(cancel_check=cancel_check)
+        if progress is not None:
+            progress(processed, processed, "Subtree scan complete")
+        return changed
 
     def index_image(
         self,
@@ -5408,10 +6707,11 @@ class Catalog:
                             return
                         try:
                             if entry.is_dir(follow_symlinks=False):
-                                if entry.name != ".marnwick":
+                                if not _is_internal_catalog_directory_name(entry.name):
                                     child_directories.append(Path(entry.path))
                             elif entry.is_file(follow_symlinks=False):
-                                child_files.append(Path(entry.path))
+                                if not is_marnwick_internal_artifact_name(entry.name):
+                                    child_files.append(Path(entry.path))
                         except OSError:
                             continue
             except OSError:
@@ -5678,17 +6978,27 @@ class Catalog:
             )
             if expected_identity is not None and source_identity != expected_identity:
                 raise OSError(f"image changed after move was confirmed: {rel_path}")
-            self._refresh_stale_source_row_before_move(rel_path, source_path, source_stat)
             if self.root == dest_catalog.root and source_dir_rel == dest_dir_rel:
                 processed += 1
                 if progress_callback is not None:
                     progress_callback(processed, total, rel_path)
                 continue
+
+            def report_image_detail(detail: str) -> None:
+                if progress_callback is not None:
+                    progress_callback(
+                        processed,
+                        total,
+                        f"{rel_path}: {detail}",
+                    )
+
             dest_path, copy_proof = self._move_file_no_clobber(
                 source_path,
                 dest_dir / source_path.name,
                 expected_source_identity=source_identity,
                 dest_catalog=dest_catalog,
+                cancel_check=cancel_check,
+                detail_callback=report_image_detail,
             )
             dest_rel_path = dest_catalog.rel_path(dest_path)
             source_removed = copy_proof is None
@@ -5700,6 +7010,7 @@ class Catalog:
                         dest_rel_path,
                         dest_catalog,
                         remember_directory=False,
+                        invalidate_content=True,
                     )
                     if is_inside_trash_rel_path(dest_rel_path) and not is_trash_rel_path(rel_path):
                         self._remember_trash_item(dest_rel_path, rel_path, "image")
@@ -5713,6 +7024,8 @@ class Catalog:
                             dest_path,
                             copy_proof,
                             wipe=wipe_on_delete,
+                            cancel_check=cancel_check,
+                            detail_callback=report_image_detail,
                         )
                         source_removed = True
                 else:
@@ -5723,12 +7036,15 @@ class Catalog:
                             dest_rel_path,
                             dest_catalog,
                             remember_directory=False,
+                            invalidate_content=True,
                         )
                         self._cleanup_copied_file_source(
                             source_path,
                             dest_path,
                             copy_proof,
                             wipe=wipe_on_delete,
+                            cancel_check=cancel_check,
+                            detail_callback=report_image_detail,
                         )
                         source_removed = True
                         self._delete_db_records([rel_path])
@@ -5738,8 +7054,9 @@ class Catalog:
                             dest_rel_path,
                             dest_catalog,
                             remember_directory=False,
+                            invalidate_content=True,
                         )
-            except Exception:
+            except Exception as error:
                 if copy_proof is not None and not source_removed:
                     # A completed destination copy is the recovery copy. Keep it
                     # when source cleanup fails; duplicate data is safer than loss.
@@ -5755,20 +7072,33 @@ class Catalog:
                     self._forget_trash_item(dest_rel_path)
                 elif copy_proof is None:
                     # A rename is reversible. Put the file and records back when
-                    # subsequent bookkeeping fails.
-                    with suppress(Exception):
+                    # subsequent bookkeeping fails. If a successor occupies the
+                    # source name first, keep ownership at the still-visible
+                    # destination instead of rolling the database back alone.
+                    filesystem_rolled_back = False
+                    try:
+                        rollback_identity = dest_catalog._catalog_file_identity(dest_path)
                         dest_catalog._rename_catalog_entry_noreplace(
                             dest_path,
                             source_path,
                             dest_catalog=self,
-                            expected_source_identity=source_identity,
+                            expected_source_identity=rollback_identity,
                         )
-                    if self.root == dest_catalog.root:
-                        with suppress(Exception):
-                            self._move_db_record_in_place(dest_rel_path, rel_path, self)
+                    except Exception as rollback_error:
+                        error.add_note(
+                            "filesystem rollback lost a race; the moved image remains at "
+                            f"{dest_rel_path}: {rollback_error}"
+                        )
                     else:
-                        with suppress(Exception):
-                            dest_catalog._delete_db_records([dest_rel_path])
+                        filesystem_rolled_back = True
+                    self._reconcile_image_records_after_failed_rename(
+                        rel_path,
+                        dest_rel_path,
+                        dest_catalog,
+                        source_tags,
+                        original_at_source=filesystem_rolled_back,
+                        error=error,
+                    )
                 raise
             impacted_dirs.setdefault(self, set()).add(source_dir_rel)
             impacted_dirs.setdefault(dest_catalog, set()).add(self._parent_dir_rel(dest_rel_path))
@@ -5781,32 +7111,6 @@ class Catalog:
                 catalog.update_hashes_after_targeted_move(dir_rels)
                 catalog._save_directory_tree_cache_safely()
         return results
-
-    def _refresh_stale_source_row_before_move(
-        self,
-        rel_path: str,
-        path: Path,
-        source_stat: os.stat_result,
-    ) -> None:
-        row = self._conn.execute(
-            """
-            SELECT file_size_bytes, modified_at_ns, ctime_ns
-            FROM images
-            WHERE rel_path = ?
-            """,
-            (rel_path,),
-        ).fetchone()
-        if row is None:
-            return
-        changed_ns = self._path_change_time_ns(path, source_stat)
-        if (
-            int(row["file_size_bytes"]) == source_stat.st_size
-            and int(row["modified_at_ns"]) == source_stat.st_mtime_ns
-            and int(row["ctime_ns"]) == changed_ns
-        ):
-            return
-        if self.index_image(rel_path, force=True) is None:
-            raise OSError(f"image changed and could not be re-indexed before move: {rel_path}")
 
     def restore_image_from_trash(
         self,
@@ -5934,11 +7238,21 @@ class Catalog:
                 if progress_callback is not None:
                     progress_callback(processed, total, dir_rel)
                 continue
+            def report_directory_detail(detail: str) -> None:
+                if progress_callback is not None:
+                    progress_callback(
+                        processed,
+                        total,
+                        f"{dir_rel}: {detail}",
+                    )
+
             dest_path, copy_proof = self._move_directory_no_clobber(
                 source_path,
                 dest_parent / source_path.name,
                 expected_source_identity=current_identity,
                 dest_catalog=dest_catalog,
+                cancel_check=cancel_check,
+                detail_callback=report_directory_detail,
             )
             dest_rel_path = dest_catalog.rel_path(dest_path)
             source_removed = copy_proof is None
@@ -5948,6 +7262,7 @@ class Catalog:
                         dir_rel,
                         dest_rel_path,
                         cancel_check=cancel_check,
+                        invalidate_content=True,
                     )
                     if is_inside_trash_rel_path(dest_rel_path) and not is_trash_rel_path(dir_rel):
                         self._remember_trash_item(dest_rel_path, dir_rel, "directory")
@@ -5961,6 +7276,8 @@ class Catalog:
                             dest_path,
                             copy_proof,
                             wipe=wipe_on_delete,
+                            cancel_check=cancel_check,
+                            detail_callback=report_directory_detail,
                         )
                         source_removed = True
                 else:
@@ -5971,12 +7288,15 @@ class Catalog:
                             dest_rel_path,
                             dest_catalog,
                             cancel_check=cancel_check,
+                            invalidate_content=True,
                         )
                         self._cleanup_copied_directory_source(
                             source_path,
                             dest_path,
                             copy_proof,
                             wipe=wipe_on_delete,
+                            cancel_check=cancel_check,
+                            detail_callback=report_directory_detail,
                         )
                         source_removed = True
                         self._delete_directory_records(dir_rel)
@@ -5986,8 +7306,9 @@ class Catalog:
                             dest_rel_path,
                             dest_catalog,
                             cancel_check=cancel_check,
+                            invalidate_content=True,
                         )
-            except Exception:
+            except Exception as error:
                 if copy_proof is not None and not source_removed:
                     # Preserve the complete copy. If cleanup was partial, refresh
                     # the remaining source subtree so both on-disk copies are
@@ -5995,24 +7316,44 @@ class Catalog:
                     if self.root == dest_catalog.root and source_path.exists():
                         with suppress(Exception):
                             self.refresh_directory(dir_rel, force=True)
+                    if dest_path.exists():
+                        with suppress(Exception):
+                            dest_catalog.refresh_subtree(dest_rel_path)
                 elif copy_proof is None:
-                    with suppress(Exception):
+                    filesystem_rolled_back = False
+                    try:
+                        rollback_identity = dest_catalog._directory_identity_for_path(
+                            dest_path
+                        )
                         dest_catalog._rename_catalog_entry_noreplace(
                             dest_path,
                             source_path,
                             dest_catalog=self,
-                            expected_source_identity=current_identity,
+                            expected_source_identity=rollback_identity,
                         )
-                    if self.root == dest_catalog.root:
-                        with suppress(Exception):
-                            self._move_directory_records_in_place(dest_rel_path, dir_rel)
+                    except Exception as rollback_error:
+                        error.add_note(
+                            "filesystem rollback lost a race; the moved directory remains at "
+                            f"{dest_rel_path}: {rollback_error}"
+                        )
                     else:
-                        with suppress(Exception):
-                            dest_catalog._delete_directory_records(dest_rel_path)
+                        filesystem_rolled_back = True
+                    self._reconcile_directory_records_after_failed_rename(
+                        dir_rel,
+                        dest_rel_path,
+                        dest_catalog,
+                        original_at_source=filesystem_rolled_back,
+                        error=error,
+                    )
                 raise
             source_affected = {source_parent_rel}
-            dest_affected = set(dest_catalog._directory_and_descendants(dest_rel_path))
-            dest_affected.add(dest_catalog._parent_dir_rel(dest_rel_path))
+            # Descendant rows were invalidated in one range UPDATE and are
+            # rebuilt by the targeted async subtree task.  Only the moved root
+            # and its ancestors need synchronous aggregate invalidation here.
+            dest_affected = {
+                dest_rel_path,
+                dest_catalog._parent_dir_rel(dest_rel_path),
+            }
             impacted_dirs.setdefault(self, set()).update(source_affected)
             impacted_dirs.setdefault(dest_catalog, set()).update(dest_affected)
             results.append(MoveResult(dir_rel, dest_rel_path, dest_catalog.root))
@@ -6148,6 +7489,18 @@ class Catalog:
             if row is not None and is_exact_image_hash(row["image_hash"])
             else None
         )
+        if expected_hash is None:
+            # An unindexed image has no durable catalog digest to compare after
+            # atomic isolation.  Establish one on the mutation worker before
+            # quarantine so a same-inode rewrite in the final rename window
+            # cannot turn an explicitly confirmed delete into deletion of
+            # different bytes.
+            proved_identity, expected_hash = self._stable_regular_file_hash(
+                path,
+                cancel_check,
+            )
+            if proved_identity != current_identity:
+                raise OSError(f"image changed while deletion was starting: {rel_path}")
         quarantine = self._quarantine_catalog_entry(
             path,
             ".marnwick-delete",
@@ -6157,12 +7510,11 @@ class Catalog:
             quarantined_identity = self._catalog_file_identity(quarantine)
             if quarantined_identity[:5] != current_identity[:5]:
                 raise OSError(f"image changed while deletion was starting: {rel_path}")
-            if expected_hash is not None:
-                _, actual_hash = self._stable_regular_file_hash(quarantine, cancel_check)
-                if actual_hash != expected_hash:
-                    raise OSError(
-                        f"image changed since it was indexed; refresh before deleting: {rel_path}"
-                    )
+            _, actual_hash = self._stable_regular_file_hash(quarantine, cancel_check)
+            if actual_hash != expected_hash:
+                raise OSError(
+                    f"image changed since it was indexed; refresh before deleting: {rel_path}"
+                )
             self._delete_file(quarantine, wipe=wipe)
         except BaseException:
             if quarantine.exists() or quarantine.is_symlink():
@@ -6178,6 +7530,8 @@ class Catalog:
                         f"delete failed and the original was retained at {quarantine}"
                     ) from restore_error
             raise
+        finally:
+            self._cleanup_private_quarantine_parent(quarantine)
 
     def _ensure_trash_directory(self) -> None:
         trash_path = self.root / TRASH_DIR_NAME
@@ -6272,7 +7626,7 @@ class Catalog:
         source_identity = self._catalog_file_identity(source_path, source_stat)
         if expected_identity is not None and source_identity != expected_identity:
             raise OSError(f"image changed after move was confirmed: {source_rel_path}")
-        self._refresh_stale_source_row_before_move(source_rel_path, source_path, source_stat)
+        source_tags = self.get_image_tags(source_rel_path)
         dest_path = self._mutation_path(dest_rel_path, allow_missing_leaf=True)
         self._mkdir_catalog_path(dest_path.parent)
         dest_path, copy_proof = self._move_file_no_clobber(
@@ -6288,6 +7642,7 @@ class Catalog:
                 actual_dest_rel_path,
                 self,
                 remember_directory=False,
+                invalidate_content=True,
             )
             if is_inside_trash_rel_path(actual_dest_rel_path) and not is_trash_rel_path(source_rel_path):
                 self._remember_trash_item(actual_dest_rel_path, source_rel_path, "image")
@@ -6302,7 +7657,7 @@ class Catalog:
                     copy_proof,
                     wipe=False,
                 )
-        except Exception:
+        except Exception as error:
             if copy_proof is not None:
                 if source_path.exists():
                     with suppress(Exception):
@@ -6314,14 +7669,29 @@ class Catalog:
                         )
                         self.index_image(actual_dest_rel_path, force=True)
             else:
-                with suppress(Exception):
+                filesystem_rolled_back = False
+                try:
+                    rollback_identity = self._catalog_file_identity(dest_path)
                     self._rename_catalog_entry_noreplace(
                         dest_path,
                         source_path,
-                        expected_source_identity=source_identity,
+                        expected_source_identity=rollback_identity,
                     )
-                with suppress(Exception):
-                    self._move_db_record_in_place(actual_dest_rel_path, source_rel_path, self)
+                except Exception as rollback_error:
+                    error.add_note(
+                        "filesystem rollback lost a race; the moved image remains at "
+                        f"{actual_dest_rel_path}: {rollback_error}"
+                    )
+                else:
+                    filesystem_rolled_back = True
+                self._reconcile_image_records_after_failed_rename(
+                    source_rel_path,
+                    actual_dest_rel_path,
+                    self,
+                    source_tags,
+                    original_at_source=filesystem_rolled_back,
+                    error=error,
+                )
             raise
         return MoveResult(source_rel_path, actual_dest_rel_path, self.root)
 
@@ -6359,7 +7729,11 @@ class Catalog:
         )
         actual_dest_dir_rel = self.rel_path(dest_path)
         try:
-            self._move_directory_records_in_place(source_dir_rel, actual_dest_dir_rel)
+            self._move_directory_records_in_place(
+                source_dir_rel,
+                actual_dest_dir_rel,
+                invalidate_content=True,
+            )
             if is_inside_trash_rel_path(actual_dest_dir_rel) and not is_trash_rel_path(source_dir_rel):
                 self._remember_trash_item(actual_dest_dir_rel, source_dir_rel, "directory")
             elif is_inside_trash_rel_path(source_dir_rel) and not is_inside_trash_rel_path(actual_dest_dir_rel):
@@ -6373,20 +7747,34 @@ class Catalog:
                     copy_proof,
                     wipe=False,
                 )
-        except Exception:
+        except Exception as error:
             if copy_proof is not None:
                 if source_path.exists():
                     with suppress(Exception):
                         self.refresh_directory(source_dir_rel, force=True)
             else:
-                with suppress(Exception):
+                filesystem_rolled_back = False
+                try:
+                    rollback_identity = self._directory_identity_for_path(dest_path)
                     self._rename_catalog_entry_noreplace(
                         dest_path,
                         source_path,
-                        expected_source_identity=current_identity,
+                        expected_source_identity=rollback_identity,
                     )
-                with suppress(Exception):
-                    self._move_directory_records_in_place(actual_dest_dir_rel, source_dir_rel)
+                except Exception as rollback_error:
+                    error.add_note(
+                        "filesystem rollback lost a race; the moved directory remains at "
+                        f"{actual_dest_dir_rel}: {rollback_error}"
+                    )
+                else:
+                    filesystem_rolled_back = True
+                self._reconcile_directory_records_after_failed_rename(
+                    source_dir_rel,
+                    actual_dest_dir_rel,
+                    self,
+                    original_at_source=filesystem_rolled_back,
+                    error=error,
+                )
             raise
         return MoveResult(source_dir_rel, actual_dest_dir_rel, self.root)
 
@@ -6405,7 +7793,11 @@ class Catalog:
         clean_name = name.strip()
         if not clean_name:
             raise ValueError("directory name cannot be empty")
-        if clean_name in {".", "..", ".marnwick", TRASH_DIR_NAME} or Path(clean_name).name != clean_name:
+        if (
+            clean_name in {".", "..", TRASH_DIR_NAME}
+            or is_marnwick_internal_artifact_name(clean_name)
+            or Path(clean_name).name != clean_name
+        ):
             raise ValueError("directory name must be a single folder name")
         parent = self._mutation_path(parent_dir_rel) if parent_dir_rel else self.root
         if not parent.is_dir():
@@ -6540,16 +7932,19 @@ class Catalog:
         except BaseException:
             if quarantine.exists() or quarantine.is_symlink():
                 try:
+                    rollback_identity = self._directory_identity_for_path(quarantine)
                     self._rename_catalog_entry_noreplace(
                         quarantine,
                         directory,
-                        expected_source_identity=current_identity,
+                        expected_source_identity=rollback_identity,
                     )
                 except OSError as restore_error:
                     raise OSError(
                         f"directory delete failed; remaining files were retained at {quarantine}"
                     ) from restore_error
             raise
+        finally:
+            self._cleanup_private_quarantine_parent(quarantine)
 
         self._delete_directory_records(dir_rel)
         parent_rel = Path(dir_rel).parent.as_posix()
@@ -6631,12 +8026,13 @@ class Catalog:
 
     def _delete_file(self, path: Path, *, wipe: bool) -> None:
         identity = self._catalog_file_identity(path)
+        display_path = path.relative_to(self.root).as_posix()
         if not wipe:
             self._unlink_catalog_file_entry(path, identity)
             return
         if identity[2] > 1:
             self.append_log(
-                f"Not wiping hard-linked file; unlinking name only: {self.rel_path(path)}",
+                f"Not wiping hard-linked file; unlinking name only: {display_path}",
                 level="WARNING",
             )
             self._unlink_catalog_file_entry(path, identity)
@@ -6644,7 +8040,7 @@ class Catalog:
         shred_bin = shutil.which("shred")
         if shred_bin is None:
             self.append_log(
-                f"shred is unavailable; deleting without wipe: {self.rel_path(path)}",
+                f"shred is unavailable; deleting without wipe: {display_path}",
                 level="WARNING",
             )
             self._unlink_catalog_file_entry(path, identity)
@@ -6728,7 +8124,13 @@ class Catalog:
         for root, _, filenames in os.walk(directory):
             for filename in filenames:
                 path = Path(root) / filename
-                if path.exists() and path.is_file():
+                try:
+                    path_stat = path.lstat()
+                except OSError:
+                    continue
+                # Never follow a link while deciding what to overwrite. The
+                # descriptor-safe tree removal below will remove the link name.
+                if stat_module.S_ISREG(path_stat.st_mode):
                     self._delete_file(path, wipe=True)
 
     def directory_summary(self, dir_rel: str) -> DirectorySummary:
@@ -6746,12 +8148,14 @@ class Catalog:
                     for entry in entries:
                         try:
                             if entry.is_dir(follow_symlinks=False):
-                                if entry.name != ".marnwick":
+                                if not _is_internal_catalog_directory_name(entry.name):
                                     pending_dirs.append(Path(entry.path))
                                 continue
                             if not entry.is_file(follow_symlinks=False):
                                 continue
                         except OSError:
+                            continue
+                        if is_marnwick_internal_artifact_name(entry.name):
                             continue
                         if is_image_name(entry.name):
                             image_count += 1
@@ -7256,7 +8660,18 @@ class Catalog:
         find_bin: str,
     ) -> int:
         process = subprocess.Popen(
-            [find_bin, ".", "-type", "d", "-name", ".marnwick", "-prune", "-o", "-type", "d", "-print0"],
+            [
+                find_bin,
+                ".",
+                "-regextype",
+                "posix-extended",
+                *_find_internal_artifact_match_args(),
+                "-prune",
+                "-o",
+                "-type",
+                "d",
+                "-print0",
+            ],
             cwd=self.root,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
@@ -7365,7 +8780,9 @@ class Catalog:
         for dirpath, dirnames, _ in os.walk(self.root):
             if cancel_check is not None:
                 cancel_check()
-            dirnames[:] = [name for name in dirnames if name != ".marnwick"]
+            dirnames[:] = [
+                name for name in dirnames if not _is_internal_catalog_directory_name(name)
+            ]
             current = Path(dirpath)
             dir_rel = "" if current == self.root else self.rel_path(current)
             if not self._sqlite_text_safe(dir_rel):
@@ -7388,7 +8805,7 @@ class Catalog:
             return ""
         prefix = "./"
         rel = display_path[len(prefix) :] if display_path.startswith(prefix) else display_path
-        if ".marnwick" in Path(rel).parts:
+        if any(_is_internal_catalog_directory_name(part) for part in Path(rel).parts):
             return None
         return Path(rel).as_posix()
 
@@ -7406,11 +8823,15 @@ class Catalog:
             [
                 find_bin,
                 ".",
+                "-regextype",
+                "posix-extended",
+                *_find_internal_artifact_match_args(),
+                "-prune",
+                "-o",
                 "-type",
                 "d",
-                "-name",
-                ".marnwick",
-                "-prune",
+                "-printf",
+                "D %p\\0",
                 "-o",
                 "-printf",
                 "%T@ %s %C@ %p\\0",
@@ -7481,10 +8902,21 @@ class Catalog:
             if cancel_check is not None:
                 cancel_check()
             dirnames[:] = sorted(
-                (name for name in dirnames if name != ".marnwick"),
+                (
+                    name
+                    for name in dirnames
+                    if not _is_internal_catalog_directory_name(name)
+                ),
                 key=str.casefold,
             )
-            filenames.sort(key=str.casefold)
+            filenames[:] = sorted(
+                (
+                    name
+                    for name in filenames
+                    if not is_marnwick_internal_artifact_name(name)
+                ),
+                key=str.casefold,
+            )
             current = Path(dirpath)
             for dirname in dirnames:
                 yield current / dirname
@@ -7526,6 +8958,8 @@ class Catalog:
                         break
                     if limit is not None and len(image_entries) >= limit:
                         break
+                    if is_marnwick_internal_artifact_name(entry.name):
+                        continue
                     if not is_image_name(entry.name):
                         continue
                     try:
@@ -7571,6 +9005,7 @@ class Catalog:
             thumb_height=0,
             thumb_blob=None,
             image_hash=None,
+            ctime_ns=self._path_change_time_ns(path, stat),
         )
 
     def _record_sort_key(self, sort_order: SortOrder) -> Callable[[ImageRecord], tuple[object, ...]]:
@@ -8011,7 +9446,7 @@ class Catalog:
         )
         return (
             "id, rel_path, dir_rel, filename, file_size_bytes AS size_bytes, "
-            "modified_at_ns AS mtime_ns, width, height, aspect_ratio, thumb_width, "
+            "modified_at_ns AS mtime_ns, ctime_ns, width, height, aspect_ratio, thumb_width, "
             f"thumb_height, image_hash, thumb_rel_path, thumb_cache_key, thumb_size_px, {thumb_column}"
         )
 
@@ -8031,6 +9466,7 @@ class Catalog:
             thumb_height=int(row["thumb_height"]),
             thumb_blob=self._thumbnail_blob_for_row(row, str(row["rel_path"])) if include_blob else None,
             image_hash=str(row["image_hash"]) if row["image_hash"] is not None else None,
+            ctime_ns=int(row["ctime_ns"]),
         )
 
     def _delete_db_records(self, rel_paths: Iterable[str]) -> None:
@@ -8176,6 +9612,39 @@ class Catalog:
                 return candidate
             counter += 1
 
+    def _discard_rejected_published_file(self, destination: Path) -> None:
+        """Remove exactly a copy published before its source proof was rejected."""
+
+        identity = self._catalog_file_identity(destination)
+        quarantine = self._quarantine_catalog_entry(
+            destination,
+            ".marnwick-rejected-move",
+            expected_source_identity=identity,
+        )
+        try:
+            quarantined_identity = self._catalog_file_identity(quarantine)
+            self._unlink_catalog_file_entry(quarantine, quarantined_identity)
+        finally:
+            self._cleanup_private_quarantine_parent(quarantine)
+
+    def _discard_rejected_published_directory(self, destination: Path) -> None:
+        """Remove exactly a directory copy whose source proof was rejected."""
+
+        identity = self._directory_identity_for_path(destination)
+        quarantine = self._quarantine_catalog_entry(
+            destination,
+            ".marnwick-rejected-move-dir",
+            expected_source_identity=identity,
+        )
+        try:
+            quarantined_identity = self._directory_identity_for_path(quarantine)
+            self._remove_catalog_directory_tree(
+                quarantine,
+                expected_identity=quarantined_identity,
+            )
+        finally:
+            self._cleanup_private_quarantine_parent(quarantine)
+
     def _move_file_no_clobber(
         self,
         source: Path,
@@ -8183,6 +9652,8 @@ class Catalog:
         *,
         expected_source_identity: CatalogFileIdentity | None = None,
         dest_catalog: "Catalog | None" = None,
+        cancel_check: CancelCallback | None = None,
+        detail_callback: MutationDetailCallback | None = None,
     ) -> tuple[Path, _FileCopyProof | None]:
         destination_owner = self if dest_catalog is None else dest_catalog
         while True:
@@ -8202,12 +9673,16 @@ class Catalog:
                 )
                 moved_identity = self._catalog_file_identity(destination)
                 if moved_identity[:5] != source_identity[:5]:
+                    if moved_identity[:2] != source_identity[:2]:
+                        raise OSError(
+                            f"move source changed; replacement retained at {destination}"
+                        )
                     try:
                         destination_owner._rename_catalog_entry_noreplace(
                             destination,
                             source,
                             dest_catalog=self,
-                            expected_source_identity=source_identity,
+                            expected_source_identity=moved_identity,
                         )
                     except OSError as restore_error:
                         raise OSError(
@@ -8218,14 +9693,21 @@ class Catalog:
             except OSError as error:
                 if error.errno == errno.EEXIST:
                     continue
-                if error.errno != errno.EXDEV:
+                if error.errno != errno.EXDEV and not _noreplace_is_unavailable(error):
                     raise
             try:
-                proof = self._copy_file_to_destination(source, destination)
+                proof = self._copy_file_to_destination(
+                    source,
+                    destination,
+                    expected_source_identity=expected_source_identity,
+                    cancel_check=cancel_check,
+                    detail_callback=detail_callback,
+                )
                 if (
                     expected_source_identity is not None
                     and proof.source_identity != expected_source_identity
                 ):
+                    destination_owner._discard_rejected_published_file(destination)
                     raise OSError(
                         f"move source changed before cross-filesystem copy: {source}"
                     )
@@ -8241,6 +9723,8 @@ class Catalog:
         *,
         expected_source_identity: DirectoryIdentity | None = None,
         dest_catalog: "Catalog | None" = None,
+        cancel_check: CancelCallback | None = None,
+        detail_callback: MutationDetailCallback | None = None,
     ) -> tuple[Path, _DirectoryCopyProof | None]:
         destination_owner = self if dest_catalog is None else dest_catalog
         while True:
@@ -8275,7 +9759,9 @@ class Catalog:
                             destination,
                             source,
                             dest_catalog=self,
-                            expected_source_identity=current_identity,
+                            expected_source_identity=destination_owner._directory_identity_for_path(
+                                destination
+                            ),
                         )
                     except OSError as restore_error:
                         raise OSError(
@@ -8286,18 +9772,26 @@ class Catalog:
             except OSError as error:
                 if error.errno == errno.EEXIST:
                     continue
-                if error.errno != errno.EXDEV:
+                if error.errno != errno.EXDEV and not _noreplace_is_unavailable(error):
                     raise
             try:
-                proof = self._copy_directory_to_destination(source, destination)
+                proof = self._copy_directory_to_destination(
+                    source,
+                    destination,
+                    expected_source_identity=expected_source_identity,
+                    cancel_check=cancel_check,
+                    detail_callback=detail_callback,
+                )
                 if (
                     expected_source_identity is not None
                     and (
                         proof.source_root_identity[0],
                         proof.source_root_identity[1],
                         proof.source_root_identity[4],
-                    ) != expected_source_identity[:3]
+                        proof.source_root_identity[5],
+                    ) != expected_source_identity[:4]
                 ):
+                    destination_owner._discard_rejected_published_directory(destination)
                     raise OSError(
                         f"directory move source changed before cross-filesystem copy: {source}"
                     )
@@ -8312,65 +9806,271 @@ class Catalog:
         return Path(temp_name)
 
     def _temporary_directory_destination(self, destination: Path) -> Path:
-        return Path(tempfile.mkdtemp(prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent))
+        return Path(
+            tempfile.mkdtemp(
+                prefix=f"{PRIVATE_QUARANTINE_DIR_PREFIX}{destination.name}.",
+                suffix=".tmp",
+                dir=destination.parent,
+            )
+        )
 
-    def _copy_file_to_destination(self, source: Path, destination: Path) -> _FileCopyProof:
-        source_identity, source_hash = self._stable_regular_file_hash(source)
+    def _copy_file_to_destination(
+        self,
+        source: Path,
+        destination: Path,
+        *,
+        expected_source_identity: CatalogFileIdentity | None = None,
+        cancel_check: CancelCallback | None = None,
+        detail_callback: MutationDetailCallback | None = None,
+    ) -> _FileCopyProof:
+        source_stat = source.lstat()
+        source_identity = self._catalog_file_identity(source, source_stat)
+        if (
+            expected_source_identity is not None
+            and source_identity != expected_source_identity
+        ):
+            raise OSError(f"move source changed before cross-filesystem copy: {source}")
         temp = self._temporary_destination(destination)
+        temp_stat = temp.lstat()
+        temp_identity = (int(temp_stat.st_dev), int(temp_stat.st_ino))
         try:
-            shutil.copy2(source, temp)
-            _, copied_hash = self._stable_regular_file_hash(temp)
-            final_source_identity, final_source_hash = self._stable_regular_file_hash(source)
+            source_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+            temp_flags = os.O_WRONLY | os.O_TRUNC | getattr(os, "O_CLOEXEC", 0)
+            if hasattr(os, "O_NOFOLLOW"):
+                source_flags |= os.O_NOFOLLOW
+                temp_flags |= os.O_NOFOLLOW
+            source_fd = os.open(source, source_flags)
+            temp_fd = -1
+            try:
+                opened_source = os.fstat(source_fd)
+                if self._index_stat_token(opened_source) != self._index_stat_token(source_stat):
+                    raise OSError(f"source changed before cross-filesystem copy: {source}")
+                temp_fd = os.open(temp, temp_flags)
+                opened_temp = os.fstat(temp_fd)
+                if (int(opened_temp.st_dev), int(opened_temp.st_ino)) != temp_identity:
+                    raise OSError(f"private file temporary changed before copy: {temp}")
+                digest = hashlib.sha256()
+                copied_bytes = 0
+                copy_progress = _report_mutation_byte_progress(
+                    detail_callback,
+                    "Copying",
+                    0,
+                    int(opened_source.st_size),
+                    -1,
+                )
+                while True:
+                    if cancel_check is not None:
+                        cancel_check()
+                    chunk = os.read(source_fd, HASH_CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+                    view = memoryview(chunk)
+                    while view:
+                        written = os.write(temp_fd, view)
+                        if written <= 0:
+                            raise OSError("cross-filesystem copy made no write progress")
+                        view = view[written:]
+                    copied_bytes += len(chunk)
+                    copy_progress = _report_mutation_byte_progress(
+                        detail_callback,
+                        "Copying",
+                        copied_bytes,
+                        int(opened_source.st_size),
+                        copy_progress,
+                    )
+                source_after = os.fstat(source_fd)
+                temp_after = os.fstat(temp_fd)
+                if (
+                    self._index_stat_token(source_after)
+                    != self._index_stat_token(opened_source)
+                    or (int(temp_after.st_dev), int(temp_after.st_ino)) != temp_identity
+                    or int(temp_after.st_size) != int(opened_source.st_size)
+                ):
+                    raise OSError(f"source changed while it was being copied: {source}")
+            finally:
+                if temp_fd >= 0:
+                    os.close(temp_fd)
+                os.close(source_fd)
+
+            current_source_stat = source.lstat()
+            if self._catalog_file_identity(source, current_source_stat) != source_identity:
+                raise OSError(f"source changed while it was being copied: {source}")
+            # Preserve the same metadata copy2 supplied, but keep byte transfer
+            # and hashing in the single descriptor pass above.
+            shutil.copystat(source, temp, follow_symlinks=False)
+            if self._catalog_file_identity(source) != source_identity:
+                raise OSError(f"source changed while its metadata was being copied: {source}")
+            source_hash = digest.hexdigest()
+            copied_identity, copied_hash = self._stable_regular_file_hash(
+                temp,
+                cancel_check,
+                detail_callback=detail_callback,
+                phase="Verifying staged copy",
+            )
             if (
-                final_source_identity != source_identity
-                or final_source_hash != source_hash
+                copied_identity[:2] != temp_identity
                 or copied_hash != source_hash
             ):
-                raise OSError(f"source changed while it was being copied: {source}")
-            self._fsync_regular_file(temp)
-            _rename_noreplace(temp, destination)
-            self._fsync_directory(destination.parent)
-            _, destination_hash = self._stable_regular_file_hash(destination)
-            if destination_hash != source_hash:
                 raise OSError(f"destination verification failed after copy: {destination}")
-            self._fsync_regular_file(destination)
+            if detail_callback is not None:
+                detail_callback("Flushing staged copy")
+            self._fsync_regular_file(temp)
+            if cancel_check is not None:
+                cancel_check()
+            if detail_callback is not None:
+                detail_callback("Publishing verified copy")
+            published_object_identity = _publish_private_file_noreplace(
+                temp,
+                destination,
+                expected_source_identity=temp_identity,
+                cancel_check=cancel_check,
+                detail_callback=detail_callback,
+            )
             self._fsync_directory(destination.parent)
-            return _FileCopyProof(source_identity, source_hash)
         finally:
-            temp.unlink(missing_ok=True)
+            try:
+                recovery = _cleanup_private_temp_if_identity(
+                    temp,
+                    temp_identity,
+                    directory=False,
+                )
+            except OSError as cleanup_error:
+                self.append_log(
+                    f"Private file temporary cleanup failed for {temp}: {cleanup_error}",
+                    level="ERROR",
+                )
+            else:
+                if recovery is not None:
+                    self.append_log(
+                        f"Private file temporary path changed; successor retained at {recovery}",
+                        level="ERROR",
+                    )
+        # Never adopt an arbitrary pathname successor as proof. Publication
+        # returns the identity it actually installed; independently hash an FD
+        # opened through the public name and require both that identity and the
+        # staged content digest before allowing later source cleanup.
+        destination_fd, destination_identity, destination_hash = (
+            self._open_pinned_regular_file_hash(
+                destination,
+                cancel_check,
+                detail_callback=detail_callback,
+                phase="Verifying published copy",
+            )
+        )
+        os.close(destination_fd)
+        if (
+            destination_identity[:2] != published_object_identity
+            or destination_hash != source_hash
+        ):
+            raise OSError(
+                f"destination changed after staged publication: {destination}"
+            )
+        if detail_callback is not None:
+            detail_callback("Flushing published copy")
+        self._fsync_regular_file(destination)
+        self._fsync_directory(destination.parent)
+        return _FileCopyProof(source_identity, source_hash, destination_identity)
 
     def _copy_directory_to_destination(
         self,
         source: Path,
         destination: Path,
+        *,
+        expected_source_identity: DirectoryIdentity | None = None,
+        cancel_check: CancelCallback | None = None,
+        detail_callback: MutationDetailCallback | None = None,
     ) -> _DirectoryCopyProof:
-        source_proof = self._directory_copy_proof(source)
+        source_proof = self._directory_copy_proof(
+            source,
+            cancel_check,
+            detail_callback,
+            phase="Verifying source",
+        )
+        if expected_source_identity is not None and (
+            source_proof.source_root_identity[0],
+            source_proof.source_root_identity[1],
+            source_proof.source_root_identity[4],
+            source_proof.source_root_identity[5],
+        ) != expected_source_identity:
+            raise OSError(
+                f"directory move source changed before cross-filesystem copy: {source}"
+            )
         temp = self._temporary_directory_destination(destination)
+        temp_stat = temp.lstat()
+        temp_identity = (int(temp_stat.st_dev), int(temp_stat.st_ino))
         try:
-            shutil.copytree(source, temp, dirs_exist_ok=True, symlinks=True)
-            copied_proof = self._directory_copy_proof(temp)
-            final_source_proof = self._directory_copy_proof(source)
+            self._copy_directory_tree(
+                source,
+                temp,
+                cancel_check=cancel_check,
+                detail_callback=detail_callback,
+                phase="Copying",
+            )
+            copied_proof = self._directory_copy_proof(
+                temp,
+                cancel_check,
+                detail_callback,
+                phase="Verifying copy",
+            )
+            final_source_proof = self._directory_copy_proof(
+                source,
+                cancel_check,
+                detail_callback,
+                phase="Rechecking source",
+            )
             if final_source_proof != source_proof:
                 raise OSError(f"source directory changed while it was being copied: {source}")
             if copied_proof.content_hash != source_proof.content_hash:
                 raise OSError(f"destination directory verification failed: {destination}")
-            self._fsync_directory_tree(temp)
-            _rename_noreplace(temp, destination)
+            if copied_proof.source_root_identity[:2] != temp_identity:
+                raise OSError(f"private directory temporary changed while copying: {temp}")
+            self._fsync_directory_tree(
+                temp,
+                cancel_check=cancel_check,
+                detail_callback=detail_callback,
+                phase="Flushing copy",
+            )
+            _publish_private_directory_noreplace(
+                temp,
+                destination,
+                expected_source_identity=temp_identity,
+            )
             self._fsync_directory(destination.parent)
-            published_proof = self._directory_copy_proof(destination)
-            if published_proof.content_hash != source_proof.content_hash:
-                raise OSError(f"published directory verification failed: {destination}")
-            self._fsync_directory_tree(destination)
-            self._fsync_directory(destination.parent)
+            published_stat = destination.lstat()
+            if (
+                int(published_stat.st_dev),
+                int(published_stat.st_ino),
+            ) != temp_identity:
+                raise OSError(f"published directory changed after copy: {destination}")
             return source_proof
         finally:
-            if temp.exists():
-                shutil.rmtree(temp, ignore_errors=True)
+            try:
+                recovery = _cleanup_private_temp_if_identity(
+                    temp,
+                    temp_identity,
+                    directory=True,
+                )
+            except OSError as cleanup_error:
+                self.append_log(
+                    f"Private directory temporary cleanup failed for {temp}: {cleanup_error}",
+                    level="ERROR",
+                )
+            else:
+                if recovery is not None:
+                    self.append_log(
+                        f"Private directory temporary path changed; successor retained at "
+                        f"{recovery}",
+                        level="ERROR",
+                    )
 
     def _stable_regular_file_hash(
         self,
         path: Path,
         cancel_check: CancelCallback | None = None,
+        *,
+        detail_callback: MutationDetailCallback | None = None,
+        phase: str = "Verifying file",
     ) -> tuple[CatalogFileIdentity, str]:
         path_stat = path.lstat()
         identity = self._catalog_file_identity(path, path_stat)
@@ -8383,6 +10083,14 @@ class Catalog:
             if self._index_stat_token(before) != self._index_stat_token(path_stat):
                 raise OSError(f"file changed before verification: {path}")
             digest = hashlib.sha256()
+            verified_bytes = 0
+            hash_progress = _report_mutation_byte_progress(
+                detail_callback,
+                phase,
+                0,
+                int(before.st_size),
+                -1,
+            )
             while True:
                 if cancel_check is not None:
                     cancel_check()
@@ -8390,6 +10098,14 @@ class Catalog:
                 if not chunk:
                     break
                 digest.update(chunk)
+                verified_bytes += len(chunk)
+                hash_progress = _report_mutation_byte_progress(
+                    detail_callback,
+                    phase,
+                    verified_bytes,
+                    int(before.st_size),
+                    hash_progress,
+                )
             after = os.fstat(fd)
         finally:
             os.close(fd)
@@ -8403,6 +10119,160 @@ class Catalog:
             raise OSError(f"file changed during verification: {path}")
         return identity, digest.hexdigest()
 
+    def _open_pinned_regular_file_hash(
+        self,
+        path: Path,
+        cancel_check: CancelCallback | None = None,
+        *,
+        detail_callback: MutationDetailCallback | None = None,
+        phase: str = "Verifying file",
+    ) -> tuple[int, CatalogFileIdentity, str]:
+        """Return a verified open descriptor that survives pathname removal."""
+
+        path_stat = path.lstat()
+        identity = self._catalog_file_identity(path, path_stat)
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(path, flags)
+        try:
+            before = os.fstat(fd)
+            if self._index_stat_token(before) != self._index_stat_token(path_stat):
+                raise OSError(f"file changed before pinned verification: {path}")
+            digest = hashlib.sha256()
+            verified_bytes = 0
+            hash_progress = _report_mutation_byte_progress(
+                detail_callback,
+                phase,
+                0,
+                int(before.st_size),
+                -1,
+            )
+            while True:
+                if cancel_check is not None:
+                    cancel_check()
+                chunk = os.read(fd, HASH_CHUNK_SIZE)
+                if not chunk:
+                    break
+                digest.update(chunk)
+                verified_bytes += len(chunk)
+                hash_progress = _report_mutation_byte_progress(
+                    detail_callback,
+                    phase,
+                    verified_bytes,
+                    int(before.st_size),
+                    hash_progress,
+                )
+            after = os.fstat(fd)
+            current = path.lstat()
+            current_identity = self._catalog_file_identity(path, current)
+            if (
+                self._index_stat_token(before) != self._index_stat_token(after)
+                or self._index_stat_token(after) != self._index_stat_token(current)
+                or current_identity != identity
+            ):
+                raise OSError(f"file changed during pinned verification: {path}")
+            os.lseek(fd, 0, os.SEEK_SET)
+            return fd, identity, digest.hexdigest()
+        except BaseException:
+            os.close(fd)
+            raise
+
+    def _open_pinned_regular_file_identity(
+        self,
+        path: Path,
+        expected_identity: CatalogFileIdentity,
+    ) -> int:
+        """Open an already content-verified file without reading it again."""
+
+        path_stat = path.lstat()
+        identity = self._catalog_file_identity(path, path_stat)
+        if identity != expected_identity:
+            raise OSError(f"verified file changed before it could be pinned: {path}")
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(path, flags)
+        try:
+            opened = os.fstat(fd)
+            named = path.lstat()
+            if (
+                self._index_stat_token(opened) != self._index_stat_token(path_stat)
+                or self._index_stat_token(named) != self._index_stat_token(opened)
+                or self._catalog_file_identity(path, named) != expected_identity
+            ):
+                raise OSError(f"verified file changed while it was being pinned: {path}")
+            return fd
+        except BaseException:
+            os.close(fd)
+            raise
+
+    def _restore_pinned_file_noreplace(
+        self,
+        source_fd: int,
+        destination: Path,
+        expected_hash: str,
+    ) -> Path:
+        """Republish a pinned file after its public destination was raced."""
+
+        temp = self._temporary_destination(destination)
+        temp_stat = temp.lstat()
+        temp_identity = (int(temp_stat.st_dev), int(temp_stat.st_ino))
+        completed = False
+        temp_fd = -1
+        try:
+            flags = os.O_WRONLY | os.O_TRUNC | getattr(os, "O_CLOEXEC", 0)
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            temp_fd = os.open(temp, flags)
+            source_before = os.fstat(source_fd)
+            os.lseek(source_fd, 0, os.SEEK_SET)
+            digest = hashlib.sha256()
+            while True:
+                chunk = os.read(source_fd, HASH_CHUNK_SIZE)
+                if not chunk:
+                    break
+                digest.update(chunk)
+                view = memoryview(chunk)
+                while view:
+                    written = os.write(temp_fd, view)
+                    if written <= 0:
+                        raise OSError("pinned recovery copy made no write progress")
+                    view = view[written:]
+            if digest.hexdigest() != expected_hash:
+                raise OSError("pinned destination bytes changed before recovery")
+            with suppress(OSError):
+                os.fchmod(temp_fd, stat_module.S_IMODE(source_before.st_mode))
+            with suppress(OSError):
+                os.utime(
+                    temp_fd,
+                    ns=(source_before.st_atime_ns, source_before.st_mtime_ns),
+                )
+            os.fsync(temp_fd)
+            source_after = os.fstat(source_fd)
+            if self._index_stat_token(source_before) != self._index_stat_token(source_after):
+                raise OSError("pinned destination changed during recovery")
+            os.close(temp_fd)
+            temp_fd = -1
+            _publish_private_file_noreplace(
+                temp,
+                destination,
+                expected_source_identity=temp_identity,
+            )
+            self._fsync_directory(destination.parent)
+            completed = True
+            return destination
+        finally:
+            if temp_fd >= 0:
+                os.close(temp_fd)
+            if not completed and temp.exists():
+                # A complete temp is preferable to losing the only remaining
+                # pinned bytes when a successor occupied the source path.
+                with suppress(OSError):
+                    _, temp_hash = self._stable_regular_file_hash(temp)
+                    if temp_hash != expected_hash:
+                        temp.unlink()
+
     @staticmethod
     def _manifest_record_value(*values: bytes) -> int:
         digest = hashlib.sha256()
@@ -8411,7 +10281,14 @@ class Catalog:
             digest.update(value)
         return int.from_bytes(digest.digest(), "big")
 
-    def _directory_copy_proof(self, root: Path) -> _DirectoryCopyProof:
+    def _directory_copy_proof(
+        self,
+        root: Path,
+        cancel_check: CancelCallback | None = None,
+        detail_callback: MutationDetailCallback | None = None,
+        *,
+        phase: str = "Verifying",
+    ) -> _DirectoryCopyProof:
         root_stat = root.lstat()
         if not stat_module.S_ISDIR(root_stat.st_mode):
             raise OSError(f"directory copy source is not a directory: {root}")
@@ -8421,6 +10298,7 @@ class Catalog:
             int(root_stat.st_nlink),
             int(root_stat.st_size),
             int(root_stat.st_mtime_ns),
+            self._path_change_time_ns(root, root_stat),
         )
         modulus = 1 << 256
         content_count = 1
@@ -8433,14 +10311,24 @@ class Catalog:
         identity_count = 1
         identity_sum = self._manifest_record_value(
             b"root",
-            repr(root_identity).encode("ascii"),
+            # A rename legitimately changes the root directory's ctime. Keep
+            # that field in the pre-copy proof, but exclude it from the content
+            # identity aggregate used again after quarantine.
+            repr(root_identity[:5]).encode("ascii"),
         )
         identity_xor = identity_sum
         pending: list[tuple[Path, str]] = [(root, "")]
+        processed = 0
+        if detail_callback is not None:
+            detail_callback(f"{phase}: starting")
         while pending:
+            if cancel_check is not None:
+                cancel_check()
             directory, directory_rel = pending.pop()
             with os.scandir(directory) as entries:
                 for entry in entries:
+                    if cancel_check is not None:
+                        cancel_check()
                     entry_path = Path(entry.path)
                     rel_path = f"{directory_rel}/{entry.name}" if directory_rel else entry.name
                     rel_bytes = rel_path.encode("utf-8", errors="surrogateescape")
@@ -8483,6 +10371,14 @@ class Catalog:
                     identity_count += 1
                     identity_sum = (identity_sum + identity_value) % modulus
                     identity_xor ^= identity_value
+                    processed += 1
+                    if (
+                        detail_callback is not None
+                        and processed % SCAN_PROGRESS_INTERVAL == 0
+                    ):
+                        detail_callback(f"{phase}: {processed} entries")
+        if detail_callback is not None:
+            detail_callback(f"{phase}: {processed} entries")
         return _DirectoryCopyProof(
             root_identity,
             self._combined_directory_entry_hash(
@@ -8524,23 +10420,220 @@ class Catalog:
         finally:
             os.close(fd)
 
-    def _fsync_directory_tree(self, root: Path) -> None:
+    def _copy_directory_tree(
+        self,
+        source: Path,
+        destination: Path,
+        *,
+        copy_function: Callable[[str, str], str] | None = None,
+        cancel_check: CancelCallback | None = None,
+        detail_callback: MutationDetailCallback | None = None,
+        phase: str = "Copying",
+    ) -> None:
+        """Copy a tree with bounded cancellation and visible entry progress."""
+
+        copier = shutil.copy2 if copy_function is None else copy_function
+        pending: list[tuple[Path, Path, bool]] = [(source, destination, False)]
+        processed = 0
+        if detail_callback is not None:
+            detail_callback(f"{phase}: starting")
+        while pending:
+            if cancel_check is not None:
+                cancel_check()
+            source_dir, destination_dir, finalize = pending.pop()
+            if finalize:
+                with suppress(OSError):
+                    shutil.copystat(source_dir, destination_dir, follow_symlinks=False)
+                continue
+            pending.append((source_dir, destination_dir, True))
+            with os.scandir(source_dir) as entries:
+                for entry in entries:
+                    if cancel_check is not None:
+                        cancel_check()
+                    source_entry = Path(entry.path)
+                    destination_entry = destination_dir / entry.name
+                    entry_stat = entry.stat(follow_symlinks=False)
+                    if stat_module.S_ISDIR(entry_stat.st_mode):
+                        destination_entry.mkdir()
+                        pending.append((source_entry, destination_entry, False))
+                    elif stat_module.S_ISREG(entry_stat.st_mode):
+                        copier(str(source_entry), str(destination_entry))
+                    elif stat_module.S_ISLNK(entry_stat.st_mode):
+                        os.symlink(os.readlink(source_entry), destination_entry)
+                        with suppress(OSError, NotImplementedError):
+                            shutil.copystat(
+                                source_entry,
+                                destination_entry,
+                                follow_symlinks=False,
+                            )
+                    else:
+                        raise shutil.SpecialFileError(
+                            f"unsupported directory entry during move: {source_entry}"
+                        )
+                    processed += 1
+                    if (
+                        detail_callback is not None
+                        and processed % SCAN_PROGRESS_INTERVAL == 0
+                    ):
+                        detail_callback(f"{phase}: {processed} entries")
+        if detail_callback is not None:
+            detail_callback(f"{phase}: {processed} entries")
+
+    def _fsync_directory_tree(
+        self,
+        root: Path,
+        *,
+        cancel_check: CancelCallback | None = None,
+        detail_callback: MutationDetailCallback | None = None,
+        phase: str = "Flushing",
+    ) -> None:
         directories: list[Path] = []
+        processed = 0
+        if detail_callback is not None:
+            detail_callback(f"{phase}: starting")
         for dirpath, dirnames, filenames in os.walk(root, topdown=True, followlinks=False):
+            if cancel_check is not None:
+                cancel_check()
             directory = Path(dirpath)
             directories.append(directory)
             for filename in filenames:
+                if cancel_check is not None:
+                    cancel_check()
                 path = directory / filename
                 if not path.is_symlink():
                     self._fsync_regular_file(path)
+                processed += 1
+                if (
+                    detail_callback is not None
+                    and processed % SCAN_PROGRESS_INTERVAL == 0
+                ):
+                    detail_callback(f"{phase}: {processed} entries")
             dirnames[:] = [name for name in dirnames if not (directory / name).is_symlink()]
         for directory in reversed(directories):
+            if cancel_check is not None:
+                cancel_check()
             self._fsync_directory(directory)
+            processed += 1
+            if (
+                detail_callback is not None
+                and processed % SCAN_PROGRESS_INTERVAL == 0
+            ):
+                detail_callback(f"{phase}: {processed} entries")
+        if detail_callback is not None:
+            detail_callback(f"{phase}: {processed} entries")
 
     def _quarantine_path(self, source: Path, suffix: str) -> Path:
         return source.with_name(
             f".{source.name}.{secrets.token_hex(12)}{suffix}"
         )
+
+    def _private_quarantine_catalog_entry(
+        self,
+        source: Path,
+        suffix: str,
+        *,
+        expected_source_identity: Sequence[int],
+    ) -> Path:
+        """Atomically isolate an entry below a private same-parent directory.
+
+        Plain rename is safe here because mkdir exclusively reserves a
+        mode-0700 parent and the destination name inside it cannot preexist.
+        Unlike a check-then-rename to a public path, no concurrent catalog
+        entry is overwritten when RENAME_NOREPLACE is unsupported.
+        """
+
+        with self._open_catalog_directory_fd(source.parent) as source_fd:
+            if source_fd is None:
+                raise OSError(
+                    errno.ENOTSUP,
+                    "private descriptor-relative quarantine is unavailable",
+                    source,
+                )
+            source_stat = os.stat(
+                source.name,
+                dir_fd=source_fd,
+                follow_symlinks=False,
+            )
+            if not self._entry_stat_matches_expected_identity(
+                source,
+                source_stat,
+                expected_source_identity,
+            ):
+                raise OSError(
+                    f"mutation source changed before private quarantine: {source}"
+                )
+            expected_object = (
+                int(expected_source_identity[0]),
+                int(expected_source_identity[1]),
+            )
+            if (int(source_stat.st_dev), int(source_stat.st_ino)) != expected_object:
+                raise OSError(f"mutation source changed before private quarantine: {source}")
+            private_name = ""
+            for _ in range(128):
+                candidate = f"{PRIVATE_QUARANTINE_DIR_PREFIX}{secrets.token_hex(12)}{suffix}"
+                try:
+                    os.mkdir(candidate, mode=0o700, dir_fd=source_fd)
+                except FileExistsError:
+                    continue
+                private_name = candidate
+                break
+            if not private_name:
+                raise FileExistsError("could not reserve a private quarantine directory")
+            private_flags = (
+                os.O_RDONLY
+                | os.O_DIRECTORY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+            )
+            private_fd = os.open(private_name, private_flags, dir_fd=source_fd)
+            try:
+                os.rename(
+                    source.name,
+                    source.name,
+                    src_dir_fd=source_fd,
+                    dst_dir_fd=private_fd,
+                )
+                isolated_stat = os.stat(
+                    source.name,
+                    dir_fd=private_fd,
+                    follow_symlinks=False,
+                )
+                isolated_object = (
+                    int(isolated_stat.st_dev),
+                    int(isolated_stat.st_ino),
+                )
+                if isolated_object != expected_object:
+                    if stat_module.S_ISREG(isolated_stat.st_mode):
+                        try:
+                            os.link(
+                                source.name,
+                                source.name,
+                                src_dir_fd=private_fd,
+                                dst_dir_fd=source_fd,
+                                follow_symlinks=False,
+                            )
+                        except OSError:
+                            pass
+                        else:
+                            os.unlink(source.name, dir_fd=private_fd)
+                    raise OSError(
+                        f"mutation source changed during private quarantine; retained in "
+                        f"{source.parent / private_name}"
+                    )
+            except BaseException:
+                with suppress(OSError):
+                    os.rmdir(private_name, dir_fd=source_fd)
+                raise
+            finally:
+                os.close(private_fd)
+        return source.parent / private_name / source.name
+
+    @staticmethod
+    def _cleanup_private_quarantine_parent(path: Path) -> None:
+        parent = path.parent
+        if parent.name.startswith(PRIVATE_QUARANTINE_DIR_PREFIX):
+            with suppress(OSError):
+                parent.rmdir()
 
     def _quarantine_catalog_entry(
         self,
@@ -8560,118 +10653,19 @@ class Catalog:
                 return quarantine
             except FileExistsError:
                 continue
+            except OSError as error:
+                if not _noreplace_is_unavailable(error):
+                    raise
+                return self._private_quarantine_catalog_entry(
+                    source,
+                    suffix,
+                    expected_source_identity=expected_source_identity,
+                )
         raise FileExistsError(
             errno.EEXIST,
             "could not allocate a private quarantine name",
             source,
         )
-
-    def _pin_destination_file_recovery(
-        self,
-        destination: Path,
-        expected_hash: str,
-    ) -> Path:
-        """Retain a private destination-FS copy until source cleanup commits.
-
-        A cross-filesystem move cannot atomically rename source to destination.
-        Verifying the public destination and then unlinking the source leaves a
-        race in which another process can replace that destination in between.
-        Prefer a cheap hard link, falling back to a durable copy on filesystems
-        that do not support links, and verify the private name independently.
-        """
-
-        recovery = self._quarantine_path(destination, ".marnwick-move-recovery")
-        try:
-            try:
-                os.link(destination, recovery, follow_symlinks=False)
-            except (NotImplementedError, OSError):
-                shutil.copy2(destination, recovery, follow_symlinks=False)
-            _, recovery_hash = self._stable_regular_file_hash(recovery)
-            if recovery_hash != expected_hash:
-                raise OSError(
-                    f"destination changed while its recovery copy was created: {destination}"
-                )
-            self._fsync_regular_file(recovery)
-            self._fsync_directory(recovery.parent)
-            return recovery
-        except BaseException:
-            with suppress(OSError):
-                recovery.unlink()
-            raise
-
-    def _release_destination_file_recovery(
-        self,
-        destination: Path,
-        recovery: Path,
-        expected_hash: str,
-    ) -> None:
-        _, destination_hash = self._stable_regular_file_hash(destination)
-        _, recovery_hash = self._stable_regular_file_hash(recovery)
-        if destination_hash != expected_hash or recovery_hash != expected_hash:
-            raise OSError(
-                f"destination changed after source cleanup; recovery retained at {recovery}"
-            )
-        recovery.unlink()
-        self._fsync_directory(recovery.parent)
-
-    @staticmethod
-    def _link_or_copy_recovery_file(source: str, destination: str) -> str:
-        try:
-            os.link(source, destination, follow_symlinks=False)
-        except (NotImplementedError, OSError):
-            return shutil.copy2(source, destination, follow_symlinks=False)
-        return destination
-
-    def _pin_destination_directory_recovery(
-        self,
-        destination: Path,
-        expected_hash: str,
-    ) -> Path:
-        recovery = Path(
-            tempfile.mkdtemp(
-                prefix=f".{destination.name}.",
-                suffix=".marnwick-move-recovery-dir",
-                dir=destination.parent,
-            )
-        )
-        try:
-            shutil.copytree(
-                destination,
-                recovery,
-                dirs_exist_ok=True,
-                symlinks=True,
-                copy_function=self._link_or_copy_recovery_file,
-            )
-            recovery_proof = self._directory_copy_proof(recovery)
-            if recovery_proof.content_hash != expected_hash:
-                raise OSError(
-                    f"destination directory changed while its recovery copy was created: {destination}"
-                )
-            self._fsync_directory_tree(recovery)
-            self._fsync_directory(recovery.parent)
-            return recovery
-        except BaseException:
-            shutil.rmtree(recovery, ignore_errors=True)
-            raise
-
-    def _release_destination_directory_recovery(
-        self,
-        destination: Path,
-        recovery: Path,
-        expected_hash: str,
-    ) -> None:
-        destination_proof = self._directory_copy_proof(destination)
-        recovery_proof = self._directory_copy_proof(recovery)
-        if (
-            destination_proof.content_hash != expected_hash
-            or recovery_proof.content_hash != expected_hash
-        ):
-            raise OSError(
-                f"destination directory changed after source cleanup; "
-                f"recovery retained at {recovery}"
-            )
-        shutil.rmtree(recovery)
-        self._fsync_directory(recovery.parent)
 
     def _cleanup_copied_file_source(
         self,
@@ -8680,55 +10674,142 @@ class Catalog:
         proof: _FileCopyProof,
         *,
         wipe: bool,
+        cancel_check: CancelCallback | None = None,
+        detail_callback: MutationDetailCallback | None = None,
     ) -> None:
-        current_identity, current_hash = self._stable_regular_file_hash(source)
-        if current_identity != proof.source_identity or current_hash != proof.content_hash:
-            raise OSError(f"source changed after it was copied; both copies were retained: {source}")
-        recovery = self._pin_destination_file_recovery(
-            destination,
-            proof.content_hash,
+        source_fd, current_identity, current_hash = self._open_pinned_regular_file_hash(
+            source,
+            cancel_check,
+            detail_callback=detail_callback,
+            phase="Rechecking source before removal",
         )
+        if current_identity != proof.source_identity or current_hash != proof.content_hash:
+            os.close(source_fd)
+            raise OSError(f"source changed after it was copied; both copies were retained: {source}")
         try:
-            quarantine = self._quarantine_catalog_entry(
-                source,
-                ".marnwick-move-source",
-                expected_source_identity=proof.source_identity,
+            if detail_callback is not None:
+                detail_callback("Pinning published copy")
+            destination_fd = self._open_pinned_regular_file_identity(
+                destination,
+                proof.destination_identity,
             )
         except BaseException:
-            with suppress(OSError):
-                recovery.unlink()
+            os.close(source_fd)
             raise
         try:
-            quarantined_identity, quarantined_hash = self._stable_regular_file_hash(quarantine)
-            _, destination_hash = self._stable_regular_file_hash(destination)
+            if cancel_check is not None:
+                cancel_check()
+            if detail_callback is not None:
+                detail_callback("Isolating verified source")
+            try:
+                # The source descriptor stays open until destination
+                # revalidation finishes so the original bytes can be restored
+                # after a late destination race.  On NFS, the hard-link based
+                # public no-replace fallback used by
+                # _quarantine_catalog_entry turns an unlink of that open inode
+                # into a hidden .nfs hard link.  Its temporary link-count bump
+                # invalidates the copy proof and can strand the private parent.
+                # A mode-0700 directory gives us an exclusively reserved
+                # destination for a plain same-directory rename, avoiding the
+                # unlink-open-file behavior entirely.
+                quarantine = self._private_quarantine_catalog_entry(
+                    source,
+                    ".marnwick-move-source",
+                    expected_source_identity=proof.source_identity,
+                )
+            except OSError as error:
+                if error.errno != errno.ENOTSUP:
+                    raise
+                # Windows lacks descriptor-relative directory operations. Its
+                # existing identity-checked no-replace path remains the safe
+                # portable fallback.
+                quarantine = self._quarantine_catalog_entry(
+                    source,
+                    ".marnwick-move-source",
+                    expected_source_identity=proof.source_identity,
+                )
+        except BaseException:
+            os.close(source_fd)
+            os.close(destination_fd)
+            raise
+        try:
+            quarantined_stat = quarantine.lstat()
+            quarantined_identity = self._catalog_file_identity(quarantine, quarantined_stat)
+            pinned_source_after_isolation = os.fstat(source_fd)
             if (
                 quarantined_identity[:5] != proof.source_identity[:5]
-                or quarantined_hash != proof.content_hash
-                or destination_hash != proof.content_hash
+                or self._index_stat_token(pinned_source_after_isolation)
+                != self._index_stat_token(quarantined_stat)
             ):
                 raise OSError("move verification changed before source cleanup")
             self._fsync_regular_file(destination)
             self._fsync_directory(destination.parent)
+            # Close the hash-to-unlink window without a second content pass.
+            # Rename legitimately changed ctime, so compare against the pinned
+            # post-isolation descriptor/stat pair captured immediately above.
+            final_quarantined_stat = quarantine.lstat()
+            if (
+                self._index_stat_token(os.fstat(source_fd))
+                != self._index_stat_token(pinned_source_after_isolation)
+                or self._index_stat_token(final_quarantined_stat)
+                != self._index_stat_token(pinned_source_after_isolation)
+            ):
+                raise OSError("move source changed at the cleanup boundary")
+            if cancel_check is not None:
+                cancel_check()
+            if detail_callback is not None:
+                detail_callback(
+                    "Securely removing verified source"
+                    if wipe
+                    else "Removing verified source"
+                )
             self._delete_file(quarantine, wipe=wipe)
             self._fsync_directory(source.parent)
-            self._release_destination_file_recovery(
-                destination,
-                recovery,
-                proof.content_hash,
-            )
+            pinned_after = os.fstat(destination_fd)
+            try:
+                named_after = destination.lstat()
+                named_identity = self._catalog_file_identity(destination, named_after)
+            except OSError:
+                named_after = None
+                named_identity = None
+            if (
+                named_after is None
+                or named_identity != proof.destination_identity
+                or self._index_stat_token(pinned_after)
+                != self._index_stat_token(named_after)
+            ):
+                try:
+                    restored = self._restore_pinned_file_noreplace(
+                        source_fd if not wipe else destination_fd,
+                        source,
+                        proof.content_hash,
+                    )
+                except OSError as restore_error:
+                    raise OSError(
+                        "destination changed during source cleanup; pinned original could "
+                        "not be restored to its source path"
+                    ) from restore_error
+                raise OSError(
+                    f"destination changed during source cleanup; original restored at {restored}"
+                )
         except BaseException:
             if quarantine.exists() or quarantine.is_symlink():
                 try:
+                    rollback_identity = self._catalog_file_identity(quarantine)
                     self._rename_catalog_entry_noreplace(
                         quarantine,
                         source,
-                        expected_source_identity=proof.source_identity,
+                        expected_source_identity=rollback_identity,
                     )
                 except OSError as restore_error:
                     raise OSError(
                         f"move cleanup failed; source was retained at {quarantine}"
                     ) from restore_error
             raise
+        finally:
+            os.close(source_fd)
+            os.close(destination_fd)
+            self._cleanup_private_quarantine_parent(quarantine)
 
     def _cleanup_copied_directory_source(
         self,
@@ -8737,13 +10818,9 @@ class Catalog:
         proof: _DirectoryCopyProof,
         *,
         wipe: bool,
+        cancel_check: CancelCallback | None = None,
+        detail_callback: MutationDetailCallback | None = None,
     ) -> None:
-        if self._directory_copy_proof(source) != proof:
-            raise OSError(f"source directory changed after it was copied; both copies were retained: {source}")
-        recovery = self._pin_destination_directory_recovery(
-            destination,
-            proof.content_hash,
-        )
         try:
             quarantine = self._quarantine_catalog_entry(
                 source,
@@ -8751,19 +10828,38 @@ class Catalog:
                 expected_source_identity=proof.source_root_identity,
             )
         except BaseException:
-            shutil.rmtree(recovery, ignore_errors=True)
             raise
         try:
-            quarantined = self._directory_copy_proof(quarantine)
-            destination_proof = self._directory_copy_proof(destination)
+            quarantined = self._directory_copy_proof(
+                quarantine,
+                cancel_check,
+                detail_callback,
+                phase="Verifying isolated source",
+            )
+            destination_proof = self._directory_copy_proof(
+                destination,
+                cancel_check,
+                detail_callback,
+                phase="Verifying published destination",
+            )
             if (
-                quarantined.source_root_identity != proof.source_root_identity
+                quarantined.source_root_identity[:5]
+                != proof.source_root_identity[:5]
                 or quarantined.source_identity_hash != proof.source_identity_hash
                 or quarantined.content_hash != proof.content_hash
                 or destination_proof.content_hash != proof.content_hash
             ):
                 raise OSError("directory move verification changed before source cleanup")
-            self._fsync_directory_tree(destination)
+            expected_destination_identity = (
+                int(destination_proof.source_root_identity[0]),
+                int(destination_proof.source_root_identity[1]),
+                int(destination_proof.source_root_identity[4]),
+                int(destination_proof.source_root_identity[5]),
+            )
+            if self._directory_identity_for_path(destination) != expected_destination_identity:
+                raise OSError(
+                    "directory destination changed at the source cleanup boundary"
+                )
             self._fsync_directory(destination.parent)
             if wipe:
                 self._wipe_directory_files(quarantine)
@@ -8772,24 +10868,22 @@ class Catalog:
                 expected_identity=proof.source_root_identity,
             )
             self._fsync_directory(source.parent)
-            self._release_destination_directory_recovery(
-                destination,
-                recovery,
-                proof.content_hash,
-            )
         except BaseException:
             if quarantine.exists() or quarantine.is_symlink():
                 try:
+                    rollback_identity = self._directory_identity_for_path(quarantine)
                     self._rename_catalog_entry_noreplace(
                         quarantine,
                         source,
-                        expected_source_identity=proof.source_root_identity,
+                        expected_source_identity=rollback_identity,
                     )
                 except OSError as restore_error:
                     raise OSError(
                         f"directory move cleanup failed; source was retained at {quarantine}"
                     ) from restore_error
             raise
+        finally:
+            self._cleanup_private_quarantine_parent(quarantine)
 
     def _move_db_record_in_place(
         self,
@@ -8798,6 +10892,7 @@ class Catalog:
         dest_catalog: "Catalog",
         *,
         remember_directory: bool = True,
+        invalidate_content: bool = False,
     ) -> None:
         dir_rel = Path(dest_rel_path).parent.as_posix()
         if dir_rel == ".":
@@ -8812,6 +10907,92 @@ class Catalog:
             """,
             (dest_rel_path, dir_rel, Path(dest_rel_path).name, source_rel_path),
         )
+        if invalidate_content:
+            dest_catalog._invalidate_image_record(dest_rel_path)
+
+    def _invalidate_image_record(self, rel_path: str) -> None:
+        self._conn.execute(
+            """
+            UPDATE images
+            SET size_bytes = 0,
+                file_size_bytes = 0,
+                mtime_ns = 0,
+                modified_at_ns = 0,
+                ctime_ns = 0,
+                image_hash = NULL,
+                width = 0,
+                height = 0,
+                aspect_ratio = 0.0,
+                perceptual_hash = NULL,
+                color_signature = NULL,
+                similarity_feature_version = 0,
+                thumb_blob = NULL,
+                thumb_rel_path = NULL,
+                thumb_cache_key = NULL,
+                thumb_width = 0,
+                thumb_height = 0,
+                thumb_size_px = 0,
+                indexed_at_ns = 0
+            WHERE rel_path = ?
+            """,
+            (rel_path,),
+        )
+        self._conn.execute(
+            "DELETE FROM image_index_failures WHERE rel_path = ?",
+            (rel_path,),
+        )
+
+    def _reconcile_image_records_after_failed_rename(
+        self,
+        source_rel_path: str,
+        dest_rel_path: str,
+        dest_catalog: "Catalog",
+        source_tags: Sequence[str],
+        *,
+        original_at_source: bool,
+        error: BaseException,
+    ) -> None:
+        """Align rows with whichever side still owns the renamed image.
+
+        A bookkeeping failure can itself race with filesystem rollback.  First
+        establish a tagged placeholder for the original image at its actual
+        location; only then clear the other row and index any successor there.
+        """
+
+        if original_at_source:
+            owner_catalog, owner_rel = self, source_rel_path
+            other_catalog, other_rel = dest_catalog, dest_rel_path
+        else:
+            owner_catalog, owner_rel = dest_catalog, dest_rel_path
+            other_catalog, other_rel = self, source_rel_path
+        try:
+            owner_catalog._insert_invalidated_transferred_image_row(
+                owner_rel,
+                source_tags,
+            )
+        except Exception as reconcile_error:
+            error.add_note(
+                f"could not preserve the moved image catalog row at {owner_rel}: "
+                f"{reconcile_error}"
+            )
+            return
+        try:
+            other_catalog._delete_db_records([other_rel])
+        except Exception as reconcile_error:
+            error.add_note(
+                f"could not clear the stale image catalog row at {other_rel}: "
+                f"{reconcile_error}"
+            )
+        for catalog, rel_path in (
+            (owner_catalog, owner_rel),
+            (other_catalog, other_rel),
+        ):
+            try:
+                catalog.index_image(rel_path, force=True)
+            except Exception as reconcile_error:
+                error.add_note(
+                    f"could not reconcile the visible image at {rel_path}: {reconcile_error}"
+                )
 
     def _move_directory_records_in_place(
         self,
@@ -8819,10 +11000,98 @@ class Catalog:
         dest_dir_rel: str,
         *,
         cancel_check: CancelCallback | None = None,
+        invalidate_content: bool = False,
     ) -> None:
         with self._database_savepoint("move_directory_records"):
             with self._sqlite_cancel_progress(cancel_check):
                 self._move_directory_records_in_place_unlocked(source_dir_rel, dest_dir_rel)
+                if invalidate_content:
+                    self._invalidate_directory_image_records(dest_dir_rel)
+
+    def _directory_records_exist(self, dir_rel: str) -> bool:
+        descendant_start, descendant_end = descendant_range_bounds(dir_rel)
+        for table in ("directories", "images", "image_index_failures"):
+            column = "dir_rel"
+            row = self._conn.execute(
+                f"""
+                SELECT 1
+                FROM {table}
+                WHERE {column} = ? OR ({column} >= ? AND {column} < ?)
+                LIMIT 1
+                """,
+                (dir_rel, descendant_start, descendant_end),
+            ).fetchone()
+            if row is not None:
+                return True
+        return False
+
+    def _reconcile_directory_records_after_failed_rename(
+        self,
+        source_dir_rel: str,
+        dest_dir_rel: str,
+        dest_catalog: "Catalog",
+        *,
+        original_at_source: bool,
+        error: BaseException,
+    ) -> None:
+        """Preserve subtree tags while aligning rows after a rollback race."""
+
+        if original_at_source:
+            owner_catalog, owner_rel = self, source_dir_rel
+            other_catalog, other_rel = dest_catalog, dest_dir_rel
+        else:
+            owner_catalog, owner_rel = dest_catalog, dest_dir_rel
+            other_catalog, other_rel = self, source_dir_rel
+        try:
+            other_has_records = other_catalog._directory_records_exist(other_rel)
+            if owner_catalog.root == other_catalog.root:
+                if other_has_records:
+                    with owner_catalog._database_savepoint(
+                        "reconcile_failed_directory_rename"
+                    ):
+                        owner_catalog._move_directory_records_in_place_unlocked(
+                            other_rel,
+                            owner_rel,
+                        )
+                        owner_catalog._invalidate_directory_image_records(owner_rel)
+                elif not owner_catalog._directory_records_exist(owner_rel):
+                    owner_catalog._remember_directory(owner_rel)
+            else:
+                if other_has_records:
+                    other_catalog._copy_directory_records(
+                        other_rel,
+                        owner_rel,
+                        owner_catalog,
+                        invalidate_content=True,
+                    )
+                elif not owner_catalog._directory_records_exist(owner_rel):
+                    owner_catalog._remember_directory(owner_rel)
+                other_catalog._delete_directory_records(other_rel)
+        except Exception as reconcile_error:
+            error.add_note(
+                f"could not align moved directory catalog rows at {owner_rel}: "
+                f"{reconcile_error}"
+            )
+
+        for catalog, rel_path in (
+            (owner_catalog, owner_rel),
+            (other_catalog, other_rel),
+        ):
+            try:
+                try:
+                    visible = catalog._mutation_path(rel_path)
+                except FileNotFoundError:
+                    catalog._delete_directory_records(rel_path)
+                    continue
+                if visible.is_dir():
+                    catalog.refresh_subtree(rel_path)
+                else:
+                    catalog._delete_directory_records(rel_path)
+            except Exception as reconcile_error:
+                error.add_note(
+                    f"could not reconcile the visible directory at {rel_path}: "
+                    f"{reconcile_error}"
+                )
 
     def _move_directory_records_in_place_unlocked(self, source_dir_rel: str, dest_dir_rel: str) -> None:
         self._delete_directory_records(dest_dir_rel)
@@ -8889,6 +11158,112 @@ class Catalog:
         )
         self._remember_directory(dest_dir_rel)
 
+    def _invalidate_directory_image_records(self, dir_rel: str) -> None:
+        """Discard content-derived state for a moved subtree without file I/O.
+
+        A directory rename proves the root directory object, but modifying a
+        nested file does not change that root's identity.  Moving cached rows
+        as if the root identity proved every descendant can therefore publish
+        an old hash or thumbnail at the new path.  One bounded SQLite update
+        makes those rows visibly pending; a background subtree refresh then
+        streams current thumbnails back without delaying the rename itself.
+        """
+
+        descendant_start, descendant_end = descendant_range_bounds(dir_rel)
+        self._conn.execute(
+            """
+            UPDATE images
+            SET size_bytes = 0,
+                file_size_bytes = 0,
+                mtime_ns = 0,
+                modified_at_ns = 0,
+                ctime_ns = 0,
+                image_hash = NULL,
+                width = 0,
+                height = 0,
+                aspect_ratio = 0.0,
+                perceptual_hash = NULL,
+                color_signature = NULL,
+                similarity_feature_version = 0,
+                thumb_blob = NULL,
+                thumb_rel_path = NULL,
+                thumb_cache_key = NULL,
+                thumb_width = 0,
+                thumb_height = 0,
+                thumb_size_px = 0,
+                indexed_at_ns = 0
+            WHERE dir_rel = ? OR (dir_rel >= ? AND dir_rel < ?)
+            """,
+            (dir_rel, descendant_start, descendant_end),
+        )
+        self._conn.execute(
+            """
+            DELETE FROM image_index_failures
+            WHERE dir_rel = ? OR (dir_rel >= ? AND dir_rel < ?)
+            """,
+            (dir_rel, descendant_start, descendant_end),
+        )
+        self._conn.execute(
+            """
+            UPDATE directories
+            SET entry_find_hash = NULL,
+                entry_hash_at_ns = 0,
+                find_hash = NULL,
+                find_hash_complete = 0,
+                hash_at_ns = 0
+            WHERE dir_rel = ? OR (dir_rel >= ? AND dir_rel < ?)
+            """,
+            (dir_rel, descendant_start, descendant_end),
+        )
+        self._conn.execute("DELETE FROM catalog_refresh_state")
+
+    def _insert_invalidated_transferred_image_row(
+        self,
+        dest_rel_path: str,
+        tag_names: Sequence[str],
+    ) -> None:
+        """Transfer ownership/tags while deferring all expensive image reads."""
+
+        dir_rel = self._parent_dir_rel(dest_rel_path)
+        self._conn.execute(
+            """
+            INSERT INTO images (
+                rel_path, dir_rel, filename, size_bytes, file_size_bytes,
+                mtime_ns, modified_at_ns, ctime_ns, image_hash, width, height,
+                aspect_ratio, perceptual_hash, color_signature,
+                similarity_feature_version, thumb_blob, thumb_rel_path,
+                thumb_cache_key, thumb_width, thumb_height, thumb_size_px,
+                indexed_at_ns
+            )
+            VALUES (?, ?, ?, 0, 0, 0, 0, 0, NULL, 0, 0, 0.0, NULL, NULL,
+                0, NULL, NULL, NULL, 0, 0, 0, 0)
+            ON CONFLICT(rel_path) DO UPDATE SET
+                dir_rel = excluded.dir_rel,
+                filename = excluded.filename,
+                size_bytes = 0,
+                file_size_bytes = 0,
+                mtime_ns = 0,
+                modified_at_ns = 0,
+                ctime_ns = 0,
+                image_hash = NULL,
+                width = 0,
+                height = 0,
+                aspect_ratio = 0.0,
+                perceptual_hash = NULL,
+                color_signature = NULL,
+                similarity_feature_version = 0,
+                thumb_blob = NULL,
+                thumb_rel_path = NULL,
+                thumb_cache_key = NULL,
+                thumb_width = 0,
+                thumb_height = 0,
+                thumb_size_px = 0,
+                indexed_at_ns = 0
+            """,
+            (dest_rel_path, dir_rel, Path(dest_rel_path).name),
+        )
+        self.set_image_tags(dest_rel_path, tag_names, replace=True)
+
     def _transfer_directory_records(
         self,
         source_dir_rel: str,
@@ -8896,12 +11271,14 @@ class Catalog:
         dest_catalog: "Catalog",
         *,
         cancel_check: CancelCallback | None = None,
+        invalidate_content: bool = False,
     ) -> None:
         self._copy_directory_records(
             source_dir_rel,
             dest_dir_rel,
             dest_catalog,
             cancel_check=cancel_check,
+            invalidate_content=invalidate_content,
         )
         with self._database_savepoint("transfer_directory_source_delete"):
             self._delete_directory_records(source_dir_rel)
@@ -8913,6 +11290,7 @@ class Catalog:
         dest_catalog: "Catalog",
         *,
         cancel_check: CancelCallback | None = None,
+        invalidate_content: bool = False,
     ) -> None:
         dest_catalog._delete_directory_records(dest_dir_rel)
         descendant_start, descendant_end = descendant_range_bounds(source_dir_rel)
@@ -8974,14 +11352,20 @@ class Catalog:
                     source_dir_rel,
                     dest_dir_rel,
                 )
-                dest_catalog._insert_transferred_image_row(
-                    row,
-                    new_rel_path,
-                    tags_by_image_id.get(int(row["id"]), ()),
-                    source_catalog=self,
-                    remember_directory=False,
-                    cancel_check=cancel_check,
-                )
+                if invalidate_content:
+                    dest_catalog._insert_invalidated_transferred_image_row(
+                        new_rel_path,
+                        tags_by_image_id.get(int(row["id"]), ()),
+                    )
+                else:
+                    dest_catalog._insert_transferred_image_row(
+                        row,
+                        new_rel_path,
+                        tags_by_image_id.get(int(row["id"]), ()),
+                        source_catalog=self,
+                        remember_directory=False,
+                        cancel_check=cancel_check,
+                    )
 
     def _tag_names_for_image_ids(
         self,
@@ -9018,12 +11402,14 @@ class Catalog:
         dest_catalog: "Catalog",
         *,
         remember_directory: bool = True,
+        invalidate_content: bool = False,
     ) -> None:
         self._copy_db_record_to_catalog(
             source_rel_path,
             dest_rel_path,
             dest_catalog,
             remember_directory=remember_directory,
+            invalidate_content=invalidate_content,
         )
         with self._database_savepoint("transfer_image_source_delete"):
             self._delete_db_records([source_rel_path])
@@ -9035,9 +11421,20 @@ class Catalog:
         dest_catalog: "Catalog",
         *,
         remember_directory: bool = True,
+        invalidate_content: bool = False,
     ) -> None:
         row = self._conn.execute("SELECT * FROM images WHERE rel_path = ?", (source_rel_path,)).fetchone()
         tag_names = self.get_image_tags(source_rel_path)
+        if invalidate_content:
+            if remember_directory:
+                dest_catalog._remember_directory(
+                    dest_catalog._parent_dir_rel(dest_rel_path)
+                )
+            dest_catalog._insert_invalidated_transferred_image_row(
+                dest_rel_path,
+                tag_names,
+            )
+            return
         if row is None:
             if remember_directory:
                 dest_catalog._remember_directory(dest_catalog._parent_dir_rel(dest_rel_path))
