@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import io
 import json
 from math import ceil, hypot
@@ -14,11 +15,11 @@ from collections import OrderedDict, defaultdict, deque
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from functools import partial
 from pathlib import Path
-from threading import Event
+from threading import Event, Lock
 from time import monotonic
 
 from PySide6.QtCore import (
@@ -82,6 +83,7 @@ from .async_utils import (
     AtomicSaveThreadPoolExecutor,
     ExecutorSaturatedError,
     LatestOnlyThreadPoolExecutor,
+    RolloverThreadPoolExecutor,
     SharedExecutorLease,
     shared_dialog_executor,
     shared_viewer_load_executor,
@@ -92,12 +94,15 @@ from .app_icon import DESKTOP_FILE_ID, app_icon_bytes, virtual_folder_icon_bytes
 from .catalog import (
     DUPLICATE_DELETE_EXACT,
     DUPLICATE_DELETE_VERY_SIMILAR,
+    QUERY_PAGE_MAX_SIZE,
     TRASH_DIR_NAME,
     Catalog,
     CatalogStorageIdentity,
     DuplicateMatchGroups,
     DuplicateDeletionResult,
     is_inside_trash_rel_path,
+    is_exact_image_hash,
+    is_marnwick_internal_artifact_name,
     is_trash_rel_path,
     is_image_name,
     normalize_tag,
@@ -127,6 +132,7 @@ from .image_ops import (
     apply_operations_to_file,
     apply_operations_to_file_with_proof,
     clone_heal_brush_in_place,
+    snapshot_image_file_identity,
     snapshot_image_file_identity_with_dates,
 )
 from .indexer import ActionPriority, BackgroundIndexer, IndexTask, IndexTaskCancelled
@@ -157,12 +163,15 @@ THUMBNAIL_MODEL_BATCH_SIZE = 400
 # exposure batch. The first query and its row objects stay bounded while still
 # filling several screens on typical displays.
 PANE_QUERY_PAGE_SIZE = 200
+# Rebuilds may need to locate the currently displayed image far beyond page
+# zero. Larger worker-side pages keep that progressive search responsive while
+# remaining bounded and leaving all SQLite/image work off the GUI thread.
+VIEWER_REBUILD_PAGE_SIZE = 2048
 PHYSICAL_PREVIEW_DIRECTORY_LIMIT = 128
 PHYSICAL_PREVIEW_SCAN_BUDGET_SECONDS = 0.012
 PENDING_THUMBNAIL_REFRESH_BATCH_SIZE = 32
-# Submit at most four reads for one pane, but keep four additional worker
-# lanes reserved so a newly selected pane can start while stale filesystem
-# calls from the previous pane unwind.
+# Submit at most four reads in the active epoch. If all four become stuck, one
+# bounded rollover exposes four replacement lanes for the newly selected pane.
 MAX_PENDING_THUMBNAIL_LOADS = 4
 MAX_WAITING_THUMBNAIL_LOADS = 256
 THUMBNAIL_RESULTS_PER_TICK = 4
@@ -238,6 +247,7 @@ class PagedImageNavigator:
     total_count: int
     page_loader: Callable[[int, int, Event], ViewerNavigationPage]
     random_mode: bool = False
+    view_kind: str = VIRTUAL_KIND_PHYSICAL
     _seen: set[str] = field(default_factory=set)
 
     def __post_init__(self) -> None:
@@ -269,6 +279,14 @@ class PagedImageNavigator:
         self.has_more = page.has_more
         self.total_count = max(len(self.order), page.total_images)
         return len(rel_paths)
+
+
+@dataclass(frozen=True, slots=True)
+class ViewerDeletePending:
+    """One optimistically hidden viewer row awaiting mutation settlement."""
+
+    rel_path: str
+    removed_index: int
 
 
 @dataclass(slots=True)
@@ -390,6 +408,11 @@ class VirtualViewResult:
     page_offset: int = 0
     next_offset: int = 0
     has_more: bool = False
+    stable_row_by_key: dict[tuple[str, str], int] | None = None
+    stable_order_token: str | None = None
+    stable_image_order: list[str] | None = None
+    excluded_image_rels: frozenset[str] = frozenset()
+    excluded_directory_rels: frozenset[str] = frozenset()
 
 
 @dataclass(slots=True)
@@ -407,6 +430,7 @@ class VirtualViewTask:
     cancel_event: Event
     cache_version: int = 0
     page_offset: int = 0
+    physical_reconcile: bool = False
 
 
 @dataclass(slots=True)
@@ -423,6 +447,16 @@ class DeletePayloadResult:
     requested: int
     deleted: int
     affected_roots: set[Path]
+    remaining_rel_paths: tuple[str, ...] | None = ()
+    error: BaseException | None = None
+    canceled: bool = False
+
+
+@dataclass(slots=True)
+class DeletePayloadOutcome:
+    """Worker-owned filesystem postcondition retained even if teardown fails."""
+
+    remaining_rel_paths: tuple[str, ...] | None
 
 
 @dataclass(slots=True)
@@ -434,6 +468,8 @@ class DeletePayloadTask:
     task: IndexTask
     future: Future[DeletePayloadResult]
     started_at: float
+    outcome: DeletePayloadOutcome
+    viewer: FullscreenViewer | None = None
 
 
 @dataclass(slots=True)
@@ -446,6 +482,8 @@ class MovePayloadResult:
     target_proofs: dict[str, object] | None = None
     catalog_settings: CatalogSettings | None = None
     force_thumbnail_reindex: bool = False
+    reconcile_subtrees: tuple[tuple[Path, str], ...] = ()
+    reconcile_images: tuple[tuple[Path, str], ...] = ()
 
 
 @dataclass(slots=True)
@@ -467,6 +505,7 @@ class MovePayloadTask:
     dedicated_executor: bool = False
     edit_operations: tuple[EditOperation, ...] = ()
     edit_owner: QWidget | None = None
+    navigation_owner: FullscreenViewer | None = None
 
 
 @dataclass(slots=True)
@@ -507,6 +546,49 @@ class ImageReconcileContext:
     replace_task: IndexTask | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class PostMoveReconcileContext:
+    root: Path
+    subtree_rel: str | None = None
+    image_rels: tuple[str, ...] = ()
+    image_dir_rels: frozenset[str] = frozenset()
+    attempt: int = 0
+    expected_root_identity: tuple[int, int] | None = None
+    expected_storage_identity: CatalogStorageIdentity | None = None
+    completion_lock: Lock = field(default_factory=Lock, repr=False, compare=False)
+    completed_image_rels: set[str] = field(
+        default_factory=set,
+        repr=False,
+        compare=False,
+    )
+
+    def mark_image_completed(self, rel_path: str) -> None:
+        """Record exact pipeline publication from a catalog worker thread."""
+
+        with self.completion_lock:
+            self.completed_image_rels.add(rel_path)
+
+    def unfinished_image_rels(self) -> tuple[str, ...]:
+        """Return inputs without an exact publication acknowledgement."""
+
+        with self.completion_lock:
+            completed = frozenset(self.completed_image_rels)
+        return tuple(
+            rel_path
+            for rel_path in self.image_rels
+            if rel_path not in completed
+        )
+
+    def contains_directory(self, dir_rel: str) -> bool:
+        if self.subtree_rel is not None:
+            return (
+                not self.subtree_rel
+                or dir_rel == self.subtree_rel
+                or dir_rel.startswith(f"{self.subtree_rel}/")
+            )
+        return dir_rel in self.image_dir_rels
+
+
 @dataclass(slots=True)
 class DeferredDeleteRequest:
     catalog: Catalog
@@ -517,6 +599,7 @@ class DeferredDeleteRequest:
     remove_from_current_view: bool
     dependencies: tuple[MovePayloadTask, ...]
     reconciliation_tasks: tuple[IndexTask, ...] = ()
+    viewer: FullscreenViewer | None = None
 
 
 @dataclass(slots=True)
@@ -615,6 +698,7 @@ QPushButton:hover {
 
 class ThumbnailModel(QAbstractListModel):
     indexesReady = Signal(int)
+    rowExposureReady = Signal()
     MIME_TYPE = "application/x-marnwick-images"
     CARD_PADDING = 1
     LABEL_GAP = 0
@@ -626,7 +710,12 @@ class ThumbnailModel(QAbstractListModel):
         self._visible_count = 0
         self._row_by_rel: dict[str, int] = {}
         self._row_by_key: dict[tuple[str, str], int] = {}
-        self._directory_rows: tuple[int, ...] = ()
+        self._complete_row_by_key: Mapping[tuple[str, str], int] | None = None
+        self._complete_order_token: str | None = None
+        self._complete_image_order: list[str] | None = None
+        self._ensure_row_target: int | None = None
+        self._row_exposure_generation = 0
+        self._directory_rows: list[int] = []
         self._image_count = 0
         self._indexed_image_count = 0
         self._image_ordinal_by_row: dict[int, int] = {}
@@ -647,13 +736,14 @@ class ThumbnailModel(QAbstractListModel):
                 tuple[int, int],
                 CatalogStorageIdentity,
                 int,
-                str,
-                bytes | None,
+                ImageRecord,
             ]
         ] = deque()
         self._thumbnail_waiting_rels: set[str] = set()
         self._thumbnail_retry_rels: set[str] = set()
-        self._thumbnail_futures: dict[Future[QImage | None], tuple[int, int, str]] = {}
+        self._thumbnail_futures: dict[
+            Future[QImage | None], tuple[int, int, ImageRecord]
+        ] = {}
         self._folder_waiting: deque[
             tuple[
                 int,
@@ -666,16 +756,20 @@ class ThumbnailModel(QAbstractListModel):
             ]
         ] = deque()
         self._folder_waiting_rels: set[str] = set()
-        self._folder_futures: dict[Future[Image.Image], tuple[int, int, str]] = {}
-        self._thumbnail_executor = AbandonableThreadPoolExecutor(
-            max_workers=8,
+        self._folder_futures: dict[
+            Future[Image.Image], tuple[int, int, DirectoryRecord, int]
+        ] = {}
+        self._thumbnail_executor = RolloverThreadPoolExecutor(
+            max_workers=4,
             thread_name_prefix="marnwick-thumbnail",
-            max_pending=8,
+            max_pending=4,
+            max_retired=1,
         )
-        self._record_index_executor = AbandonableThreadPoolExecutor(
-            max_workers=2,
+        self._record_index_executor = RolloverThreadPoolExecutor(
+            max_workers=1,
             thread_name_prefix="marnwick-thumbnail-index",
-            max_pending=2,
+            max_pending=1,
+            max_retired=1,
         )
         self._record_index_future: Future[tuple[int, int | None]] | None = None
         self._record_index_cancel_event: Event | None = None
@@ -699,10 +793,24 @@ class ThumbnailModel(QAbstractListModel):
         self._record_index_timer.setInterval(20)
         self._record_index_timer.timeout.connect(self._settle_record_index)
 
-    def set_images(self, catalog: Catalog | None, images: list[PaneRecord]) -> None:
+    def set_images(
+        self,
+        catalog: Catalog | None,
+        images: list[PaneRecord],
+        *,
+        complete_row_by_key: Mapping[tuple[str, str], int] | None = None,
+        complete_order_token: str | None = None,
+        complete_image_count: int | None = None,
+        complete_image_order: list[str] | None = None,
+        preserve_pixmap_cache: bool = False,
+    ) -> None:
+        previous_images = self.images
+        previous_complete_rows = self._complete_row_by_key
+        previous_rows = self._row_by_key
         self.beginResetModel()
         self._cancel_thumbnail_loads()
         self._cancel_record_index()
+        self._row_exposure_generation += 1
         self.catalog = catalog
         self.images = images
         self._page_request_callback = None
@@ -713,6 +821,12 @@ class ThumbnailModel(QAbstractListModel):
         self._visible_count = min(len(images), THUMBNAIL_MODEL_BATCH_SIZE)
         self._row_by_rel = {}
         self._row_by_key = {}
+        # Physical preview workers construct and exclusively own this map.
+        # Adopt it directly so publishing a huge folder remains O(1) on Qt.
+        self._complete_row_by_key = complete_row_by_key
+        self._complete_order_token = complete_order_token
+        self._complete_image_order = complete_image_order
+        self._ensure_row_target = None
         self._located_row_by_key = {}
         self._record_lookup_attempted_keys.clear()
         directory_rows: list[int] = []
@@ -722,11 +836,54 @@ class ThumbnailModel(QAbstractListModel):
         self._first_image_row = None
         for row, record in enumerate(images[:THUMBNAIL_MODEL_BATCH_SIZE]):
             self._index_record(row, record, directory_rows)
-        self._directory_rows = tuple(directory_rows)
-        self._clear_pixmap_cache()
+        self._directory_rows = directory_rows
+        if complete_image_count is not None:
+            self._image_count = max(0, int(complete_image_count))
+            self._first_image_row = (
+                len(images) - self._image_count if self._image_count else None
+            )
+        if preserve_pixmap_cache and complete_row_by_key is not None:
+            for rel_path in list(self._pixmap_cache):
+                previous_row = (
+                    previous_complete_rows.get(("image", rel_path))
+                    if previous_complete_rows is not None
+                    else previous_rows.get(("image", rel_path))
+                )
+                new_row = complete_row_by_key.get(("image", rel_path))
+                if previous_row is None or new_row is None:
+                    previous_row = (
+                        previous_complete_rows.get(("directory", rel_path))
+                        if previous_complete_rows is not None
+                        else previous_rows.get(("directory", rel_path))
+                    )
+                    new_row = complete_row_by_key.get(("directory", rel_path))
+                if previous_row is None or new_row is None:
+                    self._drop_cached_pixmap(rel_path)
+                    continue
+                previous = previous_images[previous_row]
+                current = images[new_row]
+                preserve_image = (
+                    isinstance(previous, ImageRecord)
+                    and isinstance(current, ImageRecord)
+                    and self._same_image_incarnation(previous, current)
+                )
+                preserve_directory = (
+                    isinstance(previous, DirectoryRecord)
+                    and isinstance(current, DirectoryRecord)
+                    and previous.dir_rel == current.dir_rel
+                    and previous.mtime_ns == current.mtime_ns
+                )
+                if not preserve_image and not preserve_directory and previous != current:
+                    self._drop_cached_pixmap(rel_path)
+        else:
+            self._clear_pixmap_cache()
         self._pending_thumbnail_rels.clear()
         self.endResetModel()
-        if len(images) > THUMBNAIL_MODEL_BATCH_SIZE and not self._thumbnail_closed:
+        if (
+            complete_image_count is None
+            and len(images) > THUMBNAIL_MODEL_BATCH_SIZE
+            and not self._thumbnail_closed
+        ):
             self._record_indexes_pending = True
             cancel_event = Event()
             self._record_index_cancel_event = cancel_event
@@ -741,6 +898,29 @@ class ThumbnailModel(QAbstractListModel):
                 self._record_index_cancel_event = None
             else:
                 self._record_index_timer.start()
+
+    @staticmethod
+    def _same_image_incarnation(
+        first: ImageRecord,
+        second: ImageRecord,
+    ) -> bool:
+        """Return whether two records can safely share metadata/a pixmap."""
+
+        return (
+            first.size_bytes == second.size_bytes
+            and first.mtime_ns == second.mtime_ns
+            and first.ctime_ns == second.ctime_ns
+            and not (
+                first.file_identity is not None
+                and second.file_identity is not None
+                and first.file_identity != second.file_identity
+            )
+            and not (
+                first.image_hash is not None
+                and second.image_hash is not None
+                and first.image_hash != second.image_hash
+            )
+        )
 
     def set_paged_images(
         self,
@@ -778,6 +958,18 @@ class ThumbnailModel(QAbstractListModel):
     @property
     def total_record_count(self) -> int:
         return self._total_record_count
+
+    @property
+    def complete_order_token(self) -> str | None:
+        return self._complete_order_token
+
+    @property
+    def has_complete_row_map(self) -> bool:
+        return self._complete_row_by_key is not None
+
+    @property
+    def complete_image_order(self) -> list[str] | None:
+        return self._complete_image_order
 
     @property
     def next_page_offset(self) -> int:
@@ -837,6 +1029,159 @@ class ThumbnailModel(QAbstractListModel):
         )
         return True
 
+    def update_records_in_place(self, records: Sequence[PaneRecord]) -> int:
+        """Replace metadata for existing keys without changing pane geometry.
+
+        Filesystem preview rows establish the selected directory's membership
+        and order. Database indexing may then enrich those exact rows, but it
+        must not reset the model or move a thumbnail underneath the user.
+        """
+
+        if not self.images or not records:
+            return 0
+        row_by_key = self._complete_row_by_key
+        if row_by_key is None:
+            row_by_key = {
+                (
+                    "directory" if isinstance(record, DirectoryRecord) else "image",
+                    record.rel_path,
+                ): row
+                for row, record in enumerate(self.images)
+            }
+        changed_rows: list[int] = []
+        for record in records:
+            key = (
+                "directory" if isinstance(record, DirectoryRecord) else "image",
+                record.rel_path,
+            )
+            row = row_by_key.get(key)
+            if row is None:
+                continue
+            previous = self.images[row]
+            if type(previous) is not type(record) or previous == record:
+                continue
+            if isinstance(previous, ImageRecord) and isinstance(record, ImageRecord):
+                # Physical filesystem records are the membership/incarnation
+                # authority. A late SQLite page can describe the same path
+                # before it was replaced; never let that stale metadata (and
+                # its thumbnail reference) overwrite the current placeholder.
+                known_hash_changed = (
+                    previous.image_hash is not None
+                    and record.image_hash is not None
+                    and previous.image_hash != record.image_hash
+                )
+                if not self._same_image_incarnation(previous, record):
+                    if known_hash_changed or (
+                        previous.size_bytes == record.size_bytes
+                        and previous.mtime_ns == record.mtime_ns
+                    ):
+                        self._drop_cached_pixmap(record.rel_path)
+                        self._mark_thumbnail_pending(record.rel_path)
+                        if row < self._visible_count:
+                            self._queue_thumbnail_row(row, retry=True)
+                    continue
+                if known_hash_changed:
+                    self._drop_cached_pixmap(record.rel_path)
+                    self._mark_thumbnail_pending(record.rel_path)
+                    if row < self._visible_count:
+                        self._queue_thumbnail_row(row, retry=True)
+                    continue
+            elif isinstance(previous, DirectoryRecord):
+                self._drop_cached_pixmap(record.rel_path)
+            if (
+                isinstance(previous, ImageRecord)
+                and isinstance(record, ImageRecord)
+                and record.file_identity is None
+                and previous.file_identity is not None
+            ):
+                record = replace(record, file_identity=previous.file_identity)
+            self.images[row] = record
+            changed_rows.append(row)
+            if (
+                isinstance(record, ImageRecord)
+                and self._cached_pixmap(record.rel_path) is None
+            ):
+                self._mark_thumbnail_pending(record.rel_path)
+                if row < self._visible_count:
+                    self._queue_thumbnail_row(row, retry=True)
+
+        for row in changed_rows:
+            if row >= self._visible_count:
+                continue
+            index = self.index(row, 0)
+            self.dataChanged.emit(
+                index,
+                index,
+                [
+                    Qt.ItemDataRole.DisplayRole,
+                    Qt.ItemDataRole.DecorationRole,
+                    Qt.ItemDataRole.ToolTipRole,
+                ],
+            )
+        return len(changed_rows)
+
+    def replace_complete_records_in_place(
+        self,
+        records: list[PaneRecord],
+        *,
+        total_images: int | None,
+    ) -> None:
+        """Adopt same-key/order worker records without a reset or GUI O(N) pass."""
+
+        if len(records) != len(self.images):
+            raise ValueError("same-order replacement changed row count")
+        previous_records = self.images
+        row_by_key = self._complete_row_by_key or {}
+        for rel_path in list(self._pixmap_cache):
+            row = row_by_key.get(("image", rel_path))
+            if row is None:
+                row = row_by_key.get(("directory", rel_path))
+            if row is None:
+                continue
+            previous = previous_records[row]
+            current = records[row]
+            same_image_incarnation = (
+                isinstance(previous, ImageRecord)
+                and isinstance(current, ImageRecord)
+                and previous.rel_path == current.rel_path
+                and self._same_image_incarnation(previous, current)
+            )
+            same_directory_incarnation = (
+                isinstance(previous, DirectoryRecord)
+                and isinstance(current, DirectoryRecord)
+                and previous.dir_rel == current.dir_rel
+                and previous.mtime_ns == current.mtime_ns
+            )
+            if (
+                previous != current
+                and not same_image_incarnation
+                and not same_directory_incarnation
+            ):
+                self._drop_cached_pixmap(rel_path)
+        self.images = records
+        if total_images is not None:
+            self._image_count = max(0, int(total_images))
+        # Only visible rows need repaint/thumbnail admission now. Hidden rows
+        # read the adopted records directly when Qt exposes their next batch.
+        for row in range(self._visible_count):
+            record = records[row]
+            if (
+                isinstance(record, ImageRecord)
+                and self._cached_pixmap(record.rel_path) is None
+            ):
+                self._mark_thumbnail_pending(record.rel_path)
+                self._queue_thumbnail_row(row, retry=True)
+        if self._visible_count:
+            self.dataChanged.emit(
+                self.index(0, 0),
+                self.index(self._visible_count - 1, 0),
+                [
+                    Qt.ItemDataRole.DisplayRole,
+                    Qt.ItemDataRole.DecorationRole,
+                    Qt.ItemDataRole.ToolTipRole,
+                ],
+            )
+
     def append_page(
         self,
         images: Sequence[PaneRecord],
@@ -866,10 +1211,9 @@ class ThumbnailModel(QAbstractListModel):
             end = start + len(new_records) - 1
             self.beginInsertRows(QModelIndex(), start, end)
             self.images.extend(new_records)
-            directory_rows = list(self._directory_rows)
+            directory_rows = self._directory_rows
             for row in range(start, end + 1):
                 self._index_record(row, self.images[row], directory_rows)
-            self._directory_rows = tuple(directory_rows)
             self._visible_count = len(self.images)
         self._next_page_offset = max(expected_offset, int(next_offset))
         self._total_record_count = max(len(self.images), int(total_records))
@@ -1013,6 +1357,10 @@ class ThumbnailModel(QAbstractListModel):
             key
             for key in keys
             if key not in self._row_by_key and key not in self._located_row_by_key
+            and (
+                self._complete_row_by_key is None
+                or key not in self._complete_row_by_key
+            )
             and key not in self._record_lookup_attempted_keys
         )
         if not unresolved or self._thumbnail_closed:
@@ -1055,7 +1403,8 @@ class ThumbnailModel(QAbstractListModel):
             self._record_lookup_future.cancel()
             self._record_lookup_future = None
         # These scans are pure Python and check their cancel event every 128
-        # rows. Reusing the fixed pool bounds threads across rapid model resets.
+        # rows. The active single-worker epoch can roll over once if a stale
+        # scan fails to unwind, while the two-worker lifetime cap remains fixed.
 
     @property
     def image_count(self) -> int:
@@ -1066,10 +1415,20 @@ class ThumbnailModel(QAbstractListModel):
         return self._first_image_row
 
     def image_ordinal(self, row: int) -> int | None:
-        return self._image_ordinal_by_row.get(row)
+        ordinal = self._image_ordinal_by_row.get(row)
+        if (
+            ordinal is None
+            and self._first_image_row is not None
+            and row >= self._first_image_row
+        ):
+            ordinal = row - self._first_image_row + 1
+        return ordinal
 
     def row_for_key(self, key: tuple[str, str]) -> int | None:
-        return self._row_by_key.get(key, self._located_row_by_key.get(key))
+        row = self._row_by_key.get(key)
+        if row is None and self._complete_row_by_key is not None:
+            row = self._complete_row_by_key.get(key)
+        return row if row is not None else self._located_row_by_key.get(key)
 
     @staticmethod
     def _pixmap_cost(pixmap: QPixmap) -> int:
@@ -1106,7 +1465,13 @@ class ThumbnailModel(QAbstractListModel):
     def set_tile_size(self, size: int) -> None:
         self._cancel_thumbnail_loads()
         self.tile_size = size
-        self._clear_pixmap_cache()
+        # Image cache pixmaps are source thumbnails; the delegate scales them
+        # to the current card size and maintains its own bounded scaled cache.
+        # Preserve those sources during interactive window resizing. Folder
+        # mosaics are rendered for an exact tile size and must be regenerated.
+        for rel_path in list(self._pixmap_cache):
+            if self.row_for_key(("image", rel_path)) is None:
+                self._drop_cached_pixmap(rel_path)
         self._image_placeholder = None
         self._folder_placeholder = None
         self._emit_size_changed()
@@ -1139,7 +1504,7 @@ class ThumbnailModel(QAbstractListModel):
         return QSize(logical_tile_size + inset, logical_tile_size + font_metrics.height() + self.LABEL_GAP + inset)
 
     def refresh_thumbnail(self, rel_path: str) -> None:
-        row = self._row_by_rel.get(rel_path)
+        row = self.row_for_key(("image", rel_path))
         if row is not None:
             self._drop_cached_pixmap(rel_path)
             self._mark_thumbnail_pending(rel_path)
@@ -1147,10 +1512,15 @@ class ThumbnailModel(QAbstractListModel):
             if row < self._visible_count:
                 model_index = self.index(row, 0)
                 self.dataChanged.emit(model_index, model_index, [Qt.ItemDataRole.DecorationRole])
-        for directory_row in self._directory_rows:
+        parent = Path(rel_path).parent
+        while parent.as_posix() not in {"", "."}:
+            parent_rel = parent.as_posix()
+            directory_row = self.row_for_key(("directory", parent_rel))
+            parent = parent.parent
+            if directory_row is None or directory_row >= len(self.images):
+                continue
             record = self.images[directory_row]
-            assert isinstance(record, DirectoryRecord)
-            if rel_path != record.dir_rel and not rel_path.startswith(f"{record.dir_rel}/"):
+            if not isinstance(record, DirectoryRecord):
                 continue
             self._drop_cached_pixmap(record.rel_path)
             if directory_row < self._visible_count:
@@ -1188,25 +1558,51 @@ class ThumbnailModel(QAbstractListModel):
         start = self._visible_count
         end = min(len(self.images), start + THUMBNAIL_MODEL_BATCH_SIZE) - 1
         self.beginInsertRows(QModelIndex(), start, end)
-        directory_rows = list(self._directory_rows)
+        directory_rows = self._directory_rows
         for row in range(start, end + 1):
             self._index_record(row, self.images[row], directory_rows)
-        self._directory_rows = tuple(directory_rows)
         self._visible_count = end + 1
         self.endInsertRows()
+        target = self._ensure_row_target
+        if target is not None:
+            if target < self._visible_count:
+                self._ensure_row_target = None
+                self.rowExposureReady.emit()
+            else:
+                # Expose at most one normal model batch per event-loop turn.
+                QTimer.singleShot(
+                    0,
+                    partial(
+                        self._continue_row_exposure,
+                        self._row_exposure_generation,
+                    ),
+                )
 
-    def ensure_row_loaded(self, row: int) -> None:
-        if row < self._visible_count or row < 0 or row >= len(self.images):
+    def _continue_row_exposure(self, generation: int) -> None:
+        if (
+            generation != self._row_exposure_generation
+            or self._ensure_row_target is None
+            or self.is_paged
+        ):
             return
+        self.fetchMore()
+
+    def ensure_row_loaded(self, row: int) -> bool:
+        if row < self._visible_count or row < 0 or row >= len(self.images):
+            return 0 <= row < self._visible_count
+        if self._complete_row_by_key is not None:
+            self._ensure_row_target = max(self._ensure_row_target or 0, row)
+            self.fetchMore()
+            return row < self._visible_count
         start = self._visible_count
         end = min(len(self.images), row + 1) - 1
         self.beginInsertRows(QModelIndex(), start, end)
-        directory_rows = list(self._directory_rows)
+        directory_rows = self._directory_rows
         for exposed_row in range(start, end + 1):
             self._index_record(exposed_row, self.images[exposed_row], directory_rows)
-        self._directory_rows = tuple(directory_rows)
         self._visible_count = end + 1
         self.endInsertRows()
+        return True
 
     def data(self, index: QModelIndex, role: int = Qt.ItemDataRole.DisplayRole) -> object:
         if not index.isValid() or index.row() >= self._visible_count:
@@ -1255,7 +1651,7 @@ class ThumbnailModel(QAbstractListModel):
         for _ in range(count):
             rel_path, _ = self._pending_thumbnail_rels.popitem(last=False)
             self._pending_thumbnail_rels[rel_path] = None
-            row = self._row_by_rel.get(rel_path)
+            row = self.row_for_key(("image", rel_path))
             if row is None or row >= self._visible_count:
                 continue
             if isinstance(self.images[row], ImageRecord):
@@ -1356,29 +1752,117 @@ class ThumbnailModel(QAbstractListModel):
             return []
 
     @classmethod
-    def _load_thumbnail_blob(cls, root: Path, rel_path: str, embedded_blob: bytes | None) -> bytes | None:
-        if embedded_blob:
-            return embedded_blob
-        rows = cls._thumbnail_rows(
-            root,
-            """
-            SELECT thumb_rel_path,
-                CASE WHEN length(thumb_blob) <= ? THEN thumb_blob ELSE NULL END AS thumb_blob
-            FROM images
-            WHERE rel_path = ?
-            """,
-            (MAX_THUMBNAIL_BLOB_BYTES, rel_path),
-        )
-        if not rows:
+    def _load_thumbnail_blob(
+        cls,
+        root: Path,
+        rel_path: str,
+        embedded_blob: bytes | None,
+    ) -> bytes | None:
+        """Load cache bytes only when SQLite describes the live file inode.
+
+        Filesystem placeholders deliberately have no database incarnation
+        token. Looking up a thumbnail by pathname alone could therefore paint
+        the old contents after a same-name replacement. Validate size, mtime,
+        and change time against a pinned regular-file descriptor before using
+        either cache storage. The embedded value is intentionally ignored: it
+        may have come from an older database page than the row read here.
+        """
+
+        del embedded_blob
+        try:
+            filesystem = Catalog.open_filesystem_handle(root)
+            path = filesystem.mutation_path(rel_path)
+            parent = path.parent
+            flags = (
+                os.O_RDONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NONBLOCK", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+            )
+            with filesystem._open_catalog_directory_fd(parent) as parent_fd:  # noqa: SLF001
+                fd = os.open(
+                    path if parent_fd is None else path.name,
+                    flags,
+                    **({} if parent_fd is None else {"dir_fd": parent_fd}),
+                )
+                try:
+                    opened = os.fstat(fd)
+                    if not stat.S_ISREG(opened.st_mode):
+                        return None
+                    changed_ns = filesystem._path_change_time_ns(path, opened)  # noqa: SLF001
+                    rows = cls._thumbnail_rows(
+                        root,
+                        """
+                        SELECT file_size_bytes, modified_at_ns, ctime_ns, thumb_rel_path,
+                            CASE WHEN length(thumb_blob) <= ?
+                                THEN thumb_blob ELSE NULL END AS thumb_blob
+                        FROM images
+                        WHERE rel_path = ?
+                        """,
+                        (MAX_THUMBNAIL_BLOB_BYTES, rel_path),
+                    )
+                    if not rows:
+                        return None
+                    row = rows[0]
+                    if (
+                        int(row["file_size_bytes"]) != int(opened.st_size)
+                        or int(row["modified_at_ns"]) != int(opened.st_mtime_ns)
+                        or int(row["ctime_ns"]) != changed_ns
+                    ):
+                        return None
+                    blob = cls._read_thumbnail_cache_file(
+                        root,
+                        row["thumb_rel_path"],
+                    )
+                    if not blob:
+                        legacy_blob = row["thumb_blob"]
+                        if (
+                            not legacy_blob
+                            or len(legacy_blob) > MAX_THUMBNAIL_BLOB_BYTES
+                        ):
+                            return None
+                        blob = bytes(legacy_blob)
+                    after = os.fstat(fd)
+                    opened_identity = (
+                        int(opened.st_dev),
+                        int(opened.st_ino),
+                        int(opened.st_size),
+                        int(opened.st_mtime_ns),
+                        int(getattr(opened, "st_ctime_ns", 0)),
+                    )
+                    after_identity = (
+                        int(after.st_dev),
+                        int(after.st_ino),
+                        int(after.st_size),
+                        int(after.st_mtime_ns),
+                        int(getattr(after, "st_ctime_ns", 0)),
+                    )
+                    if opened_identity != after_identity:
+                        return None
+                    if parent_fd is None:
+                        named = path.stat(follow_symlinks=False)
+                    else:
+                        named = os.stat(
+                            path.name,
+                            dir_fd=parent_fd,
+                            follow_symlinks=False,
+                        )
+                        if not filesystem._directory_fd_still_names_path(  # noqa: SLF001
+                            parent_fd,
+                            parent,
+                        ):
+                            return None
+                    if (
+                        not stat.S_ISREG(named.st_mode)
+                        or (int(named.st_dev), int(named.st_ino))
+                        != (int(opened.st_dev), int(opened.st_ino))
+                    ):
+                        return None
+                    return blob
+                finally:
+                    os.close(fd)
+        except (OSError, ValueError):
             return None
-        row = rows[0]
-        blob = cls._read_thumbnail_cache_file(root, row["thumb_rel_path"])
-        if blob:
-            return blob
-        legacy_blob = row["thumb_blob"]
-        if not legacy_blob or len(legacy_blob) > MAX_THUMBNAIL_BLOB_BYTES:
-            return None
-        return bytes(legacy_blob)
 
     @classmethod
     def _load_thumbnail_image(cls, root: Path, rel_path: str, embedded_blob: bytes | None) -> QImage | None:
@@ -1452,13 +1936,16 @@ class ThumbnailModel(QAbstractListModel):
             if retry:
                 self._thumbnail_retry_rels.add(rel_path)
             return
-        if any(task_rel == rel_path for _, _, task_rel in self._thumbnail_futures.values()):
+        if any(
+            queued_record.rel_path == rel_path
+            for _, _, queued_record in self._thumbnail_futures.values()
+        ):
             if retry:
                 self._thumbnail_retry_rels.add(rel_path)
             return
         while len(self._thumbnail_waiting) >= MAX_WAITING_THUMBNAIL_LOADS:
-            _, _, _, _, _, evicted_rel_path, _ = self._thumbnail_waiting.popleft()
-            self._thumbnail_waiting_rels.discard(evicted_rel_path)
+            _, _, _, _, _, evicted_record = self._thumbnail_waiting.popleft()
+            self._thumbnail_waiting_rels.discard(evicted_record.rel_path)
         self._thumbnail_waiting.append(
             (
                 self._thumbnail_generation,
@@ -1466,23 +1953,49 @@ class ThumbnailModel(QAbstractListModel):
                 self.catalog.root_identity,
                 self.catalog.storage_identity,
                 row,
-                rel_path,
-                record.thumb_blob,
+                record,
             )
         )
         self._thumbnail_waiting_rels.add(rel_path)
         self._pump_thumbnail_loads()
 
     def _pump_thumbnail_loads(self) -> None:
+        if self._thumbnail_closed:
+            return
+
         def outstanding() -> int:
             return len(self._thumbnail_futures) + len(self._folder_futures)
 
         while self._thumbnail_waiting and outstanding() < MAX_PENDING_THUMBNAIL_LOADS:
-            generation, root, root_identity, storage_identity, row, rel_path, embedded_blob = (
-                self._thumbnail_waiting.popleft()
-            )
+            waiting = self._thumbnail_waiting.popleft()
+            generation, root, root_identity, storage_identity, row, queued_record = waiting
+            rel_path = queued_record.rel_path
             self._thumbnail_waiting_rels.discard(rel_path)
             if generation != self._thumbnail_generation:
+                continue
+            if row < 0 or row >= self._visible_count:
+                continue
+            current_record = self.images[row]
+            if (
+                not isinstance(current_record, ImageRecord)
+                or current_record.rel_path != rel_path
+                or not self._same_image_incarnation(queued_record, current_record)
+            ):
+                if (
+                    isinstance(current_record, ImageRecord)
+                    and current_record.rel_path not in self._thumbnail_waiting_rels
+                ):
+                    self._thumbnail_waiting.append(
+                        (
+                            generation,
+                            root,
+                            root_identity,
+                            storage_identity,
+                            row,
+                            current_record,
+                        )
+                    )
+                    self._thumbnail_waiting_rels.add(current_record.rel_path)
                 continue
             try:
                 future = self._thumbnail_executor.submit(
@@ -1491,17 +2004,47 @@ class ThumbnailModel(QAbstractListModel):
                     root_identity,
                     storage_identity,
                     rel_path,
-                    embedded_blob,
+                    queued_record.thumb_blob,
                 )
             except RuntimeError:
+                # The fixed executor can still contain canceled calls from
+                # rapid prior panes. Keep the newest request and poll for
+                # admission instead of losing it after popleft().
+                self._thumbnail_waiting.appendleft(waiting)
+                self._thumbnail_waiting_rels.add(rel_path)
+                self._thumbnail_timer.start()
                 return
-            self._thumbnail_futures[future] = (generation, row, rel_path)
+            self._thumbnail_futures[future] = (generation, row, queued_record)
         while self._folder_waiting and outstanding() < MAX_PENDING_THUMBNAIL_LOADS:
-            generation, root, root_identity, storage_identity, row, record, tile_size = (
-                self._folder_waiting.popleft()
-            )
+            waiting_folder = self._folder_waiting.popleft()
+            generation, root, root_identity, storage_identity, row, record, tile_size = waiting_folder
             self._folder_waiting_rels.discard(record.rel_path)
             if generation != self._thumbnail_generation:
+                continue
+            if row < 0 or row >= self._visible_count:
+                continue
+            current_record = self.images[row]
+            if (
+                not isinstance(current_record, DirectoryRecord)
+                or current_record != record
+                or self.tile_size != tile_size
+            ):
+                if (
+                    isinstance(current_record, DirectoryRecord)
+                    and current_record.rel_path not in self._folder_waiting_rels
+                ):
+                    self._folder_waiting.append(
+                        (
+                            generation,
+                            root,
+                            root_identity,
+                            storage_identity,
+                            row,
+                            current_record,
+                            self.tile_size,
+                        )
+                    )
+                    self._folder_waiting_rels.add(current_record.rel_path)
                 continue
             try:
                 future = self._thumbnail_executor.submit(
@@ -1513,18 +2056,22 @@ class ThumbnailModel(QAbstractListModel):
                     tile_size,
                 )
             except RuntimeError:
+                self._folder_waiting.appendleft(waiting_folder)
+                self._folder_waiting_rels.add(record.rel_path)
+                self._thumbnail_timer.start()
                 return
-            self._folder_futures[future] = (generation, row, record.rel_path)
+            self._folder_futures[future] = (generation, row, record, tile_size)
         if self._thumbnail_futures or self._thumbnail_waiting or self._folder_futures or self._folder_waiting:
             self._thumbnail_timer.start()
 
     def _settle_thumbnail_loads(self) -> None:
         settled = 0
-        for future, (generation, row, rel_path) in list(self._thumbnail_futures.items()):
+        for future, (generation, row, queued_record) in list(self._thumbnail_futures.items()):
             if settled >= THUMBNAIL_RESULTS_PER_TICK or not future.done():
                 continue
             settled += 1
             self._thumbnail_futures.pop(future, None)
+            rel_path = queued_record.rel_path
             if future.cancelled():
                 continue
             try:
@@ -1537,6 +2084,10 @@ class ThumbnailModel(QAbstractListModel):
                 continue
             record = self.images[row]
             if not isinstance(record, ImageRecord) or record.rel_path != rel_path:
+                continue
+            if not self._same_image_incarnation(queued_record, record):
+                self._mark_thumbnail_pending(record.rel_path)
+                self._queue_thumbnail_row(row, retry=True)
                 continue
             pixmap = QPixmap.fromImage(image) if image is not None else QPixmap()
             if pixmap.isNull():
@@ -1552,7 +2103,12 @@ class ThumbnailModel(QAbstractListModel):
                 self._thumbnail_retry_rels.discard(rel_path)
                 index = self.index(row, 0)
                 self.dataChanged.emit(index, index, [Qt.ItemDataRole.DecorationRole])
-        for future, (generation, row, rel_path) in list(self._folder_futures.items()):
+        for future, (
+            generation,
+            row,
+            queued_record,
+            queued_tile_size,
+        ) in list(self._folder_futures.items()):
             if settled >= THUMBNAIL_RESULTS_PER_TICK or not future.done():
                 continue
             settled += 1
@@ -1566,9 +2122,12 @@ class ThumbnailModel(QAbstractListModel):
             if row < 0 or row >= self._visible_count:
                 continue
             record = self.images[row]
-            if not isinstance(record, DirectoryRecord) or record.rel_path != rel_path:
+            if not isinstance(record, DirectoryRecord):
                 continue
-            self._cache_pixmap(rel_path, pixmap_from_pil_image(image))
+            if record != queued_record or self.tile_size != queued_tile_size:
+                self._queue_folder_row(row)
+                continue
+            self._cache_pixmap(record.rel_path, pixmap_from_pil_image(image))
             index = self.index(row, 0)
             self.dataChanged.emit(index, index, [Qt.ItemDataRole.DecorationRole])
         self._pump_thumbnail_loads()
@@ -1594,9 +2153,9 @@ class ThumbnailModel(QAbstractListModel):
         self._thumbnail_futures.clear()
         self._folder_futures.clear()
         self._thumbnail_timer.stop()
-        # Keep one fixed pool. It has four reserved lanes beyond the maximum
-        # submissions for a pane, so the next pane starts while one stale pane
-        # unwinds without leaking another generation of daemon threads.
+        # Saturation can retire one four-worker epoch so the next pane starts
+        # while stale native reads unwind. The retired generation is still
+        # counted, keeping a hard process-wide cap of eight thumbnail workers.
 
     def close(self) -> None:
         if self._thumbnail_closed:
@@ -1661,7 +2220,10 @@ class ThumbnailModel(QAbstractListModel):
             return
         if record.rel_path in self._folder_waiting_rels:
             return
-        if any(task_rel == record.rel_path for _, _, task_rel in self._folder_futures.values()):
+        if any(
+            queued_record.rel_path == record.rel_path
+            for _, _, queued_record, _ in self._folder_futures.values()
+        ):
             return
         while len(self._folder_waiting) >= MAX_WAITING_THUMBNAIL_LOADS:
             _, _, _, _, _, evicted_record, _ = self._folder_waiting.popleft()
@@ -2079,6 +2641,7 @@ class ThumbnailView(QListView):
             )
 
     def cleanup_manual_drag(self) -> None:
+        was_active = self._manual_drag_active
         if self.main_window is not None:
             self.main_window.tree.set_drag_hover_item(None)
         self._manual_drag_watchdog.stop()
@@ -2094,6 +2657,14 @@ class ThumbnailView(QListView):
         self._drag_destination_dir_rel = None
         self._manual_drag_active = False
         self._drag_cursor_active = False
+        if was_active and self.main_window is not None:
+            # A thumbnail drag deliberately freezes tree publication so its
+            # destination cannot move underneath the cursor.  Resume on the
+            # next event-loop turn, after every piece of drag state is clear.
+            QTimer.singleShot(
+                0,
+                self.main_window._resume_deferred_tree_publication,
+            )
 
     def tree_item_at_global(self, global_pos: QPoint) -> QTreeWidgetItem | None:
         if self.main_window is None:
@@ -2231,9 +2802,7 @@ class DirectoryTree(QTreeWidget):
         finally:
             self.set_drag_hover_item(None)
             self.window._directory_drag_active = False
-            if self.window._tree_rebuild_deferred:
-                self.window._tree_rebuild_deferred = False
-                self.window.rebuild_tree()
+            self.window._resume_deferred_tree_publication()
 
     def dragEnterEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         if event.mimeData().hasFormat(ThumbnailModel.MIME_TYPE):
@@ -2394,10 +2963,11 @@ class MainWindow(QMainWindow):
         self.indexer = BackgroundIndexer(max_workers=4)
         # A catalog on an unavailable or very slow filesystem must not hold up
         # a newer catalog selection.
-        self.catalog_open_executor = AbandonableThreadPoolExecutor(
-            max_workers=8,
+        self.catalog_open_executor = RolloverThreadPoolExecutor(
+            max_workers=2,
             thread_name_prefix="marnwick-open",
-            max_pending=MAX_CATALOG_OPEN_TASKS,
+            max_pending=2,
+            max_retired=3,
         )
         self.timing_executor = AbandonableThreadPoolExecutor(
             max_workers=1,
@@ -2411,26 +2981,29 @@ class MainWindow(QMainWindow):
         self._config_save_futures: set[Future[None]] = set()
         self._config_save_contexts: dict[Future[None], tuple[int, tuple[str, ...]]] = {}
         self._config_save_sequence = 0
-        # A canceled filesystem/SQLite read may take a moment to observe its
-        # cancellation callback. Keep one lane available so the user's latest
-        # directory selection can start immediately instead of queuing behind it.
-        self.virtual_view_executor = AbandonableThreadPoolExecutor(
-            max_workers=8,
+        # A canceled filesystem/SQLite read may never return from native code.
+        # Finite rollover epochs let the latest directory selection bypass a
+        # few fully stuck generations while preserving the eight-thread caps.
+        self.virtual_view_executor = RolloverThreadPoolExecutor(
+            max_workers=2,
             thread_name_prefix="marnwick-virtual",
-            max_pending=8,
+            max_pending=2,
+            max_retired=3,
         )
-        self.physical_preview_executor = AbandonableThreadPoolExecutor(
-            max_workers=8,
+        self.physical_preview_executor = RolloverThreadPoolExecutor(
+            max_workers=2,
             thread_name_prefix="marnwick-physical-preview",
-            max_pending=8,
+            max_pending=2,
+            max_retired=3,
         )
         # Tree database pages are isolated from pane reads. When a genuinely
         # blocked old catalog is preempted, this executor can be rolled over so
         # the current catalog never waits behind an uninterruptible OS call.
-        self.tree_read_executor = AbandonableThreadPoolExecutor(
-            max_workers=4,
+        self.tree_read_executor = RolloverThreadPoolExecutor(
+            max_workers=1,
             thread_name_prefix="marnwick-tree-read",
-            max_pending=4,
+            max_pending=1,
+            max_retired=3,
         )
         # Kept for compatibility with older direct callers; UI file work is
         # routed through BackgroundIndexer.submit_action below.
@@ -2443,10 +3016,11 @@ class MainWindow(QMainWindow):
             thread_name_prefix="marnwick-save",
             max_pending=MAX_PENDING_IMAGE_SAVES,
         )
-        self.identity_executor = AbandonableThreadPoolExecutor(
-            max_workers=4,
+        self.identity_executor = RolloverThreadPoolExecutor(
+            max_workers=1,
             thread_name_prefix="marnwick-confirm-identity",
-            max_pending=4,
+            max_pending=1,
+            max_retired=3,
         )
         self.current_catalog: Catalog | None = None
         self.current_dir_rel = ""
@@ -2484,8 +3058,12 @@ class MainWindow(QMainWindow):
         ] = {}
         self._deferred_delete_requests: list[DeferredDeleteRequest] = []
         self._delete_confirmation_tasks: dict[Future[object], DeleteConfirmationTask] = {}
+        self._settling_delete_confirmation_keys: set[
+            tuple[Path, tuple[int, int], str, tuple[str, ...]]
+        ] = set()
         self._image_reconcile_tasks: dict[IndexTask, ImageReconcileContext] = {}
         self._image_reconcile_retries: dict[tuple[Path, str], ImageReconcileContext] = {}
+        self._post_move_reconcile_tasks: dict[IndexTask, PostMoveReconcileContext] = {}
         self._thumbnail_repair_tasks: dict[tuple[Path, str], IndexTask] = {}
         self._failed_image_edits: dict[tuple[Path, str], tuple[EditOperation, ...]] = {}
         self._tree_build_task: TreeBuildTask | None = None
@@ -2525,6 +3103,16 @@ class MainWindow(QMainWindow):
         self._pending_physical_progress_reload: tuple[Path, str, SortOrder] | None = None
         self._physical_progress_reload_timer_pending = False
         self._physical_full_result_generation = 0
+        self._physical_preview_result_generation = 0
+        self._physical_preview_retry_generation: int | None = None
+        self._physical_reconcile_pending_generation: int | None = None
+        self._pending_exclusion_cache: dict[
+            Path,
+            tuple[
+                tuple[tuple[tuple[int, bool], ...], tuple[int, ...], tuple[tuple[int, bool], ...]],
+                tuple[frozenset[str], frozenset[str]],
+            ],
+        ] = {}
         self._pending_thumbnail_index_restore: tuple[
             set[tuple[str, str]],
             tuple[str, str] | None,
@@ -2539,6 +3127,7 @@ class MainWindow(QMainWindow):
         self.model = ThumbnailModel()
         self.model.thumbnail_repair_requested = self._queue_thumbnail_repair
         self.model.indexesReady.connect(self._thumbnail_indexes_ready)
+        self.model.rowExposureReady.connect(self._thumbnail_rows_exposed)
         self.thumbnail_view = ThumbnailView(self)
         self.thumbnail_view.setModel(self.model)
         self.thumbnail_view.setItemDelegate(ThumbnailDelegate(self.thumbnail_view))
@@ -2702,6 +3291,7 @@ class MainWindow(QMainWindow):
         for future in self._delete_confirmation_tasks:
             future.cancel()
         self._delete_confirmation_tasks.clear()
+        self._settling_delete_confirmation_keys.clear()
         self.identity_executor.shutdown(wait=False, cancel_futures=True)
         self.indexer.shutdown()
         self.workspace.close()
@@ -3499,11 +4089,12 @@ class MainWindow(QMainWindow):
         names: Sequence[str],
         *,
         expected_identity: object | None = None,
+        owner: FullscreenViewer | None = None,
     ) -> MovePayloadTask | None:
         if self.workspace.catalog_for_root(catalog.root) is not catalog:
             return None
         requested_names = tuple(names)
-        return self._queue_catalog_mutation(
+        mutation = self._queue_catalog_mutation(
             catalog,
             label="Updating image tags",
             dest_dir_rel=rel_path.rpartition("/")[0],
@@ -3519,6 +4110,9 @@ class MainWindow(QMainWindow):
             completion_verb="Updated",
             error_title="Image Tags",
         )
+        if mutation is not None:
+            mutation.navigation_owner = owner
+        return mutation
 
     def open_directory_properties(self, root: Path, dir_rel: str) -> None:
         catalog = self.workspace.catalog_for_root(root)
@@ -3679,6 +4273,7 @@ class MainWindow(QMainWindow):
         expected_storage_identity: CatalogStorageIdentity,
         rel_paths: tuple[str, ...],
         directory_rel: str,
+        expected_incarnations: Mapping[str, ImageRecord | ImageFileIdentity],
     ) -> object:
         with Catalog.open_reader(
             root,
@@ -3687,7 +4282,49 @@ class MainWindow(QMainWindow):
         ) as catalog:
             if directory_rel:
                 return catalog.directory_identity(directory_rel)
-            return dict(catalog.file_identities(rel_paths))
+            identities: dict[str, object] = {}
+            for rel_path in rel_paths:
+                current_identity = catalog.file_identity(rel_path)
+                expected = expected_incarnations.get(rel_path)
+                if isinstance(expected, ImageFileIdentity):
+                    displayed_identity = snapshot_image_file_identity(
+                        catalog.mutation_path(rel_path)
+                    )
+                    if displayed_identity != expected:
+                        raise OSError(
+                            f"image changed since it was displayed: {rel_path}"
+                        )
+                elif isinstance(expected, ImageRecord):
+                    if (
+                        expected.file_identity is not None
+                        and current_identity != expected.file_identity
+                    ):
+                        raise OSError(
+                            f"image changed since its thumbnail was displayed: {rel_path}"
+                        )
+                    if (
+                        expected.size_bytes <= 0
+                        or expected.ctime_ns <= 0
+                        or current_identity[3] != expected.size_bytes
+                        or current_identity[4] != expected.mtime_ns
+                        or current_identity[5] != expected.ctime_ns
+                    ):
+                        raise OSError(
+                            f"image changed since its thumbnail was displayed: {rel_path}"
+                        )
+                    if is_exact_image_hash(expected.image_hash):
+                        current_proof = catalog.file_proof(rel_path)
+                        if (
+                            current_proof[:5] != current_identity[:5]
+                            or current_proof[5].casefold()
+                            != str(expected.image_hash).casefold()
+                        ):
+                            raise OSError(
+                                f"image content changed since its thumbnail was displayed: {rel_path}"
+                            )
+                identities[rel_path] = current_identity
+            catalog._assert_catalog_storage_identity()  # noqa: SLF001 - stale-result guard
+            return identities
 
     def _start_delete_confirmation(
         self,
@@ -3699,9 +4336,29 @@ class MainWindow(QMainWindow):
         owner: QWidget,
         wipe: bool,
         remove_from_current_view: bool,
+        expected_incarnations: Mapping[
+            str,
+            ImageRecord | ImageFileIdentity,
+        ] | None = None,
     ) -> None:
         unique_rel_paths = tuple(dict.fromkeys(rel_paths))
         if not directory_rel and not unique_rel_paths:
+            return
+        request_key = self._delete_confirmation_key(
+            catalog,
+            unique_rel_paths,
+            directory_rel,
+        )
+        if request_key in self._settling_delete_confirmation_keys or any(
+            self._delete_confirmation_key(
+                pending.catalog,
+                pending.rel_paths,
+                pending.directory_rel,
+            )
+            == request_key
+            for pending in self._delete_confirmation_tasks.values()
+        ):
+            self.progress_label.setText("Delete confirmation already pending")
             return
         try:
             future = self.identity_executor.submit(
@@ -3711,6 +4368,7 @@ class MainWindow(QMainWindow):
                 catalog.storage_identity,
                 unique_rel_paths,
                 directory_rel,
+                dict(expected_incarnations or {}),
             )
         except RuntimeError:
             self._show_identity_preflight_busy("delete")
@@ -3730,6 +4388,17 @@ class MainWindow(QMainWindow):
         self.progress_bar.setRange(0, 0)
         self.progress_label.setText("Checking selected files before delete")
 
+    @staticmethod
+    def _delete_confirmation_key(
+        catalog: Catalog,
+        rel_paths: tuple[str, ...],
+        directory_rel: str,
+    ) -> tuple[Path, tuple[int, int], str, tuple[str, ...]]:
+        # Selection order is presentation state, not delete-request identity.
+        # Treat repeated shortcuts for the same files as one pending prompt
+        # even if Qt reports the selected indexes in a different order.
+        return catalog.root, catalog.root_identity, directory_rel, tuple(sorted(rel_paths))
+
     def _delete_confirmation_is_current(self, task: DeleteConfirmationTask) -> bool:
         if self._closing or self.workspace.catalog_for_root(task.catalog.root) is not task.catalog:
             return False
@@ -3747,59 +4416,101 @@ class MainWindow(QMainWindow):
             )
         return True
 
+    def _delete_confirmation_can_commit_after_prompt(
+        self,
+        task: DeleteConfirmationTask,
+    ) -> bool:
+        """Revalidate the target without retargeting an accepted main prompt.
+
+        A modal confirmation remains bound to the catalog/identities shown
+        when it opened. If another catalog window becomes active during the
+        nested event loop, accepting must neither redirect the delete nor
+        silently cancel that explicit answer. A fullscreen prompt still
+        requires its viewer to be on the same image.
+        """
+
+        if self._closing or self.workspace.catalog_for_root(task.catalog.root) is not task.catalog:
+            return False
+        if task.kind == "images-main-selection":
+            return True
+        return self._delete_confirmation_is_current(task)
+
     def _settle_delete_confirmations(self) -> None:
         for future, task in list(self._delete_confirmation_tasks.items()):
             if not future.done():
                 continue
             self._delete_confirmation_tasks.pop(future, None)
-            if future.cancelled() or not self._delete_confirmation_is_current(task):
-                continue
-            try:
-                captured = future.result()
-            except Exception as error:
-                show_error(task.owner, "Delete Directory" if task.directory_rel else "Delete", str(error))
-                if self.current_catalog is task.catalog:
-                    self.load_current_directory(preserve_selection=True)
-                continue
-            if task.directory_rel:
-                directory = task.catalog.root.joinpath(*Path(task.directory_rel).parts)
-                if not ask_delete_directory(task.owner, directory):
-                    continue
-                if self.workspace.catalog_for_root(task.catalog.root) is not task.catalog:
-                    continue
-                self._queue_confirmed_directory_delete(
-                    task.catalog,
-                    task.directory_rel,
-                    captured,
-                    wipe=task.wipe,
-                )
-                continue
-            if not isinstance(captured, dict) or any(
-                rel_path not in captured for rel_path in task.rel_paths
-            ):
-                show_error(task.owner, "Delete", "An image changed or disappeared before confirmation.")
-                continue
-            if isinstance(task.owner, FullscreenViewer):
-                confirmed = bool(
-                    task.owner.run_with_visible_cursor(
-                        lambda: ask_delete_files(task.owner, len(task.rel_paths))
-                    )
-                )
-            else:
-                confirmed = ask_delete_files(task.owner, len(task.rel_paths))
-            if not confirmed:
-                continue
-            if self.workspace.catalog_for_root(task.catalog.root) is not task.catalog:
-                continue
-            self.queue_delete_images(
+            request_key = self._delete_confirmation_key(
                 task.catalog,
                 task.rel_paths,
-                expected_identities=captured,
-                wipe=task.wipe,
-                remove_from_current_view=task.remove_from_current_view,
+                task.directory_rel,
             )
-            if task.kind == "image-viewer" and isinstance(task.owner, FullscreenViewer):
-                task.owner.image_delete_queued(task.rel_paths[0])
+            self._settling_delete_confirmation_keys.add(request_key)
+            try:
+                self._finish_delete_confirmation(future, task)
+            finally:
+                self._settling_delete_confirmation_keys.discard(request_key)
+
+    def _finish_delete_confirmation(
+        self,
+        future: Future[object],
+        task: DeleteConfirmationTask,
+    ) -> None:
+        """Finish one identity check while suppressing nested duplicate prompts."""
+
+        if future.cancelled() or not self._delete_confirmation_is_current(task):
+            return
+        try:
+            captured = future.result()
+        except Exception as error:
+            show_error(task.owner, "Delete Directory" if task.directory_rel else "Delete", str(error))
+            if self.current_catalog is task.catalog:
+                self.load_current_directory(preserve_selection=True)
+            return
+        if task.directory_rel:
+            directory = task.catalog.root.joinpath(*Path(task.directory_rel).parts)
+            if not ask_delete_directory(task.owner, directory):
+                return
+            if (
+                not self._delete_confirmation_can_commit_after_prompt(task)
+                or self.workspace.catalog_for_root(task.catalog.root) is not task.catalog
+            ):
+                return
+            self._queue_confirmed_directory_delete(
+                task.catalog,
+                task.directory_rel,
+                captured,
+                wipe=task.wipe,
+            )
+            return
+        if not isinstance(captured, dict) or any(
+            rel_path not in captured for rel_path in task.rel_paths
+        ):
+            show_error(task.owner, "Delete", "An image changed or disappeared before confirmation.")
+            return
+        if isinstance(task.owner, FullscreenViewer):
+            confirmed = bool(
+                task.owner.run_with_visible_cursor(
+                    lambda: ask_delete_files(task.owner, len(task.rel_paths))
+                )
+            )
+        else:
+            confirmed = ask_delete_files(task.owner, len(task.rel_paths))
+        if not confirmed:
+            return
+        if (
+            not self._delete_confirmation_can_commit_after_prompt(task)
+            or self.workspace.catalog_for_root(task.catalog.root) is not task.catalog
+        ):
+            return
+        self.queue_delete_images(
+            task.catalog,
+            task.rel_paths,
+            expected_identities=captured,
+            wipe=task.wipe,
+            remove_from_current_view=task.remove_from_current_view,
+            viewer=task.owner if isinstance(task.owner, FullscreenViewer) else None,
+        )
 
     def is_restorable_trash_rel(self, rel_path: str) -> bool:
         return is_inside_trash_rel_path(rel_path)
@@ -4464,6 +5175,8 @@ class MainWindow(QMainWindow):
         task: IndexTask,
     ) -> MovePayloadResult:
         restored = 0
+        reconcile_subtrees: list[tuple[Path, str]] = []
+        reconcile_images: list[tuple[Path, str]] = []
         with Catalog.open_writer(
             root,
             expected_root_identity=task.expected_root_identity,
@@ -4494,21 +5207,33 @@ class MainWindow(QMainWindow):
                 if kind == "directory":
                     if rel_path not in expected_directories:
                         raise OSError(f"directory identity was not captured before restore: {rel_path}")
-                    catalog.restore_directory_from_trash(
+                    result = catalog.restore_directory_from_trash(
                         rel_path,
                         expected_identity=expected_directories[rel_path],
+                    )
+                    reconcile_subtrees.append(
+                        (result.dest_catalog_root, result.dest_rel_path)
                     )
                 else:
                     if rel_path not in expected_images:
                         raise OSError(f"image identity was not captured before restore: {rel_path}")
-                    catalog.restore_image_from_trash(
+                    result = catalog.restore_image_from_trash(
                         rel_path,
                         expected_identity=expected_images[rel_path],
+                    )
+                    reconcile_images.append(
+                        (result.dest_catalog_root, result.dest_rel_path)
                     )
                 restored += 1
                 task.update(index, len(restore_items), rel_path)
         task.mark_done()
-        return MovePayloadResult(len(restore_items), restored, {root})
+        return MovePayloadResult(
+            len(restore_items),
+            restored,
+            {root},
+            reconcile_subtrees=tuple(reconcile_subtrees),
+            reconcile_images=tuple(reconcile_images),
+        )
 
     def _finish_trash_restore(self, catalog: Catalog, *source_rel_paths: str) -> None:
         self._drop_very_similar_cache(catalog.root)
@@ -5051,6 +5776,7 @@ class MainWindow(QMainWindow):
         self._mark_initial_config_catalog_interaction()
         exact_catalog = self.workspace.catalog_for_exact_root(root.expanduser().absolute())
         resolved = exact_catalog.root if exact_catalog is not None else root.expanduser().absolute()
+        self._pending_exclusion_cache.pop(resolved, None)
         if self._catalog_intent_root in {resolved, root.expanduser().absolute()}:
             self._record_catalog_intent(None)
         self._cancel_catalog_open_tasks(resolved)
@@ -5077,6 +5803,9 @@ class MainWindow(QMainWindow):
         for (task_root, _), task in list(self._directory_index_tasks.items()):
             if task_root == resolved:
                 task.cancel()
+        for task, context in list(self._post_move_reconcile_tasks.items()):
+            if context.root == resolved:
+                task.cancel()
         for task_root, task in list(self._thumbnail_prune_tasks.items()):
             if task_root == resolved:
                 task.cancel()
@@ -5101,6 +5830,11 @@ class MainWindow(QMainWindow):
         self._directory_discovery_retry_at.pop(resolved, None)
         self._directory_index_tasks = {
             key: task for key, task in self._directory_index_tasks.items() if key[0] != resolved
+        }
+        self._post_move_reconcile_tasks = {
+            task: context
+            for task, context in self._post_move_reconcile_tasks.items()
+            if context.root != resolved
         }
         self._thumbnail_prune_tasks.pop(resolved, None)
         self._thumbnail_repair_tasks = {
@@ -5252,10 +5986,48 @@ class MainWindow(QMainWindow):
             dialog.deleteLater()
         return finished
 
+    def _tree_publication_blocked(self) -> bool:
+        """Whether changing tree geometry could invalidate an active drop target."""
+
+        thumbnail_view = getattr(self, "thumbnail_view", None)
+        return self._directory_drag_active or bool(
+            thumbnail_view is not None and thumbnail_view.manual_drag_active()
+        )
+
+    def _resume_deferred_tree_publication(self) -> None:
+        """Resume bounded tree work after either drag implementation finishes."""
+
+        if self._closing or self._tree_publication_blocked():
+            return
+        if self._tree_rebuild_deferred:
+            self._tree_rebuild_deferred = False
+            self.rebuild_tree()
+            return
+        build_task = self._tree_build_task
+        if build_task is not None:
+            QTimer.singleShot(
+                0,
+                partial(
+                    self._continue_incremental_tree_rebuild,
+                    build_task.generation,
+                ),
+            )
+        path_task = self._tree_path_selection_task
+        if path_task is not None:
+            QTimer.singleShot(
+                0,
+                partial(
+                    self._continue_tree_path_selection,
+                    path_task.generation,
+                ),
+            )
+        if self._tree_children_tasks or self._tree_tags_tasks:
+            QTimer.singleShot(0, self._poll_indexer)
+
     def rebuild_tree(self) -> None:
         if self._closing:
             return
-        if self._directory_drag_active:
+        if self._tree_publication_blocked():
             self._tree_rebuild_deferred = True
             return
         self._cancel_tree_path_selection()
@@ -5352,7 +6124,7 @@ class MainWindow(QMainWindow):
             )
 
     def _request_incremental_tree_rebuild(self, catalog: Catalog, *, reason: str) -> None:
-        if self._directory_drag_active:
+        if self._tree_publication_blocked():
             self._tree_rebuild_deferred = True
             return
         active_task = self._tree_build_task
@@ -5444,13 +6216,15 @@ class MainWindow(QMainWindow):
         if task.page_cancel_event is not None:
             task.page_cancel_event.set()
         page_future = task.page_future
+        page_still_running = False
         if page_future is not None:
-            page_future.cancel()
+            page_still_running = not page_future.cancel()
         self._tree_build_task = None
-        # The fixed pool has reserved lanes for a replacement build. Creating
-        # an executor per canceled page leaks one blocked daemon thread per
-        # navigation generation on an unavailable filesystem.
-        del rollover_if_running
+        # Admission rolls a saturated epoch only while one of three bounded
+        # retirement slots remains. This lets a replacement page bypass stale
+        # native reads without leaking one daemon thread per navigation.
+        if rollover_if_running and page_still_running:
+            self.tree_read_executor.rollover(cancel_futures=True)
 
     @staticmethod
     def _read_tree_page_worker(
@@ -5552,7 +6326,7 @@ class MainWindow(QMainWindow):
             self._cancel_active_tree_build()
             self._pending_tree_rebuilds.clear()
             return
-        if self._directory_drag_active:
+        if self._tree_publication_blocked():
             self._tree_rebuild_deferred = True
             return
         task = self._tree_build_task
@@ -5854,7 +6628,7 @@ class MainWindow(QMainWindow):
         if self._closing:
             self._cancel_tree_path_selection()
             return
-        if self._directory_drag_active:
+        if self._tree_publication_blocked():
             QTimer.singleShot(
                 TREE_PAGE_POLL_INTERVAL_MS,
                 lambda generation=generation: self._continue_tree_path_selection(generation),
@@ -6108,10 +6882,21 @@ class MainWindow(QMainWindow):
         if not root_value:
             return
         root = Path(root_value).expanduser().absolute()
+        parent_dir_rel = item.data(0, DIR_REL_ROLE) or ""
+        if self._tree_publication_blocked():
+            QTimer.singleShot(
+                TREE_PAGE_POLL_INTERVAL_MS,
+                partial(
+                    self._request_tree_children_for_directory,
+                    root,
+                    parent_dir_rel,
+                    offset=offset,
+                ),
+            )
+            return
         catalog = self.workspace.catalog_for_root(root)
         if catalog is None:
             return
-        parent_dir_rel = item.data(0, DIR_REL_ROLE) or ""
         item_by_dir = self._tree_item_maps.get(catalog.root)
         if item_by_dir is None or item_by_dir.get(parent_dir_rel) is not item:
             return
@@ -6159,6 +6944,8 @@ class MainWindow(QMainWindow):
         )
 
     def _settle_tree_children_tasks(self) -> None:
+        if self._tree_publication_blocked():
+            return
         for future, task in list(self._tree_children_tasks.items()):
             if not future.done():
                 continue
@@ -6345,6 +7132,19 @@ class MainWindow(QMainWindow):
                     return item
         return None
 
+    def _request_tree_tags_for_catalog(
+        self,
+        root: Path,
+        *,
+        offset: int | None = None,
+    ) -> None:
+        catalog = self.workspace.catalog_for_root(root)
+        if catalog is None:
+            return
+        tags_root = self._tag_tree_root_for_catalog(catalog)
+        if tags_root is not None:
+            self._request_tree_tags(tags_root, offset=offset)
+
     def _request_tree_tags(
         self,
         tags_root: QTreeWidgetItem,
@@ -6356,7 +7156,18 @@ class MainWindow(QMainWindow):
         root_value = tags_root.data(0, CATALOG_ROOT_ROLE)
         if not root_value:
             return
-        catalog = self.workspace.catalog_for_root(Path(root_value))
+        root = Path(root_value)
+        if self._tree_publication_blocked():
+            QTimer.singleShot(
+                TREE_PAGE_POLL_INTERVAL_MS,
+                partial(
+                    self._request_tree_tags_for_catalog,
+                    root,
+                    offset=offset,
+                ),
+            )
+            return
+        catalog = self.workspace.catalog_for_root(root)
         if catalog is None or self._tag_tree_root_for_catalog(catalog) is not tags_root:
             return
         if offset is None:
@@ -6393,6 +7204,8 @@ class MainWindow(QMainWindow):
         )
 
     def _settle_tree_tags_tasks(self) -> None:
+        if self._tree_publication_blocked():
+            return
         for future, task in list(self._tree_tags_tasks.items()):
             if not future.done():
                 continue
@@ -6595,6 +7408,12 @@ class MainWindow(QMainWindow):
     def _restore_tree_scroll_position(self, position: tuple[int, int]) -> None:
         if self._closing:
             return
+        if self._tree_publication_blocked():
+            QTimer.singleShot(
+                TREE_PAGE_POLL_INTERVAL_MS,
+                partial(self._restore_tree_scroll_position, position),
+            )
+            return
         vertical, horizontal = position
         vertical_bar = self.tree.verticalScrollBar()
         horizontal_bar = self.tree.horizontalScrollBar()
@@ -6664,6 +7483,13 @@ class MainWindow(QMainWindow):
         # request without canceling this generation.
         self._pending_physical_progress_reload = None
         self._physical_pane_generation += 1
+        for future, stale_task in list(self._virtual_view_tasks.items()):
+            if stale_task.fingerprint == self._physical_pane_generation:
+                continue
+            stale_task.cancel_event.set()
+            future.cancel()
+            self._virtual_view_tasks.pop(future, None)
+        self._physical_reconcile_pending_generation = None
         pane_generation = self._physical_pane_generation
         pending_selection = self._pending_rel_path_selection
         if pending_selection is not None and pending_selection[2] != pane_generation:
@@ -6754,34 +7580,16 @@ class MainWindow(QMainWindow):
             fingerprint,
         )
         if preview_task is None:
-            preview_cancel_event = Event()
-            try:
-                preview_future = self.physical_preview_executor.submit(
-                    self._quick_physical_view_worker,
-                    catalog.root,
-                    catalog.root_identity,
-                    dir_rel,
-                    self.current_sort.value,
-                    fingerprint,
-                    preview_cancel_event,
-                )
-            except RuntimeError:
-                preview_task = None
-            else:
-                preview_task = VirtualViewTask(
-                    root=catalog.root,
-                    kind=VIRTUAL_KIND_PHYSICAL_PREVIEW,
-                    value=dir_rel,
-                    sort_order=self.current_sort,
-                    fingerprint=fingerprint,
-                    future=preview_future,
-                    started_at=monotonic(),
-                    selection_keys=set(selection_keys),
-                    current_key=current_key,
-                    scroll_key=scroll_key,
-                    cancel_event=preview_cancel_event,
-                )
-                self._virtual_view_tasks[preview_future] = preview_task
+            preview_task = self._submit_physical_preview_task(
+                catalog,
+                dir_rel,
+                self.current_sort,
+                fingerprint,
+                selection_keys,
+                current_key,
+                scroll_key,
+                retry_attempt=0,
+            )
         task = self._matching_virtual_view_task(
             catalog.root,
             VIRTUAL_KIND_PHYSICAL,
@@ -6789,6 +7597,7 @@ class MainWindow(QMainWindow):
             self.current_sort,
             fingerprint,
         )
+        admission_failed = False
         if task is None:
             cancel_event = Event()
             try:
@@ -6804,6 +7613,7 @@ class MainWindow(QMainWindow):
                 )
             except RuntimeError:
                 task = None
+                admission_failed = True
             else:
                 task = VirtualViewTask(
                     root=catalog.root,
@@ -6838,6 +7648,329 @@ class MainWindow(QMainWindow):
             self.progress_bar.setValue(0)
             self.progress_label.setText("Catalog reader busy; retrying on the next reload")
 
+    def _submit_physical_preview_task(
+        self,
+        catalog: Catalog,
+        dir_rel: str,
+        sort_order: SortOrder,
+        fingerprint: int,
+        selection_keys: set[tuple[str, str]],
+        current_key: tuple[str, str] | None,
+        scroll_key: TreeStateKey | None,
+        *,
+        retry_attempt: int,
+    ) -> VirtualViewTask | None:
+        cancel_event = Event()
+        excluded_image_rels, excluded_directory_rels = (
+            self._pending_physical_exclusions(catalog.root)
+        )
+        try:
+            future = self.physical_preview_executor.submit(
+                self._quick_physical_view_worker,
+                catalog.root,
+                catalog.root_identity,
+                dir_rel,
+                sort_order.value,
+                fingerprint,
+                cancel_event,
+                excluded_image_rels,
+                excluded_directory_rels,
+            )
+        except RuntimeError:
+            self._schedule_physical_preview_retry(
+                catalog.root,
+                dir_rel,
+                sort_order,
+                fingerprint,
+                selection_keys,
+                current_key,
+                scroll_key,
+                retry_attempt=retry_attempt + 1,
+            )
+            return None
+        if self._physical_preview_retry_generation == fingerprint:
+            self._physical_preview_retry_generation = None
+        task = VirtualViewTask(
+            root=catalog.root,
+            kind=VIRTUAL_KIND_PHYSICAL_PREVIEW,
+            value=dir_rel,
+            sort_order=sort_order,
+            fingerprint=fingerprint,
+            future=future,
+            started_at=monotonic(),
+            selection_keys=set(selection_keys),
+            current_key=current_key,
+            scroll_key=scroll_key,
+            cancel_event=cancel_event,
+        )
+        self._virtual_view_tasks[future] = task
+        return task
+
+    def _submit_filtered_physical_snapshot_task(
+        self,
+        catalog: Catalog,
+        dir_rel: str,
+        sort_order: SortOrder,
+        fingerprint: int,
+        selection_keys: set[tuple[str, str]],
+        current_key: tuple[str, str] | None,
+        scroll_key: TreeStateKey | None,
+    ) -> VirtualViewTask | None:
+        """Hide admitted mutations by filtering the owned snapshot off Qt."""
+
+        cancel_event = Event()
+        excluded_image_rels, excluded_directory_rels = (
+            self._pending_physical_exclusions(catalog.root)
+        )
+        try:
+            future = self.physical_preview_executor.submit(
+                self._filtered_physical_snapshot_worker,
+                catalog.root,
+                dir_rel,
+                sort_order.value,
+                fingerprint,
+                self.model.images,
+                cancel_event,
+                excluded_image_rels,
+                excluded_directory_rels,
+            )
+        except RuntimeError:
+            return self._submit_physical_preview_task(
+                catalog,
+                dir_rel,
+                sort_order,
+                fingerprint,
+                selection_keys,
+                current_key,
+                scroll_key,
+                retry_attempt=0,
+            )
+        task = VirtualViewTask(
+            root=catalog.root,
+            kind=VIRTUAL_KIND_PHYSICAL_PREVIEW,
+            value=dir_rel,
+            sort_order=sort_order,
+            fingerprint=fingerprint,
+            future=future,
+            started_at=monotonic(),
+            selection_keys=set(selection_keys),
+            current_key=current_key,
+            scroll_key=scroll_key,
+            cancel_event=cancel_event,
+        )
+        self._virtual_view_tasks[future] = task
+        return task
+
+    @staticmethod
+    def _filtered_physical_snapshot_worker(
+        root: Path,
+        dir_rel: str,
+        sort_value: str,
+        fingerprint: int,
+        records: Sequence[PaneRecord],
+        cancel_event: Event,
+        excluded_image_rels: frozenset[str],
+        excluded_directory_rels: frozenset[str],
+    ) -> VirtualViewResult:
+        started_at = monotonic()
+        exclude_all = any(
+            dir_rel == excluded or dir_rel.startswith(f"{excluded}/")
+            for excluded in excluded_directory_rels
+        )
+        filtered: list[PaneRecord] = []
+        row_by_key: dict[tuple[str, str], int] = {}
+        image_order: list[str] = []
+        order_hash = hashlib.sha256()
+        for source_row, record in enumerate(records):
+            if source_row % 256 == 0 and cancel_event.is_set():
+                raise IndexTaskCancelled()
+            is_directory = isinstance(record, DirectoryRecord)
+            if exclude_all or (
+                record.rel_path in (
+                    excluded_directory_rels if is_directory else excluded_image_rels
+                )
+            ):
+                continue
+            row = len(filtered)
+            filtered.append(record)
+            row_by_key[
+                ("directory" if is_directory else "image", record.rel_path)
+            ] = row
+            order_hash.update(b"d\0" if is_directory else b"i\0")
+            order_hash.update(record.rel_path.encode("utf-8"))
+            order_hash.update(b"\0")
+            if not is_directory:
+                image_order.append(record.rel_path)
+        if cancel_event.is_set():
+            raise IndexTaskCancelled()
+        return VirtualViewResult(
+            root=root,
+            kind=VIRTUAL_KIND_PHYSICAL_PREVIEW,
+            value=dir_rel,
+            sort_order=SortOrder(sort_value),
+            fingerprint=fingerprint,
+            images=filtered,
+            duration_ms=(monotonic() - started_at) * 1000,
+            total_records=len(filtered),
+            total_images=len(image_order),
+            stable_row_by_key=row_by_key,
+            stable_order_token=order_hash.hexdigest(),
+            stable_image_order=image_order,
+            excluded_image_rels=excluded_image_rels,
+            excluded_directory_rels=excluded_directory_rels,
+        )
+
+    def _schedule_physical_preview_retry(
+        self,
+        root: Path,
+        dir_rel: str,
+        sort_order: SortOrder,
+        fingerprint: int,
+        selection_keys: set[tuple[str, str]],
+        current_key: tuple[str, str] | None,
+        scroll_key: TreeStateKey | None,
+        *,
+        retry_attempt: int,
+    ) -> None:
+        if self._physical_preview_retry_generation == fingerprint:
+            return
+        self._physical_preview_retry_generation = fingerprint
+        delay_ms = min(1000, 25 * (2 ** min(retry_attempt, 6)))
+        QTimer.singleShot(
+            delay_ms,
+            partial(
+                self._retry_physical_preview,
+                root,
+                dir_rel,
+                sort_order,
+                fingerprint,
+                set(selection_keys),
+                current_key,
+                scroll_key,
+                retry_attempt=retry_attempt,
+            ),
+        )
+
+    def _retry_physical_preview(
+        self,
+        root: Path,
+        dir_rel: str,
+        sort_order: SortOrder,
+        fingerprint: int,
+        selection_keys: set[tuple[str, str]],
+        current_key: tuple[str, str] | None,
+        scroll_key: TreeStateKey | None,
+        *,
+        retry_attempt: int,
+    ) -> None:
+        if self._physical_preview_retry_generation != fingerprint:
+            return
+        self._physical_preview_retry_generation = None
+        catalog = self.current_catalog
+        if (
+            self._closing
+            or catalog is None
+            or catalog.root != root
+            or self.current_virtual_kind is not None
+            or self.current_dir_rel != dir_rel
+            or self.current_sort != sort_order
+            or self._physical_pane_generation != fingerprint
+            or self._matching_virtual_view_task(
+                root,
+                VIRTUAL_KIND_PHYSICAL_PREVIEW,
+                dir_rel,
+                sort_order,
+                fingerprint,
+            )
+            is not None
+        ):
+            return
+        self._submit_physical_preview_task(
+            catalog,
+            dir_rel,
+            sort_order,
+            fingerprint,
+            selection_keys,
+            current_key,
+            scroll_key,
+            retry_attempt=retry_attempt,
+        )
+
+    def _request_physical_reconcile(self, root: Path, dir_rel: str) -> None:
+        """Queue one metadata-complete, same-generation final row ordering."""
+
+        catalog = self.current_catalog
+        fingerprint = self._physical_pane_generation
+        if (
+            self._closing
+            or catalog is None
+            or catalog.root != root
+            or self.current_virtual_kind is not None
+            or self.current_dir_rel != dir_rel
+        ):
+            return
+        if self._matching_virtual_view_task(
+            root,
+            VIRTUAL_KIND_PHYSICAL_PREVIEW,
+            dir_rel,
+            self.current_sort,
+            fingerprint,
+        ) is not None:
+            self._physical_reconcile_pending_generation = fingerprint
+            return
+        self._physical_reconcile_pending_generation = None
+        cancel_event = Event()
+        excluded_image_rels, excluded_directory_rels = (
+            self._pending_physical_exclusions(catalog.root)
+        )
+        try:
+            future = self.physical_preview_executor.submit(
+                self._reconciled_physical_view_worker,
+                catalog.root,
+                catalog.root_identity,
+                catalog.storage_identity,
+                dir_rel,
+                self.current_sort.value,
+                fingerprint,
+                cancel_event,
+                excluded_image_rels,
+                excluded_directory_rels,
+            )
+        except RuntimeError:
+            self._physical_reconcile_pending_generation = fingerprint
+            QTimer.singleShot(
+                100,
+                partial(self._retry_physical_reconcile, root, dir_rel, fingerprint),
+            )
+            return
+        self._virtual_view_tasks[future] = VirtualViewTask(
+            root=root,
+            kind=VIRTUAL_KIND_PHYSICAL_PREVIEW,
+            value=dir_rel,
+            sort_order=self.current_sort,
+            fingerprint=fingerprint,
+            future=future,
+            started_at=monotonic(),
+            selection_keys=self._thumbnail_selection_keys(),
+            current_key=self._current_thumbnail_selection_key(),
+            scroll_key=self._current_thumbnail_scroll_key(),
+            cancel_event=cancel_event,
+            physical_reconcile=True,
+        )
+
+    def _retry_physical_reconcile(
+        self,
+        root: Path,
+        dir_rel: str,
+        fingerprint: int,
+    ) -> None:
+        if self._physical_reconcile_pending_generation != fingerprint:
+            return
+        if fingerprint != self._physical_pane_generation:
+            self._physical_reconcile_pending_generation = None
+            return
+        self._request_physical_reconcile(root, dir_rel)
+
     @staticmethod
     def _quick_physical_view_worker(
         root: Path,
@@ -6846,8 +7979,10 @@ class MainWindow(QMainWindow):
         sort_value: str,
         fingerprint: int,
         cancel_event: Event,
+        excluded_image_rels: frozenset[str] = frozenset(),
+        excluded_directory_rels: frozenset[str] = frozenset(),
     ) -> VirtualViewResult:
-        """Build a bounded filesystem-only preview before SQLite/full materialization."""
+        """Enumerate one complete, sorted filesystem row set off the GUI thread."""
 
         started_at = monotonic()
         sort_order = SortOrder(sort_value)
@@ -6861,15 +7996,35 @@ class MainWindow(QMainWindow):
             root,
             expected_root_identity=expected_root_identity,
         )
-        dir_path = filesystem.root / relative if dir_rel else filesystem.root
-        deadline = monotonic() + PHYSICAL_PREVIEW_SCAN_BUDGET_SECONDS
-        try:
-            with os.scandir(dir_path) as entries:
+        dir_path = (
+            filesystem.mutation_path(dir_rel)
+            if dir_rel
+            else filesystem.root
+        )
+
+        exclude_entire_directory = any(
+            dir_rel == directory_rel or dir_rel.startswith(f"{directory_rel}/")
+            for directory_rel in excluded_directory_rels
+        )
+        excluded_direct_children = {
+            directory_rel
+            for directory_rel in excluded_directory_rels
+            if directory_rel.rpartition("/")[0] == dir_rel
+        }
+
+        def inside_excluded_directory(rel_path: str) -> bool:
+            return exclude_entire_directory or rel_path in excluded_direct_children
+
+        with filesystem._open_catalog_directory_fd(dir_path) as directory_fd:  # noqa: SLF001
+            initial_directory_stat = (
+                dir_path.stat(follow_symlinks=False)
+                if directory_fd is None
+                else None
+            )
+            with os.scandir(dir_path if directory_fd is None else directory_fd) as entries:
                 for entry in entries:
                     if cancel_event.is_set():
                         raise IndexTaskCancelled()
-                    if monotonic() >= deadline:
-                        break
                     try:
                         entry.name.encode("utf-8")
                     except UnicodeError:
@@ -6877,8 +8032,8 @@ class MainWindow(QMainWindow):
                     rel_path = f"{dir_rel}/{entry.name}" if dir_rel else entry.name
                     try:
                         if (
-                            len(directory_records) < PHYSICAL_PREVIEW_DIRECTORY_LIMIT
-                            and entry.name != ".marnwick"
+                            not is_marnwick_internal_artifact_name(entry.name)
+                            and not inside_excluded_directory(rel_path)
                             and entry.is_dir(follow_symlinks=False)
                         ):
                             entry_stat = entry.stat(follow_symlinks=False)
@@ -6892,11 +8047,17 @@ class MainWindow(QMainWindow):
                                 )
                             )
                         elif (
-                            len(image_records) < THUMBNAIL_MODEL_BATCH_SIZE
-                            and is_image_name(entry.name)
+                            is_image_name(entry.name)
+                            and not is_marnwick_internal_artifact_name(entry.name)
+                            and rel_path not in excluded_image_rels
+                            and not inside_excluded_directory(rel_path)
                             and entry.is_file(follow_symlinks=False)
                         ):
                             entry_stat = entry.stat(follow_symlinks=False)
+                            entry_change_ns = filesystem._path_change_time_ns(  # noqa: SLF001
+                                dir_path / entry.name,
+                                entry_stat,
+                            )
                             image_records.append(
                                 ImageRecord(
                                     id=-1,
@@ -6911,39 +8072,120 @@ class MainWindow(QMainWindow):
                                     aspect_ratio=0.0,
                                     thumb_width=0,
                                     thumb_height=0,
+                                    ctime_ns=entry_change_ns,
+                                    file_identity=(
+                                        int(entry_stat.st_dev),
+                                        int(entry_stat.st_ino),
+                                        int(entry_stat.st_nlink),
+                                        int(entry_stat.st_size),
+                                        int(entry_stat.st_mtime_ns),
+                                        entry_change_ns,
+                                    ),
                                 )
                             )
                     except OSError:
                         continue
-                    if (
-                        len(directory_records) >= PHYSICAL_PREVIEW_DIRECTORY_LIMIT
-                        and len(image_records) >= THUMBNAIL_MODEL_BATCH_SIZE
-                    ):
-                        break
-        except OSError:
-            directory_records = []
-            image_records = []
+            if directory_fd is not None:
+                if not filesystem._directory_fd_still_names_path(  # noqa: SLF001
+                    directory_fd,
+                    dir_path,
+                ):
+                    raise OSError(
+                        f"selected directory changed while it was being listed: {dir_rel or '.'}"
+                    )
+            else:
+                current_dir_path = (
+                    filesystem.mutation_path(dir_rel)
+                    if dir_rel
+                    else filesystem.root
+                )
+                current_directory_stat = current_dir_path.stat(follow_symlinks=False)
+                assert initial_directory_stat is not None
+                if (
+                    int(current_directory_stat.st_dev),
+                    int(current_directory_stat.st_ino),
+                ) != (
+                    int(initial_directory_stat.st_dev),
+                    int(initial_directory_stat.st_ino),
+                ):
+                    raise OSError(
+                        f"selected directory changed while it was being listed: {dir_rel or '.'}"
+                    )
 
-        def preview_key(record: PaneRecord) -> tuple[object, str]:
+        def image_key(record: ImageRecord) -> tuple[object, ...]:
             name = record.filename.casefold()
             if sort_order in {SortOrder.SIZE_ASC, SortOrder.SIZE_DESC}:
-                return record.size_bytes, name
+                metric = record.size_bytes
+                return (
+                    -metric if sort_order == SortOrder.SIZE_DESC else metric,
+                    name,
+                    record.rel_path.casefold(),
+                )
             if sort_order in {SortOrder.DATE_ASC, SortOrder.DATE_DESC}:
-                return record.mtime_ns, name
+                metric = record.mtime_ns
+                return (
+                    -metric if sort_order == SortOrder.DATE_DESC else metric,
+                    name,
+                    record.rel_path.casefold(),
+                )
             if sort_order in {SortOrder.ASPECT_ASC, SortOrder.ASPECT_DESC}:
-                return record.aspect_ratio, name
+                metric = record.aspect_ratio
+                return (
+                    -metric if sort_order == SortOrder.ASPECT_DESC else metric,
+                    name,
+                    record.rel_path.casefold(),
+                )
             return name, record.rel_path.casefold()
 
-        reverse = sort_order in {
+        def directory_key(record: DirectoryRecord) -> tuple[object, ...]:
+            name = record.filename.casefold()
+            if sort_order in {SortOrder.SIZE_ASC, SortOrder.SIZE_DESC}:
+                return record.size_bytes, name, record.rel_path.casefold()
+            if sort_order in {SortOrder.DATE_ASC, SortOrder.DATE_DESC}:
+                return record.mtime_ns, name, record.rel_path.casefold()
+            if sort_order in {SortOrder.ASPECT_ASC, SortOrder.ASPECT_DESC}:
+                return record.aspect_ratio, name, record.rel_path.casefold()
+            return name, record.rel_path.casefold()
+
+        # Image SQL keeps name/path ties ascending for metric-descending
+        # sorts. Directory aggregate/date queries reverse the full key.
+        image_reverse = sort_order == SortOrder.NAME_DESC
+        directory_reverse = sort_order in {
             SortOrder.NAME_DESC,
             SortOrder.SIZE_DESC,
             SortOrder.DATE_DESC,
             SortOrder.ASPECT_DESC,
         }
+        if cancel_event.is_set():
+            raise IndexTaskCancelled()
+        sorted_images = sorted(image_records, key=image_key, reverse=image_reverse)
+        if cancel_event.is_set():
+            raise IndexTaskCancelled()
         records: list[PaneRecord] = [
-            *sorted(directory_records, key=preview_key, reverse=reverse),
-            *sorted(image_records, key=preview_key, reverse=reverse),
+            *sorted(directory_records, key=directory_key, reverse=directory_reverse),
+            *sorted_images,
         ]
+        if cancel_event.is_set():
+            raise IndexTaskCancelled()
+        stable_row_by_key: dict[tuple[str, str], int] = {}
+        order_hash = hashlib.sha256()
+        for row, record in enumerate(records):
+            if row % 256 == 0 and cancel_event.is_set():
+                raise IndexTaskCancelled()
+            stable_row_by_key[
+                (
+                "directory" if isinstance(record, DirectoryRecord) else "image",
+                record.rel_path,
+                )
+            ] = row
+            order_hash.update(b"d\0" if isinstance(record, DirectoryRecord) else b"i\0")
+            order_hash.update(record.rel_path.encode("utf-8"))
+            order_hash.update(b"\0")
+        stable_image_order: list[str] = []
+        for row, record in enumerate(sorted_images):
+            if row % 256 == 0 and cancel_event.is_set():
+                raise IndexTaskCancelled()
+            stable_image_order.append(record.rel_path)
         filesystem._assert_catalog_root_identity()  # noqa: SLF001 - stale-result guard
         return VirtualViewResult(
             root=root,
@@ -6953,7 +8195,166 @@ class MainWindow(QMainWindow):
             fingerprint=fingerprint,
             images=records,
             duration_ms=(monotonic() - started_at) * 1000,
+            total_records=len(records),
+            total_images=len(image_records),
+            stable_row_by_key=stable_row_by_key,
+            stable_order_token=order_hash.hexdigest(),
+            stable_image_order=stable_image_order,
+            excluded_image_rels=excluded_image_rels,
+            excluded_directory_rels=excluded_directory_rels,
         )
+
+    @staticmethod
+    def _reconciled_physical_view_worker(
+        root: Path,
+        expected_root_identity: tuple[int, int],
+        expected_storage_identity: CatalogStorageIdentity,
+        dir_rel: str,
+        sort_value: str,
+        fingerprint: int,
+        cancel_event: Event,
+        excluded_image_rels: frozenset[str] = frozenset(),
+        excluded_directory_rels: frozenset[str] = frozenset(),
+    ) -> VirtualViewResult:
+        """Build a final filesystem list enriched by the completed catalog scan.
+
+        This may read every direct database row, so it is only queued after
+        the fast filesystem placeholder list is already visible.
+        """
+
+        result = MainWindow._quick_physical_view_worker(
+            root,
+            expected_root_identity,
+            dir_rel,
+            sort_value,
+            fingerprint,
+            cancel_event,
+            excluded_image_rels,
+            excluded_directory_rels,
+        )
+
+        def check_canceled() -> None:
+            if cancel_event.is_set():
+                raise IndexTaskCancelled()
+
+        sort_order = SortOrder(sort_value)
+        check_canceled()
+        with Catalog.open_reader(
+            root,
+            expected_root_identity=expected_root_identity,
+            expected_storage_identity=expected_storage_identity,
+        ) as catalog:
+            indexed_images = catalog.list_images(
+                dir_rel,
+                SortOrder.NAME_ASC,
+                include_blobs=False,
+                cancel_check=check_canceled,
+            )
+            indexed_by_rel: dict[str, ImageRecord] = {}
+            for row, record in enumerate(indexed_images):
+                if row % 256 == 0:
+                    check_canceled()
+                indexed_by_rel[record.rel_path] = record
+            indexed_directories = catalog.list_child_directories(
+                dir_rel,
+                sort_order,
+                include_previews=False,
+                include_filesystem_preview_fallback=True,
+                cancel_check=check_canceled,
+            )
+            directory_by_rel: dict[str, DirectoryRecord] = {}
+            for row, record in enumerate(indexed_directories):
+                if row % 256 == 0:
+                    check_canceled()
+                directory_by_rel[record.dir_rel] = record
+            catalog._assert_catalog_storage_identity()  # noqa: SLF001
+
+            directories: list[DirectoryRecord] = []
+            images: list[ImageRecord] = []
+            for record in result.images:
+                check_canceled()
+                if isinstance(record, DirectoryRecord):
+                    directories.append(directory_by_rel.get(record.dir_rel, record))
+                    continue
+                indexed = indexed_by_rel.get(record.rel_path)
+                # Never apply metadata belonging to an older file incarnation.
+                if (
+                    indexed is not None
+                    and indexed.size_bytes == record.size_bytes
+                    and indexed.mtime_ns == record.mtime_ns
+                    and indexed.ctime_ns == record.ctime_ns
+                ):
+                    images.append(
+                        replace(
+                            indexed,
+                            file_identity=record.file_identity,
+                        )
+                    )
+                else:
+                    images.append(record)
+
+            check_canceled()
+            directories.sort(
+                key=catalog._directory_sort_key(sort_order),  # noqa: SLF001
+                reverse=catalog._record_sort_reverse(sort_order),  # noqa: SLF001
+            )
+            check_canceled()
+
+        def image_key(record: ImageRecord) -> tuple[object, ...]:
+            name = record.filename.casefold()
+            if sort_order in {SortOrder.SIZE_ASC, SortOrder.SIZE_DESC}:
+                metric = record.size_bytes
+                return (
+                    -metric if sort_order == SortOrder.SIZE_DESC else metric,
+                    name,
+                    record.rel_path.casefold(),
+                )
+            if sort_order in {SortOrder.DATE_ASC, SortOrder.DATE_DESC}:
+                metric = record.mtime_ns
+                return (
+                    -metric if sort_order == SortOrder.DATE_DESC else metric,
+                    name,
+                    record.rel_path.casefold(),
+                )
+            if sort_order in {SortOrder.ASPECT_ASC, SortOrder.ASPECT_DESC}:
+                metric = record.aspect_ratio
+                return (
+                    -metric if sort_order == SortOrder.ASPECT_DESC else metric,
+                    name,
+                    record.rel_path.casefold(),
+                )
+            return name, record.rel_path.casefold()
+
+        check_canceled()
+        images.sort(key=image_key, reverse=sort_order == SortOrder.NAME_DESC)
+        check_canceled()
+        records: list[PaneRecord] = [*directories, *images]
+        row_by_key: dict[tuple[str, str], int] = {}
+        order_hash = hashlib.sha256()
+        for row, record in enumerate(records):
+            if row % 256 == 0:
+                check_canceled()
+            row_by_key[
+                (
+                "directory" if isinstance(record, DirectoryRecord) else "image",
+                record.rel_path,
+                )
+            ] = row
+            order_hash.update(b"d\0" if isinstance(record, DirectoryRecord) else b"i\0")
+            order_hash.update(record.rel_path.encode("utf-8"))
+            order_hash.update(b"\0")
+        stable_image_order: list[str] = []
+        for row, record in enumerate(images):
+            if row % 256 == 0:
+                check_canceled()
+            stable_image_order.append(record.rel_path)
+        result.images = records
+        result.stable_row_by_key = row_by_key
+        result.stable_order_token = order_hash.hexdigest()
+        result.stable_image_order = stable_image_order
+        result.total_records = len(records)
+        result.total_images = len(images)
+        return result
 
     def _physical_view_worker(
         self,
@@ -7080,6 +8481,13 @@ class MainWindow(QMainWindow):
         if position is not None and key is not None:
             self._thumbnail_scroll_positions.move_to_end(key)
         vertical, horizontal = position or (0, 0)
+        if vertical > 0 and self.model.has_complete_row_map and self.model.canFetchMore():
+            row_height = max(1, self.model.card_size(self.thumbnail_view.font()).height())
+            estimated_row = (
+                ceil(vertical / row_height) * max(1, self.thumbnail_columns)
+                + THUMBNAIL_MODEL_BATCH_SIZE
+            )
+            self.model.ensure_row_loaded(min(len(self.model.images) - 1, estimated_row))
         self._thumbnail_scroll_restore_generation += 1
         generation = self._thumbnail_scroll_restore_generation
         self._set_thumbnail_scroll_position(key, vertical, horizontal, retries=5, generation=generation)
@@ -7281,6 +8689,7 @@ class MainWindow(QMainWindow):
             return
         value = self.current_virtual_value
         fingerprint = self._physical_pane_generation
+        admission_failed = False
         task = self._matching_virtual_view_task(
             catalog.root,
             kind,
@@ -7304,6 +8713,7 @@ class MainWindow(QMainWindow):
                 )
             except RuntimeError:
                 task = None
+                admission_failed = True
             else:
                 task = VirtualViewTask(
                     root=catalog.root,
@@ -7323,16 +8733,32 @@ class MainWindow(QMainWindow):
             task.selection_keys = set(selection_keys)
             task.current_key = current_key
             task.scroll_key = scroll_key
-        self.model.set_images(catalog, [])
-        self.refresh_thumbnail_layout()
-        self._restore_thumbnail_scroll_position(scroll_key)
-        self.update_selection_status()
+        retain_existing = (
+            self.model.catalog is catalog
+            and self._thumbnail_scroll_key == scroll_key
+        )
+        if not retain_existing:
+            self.model.set_images(catalog, [])
+            self.refresh_thumbnail_layout()
+            self._restore_thumbnail_scroll_position(scroll_key)
+            self.update_selection_status()
         if task is not None:
             self._show_virtual_view_status(task)
         else:
             self.progress_bar.setRange(0, 1)
             self.progress_bar.setValue(0)
-            self.progress_label.setText("Catalog reader busy; reload the virtual directory to retry")
+            self.progress_label.setText("Catalog reader busy; retrying virtual directory")
+            if admission_failed:
+                QTimer.singleShot(
+                    50,
+                    partial(
+                        self._retry_virtual_view_admission,
+                        fingerprint,
+                        set(selection_keys),
+                        current_key,
+                        scroll_key,
+                    ),
+                )
 
     def _simple_virtual_view_worker(
         self,
@@ -7578,37 +9004,20 @@ class MainWindow(QMainWindow):
         root: Path,
         records: Sequence[PaneRecord],
     ) -> list[PaneRecord]:
-        resolved_root = root
-        pending_images = self._pending_delete_image_rels(resolved_root)
-        # A delete that is waiting for an in-flight save/reconciliation is
-        # still an accepted user intent.  Keep it hidden across directory and
-        # catalog navigation until the protected delete either commits or is
-        # explicitly restored after failure.
-        for request in self._deferred_delete_requests:
-            if request.catalog.root == resolved_root:
-                pending_images.update(request.rel_paths)
-        pending_directories: set[str] = set()
-        for move_task in self._move_payload_tasks:
-            if move_task.future.done():
-                continue
-            pending_images.update(
-                rel_path
-                for source_root, rel_path in move_task.source_images
-                if source_root == resolved_root
-            )
-            pending_directories.update(
-                rel_path
-                for source_root, rel_path in move_task.source_directories
-                if source_root == resolved_root
-            )
+        pending_images, pending_directories = self._pending_physical_exclusions(root)
         if not pending_images and not pending_directories:
             return records if isinstance(records, list) else list(records)
 
         def inside_pending_directory(rel_path: str) -> bool:
-            return any(
-                rel_path == directory_rel or rel_path.startswith(f"{directory_rel}/")
-                for directory_rel in pending_directories
-            )
+            candidate = rel_path
+            while candidate:
+                if candidate in pending_directories:
+                    return True
+                parent = candidate.rpartition("/")[0]
+                if parent == candidate:
+                    break
+                candidate = parent
+            return "" in pending_directories
 
         return [
             record
@@ -7623,6 +9032,59 @@ class MainWindow(QMainWindow):
                 and not inside_pending_directory(record.dir_rel)
             )
         ]
+
+    def _pending_physical_exclusions(
+        self,
+        root: Path,
+    ) -> tuple[frozenset[str], frozenset[str]]:
+        resolved_root = root
+        delete_tasks = tuple(
+            task for task in self._delete_payload_tasks if task.root == resolved_root
+        )
+        deferred_requests = tuple(
+            request
+            for request in self._deferred_delete_requests
+            if request.catalog.root == resolved_root
+        )
+        move_tasks = tuple(
+            task for task in self._move_payload_tasks if resolved_root in task.affected_roots
+        )
+        signature = (
+            tuple((id(task), task.future.done()) for task in delete_tasks),
+            tuple(id(request) for request in deferred_requests),
+            tuple((id(task), task.future.done()) for task in move_tasks),
+        )
+        cached = self._pending_exclusion_cache.get(resolved_root)
+        if cached is not None and cached[0] == signature:
+            return cached[1]
+
+        pending_images: set[str] = set()
+        for delete_task in delete_tasks:
+            if not delete_task.future.done():
+                pending_images.update(delete_task.rel_paths)
+        # A delete that is waiting for an in-flight save/reconciliation is
+        # still an accepted user intent.  Keep it hidden across directory and
+        # catalog navigation until the protected delete either commits or is
+        # explicitly restored after failure.
+        for request in deferred_requests:
+            pending_images.update(request.rel_paths)
+        pending_directories: set[str] = set()
+        for move_task in move_tasks:
+            if move_task.future.done():
+                continue
+            pending_images.update(
+                rel_path
+                for source_root, rel_path in move_task.source_images
+                if source_root == resolved_root
+            )
+            pending_directories.update(
+                rel_path
+                for source_root, rel_path in move_task.source_directories
+                if source_root == resolved_root
+            )
+        result = frozenset(pending_images), frozenset(pending_directories)
+        self._pending_exclusion_cache[resolved_root] = signature, result
+        return result
 
     def _merge_physical_preview_records(
         self,
@@ -7693,7 +9155,12 @@ class MainWindow(QMainWindow):
             if self.model.canFetchMore():
                 self.model.fetchMore()
         if matching_rows:
-            self.model.ensure_row_loaded(max(matching_rows))
+            if not self.model.ensure_row_loaded(max(matching_rows)):
+                self._pending_thumbnail_index_restore = (
+                    set(selection_keys),
+                    current_key,
+                )
+                return
         selection.clearSelection()
         current_index = QModelIndex()
         for row in matching_rows:
@@ -7714,6 +9181,15 @@ class MainWindow(QMainWindow):
         if pending is not None:
             self._restore_thumbnail_selection(*pending)
         self.update_selection_status()
+        self._apply_pending_rel_path_selection(self._physical_pane_generation)
+
+    def _thumbnail_rows_exposed(self) -> None:
+        pending = self._pending_thumbnail_index_restore
+        self._pending_thumbnail_index_restore = None
+        if pending is not None:
+            self._restore_thumbnail_selection(*pending)
+        if self._thumbnail_scroll_key is not None:
+            self._restore_thumbnail_scroll_position(self._thumbnail_scroll_key)
         self._apply_pending_rel_path_selection(self._physical_pane_generation)
 
     def _load_very_similar_virtual_directory(
@@ -7751,6 +9227,7 @@ class MainWindow(QMainWindow):
             self.current_sort,
             fingerprint,
         )
+        admission_failed = False
         if task is None:
             cancel_event = Event()
             try:
@@ -7766,6 +9243,7 @@ class MainWindow(QMainWindow):
                 )
             except RuntimeError:
                 task = None
+                admission_failed = True
             else:
                 task = VirtualViewTask(
                     root=catalog.root,
@@ -7787,16 +9265,48 @@ class MainWindow(QMainWindow):
             task.current_key = current_key
             task.scroll_key = scroll_key
 
-        self.model.set_images(catalog, [])
-        self.refresh_thumbnail_layout()
-        self._restore_thumbnail_scroll_position(scroll_key)
-        self.update_selection_status()
+        retain_existing = (
+            self.model.catalog is catalog
+            and self._thumbnail_scroll_key == scroll_key
+        )
+        if not retain_existing:
+            self.model.set_images(catalog, [])
+            self.refresh_thumbnail_layout()
+            self._restore_thumbnail_scroll_position(scroll_key)
+            self.update_selection_status()
         if task is not None:
             self._show_virtual_view_status(task)
         else:
             self.progress_bar.setRange(0, 1)
             self.progress_bar.setValue(0)
-            self.progress_label.setText("Catalog reader busy; reload Very Similar to retry")
+            self.progress_label.setText("Catalog reader busy; retrying Very Similar")
+            if admission_failed:
+                QTimer.singleShot(
+                    50,
+                    partial(
+                        self._retry_virtual_view_admission,
+                        fingerprint,
+                        set(selection_keys),
+                        current_key,
+                        scroll_key,
+                    ),
+                )
+
+    def _retry_virtual_view_admission(
+        self,
+        fingerprint: int,
+        selection_keys: set[tuple[str, str]],
+        current_key: tuple[str, str] | None,
+        scroll_key: TreeStateKey | None,
+    ) -> None:
+        if self._closing or fingerprint != self._physical_pane_generation:
+            return
+        self.load_current_virtual_directory(
+            preserve_selection=True,
+            selection_keys=selection_keys,
+            current_key=current_key,
+            scroll_key=scroll_key,
+        )
 
     def _very_similar_virtual_view_worker(
         self,
@@ -7891,9 +9401,9 @@ class MainWindow(QMainWindow):
             self._virtual_view_tasks.pop(future, None)
 
     def _rollover_virtual_view_executors(self) -> None:
-        # Compatibility hook: cancel tracked work while retaining the bounded
-        # fixed pools. Reserved lanes let a replacement start without creating
-        # unbounded retired executors.
+        # Compatibility hook: cancel tracked work while retaining bounded
+        # epoch pools. Saturated epochs roll automatically, up to their fixed
+        # retirement/thread cap, when replacement work is submitted.
         for future, task in list(self._virtual_view_tasks.items()):
             task.cancel_event.set()
             future.cancel()
@@ -7903,6 +9413,32 @@ class MainWindow(QMainWindow):
         for future, task in list(self._virtual_view_tasks.items()):
             if not future.done():
                 continue
+            if (
+                task.kind == VIRTUAL_KIND_PHYSICAL
+                and task.page_offset == 0
+                and (
+                    self._physical_preview_retry_generation == task.fingerprint
+                    or any(
+                        preview.root == task.root
+                        and preview.kind == VIRTUAL_KIND_PHYSICAL_PREVIEW
+                        and preview.value == task.value
+                        and preview.sort_order == task.sort_order
+                        and preview.fingerprint == task.fingerprint
+                        and not preview.cancel_event.is_set()
+                        and not preview.future.cancelled()
+                        for preview in self._virtual_view_tasks.values()
+                    )
+                )
+            ):
+                try:
+                    early_result = future.result()
+                except Exception:
+                    early_result = None
+                if early_result is not None and not early_result.images:
+                    # An empty/brand-new catalog has no useful cache to paint.
+                    # Wait for the filesystem snapshot so it publishes exactly
+                    # once, including while preview admission is retrying.
+                    continue
             self._virtual_view_tasks.pop(future, None)
             if future.cancelled() or task.cancel_event.is_set():
                 if task.page_offset and self._is_current_virtual_task(task):
@@ -7912,6 +9448,11 @@ class MainWindow(QMainWindow):
                 result = future.result()
             except Exception as error:
                 if task.kind == VIRTUAL_KIND_PHYSICAL_PREVIEW:
+                    if (
+                        self._physical_reconcile_pending_generation == task.fingerprint
+                        and not task.physical_reconcile
+                    ):
+                        self._request_physical_reconcile(task.root, task.value)
                     continue
                 if task.page_offset:
                     if self._is_current_virtual_task(task):
@@ -7940,24 +9481,80 @@ class MainWindow(QMainWindow):
                     and result.fingerprint == self._physical_pane_generation
                     and self.current_catalog is not None
                 ):
-                    preview_records = self._without_pending_delete_records(
-                        result.root,
-                        result.images,
+                    current_exclusions = self._pending_physical_exclusions(
+                        result.root
                     )
-                    published = False
-                    if (
-                        result.fingerprint == self._physical_full_result_generation
-                        and self.model.is_paged
-                    ):
-                        merged = self._merge_physical_preview_records(
-                            self.current_catalog,
-                            self.model.images,
-                            preview_records,
+                    result_exclusions = (
+                        result.excluded_image_rels,
+                        result.excluded_directory_rels,
+                    )
+                    if current_exclusions != result_exclusions:
+                        # Pending mutation membership changed while the worker
+                        # enumerated. Rescan with the new small exclusion sets
+                        # rather than filtering a huge list on the Qt thread.
+                        if task.physical_reconcile:
+                            self._request_physical_reconcile(task.root, task.value)
+                        else:
+                            self._submit_physical_preview_task(
+                                self.current_catalog,
+                                task.value,
+                                task.sort_order,
+                                task.fingerprint,
+                                task.selection_keys,
+                                task.current_key,
+                                task.scroll_key,
+                                retry_attempt=0,
+                            )
+                        continue
+                    preview_records = result.images
+                    stable_row_by_key = result.stable_row_by_key
+                    stable_order_token = result.stable_order_token
+                    stable_image_order = result.stable_image_order
+                    total_images = result.total_images
+                    if len(preview_records) != len(result.images):
+                        stable_row_by_key = {
+                            self._thumbnail_record_key(record): row
+                            for row, record in enumerate(preview_records)
+                        }
+                        stable_order_token = None
+                        stable_image_order = [
+                            record.rel_path
+                            for record in preview_records
+                            if isinstance(record, ImageRecord)
+                        ]
+                        total_images = sum(
+                            isinstance(record, ImageRecord)
+                            for record in preview_records
                         )
-                        published = self.model.merge_preview_records(merged)
-                    elif result.fingerprint != self._physical_full_result_generation:
-                        self.model.set_images(self.current_catalog, preview_records)
-                        published = True
+
+                    cached_overlay = (
+                        list(self.model.images[:QUERY_PAGE_MAX_SIZE])
+                        if self.model.is_paged
+                        and self.model.catalog is self.current_catalog
+                        else []
+                    )
+                    same_complete_order = (
+                        stable_order_token is not None
+                        and stable_order_token == self.model.complete_order_token
+                    )
+                    published = not same_complete_order
+                    if published:
+                        self.model.set_images(
+                            self.current_catalog,
+                            preview_records,
+                            complete_row_by_key=stable_row_by_key,
+                            complete_order_token=stable_order_token,
+                            complete_image_count=total_images,
+                            complete_image_order=stable_image_order,
+                            preserve_pixmap_cache=bool(cached_overlay),
+                        )
+                        self.model.update_records_in_place(cached_overlay)
+                    elif same_complete_order:
+                        self.model.replace_complete_records_in_place(
+                            preview_records,
+                            total_images=total_images,
+                        )
+                    self._physical_preview_result_generation = result.fingerprint
                     if published:
                         self.refresh_thumbnail_layout()
                         self._restore_thumbnail_selection(task.selection_keys, task.current_key)
@@ -7967,6 +9564,11 @@ class MainWindow(QMainWindow):
                             result.fingerprint,
                             clear_on_success=False,
                         )
+                if self._physical_reconcile_pending_generation == task.fingerprint:
+                    if task.physical_reconcile:
+                        self._physical_reconcile_pending_generation = None
+                    else:
+                        self._request_physical_reconcile(task.root, task.value)
                 continue
             if result.kind == VIRTUAL_KIND_VERY_SIMILAR:
                 if result.cache_version == self._very_similar_cache_versions.get(result.root, 0):
@@ -8002,6 +9604,42 @@ class MainWindow(QMainWindow):
                 catalog.root,
                 result.images,
             )
+            if (
+                result.kind == VIRTUAL_KIND_PHYSICAL
+                and result.page_offset == 0
+                and self.model.catalog is catalog
+                and self.model.has_complete_row_map
+                and result.fingerprint != self._physical_preview_result_generation
+                and (
+                    self._physical_preview_retry_generation == result.fingerprint
+                    or self._matching_virtual_view_task(
+                        catalog.root,
+                        VIRTUAL_KIND_PHYSICAL_PREVIEW,
+                        result.value,
+                        result.sort_order,
+                        result.fingerprint,
+                    )
+                    is not None
+                )
+            ):
+                # A same-folder reload retains the old complete snapshot until
+                # the new filesystem snapshot is ready. A bounded DB page may
+                # enrich matching incarnations, but must not merge/sort every
+                # old row on Qt or temporarily turn the model back into a page.
+                self.model.update_records_in_place(filtered_records)
+                self._apply_pending_rel_path_selection(result.fingerprint)
+                continue
+            if (
+                result.kind == VIRTUAL_KIND_PHYSICAL
+                and result.page_offset == 0
+                and result.fingerprint == self._physical_preview_result_generation
+            ):
+                # Keep every preview key at its original row. Indexed metadata
+                # and thumbnails enrich those rows in place as database work
+                # catches up; stale database-only rows are deliberately ignored.
+                self.model.update_records_in_place(filtered_records)
+                self._apply_pending_rel_path_selection(result.fingerprint)
+                continue
             if (
                 result.total_records is not None
                 and result.total_images is not None
@@ -8107,6 +9745,60 @@ class MainWindow(QMainWindow):
         self._pending_physical_progress_reload = (root, dir_rel, self.current_sort)
         self._flush_physical_progress_reload()
 
+    def _request_physical_record_overlay(
+        self,
+        catalog: Catalog,
+        dir_rel: str,
+        sort_order: SortOrder,
+    ) -> bool:
+        fingerprint = self._physical_pane_generation
+        if self._matching_virtual_view_task(
+            catalog.root,
+            VIRTUAL_KIND_PHYSICAL,
+            dir_rel,
+            sort_order,
+            fingerprint,
+        ) is not None:
+            return False
+        cancel_event = Event()
+        try:
+            future = self.virtual_view_executor.submit(
+                self._physical_view_worker,
+                catalog.root,
+                catalog.root_identity,
+                catalog.storage_identity,
+                dir_rel,
+                sort_order.value,
+                fingerprint,
+                cancel_event,
+                0,
+                min(
+                    QUERY_PAGE_MAX_SIZE,
+                    max(
+                        PANE_QUERY_PAGE_SIZE,
+                        self.model.rowCount()
+                        if self._physical_preview_result_generation == fingerprint
+                        else 0,
+                    ),
+                ),
+            )
+        except RuntimeError:
+            return False
+        self._virtual_view_tasks[future] = VirtualViewTask(
+            root=catalog.root,
+            kind=VIRTUAL_KIND_PHYSICAL,
+            value=dir_rel,
+            sort_order=sort_order,
+            fingerprint=fingerprint,
+            future=future,
+            started_at=monotonic(),
+            selection_keys=self._thumbnail_selection_keys(),
+            current_key=self._current_thumbnail_selection_key(),
+            scroll_key=self._current_thumbnail_scroll_key(),
+            cancel_event=cancel_event,
+        )
+        return True
+
     def _flush_physical_progress_reload(self) -> None:
         pending = self._pending_physical_progress_reload
         if pending is None:
@@ -8143,9 +9835,13 @@ class MainWindow(QMainWindow):
                 delay_ms = max(1, int((0.25 - elapsed) * 1000))
                 QTimer.singleShot(delay_ms, self._run_scheduled_physical_progress_reload)
             return
+        if not self._request_physical_record_overlay(catalog, dir_rel, sort_order):
+            if not self._physical_progress_reload_timer_pending:
+                self._physical_progress_reload_timer_pending = True
+                QTimer.singleShot(50, self._run_scheduled_physical_progress_reload)
+            return
         self._pending_physical_progress_reload = None
         self._last_physical_progress_reload_at = monotonic()
-        self.load_current_directory(preserve_selection=True)
 
     def _run_scheduled_physical_progress_reload(self) -> None:
         self._physical_progress_reload_timer_pending = False
@@ -8164,6 +9860,8 @@ class MainWindow(QMainWindow):
         return sorted(active_tasks, key=lambda task: task.started_at)[0]
 
     def _is_current_virtual_task(self, task: VirtualViewTask) -> bool:
+        if task.fingerprint != self._physical_pane_generation:
+            return False
         if task.kind in {VIRTUAL_KIND_PHYSICAL, VIRTUAL_KIND_PHYSICAL_PREVIEW}:
             return (
                 self.current_catalog is not None
@@ -8181,6 +9879,8 @@ class MainWindow(QMainWindow):
         )
 
     def _is_current_virtual_result(self, result: VirtualViewResult) -> bool:
+        if result.fingerprint != self._physical_pane_generation:
+            return False
         if result.kind in {VIRTUAL_KIND_PHYSICAL, VIRTUAL_KIND_PHYSICAL_PREVIEW}:
             return (
                 self.current_catalog is not None
@@ -8202,6 +9902,8 @@ class MainWindow(QMainWindow):
         self.progress_bar.setRange(0, 0)
         if task.kind == VIRTUAL_KIND_VERY_SIMILAR:
             self.progress_label.setText(f"Building Very Similar view ({elapsed}s)")
+        elif task.kind == VIRTUAL_KIND_PHYSICAL_PREVIEW:
+            self.progress_label.setText(f"Listing folder ({elapsed}s)")
         elif task.kind == VIRTUAL_KIND_PHYSICAL:
             self.progress_label.setText(f"Loading folder ({elapsed}s)")
         else:
@@ -8267,6 +9969,10 @@ class MainWindow(QMainWindow):
         self._pruned_catalog_roots.discard(delete_task.root)
         if self.current_catalog is not None and self.current_catalog.root == delete_task.root:
             self.rebuild_tree()
+            if self.current_virtual_kind == VIRTUAL_KIND_DUPLICATES:
+                # The completed mutation invalidates every duplicate grouping.
+                # Do not retain now-stale rows while the fresh query starts.
+                self.model.set_images(self.current_catalog, [])
             self.load_current_directory(preserve_selection=True)
         self.progress_bar.setRange(0, max(result.planned_delete_count, 1))
         self.progress_bar.setValue(min(result.deleted, max(result.planned_delete_count, 1)))
@@ -8337,16 +10043,51 @@ class MainWindow(QMainWindow):
             affected_roots.add(delete_task.root)
             if delete_task.future.cancelled():
                 canceled = True
+                self._settle_viewer_delete(
+                    delete_task,
+                    path_removed=self._viewer_delete_path_removed_from_outcome(
+                        delete_task
+                    ),
+                )
                 continue
             try:
                 result = delete_task.future.result()
             except IndexTaskCancelled:
                 canceled = True
+                self._settle_viewer_delete(
+                    delete_task,
+                    path_removed=self._viewer_delete_path_removed_from_outcome(
+                        delete_task
+                    ),
+                )
                 continue
             except Exception as error:
                 last_error = error
+                self._settle_viewer_delete(
+                    delete_task,
+                    path_removed=self._viewer_delete_path_removed_from_outcome(
+                        delete_task
+                    ),
+                )
                 continue
             affected_roots.update(result.affected_roots)
+            self._settle_viewer_delete(
+                delete_task,
+                path_removed=(
+                    None
+                    if result.remaining_rel_paths is None
+                    else (
+                        not delete_task.rel_paths
+                        or delete_task.rel_paths[0] not in result.remaining_rel_paths
+                    )
+                ),
+            )
+            if result.canceled:
+                canceled = True
+                continue
+            if result.error is not None:
+                last_error = result.error
+                continue
             last_result = result
         self._refresh_active_delete_payload_task()
         self._update_tools_menu_actions()
@@ -8367,6 +10108,35 @@ class MainWindow(QMainWindow):
             self.progress_bar.setRange(0, 1)
             self.progress_bar.setValue(0)
             self.progress_label.setText("Ready")
+
+    @staticmethod
+    def _viewer_delete_path_removed_from_outcome(
+        delete_task: DeletePayloadTask,
+    ) -> bool | None:
+        remaining = delete_task.outcome.remaining_rel_paths
+        if remaining is None:
+            return None
+        return bool(
+            not delete_task.rel_paths
+            or delete_task.rel_paths[0] not in remaining
+        )
+
+    @staticmethod
+    def _settle_viewer_delete(
+        delete_task: DeletePayloadTask,
+        *,
+        path_removed: bool | None,
+    ) -> None:
+        viewer = delete_task.viewer
+        if viewer is None or not delete_task.rel_paths:
+            return
+        if path_removed is None:
+            viewer.image_delete_postcondition_unknown(delete_task.rel_paths[0])
+        else:
+            viewer.image_delete_finished(
+                delete_task.rel_paths[0],
+                path_removed=path_removed,
+            )
 
     def _refresh_after_file_delete(self, affected_roots: set[Path]) -> None:
         for root in affected_roots:
@@ -8462,15 +10232,19 @@ class MainWindow(QMainWindow):
         thumbnail_reindex_roots: set[Path] = set()
         created_directories: list[tuple[Path, str]] = []
         saved_images: list[tuple[MovePayloadTask, Path, str, object | None]] = []
+        reconcile_subtrees: set[tuple[Path, str]] = set()
+        reconcile_images: set[tuple[Path, str]] = set()
         for move_task in completed:
             self._move_payload_tasks.remove(move_task)
             if move_task.future.cancelled():
                 canceled = True
+                failed_refresh_roots.update(move_task.affected_roots)
                 continue
             try:
                 result = move_task.future.result()
             except IndexTaskCancelled:
                 canceled = True
+                failed_refresh_roots.update(move_task.affected_roots)
                 continue
             except Exception as error:
                 last_error = error
@@ -8487,6 +10261,9 @@ class MainWindow(QMainWindow):
                     failed_refresh_roots.update(move_task.affected_roots)
                 continue
             last_result = result
+            if move_task.navigation_owner is not None:
+                with suppress(RuntimeError):
+                    move_task.navigation_owner.invalidate_paged_navigation()
             if result.catalog_settings is not None:
                 live_catalog = self.workspace.catalog_for_root(move_task.dest_root)
                 if live_catalog is not None:
@@ -8518,13 +10295,18 @@ class MainWindow(QMainWindow):
             else:
                 immediate_refresh_roots.update(move_task.affected_roots)
                 immediate_refresh_roots.update(result.affected_roots)
+                reconcile_subtrees.update(result.reconcile_subtrees)
+                reconcile_images.update(result.reconcile_images)
             if result.created_dir_rel is not None:
                 created_directories.append((move_task.dest_root, result.created_dir_rel))
         self._refresh_active_move_payload_task()
-        if immediate_refresh_roots:
-            self._refresh_after_move_payload(immediate_refresh_roots)
-        elif failed_refresh_roots:
-            self._refresh_after_move_payload(failed_refresh_roots)
+        refresh_roots = immediate_refresh_roots | failed_refresh_roots
+        if refresh_roots:
+            self._refresh_after_move_payload(refresh_roots)
+        self._queue_post_move_reconciliations(
+            reconcile_subtrees,
+            reconcile_images,
+        )
         for root in thumbnail_reindex_roots:
             self._swept_catalog_roots.discard(root)
             self._pruned_catalog_roots.discard(root)
@@ -8656,17 +10438,31 @@ class MainWindow(QMainWindow):
                 continue
             catalog = self.workspace.catalog_for_root(request.catalog.root)
             if catalog is not request.catalog:
+                self._restore_deferred_delete_view(request)
                 continue
-            self.queue_delete_images(
-                catalog,
-                request.rel_paths,
-                expected_identities=request.expected_identities,
-                expected_proofs=request.expected_proofs,
-                wipe=request.wipe,
-                remove_from_current_view=False,
-            )
+            try:
+                admitted = self.queue_delete_images(
+                    catalog,
+                    request.rel_paths,
+                    expected_identities=request.expected_identities,
+                    expected_proofs=request.expected_proofs,
+                    wipe=request.wipe,
+                    remove_from_current_view=False,
+                    viewer=request.viewer,
+                )
+            except Exception as error:
+                self.progress_label.setText(f"Delete could not be queued: {error}")
+                self._restore_deferred_delete_view(request)
+                continue
+            if not admitted:
+                self._restore_deferred_delete_view(request)
 
     def _restore_deferred_delete_view(self, request: DeferredDeleteRequest) -> None:
+        if request.viewer is not None and request.rel_paths:
+            request.viewer.image_delete_finished(
+                request.rel_paths[0],
+                path_removed=False,
+            )
         if (
             request.remove_from_current_view
             and self.current_catalog is request.catalog
@@ -8710,13 +10506,16 @@ class MainWindow(QMainWindow):
             if isinstance(context.owner, FullscreenViewer):
                 with suppress(RuntimeError):
                     context.owner.image_save_reconciled(rel_path)
-            if (
-                self.current_catalog is not None
-                and self.current_catalog.root == root
-                and self.current_virtual_kind is None
-                and self.current_dir_rel == ("" if Path(rel_path).parent.as_posix() == "." else Path(rel_path).parent.as_posix())
-            ):
-                self.load_current_directory(preserve_selection=True)
+            if self.current_catalog is not None and self.current_catalog.root == root:
+                saved_dir_rel = Path(rel_path).parent.as_posix()
+                if saved_dir_rel == ".":
+                    saved_dir_rel = ""
+                if self.current_virtual_kind is not None or self.current_dir_rel == saved_dir_rel:
+                    # An edit can change duplicate/similarity membership and
+                    # any size/date/aspect ordering. Refresh the visible
+                    # virtual query as well as the matching physical folder;
+                    # otherwise the pane behind the viewer remains stale.
+                    self.load_current_directory(preserve_selection=True)
         if completed:
             self._flush_deferred_delete_requests()
 
@@ -8763,6 +10562,213 @@ class MainWindow(QMainWindow):
         operations: tuple[EditOperation, ...],
     ) -> None:
         self._failed_image_edits[(catalog.root, rel_path)] = operations
+
+    def _queue_post_move_reconciliations(
+        self,
+        subtrees: set[tuple[Path, str]],
+        images: set[tuple[Path, str]],
+    ) -> None:
+        """Start exact, low-priority indexing after the move has committed."""
+
+        def covered_by_ancestor(rel_path: str, ancestors: set[str]) -> bool:
+            candidate = rel_path.rpartition("/")[0]
+            while True:
+                if candidate in ancestors:
+                    return True
+                if not candidate:
+                    return False
+                candidate = candidate.rpartition("/")[0]
+
+        subtree_groups: dict[Path, set[str]] = defaultdict(set)
+        for root, dir_rel in subtrees:
+            subtree_groups[root].add(dir_rel)
+        minimal_subtrees: set[tuple[Path, str]] = set()
+        minimal_subtrees_by_root: dict[Path, set[str]] = {}
+        for root, root_targets in subtree_groups.items():
+            minimal: set[str] = set()
+            for dir_rel in sorted(
+                root_targets,
+                key=lambda value: (value.count("/"), value),
+            ):
+                if covered_by_ancestor(dir_rel, minimal):
+                    continue
+                minimal.add(dir_rel)
+                minimal_subtrees.add((root, dir_rel))
+            minimal_subtrees_by_root[root] = minimal
+
+        image_groups: dict[Path, set[str]] = defaultdict(set)
+        for root, rel_path in images:
+            if covered_by_ancestor(
+                rel_path,
+                minimal_subtrees_by_root.get(root, set()),
+            ):
+                continue
+            image_groups[root].add(rel_path)
+        contexts = [
+            *(
+                PostMoveReconcileContext(root, subtree_rel=dir_rel)
+                for root, dir_rel in minimal_subtrees
+            ),
+            *(
+                PostMoveReconcileContext(
+                    root,
+                    image_rels=tuple(sorted(rel_paths)),
+                    image_dir_rels=frozenset(
+                        rel_path.rpartition("/")[0]
+                        for rel_path in rel_paths
+                    ),
+                )
+                for root, rel_paths in image_groups.items()
+                if rel_paths
+            ),
+        ]
+        queued = False
+        for context in sorted(
+            contexts,
+            key=lambda item: (
+                str(item.root),
+                item.subtree_rel is None,
+                item.subtree_rel or "",
+            ),
+        ):
+            queued = self._submit_post_move_reconcile_context(context) or queued
+        if queued:
+            QTimer.singleShot(0, self._poll_indexer)
+
+    def _submit_post_move_reconcile_context(
+        self,
+        context: PostMoveReconcileContext,
+    ) -> bool:
+        catalog = self.workspace.catalog_for_root(context.root)
+        if catalog is None or self._closing:
+            return False
+        if (
+            context.expected_root_identity is not None
+            and catalog.root_identity != context.expected_root_identity
+        ) or (
+            context.expected_storage_identity is not None
+            and catalog.storage_identity != context.expected_storage_identity
+        ):
+            return False
+        if context.expected_root_identity is None:
+            context = PostMoveReconcileContext(
+                context.root,
+                subtree_rel=context.subtree_rel,
+                image_rels=context.image_rels,
+                image_dir_rels=context.image_dir_rels,
+                attempt=context.attempt,
+                expected_root_identity=catalog.root_identity,
+                expected_storage_identity=catalog.storage_identity,
+            )
+        self._swept_catalog_roots.discard(context.root)
+        self._pruned_catalog_roots.discard(context.root)
+        if context.subtree_rel is not None:
+            task = self.indexer.refresh_subtree(
+                context.root,
+                context.subtree_rel,
+                interactive=False,
+                expected_root_identity=catalog.root_identity,
+                expected_storage_identity=catalog.storage_identity,
+            )
+        else:
+            if not context.image_rels:
+                return False
+            task = self.indexer.reconcile_images(
+                context.root,
+                context.image_rels,
+                interactive=False,
+                completion_callback=context.mark_image_completed,
+                expected_root_identity=catalog.root_identity,
+                expected_storage_identity=catalog.storage_identity,
+            )
+        self._post_move_reconcile_tasks[task] = context
+        return True
+
+    def _retry_post_move_reconcile_context(
+        self,
+        context: PostMoveReconcileContext,
+    ) -> None:
+        if self._submit_post_move_reconcile_context(context):
+            QTimer.singleShot(0, self._poll_indexer)
+
+    def _settle_post_move_reconcile_tasks(self) -> None:
+        reload_current = False
+        rebuild_roots: set[Path] = set()
+        for task, context in list(self._post_move_reconcile_tasks.items()):
+            snapshot = task.snapshot()
+            if not snapshot.done:
+                continue
+            self._post_move_reconcile_tasks.pop(task, None)
+            self._swept_catalog_roots.discard(context.root)
+            self._pruned_catalog_roots.discard(context.root)
+            self._drop_very_similar_cache(context.root)
+            if snapshot.error is not None or snapshot.canceled:
+                if context.subtree_rel is not None:
+                    retry_context = PostMoveReconcileContext(
+                        context.root,
+                        subtree_rel=context.subtree_rel,
+                        attempt=context.attempt + 1,
+                        expected_root_identity=context.expected_root_identity,
+                        expected_storage_identity=context.expected_storage_identity,
+                    )
+                else:
+                    # Processor skips and writer publications may finish out of
+                    # input order.  Retry only paths lacking an exact callback;
+                    # snapshot.processed is a count, not a prefix watermark.
+                    remaining = context.unfinished_image_rels()
+                    if not remaining:
+                        continue
+                    retry_context = PostMoveReconcileContext(
+                        context.root,
+                        image_rels=remaining,
+                        image_dir_rels=frozenset(
+                            rel_path.rpartition("/")[0]
+                            for rel_path in remaining
+                        ),
+                        attempt=context.attempt + 1,
+                        expected_root_identity=context.expected_root_identity,
+                        expected_storage_identity=context.expected_storage_identity,
+                    )
+                if not self._closing:
+                    delay_ms = min(
+                        30_000,
+                        250 * (2 ** min(retry_context.attempt - 1, 7)),
+                    )
+                    QTimer.singleShot(
+                        delay_ms,
+                        partial(
+                            self._retry_post_move_reconcile_context,
+                            retry_context,
+                        ),
+                    )
+                continue
+            if context.subtree_rel is not None:
+                rebuild_roots.add(context.root)
+            if (
+                self.current_catalog is not None
+                and self.current_catalog.root == context.root
+                and self.current_virtual_kind is None
+                and context.contains_directory(self.current_dir_rel)
+            ):
+                reload_current = True
+        for root in rebuild_roots:
+            catalog = self.workspace.catalog_for_root(root)
+            if catalog is not None:
+                self._request_incremental_tree_rebuild(
+                    catalog,
+                    reason="moved_subtree_reconcile",
+                )
+        if reload_current:
+            self.load_current_directory(preserve_selection=True)
+
+    def _active_post_move_reconcile_context(
+        self,
+        snapshot: IndexProgressSnapshot,
+    ) -> PostMoveReconcileContext | None:
+        for task, context in self._post_move_reconcile_tasks.items():
+            if self._task_is_running(task, (snapshot,)):
+                return context
+        return None
 
     def _refresh_after_move_payload(self, affected_roots: set[Path]) -> None:
         for root in affected_roots:
@@ -8898,7 +10904,8 @@ class MainWindow(QMainWindow):
                 return self.model.index(row, 0)
         row = self.model.first_image_row
         if row is not None:
-            self.model.ensure_row_loaded(row)
+            if not self.model.ensure_row_loaded(row):
+                return QModelIndex()
             return self.model.index(row, 0)
         return QModelIndex()
 
@@ -8947,6 +10954,7 @@ class MainWindow(QMainWindow):
         *,
         catalog: Catalog | None = None,
         rel_paths: Sequence[str] | None = None,
+        expected_incarnations: Mapping[str, ImageRecord] | None = None,
     ) -> None:
         catalog = catalog or self.current_catalog
         if catalog is None:
@@ -8956,6 +10964,23 @@ class MainWindow(QMainWindow):
             return
         if self.workspace.catalog_for_root(catalog.root) is not catalog:
             return
+        selected_incarnations: dict[str, ImageRecord] = dict(
+            expected_incarnations or {}
+        )
+        if rel_paths is None:
+            selected_incarnations = {
+                record.rel_path: record
+                for record in self.selected_records()
+                if isinstance(record, ImageRecord)
+            }
+            if any(
+                rel_path not in selected_incarnations
+                for rel_path in selected_rel_paths
+            ):
+                self.progress_label.setText(
+                    "Delete canceled because the selected thumbnail changed"
+                )
+                return
         self._start_delete_confirmation(
             catalog,
             kind="images-main-selection" if rel_paths is None else "images-main-explicit",
@@ -8963,6 +10988,7 @@ class MainWindow(QMainWindow):
             owner=self,
             wipe=self.wipe_on_delete_enabled(),
             remove_from_current_view=True,
+            expected_incarnations=selected_incarnations,
         )
 
     def _capture_delete_identities(
@@ -9002,10 +11028,13 @@ class MainWindow(QMainWindow):
         expected_proofs: Mapping[str, object] | None = None,
         wipe: bool,
         remove_from_current_view: bool,
-    ) -> None:
+        viewer: FullscreenViewer | None = None,
+    ) -> bool:
         unique_rel_paths = list(dict.fromkeys(rel_paths))
         if not unique_rel_paths:
-            return
+            return False
+        if viewer is not None and len(unique_rel_paths) != 1:
+            raise ValueError("a viewer delete must contain exactly one image")
         expected_proof_map = {
             rel_path: expected_proofs[rel_path]
             for rel_path in unique_rel_paths
@@ -9019,7 +11048,7 @@ class MainWindow(QMainWindow):
                 self.progress_label.setText(
                     "Delete canceled because confirmation identities were not supplied"
                 )
-                return
+                return False
             expected_identity_map = {}
         else:
             expected_identity_map = {
@@ -9036,7 +11065,7 @@ class MainWindow(QMainWindow):
             self.progress_label.setText("Delete canceled because an image proof was unavailable")
             if self.current_catalog is catalog:
                 self.load_current_directory(preserve_selection=True)
-            return
+            return False
         root = catalog.root
         selected_rel_paths = set(unique_rel_paths)
         dependencies = tuple(
@@ -9084,18 +11113,22 @@ class MainWindow(QMainWindow):
                     remove_from_current_view=remove_from_current_view,
                     dependencies=dependencies,
                     reconciliation_tasks=reconciliation_tasks,
+                    viewer=viewer,
                 )
             )
+            if viewer is not None:
+                viewer.image_delete_started(unique_rel_paths[0])
             if remove_from_current_view:
                 self._remove_records_from_current_view(root, image_rels=selected_rel_paths)
             self.progress_bar.setRange(0, 0)
             self.progress_label.setText("Saving image before delete")
-            return
+            return True
         self.indexer.cancel_idle_tasks(root)
         self.indexer.cancel_directory_tasks(root)
         self._swept_catalog_roots.discard(root)
         self._pruned_catalog_roots.discard(root)
         self._drop_very_similar_cache(root)
+        outcome = DeletePayloadOutcome(tuple(unique_rel_paths))
         task, future = self.indexer.submit_action(
             "Deleting images",
             root,
@@ -9108,6 +11141,7 @@ class MainWindow(QMainWindow):
                 expected_identity_map,
                 expected_proof_map,
                 action_task,
+                outcome,
             ),
             key=f"delete:{root}:{monotonic()}",
             interactive=True,
@@ -9124,14 +11158,19 @@ class MainWindow(QMainWindow):
             task=task,
             future=future,
             started_at=monotonic(),
+            outcome=outcome,
+            viewer=viewer,
         )
         self._delete_payload_tasks.append(delete_task)
         self._refresh_active_delete_payload_task()
+        if viewer is not None:
+            viewer.image_delete_started(unique_rel_paths[0])
         if remove_from_current_view:
             self._remove_records_from_current_view(root, image_rels=set(unique_rel_paths))
         if self._delete_payload_task is not None:
             self._show_delete_payload_status(self._delete_payload_task.task.snapshot())
         self._update_tools_menu_actions()
+        return True
 
     def _delete_images_worker(
         self,
@@ -9141,26 +11180,74 @@ class MainWindow(QMainWindow):
         expected_identities: Mapping[str, object],
         expected_proofs: Mapping[str, object],
         task: IndexTask,
+        outcome: DeletePayloadOutcome,
     ) -> DeletePayloadResult:
+        def remaining_paths(catalog: Catalog) -> tuple[str, ...] | None:
+            remaining: list[str] = []
+            for rel_path in rel_paths:
+                try:
+                    catalog.file_identity(rel_path)
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    return None
+                remaining.append(rel_path)
+            return tuple(remaining)
+
         try:
             with Catalog.open_writer(
                 root,
                 expected_root_identity=task.expected_root_identity,
                 expected_storage_identity=task.expected_storage_identity,
             ) as catalog:
-                deleted = catalog.delete_images(
-                    rel_paths,
-                    wipe=wipe,
-                    expected_identities=expected_identities,
-                    expected_proofs=expected_proofs,
-                    progress_callback=task.update,
-                    cancel_check=task.check_canceled,
-                )
+                try:
+                    deleted = catalog.delete_images(
+                        rel_paths,
+                        wipe=wipe,
+                        expected_identities=expected_identities,
+                        expected_proofs=expected_proofs,
+                        progress_callback=task.update,
+                        cancel_check=task.check_canceled,
+                    )
+                except IndexTaskCancelled as error:
+                    remaining_rel_paths = remaining_paths(catalog)
+                    outcome.remaining_rel_paths = remaining_rel_paths
+                    task.mark_canceled()
+                    return DeletePayloadResult(
+                        requested=len(rel_paths),
+                        deleted=(
+                            0
+                            if remaining_rel_paths is None
+                            else len(rel_paths) - len(remaining_rel_paths)
+                        ),
+                        affected_roots={root},
+                        remaining_rel_paths=remaining_rel_paths,
+                        error=error,
+                        canceled=True,
+                    )
+                except Exception as error:
+                    remaining_rel_paths = remaining_paths(catalog)
+                    outcome.remaining_rel_paths = remaining_rel_paths
+                    task.mark_failed(error)
+                    return DeletePayloadResult(
+                        requested=len(rel_paths),
+                        deleted=(
+                            0
+                            if remaining_rel_paths is None
+                            else len(rel_paths) - len(remaining_rel_paths)
+                        ),
+                        affected_roots={root},
+                        remaining_rel_paths=remaining_rel_paths,
+                        error=error,
+                    )
+                remaining_rel_paths = remaining_paths(catalog)
+                outcome.remaining_rel_paths = remaining_rel_paths
             task.mark_done()
             return DeletePayloadResult(
                 requested=len(rel_paths),
                 deleted=deleted,
                 affected_roots={root},
+                remaining_rel_paths=remaining_rel_paths,
             )
         except IndexTaskCancelled:
             task.mark_canceled()
@@ -9201,7 +11288,15 @@ class MainWindow(QMainWindow):
         elif selected == actions.get("list_duplicates") and isinstance(record, ImageRecord):
             self.open_duplicate_list_dialog(record, catalog=catalog)
         elif selected == actions.get("delete"):
-            self.delete_selected(catalog=catalog, rel_paths=selected_rel_paths)
+            self.delete_selected(
+                catalog=catalog,
+                rel_paths=selected_rel_paths,
+                expected_incarnations={
+                    item.rel_path: item
+                    for item in selected_records
+                    if isinstance(item, ImageRecord)
+                },
+            )
         elif selected == actions.get("metadata") and isinstance(record, ImageRecord):
             dialog = MetadataDialog(record.absolute_path, self)
             dialog.exec()
@@ -9276,7 +11371,18 @@ class MainWindow(QMainWindow):
         if isinstance(selected_record, DirectoryRecord):
             self.navigate_to_directory(selected_record.dir_rel)
             return
-        order = [record.rel_path for record in self.model.images if isinstance(record, ImageRecord)]
+        complete_order = self.model.complete_image_order
+        if complete_order is not None:
+            order = complete_order
+            first_image_row = self.model.first_image_row or 0
+            start_index = index.row() - first_image_row
+        else:
+            order = [
+                record.rel_path
+                for record in self.model.images
+                if isinstance(record, ImageRecord)
+            ]
+            start_index = order.index(selected_record.rel_path)
         start = selected_record.rel_path
         catalog = self.current_catalog
         if self.model.is_paged and self.current_virtual_kind in {
@@ -9311,16 +11417,15 @@ class MainWindow(QMainWindow):
                     self.current_sort,
                 ),
                 random_mode=random_mode,
+                view_kind=kind,
             )
         else:
-            navigator = (
-                ImageNavigator.random(order, start)
-                if random_mode
-                else ImageNavigator.sequential(order, start)
+            navigator = ImageNavigator.random(order, start) if random_mode else ImageNavigator(
+                order=order,
+                index=start_index,
             )
         viewer = FullscreenViewer(catalog, navigator, self, wipe_on_delete=self.wipe_on_delete_enabled())
-        viewer.showFullScreen()
-        viewer.exec()
+        viewer.exec_fullscreen()
         last_viewed = viewer.last_viewed_rel_path
         viewer.deleteLater()
         if self.current_catalog is catalog:
@@ -9541,6 +11646,10 @@ class MainWindow(QMainWindow):
                     root: context_catalog.root_identity
                     for root, context_catalog in preflight.catalog_context.items()
                 },
+                {
+                    root: context_catalog.storage_identity
+                    for root, context_catalog in preflight.catalog_context.items()
+                },
                 action_task,
             ),
             key=f"move:{dest_catalog.root}:{dest_dir_rel}:{monotonic()}",
@@ -9572,6 +11681,7 @@ class MainWindow(QMainWindow):
         )
         self._move_payload_tasks.append(move_task)
         self._refresh_active_move_payload_task()
+        navigated_from_moved_directory = False
         if self.current_catalog is not None:
             current_root = self.current_catalog.root
             for source_dir_rel in directory_payload.get(current_root, ()):
@@ -9580,7 +11690,10 @@ class MainWindow(QMainWindow):
                     self.current_dir_rel = "" if parent_rel == "." else parent_rel
                     self.current_virtual_kind = None
                     self.current_virtual_value = ""
+                    navigated_from_moved_directory = True
                     break
+        if navigated_from_moved_directory:
+            self.load_current_directory(preserve_selection=True)
         self._remove_queued_move_records_from_current_view(image_payload, directory_payload)
         if self._move_payload_task is not None:
             self._show_move_payload_status(self._move_payload_task.task.snapshot())
@@ -9659,6 +11772,7 @@ class MainWindow(QMainWindow):
         expected_destination_identity: object | None,
         wipe_on_delete: bool,
         expected_root_identities: Mapping[Path, tuple[int, int]],
+        expected_storage_identities: Mapping[Path, CatalogStorageIdentity],
         task: IndexTask,
     ) -> MovePayloadResult:
         affected_roots = {dest_root, *directory_groups.keys(), *image_groups.keys()}
@@ -9668,6 +11782,8 @@ class MainWindow(QMainWindow):
         processed = 0
         moved = 0
         catalogs: dict[Path, Catalog] = {}
+        reconcile_subtrees: list[tuple[Path, str]] = []
+        reconcile_images: list[tuple[Path, str]] = []
 
         def catalog_for(root: Path) -> Catalog:
             resolved = root.expanduser().absolute()
@@ -9676,6 +11792,7 @@ class MainWindow(QMainWindow):
                 catalog = Catalog.open_writer(
                     resolved,
                     expected_root_identity=expected_root_identities.get(resolved),
+                    expected_storage_identity=expected_storage_identities.get(resolved),
                 )
                 catalogs[resolved] = catalog
             return catalog
@@ -9741,6 +11858,10 @@ class MainWindow(QMainWindow):
                 )
                 processed += len(dir_rels)
                 moved += len(results)
+                reconcile_subtrees.extend(
+                    (result.dest_catalog_root, result.dest_rel_path)
+                    for result in results
+                )
                 task.update(min(processed, requested), requested, dest_dir_rel or ".")
             for source_root, rel_paths in image_groups.items():
                 source_catalog = catalog_for(source_root)
@@ -9764,9 +11885,19 @@ class MainWindow(QMainWindow):
                 )
                 processed += len(rel_paths)
                 moved += len(results)
+                reconcile_images.extend(
+                    (result.dest_catalog_root, result.dest_rel_path)
+                    for result in results
+                )
                 task.update(min(processed, requested), requested, dest_dir_rel or ".")
             task.mark_done()
-            return MovePayloadResult(requested=requested, moved=moved, affected_roots=affected_roots)
+            return MovePayloadResult(
+                requested=requested,
+                moved=moved,
+                affected_roots=affected_roots,
+                reconcile_subtrees=tuple(dict.fromkeys(reconcile_subtrees)),
+                reconcile_images=tuple(dict.fromkeys(reconcile_images)),
+            )
         except IndexTaskCancelled:
             task.mark_canceled()
             raise
@@ -9808,15 +11939,60 @@ class MainWindow(QMainWindow):
         directory_rels = directory_rels or set()
         if not image_rels and not directory_rels:
             return
+        if (
+            self.current_virtual_kind is None
+            and self.model.has_complete_row_map
+            and len(self.model.images) > THUMBNAIL_MODEL_BATCH_SIZE
+        ):
+            # The mutation task/deferred request is registered before this
+            # method runs, so a fresh worker snapshot captures its exclusion
+            # set. Filter the already-owned snapshot off Qt so the accepted
+            # source disappears promptly without another slow filesystem scan.
+            fingerprint = self._physical_pane_generation
+            active_preview = self._matching_virtual_view_task(
+                root,
+                VIRTUAL_KIND_PHYSICAL_PREVIEW,
+                self.current_dir_rel,
+                self.current_sort,
+                fingerprint,
+            )
+            if active_preview is not None:
+                active_preview.cancel_event.set()
+                active_preview.future.cancel()
+                self._virtual_view_tasks.pop(active_preview.future, None)
+            self._submit_filtered_physical_snapshot_task(
+                self.current_catalog,
+                self.current_dir_rel,
+                self.current_sort,
+                fingerprint,
+                self._thumbnail_selection_keys()
+                - {("image", rel_path) for rel_path in image_rels}
+                - {("directory", rel_path) for rel_path in directory_rels},
+                None,
+                self._current_thumbnail_scroll_key(),
+            )
+            return
         records = list(self.model.images)
         remove_flags: list[bool] = []
         filtered: list[PaneRecord] = []
         removed_rows: list[int] = []
+
+        def inside_removed_directory(rel_path: str) -> bool:
+            candidate = rel_path
+            while candidate:
+                if candidate in directory_rels:
+                    return True
+                parent = candidate.rpartition("/")[0]
+                if parent == candidate:
+                    break
+                candidate = parent
+            return "" in directory_rels
+
         for row, record in enumerate(records):
+            rel_path = record.rel_path
             remove = (
-                record.rel_path in image_rels
-                if isinstance(record, ImageRecord)
-                else record.dir_rel in directory_rels
+                (isinstance(record, ImageRecord) and rel_path in image_rels)
+                or inside_removed_directory(rel_path)
             )
             remove_flags.append(remove)
             if remove:
@@ -9856,7 +12032,8 @@ class MainWindow(QMainWindow):
         row = self.model.row_for_key(key)
         if row is None:
             return False
-        self.model.ensure_row_loaded(row)
+        if not self.model.ensure_row_loaded(row):
+            return False
         index = self.model.index(row, 0)
         selection = self.thumbnail_view.selectionModel()
         selection.clearSelection()
@@ -9956,6 +12133,7 @@ class MainWindow(QMainWindow):
             return
         self._settle_directory_discovery_tasks()
         self._settle_directory_index_tasks()
+        self._settle_post_move_reconcile_tasks()
         self._settle_idle_tasks()
         self._settle_thumbnail_prune_tasks()
         self._settle_thumbnail_repair_tasks()
@@ -9998,10 +12176,16 @@ class MainWindow(QMainWindow):
                 return
 
     def _poll_indexer(self) -> None:
+        if self.thumbnail_view.manual_drag_active():
+            # The drag payload is already captured, but both thumbnail-folder
+            # drop targets and tree rows must stay geometrically stable until
+            # the release position has been resolved.
+            return
         self._settle_initial_config_load(self._initial_config_load_generation)
         self._settle_config_saves()
-        self._settle_tree_children_tasks()
-        self._settle_tree_tags_tasks()
+        if not self._tree_publication_blocked():
+            self._settle_tree_children_tasks()
+            self._settle_tree_tags_tasks()
         if (
             self.current_catalog is not None
             and self.workspace.catalog_for_root(self.current_catalog.root) is not self.current_catalog
@@ -10011,8 +12195,6 @@ class MainWindow(QMainWindow):
             self.current_virtual_kind = None
             self.current_virtual_value = ""
             self.model.set_images(None, [])
-        if self.thumbnail_view.manual_drag_active():
-            return
         drain_completed = getattr(self.indexer, "drain_completed_snapshots", None)
         if callable(drain_completed):
             drain_completed()
@@ -10024,6 +12206,7 @@ class MainWindow(QMainWindow):
         self._settle_delete_payload_task()
         self._settle_move_payload_task()
         self._settle_image_reconcile_tasks()
+        self._settle_post_move_reconcile_tasks()
         self._flush_deferred_delete_requests()
         self._settle_virtual_view_tasks()
         self._settle_directory_discovery_tasks()
@@ -10075,6 +12258,10 @@ class MainWindow(QMainWindow):
             if active_virtual_task is not None:
                 self._show_virtual_view_status(active_virtual_task)
                 return
+            if self._physical_preview_retry_generation == self._physical_pane_generation:
+                self.progress_bar.setRange(0, 0)
+                self.progress_label.setText("Listing folder (waiting for a reader)")
+                return
             if self._tree_build_task is not None:
                 self._show_tree_build_status(self._tree_build_task)
                 return
@@ -10099,13 +12286,29 @@ class MainWindow(QMainWindow):
 
         self._indexing_was_active = True
         snapshot = sorted(visible_snapshots, key=lambda item: (item.interactive, item.started_at), reverse=True)[0]
+        post_move_context = self._active_post_move_reconcile_context(snapshot)
+        post_move_affects_current = (
+            post_move_context is not None
+            and self.current_catalog is not None
+            and post_move_context.root == self.current_catalog.root
+            and self.current_virtual_kind is None
+            and post_move_context.contains_directory(self.current_dir_rel)
+        )
         if (
             self.current_catalog is not None
             and self.current_virtual_kind is None
             and snapshot.root == self.current_catalog.root
-            and snapshot.dir_rel == self.current_dir_rel
+            and (
+                snapshot.dir_rel == self.current_dir_rel
+                or post_move_affects_current
+            )
         ):
             self.model.refresh_pending_thumbnails()
+            if post_move_affects_current:
+                self._request_physical_progress_reload(
+                    self.current_catalog.root,
+                    self.current_dir_rel,
+                )
         if snapshot.total is None:
             synthetic_total = max(snapshot.processed + 64, 1)
             self.progress_bar.setRange(0, synthetic_total)
@@ -10142,29 +12345,11 @@ class MainWindow(QMainWindow):
                 indexed_row = self.model.row_for_key(("image", snapshot.current))
                 if indexed_row is not None:
                     self.model.refresh_thumbnail(snapshot.current)
-                if (
-                    self.current_virtual_kind is None
-                    and (
-                        indexed_row is None
-                        or (
-                            indexed_row < len(self.model.images)
-                            and isinstance(self.model.images[indexed_row], ImageRecord)
-                            and self.model.images[indexed_row].id < 0
-                        )
-                    )
-                ):
-                    # Indexing publishes rows incrementally. Requery through
-                    # the bounded pane worker so newly discovered images
-                    # appear in batches without any stat/SQLite work here.
-                    # A quick filesystem preview can already have published a
-                    # negative-id placeholder; it still needs one coalesced
-                    # database reload once the current materialization ends.
-                    # Coalesce progress behind the current pane load: replacing
-                    # its generation on every poll can otherwise starve it.
-                    self._request_physical_progress_reload(
-                        self.current_catalog.root,
-                        self.current_dir_rel,
-                    )
+                # Thumbnail workers perform an exact rel-path lookup, so each
+                # newly committed thumbnail can repaint its existing row. Do
+                # not requery/rebuild a sorted database prefix on every 200 ms
+                # progress tick; one bounded metadata overlay runs at task
+                # completion instead.
         self.progress_label.setText(detail)
 
     def _task_is_running(self, task: IndexTask, snapshots: Sequence[IndexProgressSnapshot]) -> bool:
@@ -10256,8 +12441,16 @@ class MainWindow(QMainWindow):
                 self._swept_catalog_roots.discard(root)
         for root in changed_roots:
             self._drop_very_similar_cache(root)
-        if reload_current:
-            self.load_current_directory(preserve_selection=True)
+        if reload_current and self.current_catalog is not None:
+            self.model.refresh_pending_thumbnails()
+            self._request_physical_reconcile(
+                self.current_catalog.root,
+                self.current_dir_rel,
+            )
+            self._request_physical_progress_reload(
+                self.current_catalog.root,
+                self.current_dir_rel,
+            )
 
     def _settle_directory_discovery_tasks(self) -> None:
         for root, task in list(self._directory_discovery_tasks.items()):
@@ -11931,6 +14124,16 @@ class FullscreenViewer(QDialog):
         self._navigation_page_future: Future[ViewerNavigationPage] | None = None
         self._navigation_page_cancel_event: Event | None = None
         self._pending_navigation_step = 0
+        self._navigation_page_select_first = False
+        self._navigation_page_replace_all = False
+        self._navigation_rebuild_required = False
+        self._navigation_rebuild_preferred_rel_path: str | None = None
+        self._navigation_rebuild_fallback_index = 0
+        self._navigation_rebuild_rel_paths: list[str] = []
+        self._navigation_rebuild_seen: set[str] = set()
+        self._navigation_rebuild_next_offset: int | None = None
+        self._navigation_rebuild_total_count = 0
+        self._pending_image_delete: ViewerDeletePending | None = None
         self._load_closed = False
         self._pending_save_rels: set[str] = set()
         self._preview_generation = 0
@@ -11987,9 +14190,32 @@ class FullscreenViewer(QDialog):
         self.load_current()
         self.update_cursor_visibility()
 
+    def exec_fullscreen(self) -> int:
+        """Enter the modal viewer loop without first exposing a nonmodal window.
+
+        Calling ``showFullScreen()`` before ``exec()`` briefly registers the
+        viewer as an ordinary top-level window.  Some window managers then
+        restore focus to the main window when a nested message box closes,
+        even though the fullscreen viewer still covers it.  Applying the
+        state before ``exec()`` lets Qt establish the correct modal owner from
+        the viewer's first visible frame.
+        """
+
+        self.setWindowState(self.windowState() | Qt.WindowState.WindowFullScreen)
+        return int(self.exec())
+
     def keyPressEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         key = event.key()
         modifiers = event.modifiers()
+        if not self.navigator.order and key not in {
+            Qt.Key.Key_Left,
+            Qt.Key.Key_Right,
+            Qt.Key.Key_Escape,
+        }:
+            # A successful delete can leave a paged navigator briefly empty
+            # while its rebased first page is loading. Current-image actions
+            # must remain inert during that bounded gap.
+            return
         if key in (Qt.Key.Key_Plus, Qt.Key.Key_Equal):
             self.zoom_in()
             return
@@ -12185,6 +14411,8 @@ class FullscreenViewer(QDialog):
 
     @property
     def current_path(self) -> Path:
+        if not self.navigator.order:
+            raise RuntimeError("no viewer image is currently available")
         relative = Path(self.navigator.current)
         if relative.is_absolute() or any(
             part in {"", ".", ".."} for part in relative.parts
@@ -12195,6 +14423,20 @@ class FullscreenViewer(QDialog):
 
     def navigate(self, step: int) -> None:
         if not self.confirm_pending_edits():
+            return
+        if self._navigation_rebuild_required:
+            # Keep the displayed row stable while a fresh OFFSET prefix is
+            # assembled. Navigating the old prefix here could select a row
+            # whose membership or position has already changed underneath us.
+            self.setWindowTitle("Marnwick — refreshing image order…")
+            return
+        if self._pending_image_delete is not None and not self.navigator.order:
+            if (
+                step > 0
+                and isinstance(self.navigator, PagedImageNavigator)
+                and self.navigator.has_more
+            ):
+                self._pending_navigation_step = step
             return
         if self._navigation_page_future is not None and step < 0:
             # Let the useful page finish, but do not unexpectedly jump forward
@@ -12213,29 +14455,90 @@ class FullscreenViewer(QDialog):
             return
         self.load_current()
 
-    def _start_navigation_page(self, step: int) -> None:
+    def _start_navigation_page(
+        self,
+        step: int,
+        *,
+        select_first: bool = False,
+        replace_all: bool = False,
+    ) -> None:
         navigator = self.navigator
         if not isinstance(navigator, PagedImageNavigator) or self._load_closed:
             return
+        if self._pending_image_delete is not None:
+            self._pending_navigation_step = step
+            self._navigation_page_select_first |= select_first
+            self._navigation_page_replace_all |= replace_all
+            if replace_all:
+                self._navigation_rebuild_required = True
+            self.setWindowTitle("Marnwick — deleting image…")
+            return
         if self._navigation_page_future is not None:
             self._pending_navigation_step = step
+            self._navigation_page_select_first |= select_first
+            self._navigation_page_replace_all |= replace_all
             return
         cancel_event = Event()
+        page_offset = (
+            0
+            if replace_all and self._navigation_rebuild_next_offset is None
+            else (
+                self._navigation_rebuild_next_offset
+                if replace_all
+                else navigator.next_offset
+            )
+        )
         try:
             future = self._navigation_page_executor.submit(
                 navigator.page_loader,
-                navigator.next_offset,
-                PANE_QUERY_PAGE_SIZE,
+                page_offset,
+                VIEWER_REBUILD_PAGE_SIZE if replace_all else PANE_QUERY_PAGE_SIZE,
                 cancel_event,
             )
         except RuntimeError:
-            self.setWindowTitle("Marnwick — catalog reader busy")
+            if select_first or replace_all:
+                self._navigation_page_select_first = select_first
+                self._navigation_page_replace_all = replace_all
+                self.setWindowTitle("Marnwick — waiting for catalog reader…")
+                QTimer.singleShot(
+                    50,
+                    partial(
+                        self._retry_required_navigation_page,
+                        step,
+                        select_first,
+                        replace_all,
+                    ),
+                )
+            else:
+                self.setWindowTitle("Marnwick — catalog reader busy")
             return
         self._navigation_page_cancel_event = cancel_event
         self._navigation_page_future = future
         self._pending_navigation_step = step
+        self._navigation_page_select_first = select_first
+        self._navigation_page_replace_all = replace_all
         self.setWindowTitle("Marnwick — loading more images…")
         self._navigation_page_timer.start()
+
+    def _retry_required_navigation_page(
+        self,
+        step: int,
+        select_first: bool,
+        replace_all: bool,
+    ) -> None:
+        if (
+            self._load_closed
+            or self._navigation_page_future is not None
+            or self._pending_image_delete is not None
+            or self._navigation_page_select_first != select_first
+            or self._navigation_page_replace_all != replace_all
+        ):
+            return
+        self._start_navigation_page(
+            step,
+            select_first=select_first,
+            replace_all=replace_all,
+        )
 
     def _settle_navigation_page(self) -> None:
         future = self._navigation_page_future
@@ -12252,28 +14555,119 @@ class FullscreenViewer(QDialog):
             return
         pending_step = self._pending_navigation_step
         self._pending_navigation_step = 0
-        old_offset = navigator.next_offset
+        select_first = self._navigation_page_select_first
+        replace_all = self._navigation_page_replace_all
+        old_offset = (
+            (self._navigation_rebuild_next_offset or 0)
+            if replace_all
+            else navigator.next_offset
+        )
         try:
             page = future.result()
         except ExecutorSaturatedError:
             if (
-                pending_step > 0
-                and navigator.has_more
-                and not self._load_closed
-            ):
+                replace_all
+                or (
+                    (pending_step > 0 or select_first)
+                    and navigator.has_more
+                )
+            ) and not self._load_closed:
                 self.setWindowTitle("Marnwick — waiting for catalog reader…")
-                self._start_navigation_page(pending_step)
+                self._start_navigation_page(
+                    pending_step,
+                    select_first=select_first,
+                    replace_all=replace_all,
+                )
             return
         except Exception as error:
+            self._navigation_page_select_first = False
+            self._navigation_page_replace_all = False
+            if replace_all:
+                self._reset_navigation_rebuild()
+                self.accept()
+                return
             navigator.has_more = False
+            if select_first and not navigator.order:
+                self.accept()
+                return
             self.load_error = str(error)
             self.update_info_overlay()
             return
+        if replace_all:
+            rel_paths = list(dict.fromkeys(page.rel_paths))
+            if navigator.random_mode and rel_paths:
+                rel_paths = ImageNavigator.random(rel_paths, rel_paths[0]).order
+            for rel_path in rel_paths:
+                if rel_path in self._navigation_rebuild_seen:
+                    continue
+                self._navigation_rebuild_seen.add(rel_path)
+                self._navigation_rebuild_rel_paths.append(rel_path)
+            self._navigation_rebuild_next_offset = page.next_offset
+            self._navigation_rebuild_total_count = max(
+                self._navigation_rebuild_total_count,
+                len(self._navigation_rebuild_rel_paths),
+                page.total_images,
+            )
+            preferred = self._navigation_rebuild_preferred_rel_path
+            self._navigation_page_select_first = False
+            self._navigation_page_replace_all = False
+            if page.has_more and page.next_offset <= old_offset:
+                self._reset_navigation_rebuild()
+                self.accept()
+                return
+            preferred_found = (
+                preferred is not None and preferred in self._navigation_rebuild_seen
+            )
+            usable_without_preference = (
+                preferred is None and bool(self._navigation_rebuild_rel_paths)
+            )
+            if page.has_more and not preferred_found and not usable_without_preference:
+                checked = len(self._navigation_rebuild_rel_paths)
+                self._start_navigation_page(0, replace_all=True)
+                if self._navigation_page_future is not None:
+                    self.setWindowTitle(
+                        f"Marnwick — refreshing image order ({checked} checked)…"
+                    )
+                return
+            rebuilt_order = list(self._navigation_rebuild_rel_paths)
+            fallback_index = self._navigation_rebuild_fallback_index
+            next_offset = self._navigation_rebuild_next_offset or 0
+            total_count = self._navigation_rebuild_total_count
+            navigator.order = rebuilt_order
+            navigator._seen = set(rebuilt_order)
+            navigator.next_offset = next_offset
+            navigator.has_more = page.has_more
+            navigator.total_count = max(len(rebuilt_order), total_count)
+            self._reset_navigation_rebuild()
+            if navigator.order:
+                navigator.index = (
+                    navigator.order.index(preferred)
+                    if preferred in navigator.order
+                    else min(fallback_index, len(navigator.order) - 1)
+                )
+                self.load_current()
+            elif navigator.has_more:
+                self._start_navigation_page(0, select_first=True)
+            else:
+                self.accept()
+            return
         added = navigator.append_page(page)
+        self._navigation_page_select_first = False
+        self._navigation_page_replace_all = False
         if page.has_more and page.next_offset <= old_offset:
             navigator.has_more = False
             self.load_error = "Catalog navigation page did not advance"
             self.update_info_overlay()
+            return
+        if select_first:
+            if added:
+                navigator.index = 0
+                self.load_current()
+                return
+            if navigator.has_more:
+                self._start_navigation_page(0, select_first=True)
+            else:
+                self.accept()
             return
         if self.operations:
             return
@@ -12291,10 +14685,54 @@ class FullscreenViewer(QDialog):
         elif pending_step > 0:
             self.accept()
 
+    def _reset_navigation_rebuild(self) -> None:
+        self._navigation_rebuild_required = False
+        self._navigation_rebuild_preferred_rel_path = None
+        self._navigation_rebuild_fallback_index = 0
+        self._navigation_rebuild_rel_paths.clear()
+        self._navigation_rebuild_seen.clear()
+        self._navigation_rebuild_next_offset = None
+        self._navigation_rebuild_total_count = 0
+
+    def invalidate_paged_navigation(self) -> None:
+        """Rebuild a live OFFSET navigator after membership/order mutation.
+
+        The old navigator remains published while bounded pages are read from
+        page zero. If the displayed image moved beyond page zero, pages keep
+        accumulating asynchronously until that exact image is found. This
+        avoids both a visible jump and a discontinuous prefix that would break
+        backward navigation.
+        """
+
+        navigator = self.navigator
+        if self._load_closed or not isinstance(navigator, PagedImageNavigator):
+            return
+        preferred = navigator.current if navigator.order else None
+        fallback_index = navigator.index if navigator.order else 0
+        self._cancel_navigation_page_for_delete(preserve_rebuild=False)
+        self._pending_navigation_step = 0
+        self._navigation_rebuild_required = True
+        self._navigation_rebuild_preferred_rel_path = preferred
+        self._navigation_rebuild_fallback_index = fallback_index
+        self._start_navigation_page(0, replace_all=True)
+
     def delete_current_image(self) -> None:
         if not self.confirm_pending_edits():
             return
+        if not self.navigator.order:
+            return
+        if self._pending_image_delete is not None:
+            self.setWindowTitle("Marnwick — delete already in progress…")
+            return
         rel_path = self.navigator.current
+        displayed_identity = self.loaded_file_identity
+        if displayed_identity is None:
+            show_error(
+                self,
+                "Delete",
+                "The image is still loading or could not be verified; it was not deleted.",
+            )
+            return
         parent = self.parent()
         if isinstance(parent, MainWindow):
             parent._start_delete_confirmation(
@@ -12304,6 +14742,7 @@ class FullscreenViewer(QDialog):
                 owner=self,
                 wipe=self.wipe_on_delete,
                 remove_from_current_view=True,
+                expected_incarnations={rel_path: displayed_identity},
             )
             return
         show_error(
@@ -12312,21 +14751,140 @@ class FullscreenViewer(QDialog):
             "This standalone viewer cannot safely mutate files without its catalog window.",
         )
 
-    def image_delete_queued(self, rel_path: str) -> None:
-        if self._load_closed or self.navigator.current != rel_path:
+    def _cancel_navigation_page_for_delete(
+        self,
+        *,
+        preserve_rebuild: bool = False,
+    ) -> None:
+        self._navigation_page_timer.stop()
+        if self._navigation_page_cancel_event is not None:
+            self._navigation_page_cancel_event.set()
+            self._navigation_page_cancel_event = None
+        if self._navigation_page_future is not None:
+            self._navigation_page_future.cancel()
+            self._navigation_page_future = None
+        self._navigation_page_select_first = False
+        self._navigation_page_replace_all = False
+        if preserve_rebuild and self._navigation_rebuild_required:
+            # A delete changes the live query while this snapshot is being
+            # assembled. Keep the sticky requirement, but restart from page
+            # zero after the worker proves success or failure.
+            self._navigation_rebuild_rel_paths.clear()
+            self._navigation_rebuild_seen.clear()
+            self._navigation_rebuild_next_offset = None
+            self._navigation_rebuild_total_count = 0
+        else:
+            self._reset_navigation_rebuild()
+
+    def image_delete_started(self, rel_path: str) -> None:
+        if self._load_closed:
             return
-        old_index = self.navigator.index
-        self.navigator.order = [item for item in self.navigator.order if item != rel_path]
-        if isinstance(self.navigator, PagedImageNavigator):
-            self.navigator.total_count = max(
-                len(self.navigator.order),
-                self.navigator.total_count - 1,
-            )
+        pending = self._pending_image_delete
+        if pending is not None:
+            if pending.rel_path != rel_path:
+                raise RuntimeError("viewer already has a different pending delete")
+            return
+        try:
+            removed_index = self.navigator.order.index(rel_path)
+        except ValueError:
+            return
+        self._cancel_navigation_page_for_delete(preserve_rebuild=True)
+        self._pending_image_delete = ViewerDeletePending(rel_path, removed_index)
+        self.navigator.order.pop(removed_index)
         if not self.navigator.order:
-            self.accept()
+            self.navigator.index = 0
+            self.setWindowTitle("Marnwick — deleting image…")
             return
-        self.navigator.index = min(old_index, len(self.navigator.order) - 1)
+        self.navigator.index = min(removed_index, len(self.navigator.order) - 1)
         self.load_current()
+        self.setWindowTitle("Marnwick — deleting image…")
+
+    def image_delete_finished(self, rel_path: str, *, path_removed: bool) -> None:
+        pending = self._pending_image_delete
+        if self._load_closed or pending is None or pending.rel_path != rel_path:
+            return
+        self._pending_image_delete = None
+        pending_step = self._pending_navigation_step
+        self._pending_navigation_step = 0
+        navigator = self.navigator
+        self.setWindowTitle("Marnwick")
+        if not path_removed:
+            current_rel_path = navigator.current if navigator.order else None
+            restored_index = min(pending.removed_index, len(navigator.order))
+            navigator.order.insert(restored_index, rel_path)
+            if isinstance(navigator, PagedImageNavigator):
+                navigator._seen.add(rel_path)
+            if current_rel_path is None:
+                navigator.index = restored_index
+                self.load_current()
+            else:
+                navigator.index = navigator.order.index(current_rel_path)
+                self.update_info_overlay()
+            if self._navigation_rebuild_required and isinstance(
+                navigator,
+                PagedImageNavigator,
+            ):
+                self.invalidate_paged_navigation()
+                return
+            if pending_step > 0 and isinstance(navigator, PagedImageNavigator):
+                self._start_navigation_page(pending_step)
+            return
+
+        if (
+            isinstance(navigator, PagedImageNavigator)
+            and navigator.view_kind == VIRTUAL_KIND_DUPLICATES
+        ):
+            # Removing one duplicate can make several surviving singletons
+            # disappear from this query. Its membership shrink is not a
+            # one-row OFFSET adjustment, so rebuild from a fresh page zero.
+            navigator._seen.discard(rel_path)
+            self.invalidate_paged_navigation()
+            return
+        if isinstance(navigator, PagedImageNavigator):
+            # The removed image occupied one row inside the already consumed
+            # database prefix. Rebase OFFSET only after the worker confirms
+            # that the path is gone; failure restoration must retain the old
+            # cursor unchanged.
+            navigator.next_offset = max(0, navigator.next_offset - 1)
+            navigator.total_count = max(
+                len(navigator.order),
+                navigator.total_count - 1,
+            )
+            navigator._seen.discard(rel_path)
+            navigator.has_more = bool(
+                navigator.has_more and navigator.total_count > len(navigator.order)
+            )
+            if self._navigation_rebuild_required:
+                self.invalidate_paged_navigation()
+                return
+        if navigator.order:
+            self.update_info_overlay()
+            if pending_step > 0 and isinstance(navigator, PagedImageNavigator):
+                self._start_navigation_page(pending_step)
+            return
+        if isinstance(navigator, PagedImageNavigator) and navigator.has_more:
+            self._start_navigation_page(0, select_first=True)
+            return
+        self.accept()
+
+    def image_delete_postcondition_unknown(self, rel_path: str) -> None:
+        """Close a viewer whose filesystem could not prove either outcome.
+
+        The main pane performs its normal background refresh. Keeping an
+        optimistic or restored OFFSET cursor here would assert a fact the
+        mutation worker could not verify after an I/O failure.
+        """
+
+        pending = self._pending_image_delete
+        if self._load_closed or pending is None or pending.rel_path != rel_path:
+            return
+        self._pending_image_delete = None
+        self.accept()
+
+    def image_delete_queued(self, rel_path: str) -> None:
+        """Compatibility alias for callers that only report queue admission."""
+
+        self.image_delete_started(rel_path)
 
     def load_current(self) -> None:
         self.stop_movie()
@@ -12748,6 +15306,10 @@ class FullscreenViewer(QDialog):
         if self._navigation_page_future is not None:
             self._navigation_page_future.cancel()
             self._navigation_page_future = None
+        self._navigation_page_select_first = False
+        self._navigation_page_replace_all = False
+        self._reset_navigation_rebuild()
+        self._pending_image_delete = None
         self._cancel_movie_validation()
         self._cancel_preview_render()
         if self._load_future is not None:
@@ -12762,7 +15324,11 @@ class FullscreenViewer(QDialog):
         rel_path: str,
         operations: tuple[EditOperation, ...],
     ) -> bool:
-        if self.navigator.current != rel_path or self.operations:
+        if (
+            not self.navigator.order
+            or self.navigator.current != rel_path
+            or self.operations
+        ):
             return False
         self.operations.extend(operations)
         self.render_preview()
@@ -12798,7 +15364,7 @@ class FullscreenViewer(QDialog):
 
     def image_save_started(self, rel_path: str) -> None:
         self._pending_save_rels.add(rel_path)
-        if self.navigator.current == rel_path:
+        if self.navigator.order and self.navigator.current == rel_path:
             self.exit_region_edit()
 
     def image_save_failed(self, rel_path: str) -> None:
@@ -12806,15 +15372,28 @@ class FullscreenViewer(QDialog):
 
     def image_save_reconciled(self, rel_path: str) -> None:
         self._pending_save_rels.discard(rel_path)
-        if not self._load_closed and self.navigator.current == rel_path:
+        self.invalidate_paged_navigation()
+        if (
+            not self._load_closed
+            and self.navigator.order
+            and self.navigator.current == rel_path
+        ):
             self.load_current()
 
     def image_save_reconcile_failed(self, rel_path: str) -> None:
         self._pending_save_rels.discard(rel_path)
-        if not self._load_closed and self.navigator.current == rel_path:
+        if (
+            not self._load_closed
+            and self.navigator.order
+            and self.navigator.current == rel_path
+        ):
             self.load_current()
 
     def can_edit_current(self) -> bool:
+        if not self.navigator.order:
+            return False
+        if self._navigation_rebuild_required:
+            return False
         if self.navigator.current in self._pending_save_rels:
             return False
         if self._load_future is not None and not self._load_future.done():
@@ -12835,6 +15414,8 @@ class FullscreenViewer(QDialog):
         self.info_overlay.raise_()
 
     def info_overlay_text(self) -> str:
+        if not self.navigator.order:
+            return "Loading the next image…"
         identity = self.loaded_file_identity
         file_date = (
             datetime.fromtimestamp(identity.modified_ns / 1_000_000_000).strftime(
@@ -13025,21 +15606,63 @@ class FullscreenViewer(QDialog):
         )
 
     def open_tags(self) -> None:
+        if not self.navigator.order:
+            return
+        target_rel_path = self.navigator.current
+        if self.operations:
+            if not self.confirm_pending_edits():
+                return
+            # A nested save/discard prompt can process mutation settlements.
+            # Do not silently retarget the tag command if that changed the
+            # displayed row while the prompt was open.
+            if (
+                not self.navigator.order
+                or self.navigator.current != target_rel_path
+            ):
+                return
+        if target_rel_path in self._pending_save_rels:
+            # Saving is asynchronous. Opening a tag writer concurrently would
+            # either race the encoded replacement or be rejected by the
+            # catalog mutation lane, so leave the viewer responsive and let
+            # the user invoke Tags again after reconciliation completes.
+            self.setWindowTitle("Marnwick — finish saving before editing tags…")
+            return
         dialog: TagDialog | None = None
 
         def exec_dialog() -> int:
             nonlocal dialog
-            dialog = TagDialog(self.catalog, self.navigator.current, self)
+            dialog = TagDialog(self.catalog, target_rel_path, self)
             return int(dialog.exec())
 
         accepted = self.run_with_visible_cursor(exec_dialog) == int(QDialog.DialogCode.Accepted)
         selected_tags = dialog.selected_tags() if accepted and dialog is not None else []
+        expected_identity = (
+            dialog.loaded_file_identity
+            if accepted and dialog is not None
+            else None
+        )
         if dialog is not None:
             dialog.deleteLater()
         if accepted:
             parent = self.parent()
             if isinstance(parent, MainWindow):
-                parent.queue_image_tags(self.catalog, self.navigator.current, selected_tags)
+                if target_rel_path in self._pending_save_rels:
+                    self.setWindowTitle("Marnwick — finish saving before editing tags…")
+                    return
+                if expected_identity is None:
+                    show_error(
+                        self,
+                        "Tags",
+                        "The image identity was unavailable; tags were not changed.",
+                    )
+                    return
+                parent.queue_image_tags(
+                    self.catalog,
+                    target_rel_path,
+                    selected_tags,
+                    expected_identity=expected_identity,
+                    owner=self,
+                )
             else:
                 show_error(
                     self,
@@ -13048,6 +15671,8 @@ class FullscreenViewer(QDialog):
                 )
 
     def open_edit_tools(self) -> None:
+        if not self.navigator.order:
+            return
         if not self.can_edit_current():
             return
         if self.base_pixmap.isNull() or self.load_error is not None:
@@ -13139,11 +15764,13 @@ class FullscreenViewer(QDialog):
             self.label.unsetCursor()
 
     def run_with_visible_cursor(self, callback: Callable[[], object]) -> object:
+        focus_widget = QApplication.focusWidget()
         self.restore_cursor_visibility()
         try:
             return callback()
         finally:
             self.update_cursor_visibility()
+            restore_window_after_modal(self, focus_widget=focus_widget)
 
     def region_selection_rect(self, origin: QPoint, current: QPoint) -> QRect:
         if self.edit_mode != "red_eye":
@@ -13324,7 +15951,7 @@ class FullscreenViewer(QDialog):
         self.preview_image_current = False
         self.display_preview_image = None
         self.display_preview_size = None
-        if not self.operations or self._load_closed:
+        if not self.operations or self._load_closed or not self.navigator.order:
             return
         self._preview_generation += 1
         generation = self._preview_generation
@@ -13534,6 +16161,15 @@ class FullscreenViewer(QDialog):
     def confirm_pending_edits(self) -> bool:
         if not self.operations:
             return True
+        if not self.navigator.order:
+            return False
+        # Bind the prompt to the exact displayed incarnation. Modal dialogs
+        # run a nested event loop, so background mutation settlement must not
+        # be able to retarget these operations to a different image.
+        rel_path = self.navigator.current
+        operations = tuple(self.operations)
+        expected_identity = self.loaded_file_identity
+        original_file_dates = self.loaded_file_dates
         response = self.run_with_visible_cursor(lambda: ask_save_edits(self))
         if response == "cancel":
             return False
@@ -13544,34 +16180,34 @@ class FullscreenViewer(QDialog):
                 if isinstance(parent, MainWindow):
                     parent.queue_image_edit(
                         self.catalog,
-                        self.navigator.current,
-                        self.operations,
+                        rel_path,
+                        operations,
                         preserve_file_dates=response == "save_preserve_date",
-                        expected_identity=self.loaded_file_identity,
-                        original_file_dates=self.loaded_file_dates,
+                        expected_identity=expected_identity,
+                        original_file_dates=original_file_dates,
                         owner=self,
                     )
                 else:
                     try:
                         apply_operations_to_file(
-                            self.catalog.mutation_path(self.navigator.current),
-                            self.operations,
+                            self.catalog.mutation_path(rel_path),
+                            operations,
                             preserve_timestamp=False,
                             preserve_file_dates=response == "save_preserve_date",
-                            expected_identity=self.loaded_file_identity,
-                            original_file_dates=self.loaded_file_dates,
+                            expected_identity=expected_identity,
+                            original_file_dates=original_file_dates,
                         )
                     except ImageSaveCommittedError as error:
                         committed_warning = str(error)
                     with suppress(Exception):
-                        self.catalog.rebuild_thumbnail(self.navigator.current)
+                        self.catalog.rebuild_thumbnail(rel_path)
             except (OSError, ValueError, UnsafeImageSaveError) as error:
                 show_error(self, "Save Image", str(error))
                 return False
         # Saving has transferred the operations to the protected mutation
         # lane; discarding is an equally explicit user decision. In either
         # case the preview-restoration safety copy is no longer needed.
-        self._release_retained_preview_backup(self.navigator.current)
+        self._release_retained_preview_backup(rel_path)
         self.operations.clear()
         self.cleanup_preview()
         if committed_warning is not None:
@@ -13770,10 +16406,14 @@ def ask_delete_directory(parent: QWidget, directory: Path) -> bool:
 
 
 def ask_save_edits(parent: QWidget) -> str:
-    box, save_button, preserve_button, discard_button = create_save_edits_message_box(parent)
+    owner = visible_modal_dialog_owner(parent)
+    focus_widget = QApplication.focusWidget()
+    box, save_button, preserve_button, discard_button = create_save_edits_message_box(owner)
     box.exec()
     clicked = box.clickedButton()
+    box.hide()
     box.deleteLater()
+    restore_window_after_modal(owner, focus_widget=focus_widget)
     if clicked == save_button:
         return "save"
     if clicked == preserve_button:
@@ -13828,8 +16468,83 @@ def style_message_box_buttons(box: QMessageBox) -> None:
         button.setStyleSheet(MESSAGE_BUTTON_STYLESHEET)
 
 
+def visible_modal_dialog_owner(parent: QWidget) -> QWidget:
+    """Return a visible owner that cannot be trapped behind an active modal."""
+
+    modal = QApplication.activeModalWidget()
+    if modal is not None:
+        try:
+            if modal.isVisible():
+                return modal
+        except RuntimeError:
+            pass
+    try:
+        if QWidget.window(parent).isVisible():
+            return parent
+    except RuntimeError:
+        pass
+    active = QApplication.activeWindow()
+    if active is not None:
+        try:
+            if active.isVisible():
+                return active
+        except RuntimeError:
+            pass
+    return parent
+
+
+def restore_window_after_modal(
+    owner: QWidget,
+    *,
+    focus_widget: QWidget | None = None,
+) -> None:
+    """Restore an owned window after a nested dialog releases its focus.
+
+    The immediate activation handles ordinary Qt behavior.  The queued retry
+    runs after the closed dialog's native focus events, which is important for
+    fullscreen viewers on window managers that otherwise activate the covered
+    main window.
+    """
+
+    try:
+        window = QWidget.window(owner)
+    except RuntimeError:
+        return
+
+    def reactivate() -> None:
+        try:
+            if not window.isVisible() or window.isMinimized():
+                return
+            active_modal = QApplication.activeModalWidget()
+            if active_modal is not None and active_modal is not window:
+                try:
+                    if active_modal.isVisible():
+                        return
+                except RuntimeError:
+                    pass
+            window.raise_()
+            window.activateWindow()
+            target = focus_widget
+            if (
+                target is None
+                or not target.isVisible()
+                or not (target is window or window.isAncestorOf(target))
+            ):
+                target = window
+            target.setFocus(Qt.FocusReason.ActiveWindowFocusReason)
+        except RuntimeError:
+            # A queued activation may race owner destruction after the dialog
+            # accepted a close request.
+            return
+
+    reactivate()
+    QTimer.singleShot(0, reactivate)
+
+
 def show_error(parent: QWidget, title: str, message: str) -> None:
-    box = QMessageBox(parent)
+    owner = visible_modal_dialog_owner(parent)
+    focus_widget = QApplication.focusWidget()
+    box = QMessageBox(owner)
     box.setWindowTitle(title)
     box.setIcon(QMessageBox.Icon.Warning)
     box.setText(message)
@@ -13837,7 +16552,9 @@ def show_error(parent: QWidget, title: str, message: str) -> None:
     box.addButton("OK", QMessageBox.ButtonRole.AcceptRole)
     style_message_box_buttons(box)
     box.exec()
+    box.hide()
     box.deleteLater()
+    restore_window_after_modal(owner, focus_widget=focus_widget)
 
 
 def copy_files_to_clipboard(paths: list[Path]) -> None:
