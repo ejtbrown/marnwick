@@ -29,6 +29,7 @@ from pathlib import Path
 
 from PIL import Image, ImageOps
 
+from .image_ops import FileDateSnapshot, restore_file_dates
 from .models import (
     CatalogSettings,
     DirectoryRecord,
@@ -80,6 +81,7 @@ DISCOVERY_WRITE_BATCH_SIZE = 512
 DIRECTORY_RECORD_TRANSFER_BATCH_SIZE = 256
 HASH_CHUNK_SIZE = 1024 * 1024
 MUTATION_BYTE_PROGRESS_INTERVAL = 8 * HASH_CHUNK_SIZE
+TIMESTAMP_PRESERVATION_TOLERANCE_NS = 1_000_000_000
 SHRED_TIMEOUT_SECONDS = 15.0
 SHUTIL_RMTREE_AVOIDS_SYMLINK_ATTACKS = bool(
     getattr(shutil.rmtree, "avoids_symlink_attacks", False)
@@ -282,6 +284,137 @@ class _WindowsFileBasicInfo(ctypes.Structure):
         ("change_time", ctypes.c_longlong),
         ("file_attributes", ctypes.c_uint32),
     ]
+
+
+def _file_date_snapshot_from_stat(file_stat: os.stat_result) -> FileDateSnapshot:
+    created_ns = getattr(file_stat, "st_birthtime_ns", None)
+    if created_ns is None:
+        created_seconds = getattr(file_stat, "st_birthtime", None)
+        if created_seconds is not None:
+            created_ns = int(float(created_seconds) * 1_000_000_000)
+        elif sys.platform == "win32":
+            created_ns = int(file_stat.st_ctime_ns)
+    return FileDateSnapshot(
+        accessed_ns=int(file_stat.st_atime_ns),
+        modified_ns=int(file_stat.st_mtime_ns),
+        created_ns=None if created_ns is None else int(created_ns),
+    )
+
+
+def _dates_within_copy_tolerance(left_ns: int, right_ns: int) -> bool:
+    return abs(int(left_ns) - int(right_ns)) <= TIMESTAMP_PRESERVATION_TOLERANCE_NS
+
+
+def _restore_and_verify_copy_dates(
+    destination: Path,
+    dates: FileDateSnapshot,
+) -> bool:
+    """Restore required dates and report whether creation time also survived.
+
+    Modification time is portable enough to be a required move attribute, but
+    different filesystems legitimately round it.  Creation/birth time is
+    checked where it is exposed; callers log a limitation instead of rejecting
+    otherwise verified bytes when the destination cannot set it.
+    """
+
+    restore_file_dates(destination, dates)
+    restored = _file_date_snapshot_from_stat(destination.lstat())
+    if not _dates_within_copy_tolerance(restored.modified_ns, dates.modified_ns):
+        raise OSError(f"destination modification date was not preserved: {destination}")
+    if dates.created_ns is None:
+        return True
+    return (
+        restored.created_ns is not None
+        and _dates_within_copy_tolerance(restored.created_ns, dates.created_ns)
+    )
+
+
+def _verify_copy_modification_date(
+    path: Path,
+    reference: Path,
+    path_stat: os.stat_result,
+) -> None:
+    reference_stat = reference.lstat()
+    if not _dates_within_copy_tolerance(
+        int(path_stat.st_mtime_ns),
+        int(reference_stat.st_mtime_ns),
+    ):
+        raise OSError(
+            f"destination modification date differs from its source by more than one "
+            f"second: {path}"
+        )
+
+
+def _open_readonly_file_descriptor(
+    path: Path,
+    *,
+    share_delete: bool = False,
+    share_write: bool = False,
+) -> int:
+    """Open a regular file, optionally retaining Win32 delete sharing.
+
+    A normal CRT descriptor prevents rename/unlink on native Windows.  A
+    source held across verified cross-volume cleanup must instead be opened
+    with FILE_SHARE_DELETE so its pinned bytes remain available for recovery
+    while the private source name is removed.
+    """
+
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if not share_delete or sys.platform != "win32":
+        return os.open(path, flags)
+
+    import msvcrt
+    from ctypes import wintypes
+
+    generic_read = 0x80000000
+    file_share_read = 0x00000001
+    file_share_write = 0x00000002
+    file_share_delete = 0x00000004
+    open_existing = 3
+    file_flag_open_reparse_point = 0x00200000
+    file_flag_sequential_scan = 0x08000000
+    invalid_handle_value = wintypes.HANDLE(-1).value
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    create_file.restype = wintypes.HANDLE
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [wintypes.HANDLE]
+    close_handle.restype = wintypes.BOOL
+    handle = create_file(
+        str(path),
+        generic_read,
+        file_share_read
+        | (file_share_write if share_write else 0)
+        | file_share_delete,
+        None,
+        open_existing,
+        file_flag_open_reparse_point | file_flag_sequential_scan,
+        None,
+    )
+    if handle == invalid_handle_value:
+        raise ctypes.WinError(ctypes.get_last_error())  # type: ignore[attr-defined]
+    try:
+        descriptor_flags = (
+            os.O_RDONLY
+            | getattr(os, "O_BINARY", 0)
+            | getattr(os, "O_NOINHERIT", 0)
+        )
+        return msvcrt.open_osfhandle(int(handle), descriptor_flags)
+    except BaseException:
+        close_handle(handle)
+        raise
 
 
 def _rename_noreplace(source: Path, destination: Path) -> None:
@@ -9825,6 +9958,7 @@ class Catalog:
     ) -> _FileCopyProof:
         source_stat = source.lstat()
         source_identity = self._catalog_file_identity(source, source_stat)
+        source_dates = _file_date_snapshot_from_stat(source_stat)
         if (
             expected_source_identity is not None
             and source_identity != expected_source_identity
@@ -9896,9 +10030,19 @@ class Catalog:
             current_source_stat = source.lstat()
             if self._catalog_file_identity(source, current_source_stat) != source_identity:
                 raise OSError(f"source changed while it was being copied: {source}")
-            # Preserve the same metadata copy2 supplied, but keep byte transfer
-            # and hashing in the single descriptor pass above.
-            shutil.copystat(source, temp, follow_symlinks=False)
+            # Content identity is the byte digest above.  Filesystem metadata
+            # must not make a portable copy fail.  Modification time is the
+            # required portable attribute; creation time is restored where the
+            # platform permits it.
+            creation_date_preserved = _restore_and_verify_copy_dates(temp, source_dates)
+            with suppress(OSError, NotImplementedError):
+                shutil.copymode(source, temp, follow_symlinks=False)
+            if source_dates.created_ns is not None and not creation_date_preserved:
+                self.append_log(
+                    f"Creation date could not be preserved while moving {source} to "
+                    f"{destination}; file bytes and modification date remain verified",
+                    level="WARNING",
+                )
             if self._catalog_file_identity(source) != source_identity:
                 raise OSError(f"source changed while its metadata was being copied: {source}")
             source_hash = digest.hexdigest()
@@ -9966,6 +10110,7 @@ class Catalog:
             raise OSError(
                 f"destination changed after staged publication: {destination}"
             )
+        _verify_copy_modification_date(destination, source, destination.lstat())
         if detail_callback is not None:
             detail_callback("Flushing published copy")
         self._fsync_regular_file(destination)
@@ -10012,6 +10157,7 @@ class Catalog:
                 cancel_check,
                 detail_callback,
                 phase="Verifying copy",
+                timestamp_reference=source,
             )
             final_source_proof = self._directory_copy_proof(
                 source,
@@ -10126,15 +10272,18 @@ class Catalog:
         *,
         detail_callback: MutationDetailCallback | None = None,
         phase: str = "Verifying file",
+        allow_delete_while_open: bool = False,
+        allow_write_while_open: bool = False,
     ) -> tuple[int, CatalogFileIdentity, str]:
         """Return a verified open descriptor that survives pathname removal."""
 
         path_stat = path.lstat()
         identity = self._catalog_file_identity(path, path_stat)
-        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        fd = os.open(path, flags)
+        fd = _open_readonly_file_descriptor(
+            path,
+            share_delete=allow_delete_while_open,
+            share_write=allow_write_while_open,
+        )
         try:
             before = os.fstat(fd)
             if self._index_stat_token(before) != self._index_stat_token(path_stat):
@@ -10288,10 +10437,13 @@ class Catalog:
         detail_callback: MutationDetailCallback | None = None,
         *,
         phase: str = "Verifying",
+        timestamp_reference: Path | None = None,
     ) -> _DirectoryCopyProof:
         root_stat = root.lstat()
         if not stat_module.S_ISDIR(root_stat.st_mode):
             raise OSError(f"directory copy source is not a directory: {root}")
+        if timestamp_reference is not None:
+            _verify_copy_modification_date(root, timestamp_reference, root_stat)
         root_identity = (
             int(root_stat.st_dev),
             int(root_stat.st_ino),
@@ -10302,11 +10454,11 @@ class Catalog:
         )
         modulus = 1 << 256
         content_count = 1
-        content_sum = self._manifest_record_value(
-            b"root",
-            str(stat_module.S_IMODE(root_stat.st_mode)).encode("ascii"),
-            str(root_stat.st_mtime_ns).encode("ascii"),
-        )
+        # Portable content identity deliberately excludes inode/link fields,
+        # allocation-dependent directory sizes, mount-derived modes, and exact
+        # timestamp representation.  File bytes, relative structure, and
+        # symlink targets are the only values that must match across filesystems.
+        content_sum = self._manifest_record_value(b"root")
         content_xor = content_sum
         identity_count = 1
         identity_sum = self._manifest_record_value(
@@ -10334,10 +10486,6 @@ class Catalog:
                     rel_bytes = rel_path.encode("utf-8", errors="surrogateescape")
                     entry_stat = entry_path.lstat()
                     stat_identity = self._index_stat_token(entry_stat)
-                    metadata = (
-                        f"{stat_module.S_IMODE(entry_stat.st_mode)}:{entry_stat.st_size}:"
-                        f"{entry_stat.st_mtime_ns}"
-                    ).encode("ascii")
                     if stat_module.S_ISDIR(entry_stat.st_mode):
                         kind = b"d"
                         payload = b""
@@ -10353,10 +10501,15 @@ class Catalog:
                         payload = os.fsencode(os.readlink(entry_path))
                     else:
                         raise OSError(f"unsupported directory entry during move: {entry_path}")
+                    if timestamp_reference is not None and kind != b"l":
+                        _verify_copy_modification_date(
+                            entry_path,
+                            timestamp_reference / rel_path,
+                            entry_stat,
+                        )
                     content_value = self._manifest_record_value(
                         rel_bytes,
                         kind,
-                        metadata,
                         payload,
                     )
                     identity_value = self._manifest_record_value(
@@ -10432,9 +10585,12 @@ class Catalog:
     ) -> None:
         """Copy a tree with bounded cancellation and visible entry progress."""
 
-        copier = shutil.copy2 if copy_function is None else copy_function
+        # Copy bytes first.  Filesystem metadata other than the user-visible
+        # creation and modification dates is not part of portable identity.
+        copier = shutil.copyfile if copy_function is None else copy_function
         pending: list[tuple[Path, Path, bool]] = [(source, destination, False)]
         processed = 0
+        unpreserved_creation_dates = 0
         if detail_callback is not None:
             detail_callback(f"{phase}: starting")
         while pending:
@@ -10442,8 +10598,16 @@ class Catalog:
                 cancel_check()
             source_dir, destination_dir, finalize = pending.pop()
             if finalize:
-                with suppress(OSError):
-                    shutil.copystat(source_dir, destination_dir, follow_symlinks=False)
+                source_stat = source_dir.lstat()
+                source_dates = _file_date_snapshot_from_stat(source_stat)
+                if not _restore_and_verify_copy_dates(destination_dir, source_dates):
+                    unpreserved_creation_dates += 1
+                with suppress(OSError, NotImplementedError):
+                    shutil.copymode(
+                        source_dir,
+                        destination_dir,
+                        follow_symlinks=False,
+                    )
                 continue
             pending.append((source_dir, destination_dir, True))
             with os.scandir(source_dir) as entries:
@@ -10457,15 +10621,21 @@ class Catalog:
                         destination_entry.mkdir()
                         pending.append((source_entry, destination_entry, False))
                     elif stat_module.S_ISREG(entry_stat.st_mode):
+                        source_dates = _file_date_snapshot_from_stat(entry_stat)
                         copier(str(source_entry), str(destination_entry))
-                    elif stat_module.S_ISLNK(entry_stat.st_mode):
-                        os.symlink(os.readlink(source_entry), destination_entry)
+                        if not _restore_and_verify_copy_dates(
+                            destination_entry,
+                            source_dates,
+                        ):
+                            unpreserved_creation_dates += 1
                         with suppress(OSError, NotImplementedError):
-                            shutil.copystat(
+                            shutil.copymode(
                                 source_entry,
                                 destination_entry,
                                 follow_symlinks=False,
                             )
+                    elif stat_module.S_ISLNK(entry_stat.st_mode):
+                        os.symlink(os.readlink(source_entry), destination_entry)
                     else:
                         raise shutil.SpecialFileError(
                             f"unsupported directory entry during move: {source_entry}"
@@ -10478,6 +10648,13 @@ class Catalog:
                         detail_callback(f"{phase}: {processed} entries")
         if detail_callback is not None:
             detail_callback(f"{phase}: {processed} entries")
+        if unpreserved_creation_dates:
+            self.append_log(
+                f"Creation dates could not be represented for "
+                f"{unpreserved_creation_dates} entries while moving {source}; file bytes "
+                f"and modification dates remain verified",
+                level="WARNING",
+            )
 
     def _fsync_directory_tree(
         self,
@@ -10682,6 +10859,8 @@ class Catalog:
             cancel_check,
             detail_callback=detail_callback,
             phase="Rechecking source before removal",
+            allow_delete_while_open=True,
+            allow_write_while_open=wipe,
         )
         if current_identity != proof.source_identity or current_hash != proof.content_hash:
             os.close(source_fd)
@@ -10720,9 +10899,10 @@ class Catalog:
             except OSError as error:
                 if error.errno != errno.ENOTSUP:
                     raise
-                # Windows lacks descriptor-relative directory operations. Its
-                # existing identity-checked no-replace path remains the safe
-                # portable fallback.
+                # Windows lacks descriptor-relative directory operations.  Its
+                # source descriptor was opened with FILE_SHARE_DELETE, so this
+                # identity-checked no-replace rename can safely retain pinned
+                # recovery bytes while the private source name is removed.
                 quarantine = self._quarantine_catalog_entry(
                     source,
                     ".marnwick-move-source",
@@ -10841,6 +11021,7 @@ class Catalog:
                 cancel_check,
                 detail_callback,
                 phase="Verifying published destination",
+                timestamp_reference=quarantine,
             )
             if (
                 quarantined.source_root_identity[:5]

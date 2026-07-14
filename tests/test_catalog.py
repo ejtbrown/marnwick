@@ -2192,7 +2192,9 @@ def test_cross_filesystem_cleanup_uses_portable_quarantine_when_private_unsuppor
     with Catalog(source_root) as source, Catalog(dest_root) as dest:
         source.refresh()
         public_calls = 0
+        share_delete_paths: list[Path] = []
         portable_quarantine = source._quarantine_catalog_entry
+        open_pinned = source._open_pinned_regular_file_hash
 
         def private_unavailable(*_args, **_kwargs):  # type: ignore[no-untyped-def]
             raise OSError(errno.ENOTSUP, "descriptor-relative rename unavailable")
@@ -2202,19 +2204,88 @@ def test_cross_filesystem_cleanup_uses_portable_quarantine_when_private_unsuppor
             public_calls += 1
             return portable_quarantine(*args, **kwargs)
 
+        def capture_pinned_open(path: Path, *args, **kwargs):  # type: ignore[no-untyped-def]
+            if kwargs.get("allow_delete_while_open"):
+                share_delete_paths.append(path)
+            return open_pinned(path, *args, **kwargs)
+
         monkeypatch.setattr(
             source,
             "_private_quarantine_catalog_entry",
             private_unavailable,
         )
         monkeypatch.setattr(source, "_quarantine_catalog_entry", capture_portable)
+        monkeypatch.setattr(source, "_open_pinned_regular_file_hash", capture_pinned_open)
 
         result = source.move_images(["image.jpg"], dest)
 
         assert result[0].dest_rel_path == "image.jpg"
         assert public_calls == 1
+        assert share_delete_paths == [source_path]
         assert not source_path.exists()
         assert (dest_root / "image.jpg").is_file()
+
+
+def test_windows_share_delete_open_uses_native_delete_sharing(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    path = tmp_path / "image.jpg"
+    make_image(path)
+    handle = 0x1_0000_4321
+    create_calls: list[tuple[object, ...]] = []
+    descriptor_calls: list[tuple[int, int]] = []
+    closed: list[int] = []
+
+    class FakeFunction:
+        def __init__(self, callback):  # type: ignore[no-untyped-def]
+            self.callback = callback
+            self.argtypes = None
+            self.restype = None
+
+        def __call__(self, *args):  # type: ignore[no-untyped-def]
+            return self.callback(*args)
+
+    class FakeKernel32:
+        CreateFileW = FakeFunction(
+            lambda *args: create_calls.append(tuple(args)) or handle
+        )
+        CloseHandle = FakeFunction(lambda value: closed.append(value) or 1)
+
+    class FakeMsvcrt:
+        @staticmethod
+        def open_osfhandle(value: int, flags: int) -> int:
+            descriptor_calls.append((value, flags))
+            return 73
+
+    monkeypatch.setattr(catalog_module.sys, "platform", "win32")
+    monkeypatch.setattr(
+        catalog_module.ctypes,
+        "WinDLL",
+        lambda *_args, **_kwargs: FakeKernel32(),
+        raising=False,
+    )
+    monkeypatch.setitem(sys.modules, "msvcrt", FakeMsvcrt())
+
+    descriptor = catalog_module._open_readonly_file_descriptor(
+        path,
+        share_delete=True,
+    )
+
+    assert descriptor == 73
+    assert len(create_calls) == 1
+    assert create_calls[0][2] == 0x5
+    assert int(create_calls[0][5]) & 0x00200000
+    assert descriptor_calls == [
+        (
+            handle,
+            os.O_RDONLY
+            | getattr(os, "O_BINARY", 0)
+            | getattr(os, "O_NOINHERIT", 0),
+        )
+    ]
+    # open_osfhandle owns the native handle after successful conversion.
+    assert closed == []
 
 
 def test_cross_filesystem_move_pins_destination_through_source_destruction(
@@ -2809,6 +2880,161 @@ def test_cross_filesystem_directory_copy_preserves_symlinks(tmp_path: Path, monk
 
         assert (dest_root / "set" / "alias.jpg").is_symlink()
         assert (dest_root / "set" / "alias.jpg").read_bytes() == (dest_root / "set" / "image.jpg").read_bytes()
+
+
+def test_directory_content_proof_excludes_filesystem_specific_metadata(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    make_image(source / "nested" / "image.jpg", color=(10, 20, 30))
+    make_image(destination / "nested" / "image.jpg", color=(10, 20, 30))
+
+    os.chmod(source / "nested", 0o750)
+    os.chmod(destination / "nested", 0o700)
+    os.chmod(source / "nested" / "image.jpg", 0o640)
+    os.chmod(destination / "nested" / "image.jpg", 0o600)
+    source_time = 1_700_000_000_100_000_000
+    destination_time = source_time + 5_000_000_000
+    os.utime(source / "nested" / "image.jpg", ns=(source_time, source_time))
+    os.utime(
+        destination / "nested" / "image.jpg",
+        ns=(destination_time, destination_time),
+    )
+    os.utime(source / "nested", ns=(source_time, source_time))
+    os.utime(destination / "nested", ns=(destination_time, destination_time))
+
+    with Catalog(tmp_path / "catalog") as catalog:
+        source_proof = catalog._directory_copy_proof(source)
+        destination_proof = catalog._directory_copy_proof(destination)
+
+        assert destination_proof.content_hash == source_proof.content_hash
+        assert destination_proof.source_identity_hash != source_proof.source_identity_hash
+        with pytest.raises(OSError, match="modification date differs"):
+            catalog._directory_copy_proof(
+                destination,
+                timestamp_reference=source,
+            )
+
+
+def test_cross_filesystem_directory_move_accepts_subsecond_timestamp_rounding(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source_root = tmp_path / "source"
+    destination_root = tmp_path / "destination"
+    source_path = source_root / "album"
+    make_image(source_path / "nested" / "image.jpg", color=(10, 20, 30))
+    source_bytes = (source_path / "nested" / "image.jpg").read_bytes()
+    source_mtimes = {
+        relative: (source_path / relative).lstat().st_mtime_ns
+        for relative in (Path("."), Path("nested"), Path("nested/image.jpg"))
+    }
+    force_cross_device_move(monkeypatch, source_path)
+    copy_directory_tree = Catalog._copy_directory_tree
+
+    def copy_with_destination_representation(
+        self: Catalog,
+        source: Path,
+        destination: Path,
+        **kwargs,
+    ) -> None:  # type: ignore[no-untyped-def]
+        copy_directory_tree(self, source, destination, **kwargs)
+        for path in (
+            destination / "nested" / "image.jpg",
+            destination / "nested",
+            destination,
+        ):
+            current = path.lstat()
+            os.utime(
+                path,
+                ns=(
+                    int(current.st_atime_ns),
+                    int(current.st_mtime_ns) + 900_000_000,
+                ),
+            )
+        os.chmod(destination / "nested", 0o700)
+        os.chmod(destination / "nested" / "image.jpg", 0o600)
+
+    monkeypatch.setattr(Catalog, "_copy_directory_tree", copy_with_destination_representation)
+
+    with Catalog(source_root) as source, Catalog(destination_root) as destination:
+        source.refresh()
+        moved = source.move_directories(["album"], destination)
+
+    destination_path = destination_root / "album"
+    assert moved[0].dest_rel_path == "album"
+    assert not source_path.exists()
+    assert (destination_path / "nested" / "image.jpg").read_bytes() == source_bytes
+    for relative, source_mtime_ns in source_mtimes.items():
+        assert (
+            (destination_path / relative).lstat().st_mtime_ns - source_mtime_ns
+            == 900_000_000
+        )
+
+
+def test_cross_filesystem_file_move_accepts_subsecond_timestamp_rounding(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source_root = tmp_path / "source"
+    destination_root = tmp_path / "destination"
+    source_path = source_root / "image.jpg"
+    make_image(source_path, color=(10, 20, 30))
+    source_mtime_ns = source_path.stat().st_mtime_ns
+    force_cross_device_move(monkeypatch, source_path)
+    restore_dates = catalog_module.restore_file_dates
+
+    def restore_with_rounding(path: Path, dates) -> None:  # type: ignore[no-untyped-def]
+        restore_dates(path, dates)
+        os.utime(
+            path,
+            ns=(dates.accessed_ns, dates.modified_ns + 900_000_000),
+        )
+
+    monkeypatch.setattr(catalog_module, "restore_file_dates", restore_with_rounding)
+
+    with Catalog(source_root) as source, Catalog(destination_root) as destination:
+        source.refresh()
+        moved = source.move_images(["image.jpg"], destination)
+
+    destination_path = destination_root / "image.jpg"
+    assert moved[0].dest_rel_path == "image.jpg"
+    assert not source_path.exists()
+    assert abs(destination_path.stat().st_mtime_ns - source_mtime_ns) <= 1_000_000_000
+
+
+def test_cross_filesystem_file_move_rejects_unpreserved_modification_date(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source_root = tmp_path / "source"
+    destination_root = tmp_path / "destination"
+    source_path = source_root / "image.jpg"
+    make_image(source_path, color=(10, 20, 30))
+    force_cross_device_move(monkeypatch, source_path)
+    restore_dates = catalog_module.restore_file_dates
+
+    def fail_to_restore_modification_date(path: Path, dates) -> None:  # type: ignore[no-untyped-def]
+        restore_dates(path, dates)
+        os.utime(
+            path,
+            ns=(dates.accessed_ns, dates.modified_ns + 1_000_000_001),
+        )
+
+    monkeypatch.setattr(
+        catalog_module,
+        "restore_file_dates",
+        fail_to_restore_modification_date,
+    )
+
+    with Catalog(source_root) as source, Catalog(destination_root) as destination:
+        source.refresh()
+        with pytest.raises(OSError, match="modification date was not preserved"):
+            source.move_images(["image.jpg"], destination)
+
+    assert source_path.is_file()
+    assert not (destination_root / "image.jpg").exists()
 
 
 def test_same_filesystem_move_rolls_back_file_on_database_failure(tmp_path: Path, monkeypatch) -> None:
