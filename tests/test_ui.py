@@ -3,8 +3,9 @@ from __future__ import annotations
 import json
 import os
 import socket
+from concurrent.futures import Future
 from pathlib import Path
-from threading import Event
+from threading import Event, enumerate as enumerate_threads, get_ident
 from time import monotonic, sleep
 
 from PIL import Image
@@ -15,19 +16,27 @@ import marnwick.safe_image as safe_image
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("MARNWICK_DISABLE_CONFIG", "1")
 
+import marnwick.ui as ui_module  # noqa: E402
+
 from PySide6.QtCore import QEvent, QItemSelectionModel, QModelIndex, QPoint, QPointF, QRect, Qt, QTimer  # noqa: E402
-from PySide6.QtGui import QColor, QCursor, QFontMetrics, QKeyEvent, QMouseEvent, QPainter, QPixmap  # noqa: E402
+from PySide6.QtGui import QColor, QCursor, QFontMetrics, QImage, QKeyEvent, QMouseEvent, QPainter, QPixmap  # noqa: E402
 from PySide6.QtWidgets import QAbstractItemView, QApplication, QDialog, QMenu, QStyle, QStyleOptionViewItem  # noqa: E402
 
 from marnwick.catalog import DuplicateMatchGroups, SIMILARITY_FEATURE_VERSION, TRASH_DIR_NAME, Catalog  # noqa: E402
 from marnwick.config import NORMAL_DELETE, WIPE_ON_DELETE, AppConfig, WindowConfig, load_config, save_config  # noqa: E402
 from marnwick.debug import DebugCommandServer  # noqa: E402
-from marnwick.image_ops import EditOperation  # noqa: E402
-from marnwick.indexer import IndexProgressSnapshot, IndexTask, IndexTaskCancelled  # noqa: E402
-from marnwick.models import DirectoryRecord, ImageRecord, SortOrder  # noqa: E402
+from marnwick.image_ops import (  # noqa: E402
+    CommittedImageProof,
+    EditOperation,
+    ImageSaveCommittedError,
+    snapshot_image_file_identity,
+)
+from marnwick.indexer import ActionPriority, IndexProgressSnapshot, IndexTask, IndexTaskCancelled  # noqa: E402
+from marnwick.models import CatalogSettings, DirectoryRecord, ImageRecord, SortOrder  # noqa: E402
 from marnwick.navigation import ImageNavigator  # noqa: E402
 from marnwick.ui import (  # noqa: E402
     AppPreferencesDialog,
+    CatalogTagsDialog,
     DIALOG_STYLESHEET,
     DIR_REL_ROLE,
     DeletePayloadResult,
@@ -36,12 +45,18 @@ from marnwick.ui import (  # noqa: E402
     DuplicateListDialog,
     FullscreenViewer,
     LogsDialog,
+    MAX_PENDING_THUMBNAIL_RETRIES,
+    MAX_THUMBNAIL_PIXMAP_CACHE_ITEMS,
+    MAX_WAITING_THUMBNAIL_LOADS,
+    MetadataDialog,
     MovePayloadResult,
+    MovePayloadTask,
     MainWindow,
     TagDialog,
     ThumbnailDelegate,
     ThumbnailModel,
     ThumbnailView,
+    VirtualViewResult,
     VIRTUAL_KIND_DUPLICATES,
     VIRTUAL_KIND_ROLE,
     VIRTUAL_KIND_TAG,
@@ -104,6 +119,37 @@ def settle_virtual_view_tasks(window: MainWindow, qt_app: QApplication, *, timeo
     assert not window._virtual_view_tasks
 
 
+def settle_initial_config_load(
+    window: MainWindow,
+    qt_app: QApplication,
+    *,
+    timeout: float = 2.0,
+) -> None:
+    deadline = monotonic() + timeout
+    while window._initial_config_load_future is not None and monotonic() < deadline:
+        qt_app.processEvents()
+        window._settle_initial_config_load(window._initial_config_load_generation)
+        sleep(0.005)
+    qt_app.processEvents()
+    window._settle_initial_config_load(window._initial_config_load_generation)
+    assert window._initial_config_load_future is None
+
+
+def settle_delete_confirmation_tasks(
+    window: MainWindow,
+    qt_app: QApplication,
+    *,
+    timeout: float = 2.0,
+) -> None:
+    deadline = monotonic() + timeout
+    while window._delete_confirmation_tasks and monotonic() < deadline:
+        qt_app.processEvents()
+        window._settle_delete_confirmations()
+        sleep(0.01)
+    window._settle_delete_confirmations()
+    assert not window._delete_confirmation_tasks
+
+
 def settle_duplicate_delete_task(window: MainWindow, qt_app: QApplication, *, timeout: float = 2.0) -> None:
     deadline = monotonic() + timeout
     while window._duplicate_delete_task is not None and monotonic() < deadline:
@@ -126,12 +172,131 @@ def settle_delete_payload_task(window: MainWindow, qt_app: QApplication, *, time
 
 def settle_move_payload_task(window: MainWindow, qt_app: QApplication, *, timeout: float = 2.0) -> None:
     deadline = monotonic() + timeout
-    while window._move_payload_task is not None and monotonic() < deadline:
+    while (
+        window._move_identity_preflights
+        or window._restore_identity_preflights
+        or window._move_payload_task is not None
+    ) and monotonic() < deadline:
         qt_app.processEvents()
+        window._settle_move_identity_preflights()
+        window._settle_restore_identity_preflights()
         window._settle_move_payload_task()
         sleep(0.01)
+    window._settle_move_identity_preflights()
+    window._settle_restore_identity_preflights()
     window._settle_move_payload_task()
+    assert not window._move_identity_preflights
+    assert not window._restore_identity_preflights
     assert window._move_payload_task is None
+
+
+def settle_mutation_identity_preflights(
+    window: MainWindow,
+    qt_app: QApplication,
+    *,
+    timeout: float = 2.0,
+) -> None:
+    deadline = monotonic() + timeout
+    while (
+        window._move_identity_preflights or window._restore_identity_preflights
+    ) and monotonic() < deadline:
+        qt_app.processEvents()
+        window._settle_move_identity_preflights()
+        window._settle_restore_identity_preflights()
+        sleep(0.01)
+    window._settle_move_identity_preflights()
+    window._settle_restore_identity_preflights()
+    assert not window._move_identity_preflights
+    assert not window._restore_identity_preflights
+
+
+def settle_tree_build_tasks(
+    window: MainWindow,
+    qt_app: QApplication,
+    *,
+    timeout: float = 2.0,
+) -> None:
+    deadline = monotonic() + timeout
+    while (
+        window._tree_build_task is not None
+        or window._pending_tree_rebuilds
+        or window._tree_path_selection_task is not None
+    ) and monotonic() < deadline:
+        qt_app.processEvents()
+        sleep(0.001)
+    qt_app.processEvents()
+    assert window._tree_build_task is None
+    assert not window._pending_tree_rebuilds
+    assert window._tree_path_selection_task is None
+
+
+def block_mutation_lane(window: MainWindow, root: Path) -> tuple[Event, Future[object]]:
+    started = Event()
+    release = Event()
+
+    def worker(task: IndexTask) -> None:
+        started.set()
+        task.update(0, 1, "blocked")
+        if not release.wait(timeout=5):
+            raise TimeoutError("test mutation lane was not released")
+        task.update(1, 1, "released")
+        task.mark_done()
+
+    _, future = window.indexer.submit_action(
+        "Blocking mutation lane",
+        root,
+        "",
+        priority=ActionPriority.FILE_MOVE_CROSS_CATALOG,
+        worker=worker,
+        key=f"test-block-mutation:{root}:{monotonic()}",
+        interactive=True,
+        force_refresh=False,
+        preemptible=False,
+    )
+    assert started.wait(timeout=1)
+    return release, future
+
+
+def settle_viewer_load(viewer: FullscreenViewer, qt_app: QApplication, *, timeout: float = 2.0) -> None:
+    deadline = monotonic() + timeout
+    while (
+        viewer._load_future is not None
+        or viewer._movie_validation_future is not None
+    ) and monotonic() < deadline:
+        qt_app.processEvents()
+        viewer._settle_async_load()
+        viewer._settle_movie_validation()
+        sleep(0.01)
+    viewer._settle_async_load()
+    viewer._settle_movie_validation()
+    assert viewer._load_future is None
+    assert viewer._movie_validation_future is None
+
+
+def settle_saved_image(
+    window: MainWindow,
+    viewer: FullscreenViewer,
+    qt_app: QApplication,
+    *,
+    timeout: float = 5.0,
+) -> None:
+    deadline = monotonic() + timeout
+    while monotonic() < deadline:
+        qt_app.processEvents()
+        window._poll_indexer()
+        viewer._settle_async_load()
+        if (
+            not window._move_payload_tasks
+            and not window._image_reconcile_tasks
+            and not window._image_reconcile_retries
+            and viewer._load_future is None
+        ):
+            break
+        sleep(0.01)
+    assert not window._move_payload_tasks
+    assert not window._image_reconcile_tasks
+    assert not window._image_reconcile_retries
+    assert viewer._load_future is None
 
 
 def find_virtual_tree_root(window: MainWindow):
@@ -421,6 +586,53 @@ def test_fullscreen_viewer_plays_displayed_gif(tmp_path: Path) -> None:
             viewer.close()
             viewer.deleteLater()
             qt_app.processEvents()
+
+
+def test_async_gif_playback_never_opens_or_stats_the_path_on_qt_thread(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    gif_path = root / "animated.gif"
+    first = Image.new("RGB", (16, 16), (255, 0, 0))
+    second = Image.new("RGB", (16, 16), (0, 0, 255))
+    first.save(gif_path, save_all=True, append_images=[second], duration=50, loop=0)
+    qt_thread = get_ident()
+    real_stat = Path.stat
+    window = MainWindow()
+    viewer = None
+
+    def guarded_stat(path: Path, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if path == gif_path:
+            assert get_ident() != qt_thread, "animated image path was statted on the Qt thread"
+        return real_stat(path, *args, **kwargs)
+
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        catalog.refresh()
+        monkeypatch.setattr(Path, "stat", guarded_stat)
+        viewer = FullscreenViewer(
+            catalog,
+            ImageNavigator.sequential(["animated.gif"], "animated.gif"),
+            window,
+        )
+        settle_viewer_load(viewer, qt_app)
+
+        assert viewer.movie is not None
+        assert viewer.movie.isValid()
+        assert viewer._movie_buffer is not None
+        assert viewer.movie.fileName() == ""
+    finally:
+        if viewer is not None:
+            viewer.close()
+            viewer.deleteLater()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
 
 
 def test_fullscreen_viewer_hides_cursor_except_for_edit_and_dialogs(tmp_path: Path) -> None:
@@ -830,6 +1042,106 @@ def test_metadata_text_reports_oversized_image_error(tmp_path: Path, monkeypatch
     assert "pixel limit" in text
 
 
+def test_metadata_dialog_loads_off_the_ui_thread(tmp_path: Path, monkeypatch) -> None:
+    qt_app = app()
+    path = tmp_path / "image.jpg"
+    Image.new("RGB", (8, 8), (10, 20, 30)).save(path)
+    started = Event()
+    release = Event()
+
+    def slow_metadata(_path: Path) -> str:
+        started.set()
+        assert release.wait(timeout=5)
+        return "loaded metadata"
+
+    monkeypatch.setattr("marnwick.ui.metadata_text", slow_metadata)
+    started_at = monotonic()
+    dialog = MetadataDialog(path)
+    try:
+        assert monotonic() - started_at < 0.1
+        assert dialog.text.toPlainText() == "Loading metadata…"
+        assert started.wait(timeout=1)
+        release.set()
+        deadline = monotonic() + 2
+        while dialog.text.toPlainText() != "loaded metadata" and monotonic() < deadline:
+            qt_app.processEvents()
+            sleep(0.01)
+        assert dialog.text.toPlainText() == "loaded metadata"
+    finally:
+        release.set()
+        dialog.close()
+        dialog.deleteLater()
+        qt_app.processEvents()
+
+
+def test_metadata_dialog_blocked_read_cannot_starve_next_dialog(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    blocked_path = tmp_path / "blocked.jpg"
+    fast_path = tmp_path / "fast.jpg"
+    Image.new("RGB", (8, 8), (10, 20, 30)).save(blocked_path)
+    Image.new("RGB", (8, 8), (30, 20, 10)).save(fast_path)
+    started = Event()
+    release = Event()
+
+    def selective_metadata(path: Path) -> str:
+        if path == blocked_path:
+            started.set()
+            assert release.wait(timeout=5)
+            return "old metadata"
+        return "new metadata"
+
+    monkeypatch.setattr("marnwick.ui.metadata_text", selective_metadata)
+    blocked = MetadataDialog(blocked_path)
+    fast = None
+    try:
+        assert started.wait(timeout=1)
+        blocked.close()
+        qt_app.processEvents()
+        fast = MetadataDialog(fast_path)
+        deadline = monotonic() + 2
+        while fast.text.toPlainText() != "new metadata" and monotonic() < deadline:
+            qt_app.processEvents()
+            sleep(0.01)
+        assert fast.text.toPlainText() == "new metadata"
+    finally:
+        release.set()
+        blocked.close()
+        blocked.deleteLater()
+        if fast is not None:
+            fast.close()
+            fast.deleteLater()
+        qt_app.processEvents()
+
+
+def test_metadata_dialog_and_value_formatting_bound_untrusted_output(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    path = tmp_path / "image.jpg"
+    Image.new("RGB", (8, 8), (10, 20, 30)).save(path)
+    oversized = "x" * (MetadataDialog.MAX_METADATA_TEXT_CHARS + 10_000)
+    monkeypatch.setattr("marnwick.ui.metadata_text", lambda _path: oversized)
+
+    dialog = MetadataDialog(path)
+    try:
+        deadline = monotonic() + 2
+        while dialog.text.toPlainText() == "Loading metadata…" and monotonic() < deadline:
+            qt_app.processEvents()
+            sleep(0.01)
+        rendered = dialog.text.toPlainText()
+        assert len(rendered) <= MetadataDialog.MAX_METADATA_TEXT_CHARS
+        assert rendered.endswith("[metadata output truncated]")
+        assert MetadataDialog.format_metadata_value(b"x" * 1_000_000) == "<1,000,000 bytes>"
+    finally:
+        dialog.close()
+        dialog.deleteLater()
+        qt_app.processEvents()
+
+
 def test_copy_files_to_clipboard_sets_file_urls_and_gnome_payload(tmp_path: Path) -> None:
     qt_app = app()
     path = tmp_path / "copy.jpg"
@@ -861,14 +1173,17 @@ def test_fullscreen_delete_removes_current_image_and_advances(tmp_path: Path, mo
         window.idle_timer.stop()
         catalog = window.workspace.open_catalog(root)
         catalog.refresh()
+        monkeypatch.setattr("marnwick.ui.show_error", lambda *_args: None)
         window.current_catalog = catalog
         window.current_dir_rel = ""
         window.load_current_directory()
+        settle_virtual_view_tasks(window, qt_app)
         viewer = FullscreenViewer(catalog, ImageNavigator.sequential(["first.jpg", "second.jpg"], "first.jpg"), window)
         try:
             monkeypatch.setattr("marnwick.ui.ask_delete_files", lambda parent, count: True)
 
             viewer.delete_current_image()
+            settle_delete_confirmation_tasks(window, qt_app)
 
             assert viewer.navigator.order == ["second.jpg"]
             assert [record.rel_path for record in window.model.images if isinstance(record, ImageRecord)] == ["second.jpg"]
@@ -910,6 +1225,7 @@ def test_fullscreen_delete_only_image_keeps_last_viewed_reference(tmp_path: Path
             monkeypatch.setattr("marnwick.ui.ask_delete_files", lambda parent, count: True)
 
             viewer.delete_current_image()
+            settle_delete_confirmation_tasks(window, qt_app)
 
             assert [record.rel_path for record in window.model.images if isinstance(record, ImageRecord)] == []
             settle_delete_payload_task(window, qt_app)
@@ -950,10 +1266,11 @@ def test_delete_selected_returns_while_worker_is_busy_and_hides_thumbnail(
         window.current_catalog = catalog
         window.current_dir_rel = ""
         window.load_current_directory()
+        settle_virtual_view_tasks(window, qt_app)
         select_thumbnail_rows(window, [0])
         monkeypatch.setattr("marnwick.ui.ask_delete_files", lambda parent, count: True)
 
-        def slow_delete_worker(root_arg, rel_paths, _wipe, task):
+        def slow_delete_worker(root_arg, rel_paths, _wipe, _identities, _proofs, task):
             started.set()
             task.update(0, len(rel_paths), "waiting")
             if not release.wait(timeout=1.0):
@@ -965,6 +1282,7 @@ def test_delete_selected_returns_while_worker_is_busy_and_hides_thumbnail(
 
         started_at = monotonic()
         window.delete_selected()
+        settle_delete_confirmation_tasks(window, qt_app)
 
         assert monotonic() - started_at < 0.5
         assert started.wait(timeout=1.0)
@@ -982,6 +1300,195 @@ def test_delete_selected_returns_while_worker_is_busy_and_hides_thumbnail(
         window.idle_timer.stop()
         window.indexer.shutdown()
         window.workspace.close()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_pending_delete_stays_hidden_after_switching_directories_and_back(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    (root / "source").mkdir(parents=True)
+    (root / "other").mkdir()
+    image_path = root / "source" / "delete.jpg"
+    Image.new("RGB", (8, 8), (10, 20, 30)).save(image_path)
+    started = Event()
+    release = Event()
+    window = MainWindow()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        catalog.refresh()
+        window.current_catalog = catalog
+        window.current_dir_rel = "source"
+        window.load_current_directory()
+        settle_virtual_view_tasks(window, qt_app)
+        original_worker = window._delete_images_worker
+
+        def slow_worker(*args, **kwargs):  # type: ignore[no-untyped-def]
+            started.set()
+            assert release.wait(timeout=5)
+            return original_worker(*args, **kwargs)
+
+        monkeypatch.setattr(window, "_delete_images_worker", slow_worker)
+        monkeypatch.setattr("marnwick.ui.ask_delete_files", lambda _parent, _count: True)
+        window.delete_selected(catalog=catalog, rel_paths=["source/delete.jpg"])
+        settle_delete_confirmation_tasks(window, qt_app)
+        assert started.wait(timeout=1)
+
+        window.current_dir_rel = "other"
+        window.load_current_directory()
+        settle_virtual_view_tasks(window, qt_app)
+        window.current_dir_rel = "source"
+        window.load_current_directory()
+        settle_virtual_view_tasks(window, qt_app)
+
+        assert "source/delete.jpg" not in [
+            record.rel_path
+            for record in window.model.images
+            if isinstance(record, ImageRecord)
+        ]
+
+        release.set()
+        settle_delete_payload_task(window, qt_app, timeout=5)
+        assert not image_path.exists()
+    finally:
+        release.set()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_deferred_delete_stays_hidden_after_switching_directories_and_back(
+    tmp_path: Path,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    (root / "source").mkdir(parents=True)
+    (root / "other").mkdir()
+    Image.new("RGB", (8, 8), (10, 20, 30)).save(root / "source" / "delete.jpg")
+    window = MainWindow()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        catalog.refresh()
+        waiting_reconcile = IndexTask(
+            "Updating saved image",
+            catalog.root,
+            "source",
+            interactive=False,
+            idle_sleep_seconds=0.0,
+            preemptible=False,
+        )
+        window._deferred_delete_requests.append(
+            ui_module.DeferredDeleteRequest(
+                catalog=catalog,
+                rel_paths=("source/delete.jpg",),
+                expected_identities={
+                    "source/delete.jpg": catalog.file_identity("source/delete.jpg")
+                },
+                expected_proofs={},
+                wipe=False,
+                remove_from_current_view=True,
+                dependencies=(),
+                reconciliation_tasks=(waiting_reconcile,),
+            )
+        )
+
+        window.current_catalog = catalog
+        window.current_dir_rel = "other"
+        window.load_current_directory()
+        settle_virtual_view_tasks(window, qt_app)
+        window.current_dir_rel = "source"
+        window.load_current_directory()
+        settle_virtual_view_tasks(window, qt_app)
+
+        assert "source/delete.jpg" not in [
+            record.rel_path
+            for record in window.model.images
+            if isinstance(record, ImageRecord)
+        ]
+    finally:
+        window._deferred_delete_requests.clear()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_saturated_identity_pool_reports_that_delete_was_not_started(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    Image.new("RGB", (8, 8), (10, 20, 30)).save(root / "one.jpg")
+    window = MainWindow()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+
+        def saturated(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+            raise RuntimeError("identity pool saturated")
+
+        monkeypatch.setattr(window.identity_executor, "submit", saturated)
+        window.delete_selected(catalog=catalog, rel_paths=["one.jpg"])
+
+        assert not window._delete_confirmation_tasks
+        assert "file checks are busy" in window.progress_label.text()
+        assert (root / "one.jpg").is_file()
+    finally:
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_delete_confirmation_identity_snapshot_never_runs_on_gui_thread(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    Image.new("RGB", (8, 8), (10, 20, 30)).save(root / "one.jpg")
+    window = MainWindow()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        catalog.refresh()
+        window.current_catalog = catalog
+        window.current_dir_rel = ""
+        window.load_current_directory()
+        settle_virtual_view_tasks(window, qt_app)
+        select_thumbnail_rows(window, [0])
+        gui_thread = get_ident()
+        original = Catalog.file_identities
+
+        def guarded(catalog_arg: Catalog, rel_paths):  # type: ignore[no-untyped-def]
+            assert get_ident() != gui_thread
+            return original(catalog_arg, rel_paths)
+
+        def decline(_parent, _count: int) -> bool:  # type: ignore[no-untyped-def]
+            assert get_ident() == gui_thread
+            return False
+
+        monkeypatch.setattr(Catalog, "file_identities", guarded)
+        monkeypatch.setattr("marnwick.ui.ask_delete_files", decline)
+
+        started_at = monotonic()
+        window.delete_selected()
+        assert monotonic() - started_at < 0.1
+        settle_delete_confirmation_tasks(window, qt_app)
+
+        assert (root / "one.jpg").is_file()
+    finally:
         window.close()
         window.deleteLater()
         qt_app.processEvents()
@@ -1353,12 +1860,14 @@ def test_thumbnail_selection_survives_same_directory_reload(tmp_path: Path) -> N
         window.current_catalog = catalog
         window.current_dir_rel = ""
         window.load_current_directory()
+        settle_virtual_view_tasks(window, qt_app)
 
         select_thumbnail_rows(window, [0, 1])
 
         assert window.selected_rel_paths() == ["one.jpg", "three.jpg"]
 
         window.load_current_directory(preserve_selection=True)
+        settle_virtual_view_tasks(window, qt_app)
 
         assert window.selected_rel_paths() == ["one.jpg", "three.jpg"]
         assert window.thumbnail_view.currentIndex().row() == 1
@@ -1394,6 +1903,7 @@ def test_thumbnail_scroll_position_is_remembered_per_directory(tmp_path: Path) -
         window.resize(520, 260)
         window.show()
         window.load_current_directory()
+        settle_virtual_view_tasks(window, qt_app)
 
         scroll_bar = window.thumbnail_view.verticalScrollBar()
         deadline = monotonic() + 1.0
@@ -1406,12 +1916,13 @@ def test_thumbnail_scroll_position_is_remembered_per_directory(tmp_path: Path) -
         saved_position = scroll_bar.value()
         window.current_dir_rel = "second"
         window.load_current_directory()
-        qt_app.processEvents()
+        settle_virtual_view_tasks(window, qt_app)
 
         assert scroll_bar.value() == 0
 
         window.current_dir_rel = "first"
         window.load_current_directory()
+        settle_virtual_view_tasks(window, qt_app)
         deadline = monotonic() + 1.0
         while scroll_bar.value() != saved_position and monotonic() < deadline:
             qt_app.processEvents()
@@ -1447,6 +1958,7 @@ def test_select_rel_path_cancels_pending_thumbnail_scroll_restore(tmp_path: Path
         window.resize(520, 260)
         window.show()
         window.load_current_directory()
+        settle_virtual_view_tasks(window, qt_app)
 
         scroll_bar = window.thumbnail_view.verticalScrollBar()
         deadline = monotonic() + 1.0
@@ -1494,6 +2006,7 @@ def test_fullscreen_navigation_syncs_thumbnail_scroll_to_current_image(tmp_path:
         window.resize(520, 260)
         window.show()
         window.load_current_directory()
+        settle_virtual_view_tasks(window, qt_app)
 
         scroll_bar = window.thumbnail_view.verticalScrollBar()
         deadline = monotonic() + 1.0
@@ -1550,6 +2063,8 @@ def test_duplicate_list_dialog_double_click_navigates_to_image(tmp_path: Path) -
         window.current_dir_rel = ""
         window.rebuild_tree()
         window.load_current_directory()
+        settle_virtual_view_tasks(window, qt_app)
+        settle_tree_build_tasks(window, qt_app)
         dialog = DuplicateListDialog(
             catalog,
             source,
@@ -1566,6 +2081,8 @@ def test_duplicate_list_dialog_double_click_navigates_to_image(tmp_path: Path) -
         assert target_item is not None
 
         dialog._item_double_clicked(target_item)
+        settle_virtual_view_tasks(window, qt_app)
+        settle_tree_build_tasks(window, qt_app)
 
         assert window.current_dir_rel == "album"
         assert window.selected_rel_paths() == ["album/two.jpg"]
@@ -1629,6 +2146,7 @@ def test_thumbnail_view_manual_drag_uses_static_cursor(tmp_path: Path) -> None:
         window.current_catalog = catalog
         window.current_dir_rel = ""
         window.load_current_directory()
+        settle_virtual_view_tasks(window, qt_app)
         index = window.model.index(0, 0)
 
         assert window.thumbnail_view.begin_manual_drag([index], QPoint(100, 100))
@@ -1663,6 +2181,7 @@ def test_thumbnail_view_manual_drag_cleans_cursor_when_button_state_is_lost(tmp_
         window.current_catalog = catalog
         window.current_dir_rel = ""
         window.load_current_directory()
+        settle_virtual_view_tasks(window, qt_app)
         index = window.model.index(0, 0)
 
         assert window.thumbnail_view.begin_manual_drag([index], QPoint(100, 100))
@@ -1707,7 +2226,8 @@ def test_thumbnail_drag_watchdog_highlights_and_drops_on_directory(tmp_path: Pat
         window.load_current_directory()
         window.resize(800, 480)
         window.show()
-        qt_app.processEvents()
+        settle_virtual_view_tasks(window, qt_app)
+        settle_tree_build_tasks(window, qt_app)
 
         root_item = window.tree.topLevelItem(0)
         assert root_item is not None
@@ -1775,7 +2295,8 @@ def test_thumbnail_drag_watchdog_drops_on_right_pane_folder(tmp_path: Path, monk
         window.load_current_directory()
         window.resize(800, 480)
         window.show()
-        qt_app.processEvents()
+        settle_virtual_view_tasks(window, qt_app)
+        settle_tree_build_tasks(window, qt_app)
 
         folder_row = next(row for row, record in enumerate(window.model.images) if isinstance(record, DirectoryRecord))
         image_row = next(row for row, record in enumerate(window.model.images) if isinstance(record, ImageRecord))
@@ -1839,7 +2360,8 @@ def test_thumbnail_drag_defers_indexer_refresh_and_keeps_payload(tmp_path: Path,
         window.load_current_directory()
         window.resize(800, 480)
         window.show()
-        qt_app.processEvents()
+        settle_virtual_view_tasks(window, qt_app)
+        settle_tree_build_tasks(window, qt_app)
 
         root_item = window.tree.topLevelItem(0)
         assert root_item is not None
@@ -1992,6 +2514,10 @@ def test_tag_dialog_uses_readable_container_styles(tmp_path: Path) -> None:
         catalog.define_tags(["Family"])
         dialog = TagDialog(catalog, "image.jpg")
         try:
+            deadline = monotonic() + 2
+            while not dialog._load_finished and monotonic() < deadline:
+                qt_app.processEvents()
+                sleep(0.01)
             assert dialog.checkboxes
             assert "color: #202124" in dialog.checkboxes[0].styleSheet()
         finally:
@@ -2011,7 +2537,10 @@ def test_tag_dialog_focus_starts_in_entry(tmp_path: Path) -> None:
         dialog = TagDialog(catalog, "image.jpg")
         try:
             dialog.show()
-            qt_app.processEvents()
+            deadline = monotonic() + 2
+            while not dialog._load_finished and monotonic() < deadline:
+                qt_app.processEvents()
+                sleep(0.01)
 
             assert dialog.entry.hasFocus()
         finally:
@@ -2031,6 +2560,10 @@ def test_tag_dialog_return_from_entry_accepts_csv_tags(tmp_path: Path) -> None:
         dialog = TagDialog(catalog, "image.jpg")
         try:
             dialog.show()
+            deadline = monotonic() + 2
+            while not dialog._load_finished and monotonic() < deadline:
+                qt_app.processEvents()
+                sleep(0.01)
             dialog.entry.setText('Travel, "Black and White"')
             dialog.entry.setFocus()
             qt_app.processEvents()
@@ -2050,6 +2583,55 @@ def test_tag_dialog_return_from_entry_accepts_csv_tags(tmp_path: Path) -> None:
             qt_app.processEvents()
 
 
+def test_tag_dialog_constructor_stays_responsive_while_tag_query_blocks(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    Image.new("RGB", (8, 8), (10, 20, 30)).save(root / "image.jpg")
+    started = Event()
+    release = Event()
+
+    def blocked_tag_state(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        started.set()
+        assert release.wait(timeout=5)
+        with Catalog.open_reader(root) as reader:
+            identity = reader.file_identity("image.jpg")
+        return ["Family"], [], False, identity
+
+    monkeypatch.setattr(TagDialog, "_load_tag_state", staticmethod(blocked_tag_state))
+    with Catalog(root) as catalog:
+        catalog.refresh()
+        started_at = monotonic()
+        dialog = TagDialog(catalog, "image.jpg")
+        try:
+            assert monotonic() - started_at < 0.1
+            assert started.wait(timeout=1)
+            heartbeat = Event()
+            QTimer.singleShot(0, heartbeat.set)
+            qt_app.processEvents()
+            assert heartbeat.is_set()
+
+            # An early Enter is remembered rather than accepting an incomplete
+            # tag snapshot that could silently clear existing assignments.
+            dialog.entry.setText("Travel")
+            dialog._accept_when_ready()
+            assert dialog.result() != QDialog.DialogCode.Accepted
+            release.set()
+            deadline = monotonic() + 2
+            while dialog.result() != QDialog.DialogCode.Accepted and monotonic() < deadline:
+                qt_app.processEvents()
+                sleep(0.01)
+            assert dialog.result() == QDialog.DialogCode.Accepted
+        finally:
+            release.set()
+            dialog.close()
+            dialog.deleteLater()
+            qt_app.processEvents()
+
+
 def test_status_left_segment_shows_count_and_selected_image_details(tmp_path: Path) -> None:
     qt_app = app()
     root = tmp_path / "catalog"
@@ -2064,6 +2646,7 @@ def test_status_left_segment_shows_count_and_selected_image_details(tmp_path: Pa
         window.current_catalog = catalog
         window.current_dir_rel = ""
         window.load_current_directory()
+        settle_virtual_view_tasks(window, qt_app)
 
         assert window.status_left_label.text() == "2"
 
@@ -2124,6 +2707,288 @@ def test_config_file_round_trips_window_and_catalogs(tmp_path: Path) -> None:
     assert loaded.sort_order == SortOrder.DATE_DESC.value
 
 
+def test_hung_initial_config_load_neither_blocks_construction_nor_shutdown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    qt_app = app()
+    started = Event()
+    release = Event()
+    config_path = tmp_path / "slow-config.json"
+    save_config(
+        AppConfig(
+            catalogs=["/persisted/catalog"],
+            thumbnail_size=13,
+            sort_order=SortOrder.SIZE_DESC.value,
+        ),
+        config_path,
+    )
+    original_config = config_path.read_bytes()
+
+    def blocked_load(_path: Path) -> AppConfig:
+        started.set()
+        assert release.wait(timeout=5)
+        return AppConfig(thumbnail_size=11)
+
+    monkeypatch.setattr(ui_module, "load_config", blocked_load)
+    started_at = monotonic()
+    window = MainWindow(config_path=config_path)
+    construction_duration = monotonic() - started_at
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        assert started.wait(timeout=1)
+        assert construction_duration < 0.5
+        assert window.thumbnail_columns == 5
+        assert window._initial_config_load_future is not None
+
+        close_started_at = monotonic()
+        window.close()
+
+        assert monotonic() - close_started_at < 0.5
+        assert window._initial_config_load_future is None
+        assert window.config_load_executor is None
+        assert config_path.read_bytes() == original_config
+    finally:
+        release.set()
+        deadline = monotonic() + 2
+        while (
+            any(thread.name.startswith("marnwick-config-load") for thread in enumerate_threads())
+            and monotonic() < deadline
+        ):
+            qt_app.processEvents()
+            sleep(0.01)
+        window.deleteLater()
+        qt_app.processEvents()
+
+    assert not any(
+        thread.name.startswith("marnwick-config-load")
+        for thread in enumerate_threads()
+    )
+
+
+def test_late_initial_config_applies_untouched_window_controls_and_catalogs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    qt_app = app()
+    catalog_root = tmp_path / "configured"
+    catalog_root.mkdir()
+    started = Event()
+    release = Event()
+    loaded = AppConfig(
+        window=WindowConfig(width=640, height=480),
+        catalogs=[str(catalog_root)],
+        thumbnail_size=7,
+        delete_behavior=WIPE_ON_DELETE,
+        sort_order=SortOrder.DATE_DESC.value,
+        _loaded_catalogs=(str(catalog_root),),
+    )
+
+    def delayed_load(_path: Path) -> AppConfig:
+        started.set()
+        assert release.wait(timeout=5)
+        return loaded
+
+    monkeypatch.setattr(ui_module, "load_config", delayed_load)
+    window = MainWindow(config_path=tmp_path / "config.json")
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        assert started.wait(timeout=1)
+        assert window.thumbnail_columns == 5
+
+        release.set()
+        settle_initial_config_load(window, qt_app)
+        deadline = monotonic() + 5
+        while monotonic() < deadline:
+            qt_app.processEvents()
+            window._settle_catalog_open_tasks()
+            if (
+                not window._catalog_open_tasks
+                and window.workspace.catalog_for_root(catalog_root) is not None
+            ):
+                break
+            sleep(0.01)
+
+        assert window.size().width() == 640
+        assert window.size().height() == 480
+        assert window.thumbnail_columns == 7
+        assert window.size_slider.value() == 7
+        assert window.current_sort == SortOrder.DATE_DESC
+        assert window.app_config.delete_behavior == WIPE_ON_DELETE
+        assert window.current_catalog is not None
+        assert window.current_catalog.root == catalog_root.resolve()
+    finally:
+        release.set()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_user_open_between_config_settlement_and_restore_timer_keeps_selection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    qt_app = app()
+    configured_root = tmp_path / "configured"
+    user_root = tmp_path / "user-opened"
+    configured_root.mkdir()
+    user_root.mkdir()
+    loaded = AppConfig(
+        catalogs=[str(configured_root)],
+        _loaded_catalogs=(str(configured_root),),
+    )
+    monkeypatch.setattr(ui_module, "load_config", lambda _path: loaded)
+    window = MainWindow(config_path=tmp_path / "config.json")
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        future = window._initial_config_load_future
+        if future is not None:
+            deadline = monotonic() + 2
+            while not future.done() and monotonic() < deadline:
+                sleep(0.005)
+            window._settle_initial_config_load(window._initial_config_load_generation)
+        assert window._initial_config_load_future is None
+
+        # The config restore is queued for the next Qt turn. This explicit
+        # request must invalidate its captured selection permission even though
+        # the configuration future itself has already settled.
+        window.open_catalog_async(user_root)
+        qt_app.processEvents()
+        deadline = monotonic() + 5
+        while window._catalog_open_tasks and monotonic() < deadline:
+            qt_app.processEvents()
+            window._settle_catalog_open_tasks()
+            sleep(0.01)
+
+        assert window.workspace.catalog_for_root(configured_root) is not None
+        assert window.current_catalog is not None
+        assert window.current_catalog.root == user_root.resolve()
+    finally:
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_late_initial_config_does_not_overwrite_newer_user_intent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    qt_app = app()
+    configured_root = tmp_path / "configured"
+    user_root = tmp_path / "user-opened"
+    configured_root.mkdir()
+    user_root.mkdir()
+    started = Event()
+    release = Event()
+    loaded = AppConfig(
+        window=WindowConfig(width=920, height=700),
+        catalogs=[str(configured_root)],
+        thumbnail_size=2,
+        delete_behavior=WIPE_ON_DELETE,
+        sort_order=SortOrder.DATE_DESC.value,
+        _loaded_catalogs=(str(configured_root),),
+    )
+
+    def delayed_load(_path: Path) -> AppConfig:
+        started.set()
+        assert release.wait(timeout=5)
+        return loaded
+
+    monkeypatch.setattr(ui_module, "load_config", delayed_load)
+    window = MainWindow(config_path=tmp_path / "config.json")
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        assert started.wait(timeout=1)
+
+        window.show()
+        qt_app.processEvents()
+        window.resize(1000, 650)
+        qt_app.processEvents()
+        user_size = window.size()
+        window.set_thumbnail_size(9)
+        window.set_sort_order(SortOrder.NAME_DESC)
+        window.open_catalog_async(user_root)
+        deadline = monotonic() + 5
+        while window.current_catalog is None and monotonic() < deadline:
+            qt_app.processEvents()
+            window._settle_catalog_open_tasks()
+            sleep(0.01)
+        assert window.current_catalog is not None
+        assert window.current_catalog.root == user_root.resolve()
+
+        release.set()
+        settle_initial_config_load(window, qt_app)
+        deadline = monotonic() + 5
+        while monotonic() < deadline:
+            qt_app.processEvents()
+            window._settle_catalog_open_tasks()
+            if (
+                not window._catalog_open_tasks
+                and window.workspace.catalog_for_root(configured_root) is not None
+            ):
+                break
+            sleep(0.01)
+
+        assert window.size() == user_size
+        assert window.thumbnail_columns == 9
+        assert window.current_sort == SortOrder.NAME_DESC
+        assert window.workspace.catalog_for_root(configured_root) is not None
+        assert window.current_catalog is not None
+        assert window.current_catalog.root == user_root.resolve()
+    finally:
+        release.set()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_late_initial_config_does_not_reopen_catalog_user_already_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    qt_app = app()
+    catalog_root = tmp_path / "catalog"
+    catalog_root.mkdir()
+    started = Event()
+    release = Event()
+    loaded = AppConfig(
+        catalogs=[str(catalog_root)],
+        _loaded_catalogs=(str(catalog_root),),
+    )
+
+    def delayed_load(_path: Path) -> AppConfig:
+        started.set()
+        assert release.wait(timeout=5)
+        return loaded
+
+    monkeypatch.setattr(ui_module, "load_config", delayed_load)
+    window = MainWindow(config_path=tmp_path / "config.json")
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        assert started.wait(timeout=1)
+
+        window.open_catalog(catalog_root, log_event=False)
+        window.close_catalog(catalog_root)
+        assert window.workspace.catalogs == []
+
+        release.set()
+        settle_initial_config_load(window, qt_app)
+        qt_app.processEvents()
+
+        assert window.workspace.catalogs == []
+        assert not window._catalog_open_tasks
+    finally:
+        release.set()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
 def test_main_window_restores_and_persists_config_catalogs(tmp_path: Path) -> None:
     qt_app = app()
     catalog_root = tmp_path / "catalog"
@@ -2143,6 +3008,15 @@ def test_main_window_restores_and_persists_config_catalogs(tmp_path: Path) -> No
     try:
         window.progress_timer.stop()
         window.idle_timer.stop()
+        settle_initial_config_load(window, qt_app)
+        deadline = monotonic() + 3.0
+        while (
+            window.workspace.catalog_for_root(catalog_root) is None
+            and monotonic() < deadline
+        ):
+            qt_app.processEvents()
+            window._settle_catalog_open_tasks()
+            sleep(0.01)
 
         assert [catalog.root for catalog in window.workspace.catalogs] == [catalog_root.resolve()]
         assert window.size().width() == 640
@@ -2169,6 +3043,64 @@ def test_main_window_restores_and_persists_config_catalogs(tmp_path: Path) -> No
         assert saved.delete_behavior == WIPE_ON_DELETE
         assert saved.sort_order == SortOrder.ASPECT_ASC.value
     finally:
+        window.indexer.shutdown()
+        window.workspace.close()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_async_config_save_churn_keeps_only_the_latest_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    qt_app = app()
+    config_path = tmp_path / "config.json"
+    save_config(AppConfig(), config_path)
+    window = MainWindow(config_path=config_path)
+    started = Event()
+    release = Event()
+    saved_snapshots: list[tuple[int, tuple[str, ...], tuple[str, ...] | None]] = []
+
+    def controlled_save(snapshot: AppConfig, _path: Path) -> None:
+        saved_snapshots.append(
+            (snapshot.thumbnail_size, tuple(snapshot.catalogs), snapshot._loaded_catalogs)
+        )
+        if len(saved_snapshots) == 1:
+            started.set()
+            assert release.wait(timeout=5)
+
+    monkeypatch.setattr(ui_module, "save_config", controlled_save)
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        settle_initial_config_load(window, qt_app)
+        window.thumbnail_columns = 2
+        first = window.save_window_config(wait=False)
+        assert first is not None
+        assert started.wait(timeout=1)
+
+        window.thumbnail_columns = 3
+        window._unavailable_catalog_paths = ["/catalog/one"]
+        superseded = window.save_window_config(wait=False)
+        assert superseded is not None
+        window.thumbnail_columns = 20
+        window._unavailable_catalog_paths = ["/catalog/one", "/catalog/two"]
+        latest = window.save_window_config(wait=False)
+
+        assert latest is not None
+        assert superseded.cancelled()
+        assert window.config_save_executor.pending_count == 2
+        assert len(window._config_save_futures) <= 2
+        release.set()
+        first.result(timeout=1)
+        latest.result(timeout=1)
+        assert saved_snapshots == [
+            (2, (), ()),
+            (20, ("/catalog/one", "/catalog/two"), ()),
+        ]
+    finally:
+        release.set()
         window.indexer.shutdown()
         window.workspace.close()
         window.close()
@@ -2261,10 +3193,17 @@ def test_move_payload_to_directory_moves_selected_images_across_catalogs(tmp_pat
         assert dest.get_image("target/image.jpg") is not None
         assert source.root not in window._swept_catalog_roots
         assert dest.root not in window._swept_catalog_roots
-        assert source.directory_hash_matches("set")
-        assert dest.directory_hash_matches("target")
-        assert source.catalog_refresh_is_current()
-        assert dest.catalog_refresh_is_current()
+        # Targeted moves keep rows and thumbnail metadata coherent immediately,
+        # but deliberately invalidate recursive freshness proofs instead of
+        # walking both catalog subtrees on the UI-critical mutation path.
+        assert not source.directory_hash_matches("set")
+        assert not dest.directory_hash_matches("target")
+        assert source.refresh_directory("set", force=False)
+        assert dest.refresh_directory("target", force=False)
+        assert source.directory_entry_hash_matches("set")
+        assert dest.directory_entry_hash_matches("target")
+        assert not source.catalog_refresh_is_current()
+        assert not dest.catalog_refresh_is_current()
     finally:
         window.progress_timer.stop()
         window.idle_timer.stop()
@@ -2361,7 +3300,18 @@ def test_move_payload_to_directory_returns_while_worker_is_busy(tmp_path: Path, 
         source.refresh()
         dest.refresh()
 
-        def slow_worker(_image_groups, _directory_groups, _dest_root, _dest_dir_rel, _wipe_on_delete, task):
+        def slow_worker(
+            _image_groups,
+            _directory_groups,
+            _dest_root,
+            _dest_dir_rel,
+            _expected_images,
+            _expected_directories,
+            _expected_destination,
+            _wipe_on_delete,
+            _expected_root_identities,
+            task,
+        ):
             started.set()
             task.update(0, 1, "waiting")
             if not release.wait(timeout=1.0):
@@ -2379,6 +3329,7 @@ def test_move_payload_to_directory_returns_while_worker_is_busy(tmp_path: Path, 
         )
 
         assert monotonic() - started_at < 0.5
+        settle_mutation_identity_preflights(window, qt_app)
         assert window._move_payload_task is not None
         assert started.wait(timeout=1.0)
         assert not window._move_payload_task.future.done()
@@ -2421,8 +3372,20 @@ def test_move_payload_to_directory_queues_multiple_moves_and_hides_thumbnails(
         window.current_catalog = source
         window.current_dir_rel = ""
         window.load_current_directory()
+        settle_virtual_view_tasks(window, qt_app)
 
-        def slow_first_worker(_image_groups, _directory_groups, _dest_root, _dest_dir_rel, _wipe_on_delete, task):
+        def slow_first_worker(
+            _image_groups,
+            _directory_groups,
+            _dest_root,
+            _dest_dir_rel,
+            _expected_images,
+            _expected_directories,
+            _expected_destination,
+            _wipe_on_delete,
+            _expected_root_identities,
+            task,
+        ):
             nonlocal calls
             calls += 1
             task.update(0, 1, "waiting")
@@ -2440,6 +3403,7 @@ def test_move_payload_to_directory_queues_multiple_moves_and_hides_thumbnails(
             dest.root,
             "target",
         )
+        settle_mutation_identity_preflights(window, qt_app)
         assert started.wait(timeout=1.0)
         assert [record.rel_path for record in window.model.images if isinstance(record, ImageRecord)] == ["two.jpg"]
 
@@ -2448,6 +3412,7 @@ def test_move_payload_to_directory_queues_multiple_moves_and_hides_thumbnails(
             dest.root,
             "target",
         )
+        settle_mutation_identity_preflights(window, qt_app)
 
         assert len(window._move_payload_tasks) == 2
         assert [record.rel_path for record in window.model.images if isinstance(record, ImageRecord)] == []
@@ -2461,6 +3426,73 @@ def test_move_payload_to_directory_queues_multiple_moves_and_hides_thumbnails(
         window.idle_timer.stop()
         window.indexer.shutdown()
         window.workspace.close()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_two_preflighted_moves_to_same_destination_both_commit(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    source_root = tmp_path / "source"
+    dest_root = tmp_path / "dest"
+    source_root.mkdir()
+    (dest_root / "target").mkdir(parents=True)
+    Image.new("RGB", (8, 8), (10, 20, 30)).save(source_root / "one.jpg")
+    Image.new("RGB", (8, 8), (40, 50, 60)).save(source_root / "two.jpg")
+    first_started = Event()
+    release_first = Event()
+    calls = 0
+
+    window = MainWindow()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        source = window.workspace.open_catalog(source_root)
+        dest = window.workspace.open_catalog(dest_root)
+        source.refresh()
+        dest.refresh()
+        original_worker = window._move_payload_worker
+
+        def pause_first_worker(*args, **kwargs):  # type: ignore[no-untyped-def]
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                first_started.set()
+                assert release_first.wait(timeout=5)
+            return original_worker(*args, **kwargs)
+
+        monkeypatch.setattr(window, "_move_payload_worker", pause_first_worker)
+        window.move_payload_to_directory(
+            [{"catalog_root": str(source.root), "rel_path": "one.jpg"}],
+            dest.root,
+            "target",
+        )
+        settle_mutation_identity_preflights(window, qt_app)
+        assert first_started.wait(timeout=1)
+
+        # The second confirmation observes the same destination inode and its
+        # original mtime while the first move is still paused.
+        window.move_payload_to_directory(
+            [{"catalog_root": str(source.root), "rel_path": "two.jpg"}],
+            dest.root,
+            "target",
+        )
+        settle_mutation_identity_preflights(window, qt_app)
+        assert len(window._move_payload_tasks) == 2
+
+        release_first.set()
+        settle_move_payload_task(window, qt_app, timeout=8)
+
+        assert calls == 2
+        assert (dest_root / "target" / "one.jpg").is_file()
+        assert (dest_root / "target" / "two.jpg").is_file()
+        assert not (source_root / "one.jpg").exists()
+        assert not (source_root / "two.jpg").exists()
+    finally:
+        release_first.set()
         window.close()
         window.deleteLater()
         qt_app.processEvents()
@@ -2487,6 +3519,7 @@ def test_move_payload_removal_keeps_thumbnail_scroll_anchored(tmp_path: Path, mo
         window.resize(520, 260)
         window.show()
         window.load_current_directory()
+        settle_virtual_view_tasks(window, qt_app)
 
         scroll_bar = window.thumbnail_view.verticalScrollBar()
         deadline = monotonic() + 1.0
@@ -2497,7 +3530,18 @@ def test_move_payload_removal_keeps_thumbnail_scroll_anchored(tmp_path: Path, mo
         window.select_rel_path("image-70.jpg")
         assert scroll_bar.value() > 0
 
-        def slow_move_worker(_image_groups, _directory_groups, _dest_root, _dest_dir_rel, _wipe_on_delete, task):
+        def slow_move_worker(
+            _image_groups,
+            _directory_groups,
+            _dest_root,
+            _dest_dir_rel,
+            _expected_images,
+            _expected_directories,
+            _expected_destination,
+            _wipe_on_delete,
+            _expected_root_identities,
+            task,
+        ):
             started.set()
             task.update(0, 1, "waiting")
             if not release.wait(timeout=1.0):
@@ -2512,6 +3556,7 @@ def test_move_payload_removal_keeps_thumbnail_scroll_anchored(tmp_path: Path, mo
             catalog.root,
             "target",
         )
+        settle_mutation_identity_preflights(window, qt_app)
 
         assert started.wait(timeout=1.0)
         assert window.selected_rel_paths() == ["image-71.jpg"]
@@ -2585,12 +3630,14 @@ def test_right_pane_shows_directory_tiles_before_images_and_navigates(tmp_path: 
         window.current_dir_rel = ""
         window.set_sort_order(SortOrder.NAME_DESC)
         window.load_current_directory()
+        settle_virtual_view_tasks(window, qt_app)
 
         assert isinstance(window.model.images[0], DirectoryRecord)
         assert window.model.images[0].dir_rel == "z-child"
         assert any(isinstance(record, ImageRecord) for record in window.model.images[1:])
 
         window.open_viewer(window.model.index(0, 0), random_mode=False)
+        settle_tree_build_tasks(window, qt_app)
 
         assert window.current_dir_rel == "z-child"
         selected = window.tree.currentItem()
@@ -2633,6 +3680,8 @@ def test_create_directory_from_tree_does_not_navigate_right_pane(tmp_path: Path,
         window.current_dir_rel = ""
         window.rebuild_tree()
         window.load_current_directory()
+        settle_virtual_view_tasks(window, qt_app)
+        settle_tree_build_tasks(window, qt_app)
         window.select_rel_path("one.jpg")
         queue_calls: list[tuple[Path, str, dict[str, object]]] = []
 
@@ -2644,6 +3693,8 @@ def test_create_directory_from_tree_does_not_navigate_right_pane(tmp_path: Path,
 
         window.create_directory(catalog.root, "")
         settle_move_payload_task(window, qt_app)
+        settle_virtual_view_tasks(window, qt_app)
+        settle_tree_build_tasks(window, qt_app)
 
         assert (root / "new-folder").is_dir()
         assert window.current_catalog == catalog
@@ -2663,6 +3714,66 @@ def test_create_directory_from_tree_does_not_navigate_right_pane(tmp_path: Path,
         qt_app.processEvents()
 
 
+def test_create_directory_rejects_replaced_parent_after_dialog_opened(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    parent = root / "parent"
+    parent.mkdir(parents=True)
+    displaced = root / "displaced-parent"
+    captured = Event()
+    errors: list[tuple[str, str]] = []
+    window = MainWindow()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        catalog.refresh()
+        original_capture = window._capture_directory_identity_worker
+
+        def capture_parent(*args, **kwargs):  # type: ignore[no-untyped-def]
+            result = original_capture(*args, **kwargs)
+            captured.set()
+            return result
+
+        class ReplacingDirectoryNameDialog:
+            def __init__(self, _parent_path: Path, _parent=None) -> None:  # type: ignore[no-untyped-def]
+                pass
+
+            def exec(self) -> QDialog.DialogCode:
+                assert captured.wait(timeout=2)
+                parent.rename(displaced)
+                parent.mkdir()
+                return QDialog.DialogCode.Accepted
+
+            def directory_name(self) -> str:
+                return "must-not-cross"
+
+        monkeypatch.setattr(window, "_capture_directory_identity_worker", capture_parent)
+        monkeypatch.setattr(
+            "marnwick.ui.DirectoryNameDialog",
+            ReplacingDirectoryNameDialog,
+        )
+        monkeypatch.setattr(
+            "marnwick.ui.show_error",
+            lambda _owner, title, detail: errors.append((title, str(detail))),
+        )
+
+        window.create_directory(catalog.root, "parent")
+        settle_move_payload_task(window, qt_app)
+
+        assert not (parent / "must-not-cross").exists()
+        assert not (displaced / "must-not-cross").exists()
+        assert errors and errors[-1][0] == "Create Directory"
+        assert "changed" in errors[-1][1]
+    finally:
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
 def test_folder_tile_fetches_current_preview_blobs_when_record_is_stale(tmp_path: Path) -> None:
     qt_app = app()
     root = tmp_path / "catalog"
@@ -2675,19 +3786,71 @@ def test_folder_tile_fetches_current_preview_blobs_when_record_is_stale(tmp_path
         model = ThumbnailModel()
         model.set_tile_size(128)
         model.set_images(catalog, [record])
+        try:
+            placeholder = model.data(model.index(0, 0), Qt.ItemDataRole.DecorationRole)
+            assert isinstance(placeholder, QPixmap)
+            deadline = monotonic() + 2
+            pixmap = placeholder
+            while pixmap.cacheKey() == placeholder.cacheKey() and monotonic() < deadline:
+                qt_app.processEvents()
+                pixmap = model.data(model.index(0, 0), Qt.ItemDataRole.DecorationRole)
+                sleep(0.01)
 
-        pixmap = model.data(model.index(0, 0), Qt.ItemDataRole.DecorationRole)
-
-        assert isinstance(pixmap, QPixmap)
-        image = pixmap.toImage()
-        red_pixels = 0
-        for x in range(image.width()):
-            for y in range(image.height()):
-                color = image.pixelColor(x, y)
-                if color.red() > 180 and color.green() < 80 and color.blue() < 80:
-                    red_pixels += 1
-        assert red_pixels > 0
+            image = pixmap.toImage()
+            red_pixels = 0
+            for x in range(image.width()):
+                for y in range(image.height()):
+                    color = image.pixelColor(x, y)
+                    if color.red() > 180 and color.green() < 80 and color.blue() < 80:
+                        red_pixels += 1
+            assert red_pixels > 0
+        finally:
+            model.close()
     qt_app.processEvents()
+
+
+def test_small_directory_load_does_not_read_folder_previews_on_gui_thread(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    (root / "child").mkdir(parents=True)
+    Image.new("RGB", (16, 16), (10, 20, 30)).save(root / "child" / "image.jpg")
+    window = MainWindow()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        catalog.refresh()
+        window.current_catalog = catalog
+        window.current_dir_rel = ""
+        monkeypatch.setattr(
+            catalog,
+            "folder_preview_items_under",
+            lambda *_args, **_kwargs: pytest.fail("folder preview queried on GUI load"),
+        )
+        monkeypatch.setattr(
+            ThumbnailModel,
+            "_read_thumbnail_cache_file",
+            lambda *_args, **_kwargs: pytest.fail("thumbnail cache read on GUI load"),
+        )
+
+        window.load_current_directory()
+        settle_virtual_view_tasks(window, qt_app)
+
+        directory = next(
+            record for record in window.model.images if isinstance(record, DirectoryRecord)
+        )
+        # The worker may return indexed preview data; it must not defer a
+        # filesystem/cache read back to painting on the GUI thread.
+        assert directory.preview_items
+        assert directory.preview_blobs
+        assert not directory.allow_preview_fallback
+    finally:
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
 
 
 def test_move_payload_to_directory_moves_directories_across_catalogs(tmp_path: Path) -> None:
@@ -2721,13 +3884,299 @@ def test_move_payload_to_directory_moves_directories_across_catalogs(tmp_path: P
         assert dest.get_image("target/set/nested/image.jpg") is not None
         assert source.root not in window._swept_catalog_roots
         assert dest.root not in window._swept_catalog_roots
-        assert source.catalog_refresh_is_current()
-        assert dest.catalog_refresh_is_current()
+        assert not source.catalog_refresh_is_current()
+        assert not dest.catalog_refresh_is_current()
+        assert source.refresh_directory("", force=False)
+        assert dest.refresh_directory("target", force=False)
+        assert source.directory_entry_hash_matches("")
+        assert dest.directory_entry_hash_matches("target")
     finally:
         window.progress_timer.stop()
         window.idle_timer.stop()
         window.indexer.shutdown()
         window.workspace.close()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_queued_image_move_refuses_replacement_captured_before_serialized_lane(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    (root / "target").mkdir(parents=True)
+    source_path = root / "image.png"
+    Image.new("RGB", (8, 8), (10, 20, 30)).save(source_path)
+    errors: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        "marnwick.ui.show_error",
+        lambda _parent, title, detail: errors.append((title, detail)),
+    )
+    window = MainWindow()
+    release: Event | None = None
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        catalog.refresh()
+        window.current_catalog = catalog
+        window.current_dir_rel = ""
+        window.load_current_directory()
+        settle_virtual_view_tasks(window, qt_app)
+        release, _ = block_mutation_lane(window, catalog.root)
+
+        window.move_payload_to_directory(
+            [{"catalog_root": str(catalog.root), "rel_path": "image.png", "kind": "image"}],
+            catalog.root,
+            "target",
+        )
+        settle_mutation_identity_preflights(window, qt_app)
+        assert "image.png" not in [record.rel_path for record in window.model.images]
+
+        replacement = root / "replacement.png"
+        Image.new("RGB", (8, 8), (200, 30, 40)).save(replacement)
+        os.replace(replacement, source_path)
+        release.set()
+        settle_move_payload_task(window, qt_app, timeout=5)
+        settle_virtual_view_tasks(window, qt_app)
+
+        assert source_path.is_file()
+        assert not (root / "target" / "image.png").exists()
+        with Image.open(source_path) as image:
+            assert image.getpixel((0, 0)) == (200, 30, 40)
+        assert "image.png" in [record.rel_path for record in window.model.images]
+        assert errors and errors[-1][0] == "Move"
+        assert "changed after move was requested" in errors[-1][1]
+    finally:
+        if release is not None:
+            release.set()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_queued_directory_move_refuses_replacement_captured_before_serialized_lane(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    (root / "source").mkdir(parents=True)
+    (root / "source" / "original.txt").write_text("original", encoding="utf-8")
+    (root / "target").mkdir()
+    errors: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        "marnwick.ui.show_error",
+        lambda _parent, title, detail: errors.append((title, detail)),
+    )
+    window = MainWindow()
+    release: Event | None = None
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        catalog.refresh()
+        window.current_catalog = catalog
+        window.current_dir_rel = ""
+        window.load_current_directory()
+        settle_virtual_view_tasks(window, qt_app)
+        release, _ = block_mutation_lane(window, catalog.root)
+
+        window.move_payload_to_directory(
+            [{"catalog_root": str(catalog.root), "rel_path": "source", "kind": "directory"}],
+            catalog.root,
+            "target",
+        )
+        settle_mutation_identity_preflights(window, qt_app)
+        assert "source" not in [
+            record.dir_rel for record in window.model.images if isinstance(record, DirectoryRecord)
+        ]
+
+        (root / "source").rename(root / "captured-source")
+        (root / "source").mkdir()
+        (root / "source" / "replacement.txt").write_text("replacement", encoding="utf-8")
+        release.set()
+        settle_move_payload_task(window, qt_app, timeout=5)
+        settle_virtual_view_tasks(window, qt_app)
+
+        assert (root / "source" / "replacement.txt").read_text(encoding="utf-8") == "replacement"
+        assert not (root / "target" / "source").exists()
+        assert "source" in [
+            record.dir_rel for record in window.model.images if isinstance(record, DirectoryRecord)
+        ]
+        assert errors and errors[-1][0] == "Move"
+        assert "changed after move was requested" in errors[-1][1]
+    finally:
+        if release is not None:
+            release.set()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_queued_move_refuses_replaced_destination_captured_before_serialized_lane(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    (root / "target").mkdir(parents=True)
+    source_path = root / "image.png"
+    Image.new("RGB", (8, 8), (10, 20, 30)).save(source_path)
+    errors: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        "marnwick.ui.show_error",
+        lambda _parent, title, detail: errors.append((title, detail)),
+    )
+    window = MainWindow()
+    release: Event | None = None
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        catalog.refresh()
+        release, _ = block_mutation_lane(window, catalog.root)
+
+        window.move_payload_to_directory(
+            [{"catalog_root": str(catalog.root), "rel_path": "image.png", "kind": "image"}],
+            catalog.root,
+            "target",
+        )
+        settle_mutation_identity_preflights(window, qt_app)
+
+        (root / "target").rename(root / "captured-target")
+        (root / "target").mkdir()
+        (root / "target" / "replacement-marker.txt").write_text(
+            "replacement",
+            encoding="utf-8",
+        )
+        release.set()
+        settle_move_payload_task(window, qt_app, timeout=5)
+
+        assert source_path.is_file()
+        assert not (root / "target" / "image.png").exists()
+        assert (root / "target" / "replacement-marker.txt").read_text(
+            encoding="utf-8"
+        ) == "replacement"
+        assert errors and errors[-1][0] == "Move"
+        assert "destination changed after move was requested" in errors[-1][1]
+    finally:
+        if release is not None:
+            release.set()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_queued_image_restore_refuses_replacement_captured_before_serialized_lane(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    Image.new("RGB", (8, 8), (10, 20, 30)).save(root / "image.png")
+    errors: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        "marnwick.ui.show_error",
+        lambda _parent, title, detail: errors.append((title, detail)),
+    )
+    window = MainWindow()
+    release: Event | None = None
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        catalog.refresh()
+        trashed_rel = catalog.move_images(["image.png"], catalog, TRASH_DIR_NAME)[0].dest_rel_path
+        trashed_path = root / trashed_rel
+        window.current_catalog = catalog
+        window.current_dir_rel = TRASH_DIR_NAME
+        window.load_current_directory()
+        settle_virtual_view_tasks(window, qt_app)
+        release, _ = block_mutation_lane(window, catalog.root)
+
+        window._queue_restore_records(catalog, (("image", trashed_rel),))
+        settle_mutation_identity_preflights(window, qt_app)
+        settle_virtual_view_tasks(window, qt_app)
+        assert trashed_rel not in [record.rel_path for record in window.model.images]
+
+        replacement = root / "replacement.png"
+        Image.new("RGB", (8, 8), (90, 100, 110)).save(replacement)
+        os.replace(replacement, trashed_path)
+        release.set()
+        settle_move_payload_task(window, qt_app, timeout=5)
+        settle_virtual_view_tasks(window, qt_app)
+
+        assert trashed_path.is_file()
+        assert not (root / "image.png").exists()
+        with Image.open(trashed_path) as image:
+            assert image.getpixel((0, 0)) == (90, 100, 110)
+        assert trashed_rel in [record.rel_path for record in window.model.images]
+        assert errors and errors[-1][0] == "Restore"
+        assert "changed after restore was requested" in errors[-1][1]
+    finally:
+        if release is not None:
+            release.set()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_queued_directory_restore_refuses_replacement_captured_before_serialized_lane(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    (root / "album").mkdir(parents=True)
+    (root / "album" / "original.txt").write_text("original", encoding="utf-8")
+    errors: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        "marnwick.ui.show_error",
+        lambda _parent, title, detail: errors.append((title, detail)),
+    )
+    window = MainWindow()
+    release: Event | None = None
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        catalog.refresh()
+        trashed_rel = catalog.move_directories(["album"], catalog, TRASH_DIR_NAME)[0].dest_rel_path
+        trashed_path = root / trashed_rel
+        window.current_catalog = catalog
+        window.current_dir_rel = TRASH_DIR_NAME
+        window.load_current_directory()
+        settle_virtual_view_tasks(window, qt_app)
+        release, _ = block_mutation_lane(window, catalog.root)
+
+        window._queue_restore_records(catalog, (("directory", trashed_rel),))
+        settle_mutation_identity_preflights(window, qt_app)
+        settle_virtual_view_tasks(window, qt_app)
+        assert trashed_rel not in [
+            record.dir_rel for record in window.model.images if isinstance(record, DirectoryRecord)
+        ]
+
+        trashed_path.rename(root / TRASH_DIR_NAME / "captured-album")
+        trashed_path.mkdir()
+        (trashed_path / "replacement.txt").write_text("replacement", encoding="utf-8")
+        release.set()
+        settle_move_payload_task(window, qt_app, timeout=5)
+        settle_virtual_view_tasks(window, qt_app)
+
+        assert (trashed_path / "replacement.txt").read_text(encoding="utf-8") == "replacement"
+        assert not (root / "album").exists()
+        assert trashed_rel in [
+            record.dir_rel for record in window.model.images if isinstance(record, DirectoryRecord)
+        ]
+        assert errors and errors[-1][0] == "Restore"
+        assert "changed after restore was requested" in errors[-1][1]
+    finally:
+        if release is not None:
+            release.set()
         window.close()
         window.deleteLater()
         qt_app.processEvents()
@@ -2748,7 +4197,16 @@ def test_tools_menu_refresh_catalog_forces_current_catalog_refresh(tmp_path: Pat
         def cancel_directory_tasks(self, root: Path, *, keep_dir_rel: str | None = None) -> None:
             return None
 
-        def refresh_catalog(self, root: Path, *, interactive: bool = False, force: bool = False):  # type: ignore[no-untyped-def]
+        def refresh_catalog(
+            self,
+            root: Path,
+            *,
+            interactive: bool = False,
+            force: bool = False,
+            expected_root_identity: tuple[int, int] | None = None,
+            expected_storage_identity: object | None = None,
+        ):  # type: ignore[no-untyped-def]
+            del expected_root_identity, expected_storage_identity
             self.calls.append((root, interactive, force))
             return object()
 
@@ -2790,12 +4248,22 @@ def test_tools_menu_refresh_catalog_forces_current_catalog_refresh(tmp_path: Pat
 def test_tools_menu_prune_thumbnails_schedules_current_catalog_prune(tmp_path: Path, monkeypatch) -> None:
     qt_app = app()
     root = tmp_path / "catalog"
+    root.mkdir()
 
     class FakeIndexer:
         def __init__(self) -> None:
             self.calls: list[tuple[Path, bool, bool]] = []
 
-        def prune_thumbnails(self, root: Path, *, interactive: bool = False, force: bool = False):  # type: ignore[no-untyped-def]
+        def prune_thumbnails(
+            self,
+            root: Path,
+            *,
+            interactive: bool = False,
+            force: bool = False,
+            expected_root_identity: tuple[int, int] | None = None,
+            expected_storage_identity: object | None = None,
+        ):  # type: ignore[no-untyped-def]
+            del expected_root_identity, expected_storage_identity
             self.calls.append((root, interactive, force))
             return object()
 
@@ -2886,6 +4354,7 @@ def test_tools_menu_auto_delete_duplicates_runs_in_background(tmp_path: Path, mo
         window.current_virtual_value = ""
         window.current_dir_rel = "T-r-a-s-h"
         window.load_current_directory()
+        settle_virtual_view_tasks(window, qt_app)
 
         assert [record.rel_path for record in window.model.images if isinstance(record, ImageRecord)] == [
             "T-r-a-s-h/two.jpg"
@@ -3007,7 +4476,13 @@ def test_close_catalog_responsively_waits_for_protected_delete(tmp_path: Path, m
             return original_worker(*args, **kwargs)
 
         monkeypatch.setattr(window, "_delete_images_worker", slow_worker)
-        window.queue_delete_images(catalog, ["one.jpg"], wipe=False, remove_from_current_view=False)
+        window.queue_delete_images(
+            catalog,
+            ["one.jpg"],
+            expected_identities=catalog.file_identities(["one.jpg"]),
+            wipe=False,
+            remove_from_current_view=False,
+        )
         assert started.wait(timeout=1)
         QTimer.singleShot(10, heartbeat.set)
         QTimer.singleShot(50, release.set)
@@ -3017,6 +4492,57 @@ def test_close_catalog_responsively_waits_for_protected_delete(tmp_path: Path, m
         assert heartbeat.is_set()
         assert window.workspace.catalog_for_root(root) is None
         assert not window._delete_payload_tasks
+    finally:
+        release.set()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_app_close_finishes_move_whose_identity_preflight_is_still_running(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    (root / "target").mkdir(parents=True)
+    Image.new("RGB", (8, 8), (10, 20, 30)).save(root / "image.png")
+    started = Event()
+    release = Event()
+    heartbeat = Event()
+    window = MainWindow()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        catalog.refresh()
+        original_capture = window._capture_move_identities_worker
+
+        def blocked_capture(*args, **kwargs):  # type: ignore[no-untyped-def]
+            started.set()
+            if not release.wait(timeout=5):
+                raise TimeoutError("identity preflight was not released")
+            return original_capture(*args, **kwargs)
+
+        monkeypatch.setattr(window, "_capture_move_identities_worker", blocked_capture)
+        window.move_payload_to_directory(
+            [{"catalog_root": str(catalog.root), "rel_path": "image.png", "kind": "image"}],
+            catalog.root,
+            "target",
+        )
+        assert started.wait(timeout=1)
+        assert window._move_identity_preflights
+        assert not window._move_payload_tasks
+
+        QTimer.singleShot(10, heartbeat.set)
+        QTimer.singleShot(50, release.set)
+        window.close()
+
+        assert heartbeat.is_set()
+        assert not window._move_identity_preflights
+        assert not window._move_payload_tasks
+        assert not (root / "image.png").exists()
+        assert (root / "target" / "image.png").is_file()
     finally:
         release.set()
         window.close()
@@ -3197,7 +4723,15 @@ def test_idle_catalog_refresh_resumes_after_interactive_directory_index(tmp_path
 
     scheduled: list[Path] = []
 
-    def refresh_catalog(catalog_root: Path, *, interactive: bool = False, force: bool = False) -> FakeTask:
+    def refresh_catalog(
+        catalog_root: Path,
+        *,
+        interactive: bool = False,
+        force: bool = False,
+        expected_root_identity: tuple[int, int] | None = None,
+        expected_storage_identity: object | None = None,
+    ) -> FakeTask:
+        del expected_root_identity, expected_storage_identity
         scheduled.append(catalog_root.resolve())
         return FakeTask(done=False)
 
@@ -3239,6 +4773,7 @@ def test_open_catalog_discovers_directory_tree_without_waiting_for_image_index(t
         if task is not None:
             task.wait(timeout=5)
         window._poll_indexer()
+        settle_tree_build_tasks(window, qt_app)
 
         root_item = window.tree.topLevelItem(0)
         assert root_item is not None
@@ -3283,9 +4818,7 @@ def test_open_catalog_dialog_defers_open_until_next_event_loop_tick(tmp_path: Pa
         window.open_catalog_dialog()
 
         assert calls == []
-        timings_path = root / ".marnwick" / "timings.json"
-        timings = json.loads(timings_path.read_text(encoding="utf-8"))
-        assert timings["events"][-1]["phase"] == "dialog_selected"
+        assert not (root / ".marnwick").exists()
 
         qt_app.processEvents()
 
@@ -3331,7 +4864,15 @@ def test_async_open_catalog_writes_phase_timings(tmp_path: Path) -> None:
             )
 
     class FakeIndexer:
-        def discover_directories(self, task_root: Path, *, interactive: bool = True) -> FakeTask:
+        def discover_directories(
+            self,
+            task_root: Path,
+            *,
+            interactive: bool = True,
+            expected_root_identity: tuple[int, int] | None = None,
+            expected_storage_identity: object | None = None,
+        ) -> FakeTask:
+            del expected_root_identity, expected_storage_identity
             return FakeTask(f"Discovering folders {task_root.name}", task_root)
 
         def refresh_directory(
@@ -3341,13 +4882,34 @@ def test_async_open_catalog_writes_phase_timings(tmp_path: Path) -> None:
             *,
             interactive: bool = True,
             force: bool = False,
+            expected_root_identity: tuple[int, int] | None = None,
+            expected_storage_identity: object | None = None,
         ) -> FakeTask:
+            del expected_root_identity, expected_storage_identity
             return FakeTask(f"Indexing {dir_rel or task_root.name}", task_root, dir_rel)
 
-        def refresh_catalog(self, task_root: Path, *, interactive: bool = False, force: bool = False) -> FakeTask:
+        def refresh_catalog(
+            self,
+            task_root: Path,
+            *,
+            interactive: bool = False,
+            force: bool = False,
+            expected_root_identity: tuple[int, int] | None = None,
+            expected_storage_identity: object | None = None,
+        ) -> FakeTask:
+            del expected_root_identity, expected_storage_identity
             return FakeTask(f"Refreshing catalog {task_root.name}", task_root)
 
-        def prune_thumbnails(self, task_root: Path, *, interactive: bool = False, force: bool = False) -> FakeTask:
+        def prune_thumbnails(
+            self,
+            task_root: Path,
+            *,
+            interactive: bool = False,
+            force: bool = False,
+            expected_root_identity: tuple[int, int] | None = None,
+            expected_storage_identity: object | None = None,
+        ) -> FakeTask:
+            del expected_root_identity, expected_storage_identity
             return FakeTask(f"Pruning thumbnails {task_root.name}", task_root)
 
         def active_snapshots(self) -> list[IndexProgressSnapshot]:
@@ -3380,10 +4942,26 @@ def test_async_open_catalog_writes_phase_timings(tmp_path: Path) -> None:
             window._poll_indexer()
 
         assert window.workspace.catalog_for_root(root) is not None
-        timings = json.loads((root / ".marnwick" / "timings.json").read_text(encoding="utf-8"))
-        phases = [event["phase"] for event in timings["events"]]
+        timings_path = root / ".marnwick" / "timings.json"
+        expected_phases = {
+            "catalog_init",
+            "rebuild_tree",
+            "load_current_directory",
+            "open_catalog_total",
+        }
+        phases: list[str] = []
+        timing_deadline = monotonic() + 3.0
+        while monotonic() < timing_deadline:
+            try:
+                timings = json.loads(timings_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                sleep(0.01)
+                continue
+            phases = [event["phase"] for event in timings["events"]]
+            if expected_phases.issubset(phases):
+                break
+            sleep(0.01)
 
-        assert "deferred_open_start" in phases
         assert "catalog_init" in phases
         assert "rebuild_tree" in phases
         assert "load_current_directory" in phases
@@ -3394,6 +4972,298 @@ def test_async_open_catalog_writes_phase_timings(tmp_path: Path) -> None:
         window.catalog_open_executor.shutdown(wait=False, cancel_futures=True)
         window.indexer.shutdown()
         window.workspace.close()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_new_catalog_open_is_not_blocked_by_older_slow_open(tmp_path: Path, monkeypatch) -> None:
+    qt_app = app()
+    slow_root = tmp_path / "slow"
+    quick_root = tmp_path / "quick"
+    slow_root.mkdir()
+    quick_root.mkdir()
+    slow_started = Event()
+    release_slow = Event()
+    window = MainWindow()
+    original_worker = window._open_catalog_worker
+
+    def worker(root: Path):  # type: ignore[no-untyped-def]
+        if root == slow_root:
+            slow_started.set()
+            assert release_slow.wait(timeout=5)
+        return original_worker(root)
+
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        monkeypatch.setattr(window, "_open_catalog_worker", worker)
+        window.open_catalog_async(slow_root)
+        assert slow_started.wait(timeout=1)
+        window.open_catalog_async(quick_root)
+
+        deadline = monotonic() + 2
+        while window.workspace.catalog_for_root(quick_root) is None and monotonic() < deadline:
+            qt_app.processEvents()
+            window._settle_catalog_open_tasks()
+            sleep(0.01)
+
+        quick_catalog = window.workspace.catalog_for_root(quick_root)
+        assert quick_catalog is not None
+        assert window.current_catalog is quick_catalog
+
+        release_slow.set()
+        deadline = monotonic() + 5
+        while window._catalog_open_tasks and monotonic() < deadline:
+            qt_app.processEvents()
+            window._settle_catalog_open_tasks()
+            sleep(0.01)
+        assert not window._catalog_open_tasks
+        assert window.current_catalog is quick_catalog
+    finally:
+        release_slow.set()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_rejected_latest_catalog_open_falls_back_to_newest_admitted_success(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    admitted_root = tmp_path / "admitted"
+    rejected_root = tmp_path / "rejected"
+    admitted_root.mkdir()
+    rejected_root.mkdir()
+    started = Event()
+    release = Event()
+    window = MainWindow()
+    original_worker = window._open_catalog_worker
+
+    def blocked_worker(root: Path):  # type: ignore[no-untyped-def]
+        started.set()
+        assert release.wait(timeout=5)
+        return original_worker(root)
+
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        monkeypatch.setattr(window, "_open_catalog_worker", blocked_worker)
+        window.open_catalog_async(admitted_root)
+        assert started.wait(timeout=1)
+
+        def reject_submit(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+            raise RuntimeError("catalog open executor saturated")
+
+        monkeypatch.setattr(window.catalog_open_executor, "submit", reject_submit)
+        window.open_catalog_async(rejected_root)
+        assert "workers are busy" in window.progress_label.text()
+
+        release.set()
+        deadline = monotonic() + 5
+        while window._catalog_open_tasks and monotonic() < deadline:
+            qt_app.processEvents()
+            window._settle_catalog_open_tasks()
+            sleep(0.01)
+
+        admitted = window.workspace.catalog_for_root(admitted_root)
+        assert admitted is not None
+        assert window.current_catalog is admitted
+        assert window.workspace.catalog_for_root(rejected_root) is None
+    finally:
+        release.set()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_fifth_catalog_open_starts_while_four_older_filesystems_are_blocked(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    slow_roots = [tmp_path / f"slow-{index}" for index in range(4)]
+    quick_root = tmp_path / "quick"
+    for root in [*slow_roots, quick_root]:
+        root.mkdir()
+    started = {root: Event() for root in slow_roots}
+    release = Event()
+    window = MainWindow()
+    original_worker = window._open_catalog_worker
+
+    def worker(root: Path):  # type: ignore[no-untyped-def]
+        if root in started:
+            started[root].set()
+            assert release.wait(timeout=5)
+        return original_worker(root)
+
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        monkeypatch.setattr(window, "_open_catalog_worker", worker)
+        for root in slow_roots:
+            window.open_catalog_async(root)
+        assert all(event.wait(timeout=1) for event in started.values())
+
+        window.open_catalog_async(quick_root)
+        deadline = monotonic() + 2
+        while window.workspace.catalog_for_root(quick_root) is None and monotonic() < deadline:
+            qt_app.processEvents()
+            window._settle_catalog_open_tasks()
+            sleep(0.01)
+
+        quick_catalog = window.workspace.catalog_for_root(quick_root)
+        assert quick_catalog is not None
+        assert window.current_catalog is quick_catalog
+    finally:
+        release.set()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_catalog_open_churn_has_a_process_wide_thread_and_queue_bound(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    roots = [tmp_path / f"blocked-{index:02d}" for index in range(30)]
+    for root in roots:
+        root.mkdir()
+    release = Event()
+    started = Event()
+    window = MainWindow()
+
+    def blocked_worker(_root: Path):  # type: ignore[no-untyped-def]
+        started.set()
+        assert release.wait(timeout=5)
+        raise OSError("test filesystem remained unavailable")
+
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        baseline = {
+            thread.ident
+            for thread in enumerate_threads()
+            if thread.name.startswith("marnwick-open_")
+        }
+        monkeypatch.setattr(window, "_open_catalog_worker", blocked_worker)
+        for root in roots:
+            window.open_catalog_async(root)
+        assert started.wait(timeout=1)
+
+        live = {
+            thread.ident
+            for thread in enumerate_threads()
+            if thread.name.startswith("marnwick-open_") and thread.ident not in baseline
+        }
+        assert len(live) <= 8
+        assert len(window._catalog_open_tasks) <= 8
+        assert window.catalog_open_executor.pending_count <= 8
+    finally:
+        release.set()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_async_catalog_open_does_no_filesystem_io_on_gui_path(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    window = MainWindow()
+    ui_thread = get_ident()
+    original_resolve = Path.resolve
+    original_is_dir = Path.is_dir
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+
+        def guarded_resolve(path: Path, *args, **kwargs) -> Path:  # type: ignore[no-untyped-def]
+            assert get_ident() != ui_thread, "Path.resolve ran on the GUI thread"
+            return original_resolve(path, *args, **kwargs)
+
+        def guarded_is_dir(path: Path) -> bool:
+            assert get_ident() != ui_thread, "Path.is_dir ran on the GUI thread"
+            return original_is_dir(path)
+
+        with monkeypatch.context() as context:
+            context.setattr(Path, "resolve", guarded_resolve)
+            context.setattr(Path, "is_dir", guarded_is_dir)
+            window.open_catalog_async(root)
+
+        deadline = monotonic() + 5
+        while window._catalog_open_tasks and monotonic() < deadline:
+            qt_app.processEvents()
+            window._settle_catalog_open_tasks()
+            sleep(0.01)
+
+        assert not window._catalog_open_tasks
+        assert window.current_catalog is not None
+        assert window.current_catalog.root == root.resolve()
+    finally:
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_failed_latest_catalog_open_falls_back_to_newest_successful_request(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    first_root = tmp_path / "first"
+    failed_root = tmp_path / "failed"
+    first_root.mkdir()
+    failed_root.mkdir()
+    first_started = Event()
+    release_first = Event()
+    window = MainWindow()
+    original_worker = window._open_catalog_worker
+
+    def worker(root: Path):  # type: ignore[no-untyped-def]
+        if root == first_root:
+            first_started.set()
+            assert release_first.wait(timeout=5)
+        if root == failed_root:
+            raise OSError("unavailable")
+        return original_worker(root)
+
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        monkeypatch.setattr(window, "_open_catalog_worker", worker)
+        monkeypatch.setattr("marnwick.ui.show_error", lambda *_args: None)
+        window.open_catalog_async(first_root)
+        assert first_started.wait(timeout=1)
+        window.open_catalog_async(failed_root)
+
+        deadline = monotonic() + 2
+        while (
+            any(task.root == failed_root for task in window._catalog_open_tasks.values())
+            and monotonic() < deadline
+        ):
+            qt_app.processEvents()
+            window._settle_catalog_open_tasks()
+            sleep(0.01)
+        assert window.current_catalog is None
+
+        release_first.set()
+        deadline = monotonic() + 5
+        while window._catalog_open_tasks and monotonic() < deadline:
+            qt_app.processEvents()
+            window._settle_catalog_open_tasks()
+            sleep(0.01)
+
+        assert not window._catalog_open_tasks
+        assert window.current_catalog is not None
+        assert window.current_catalog.root == first_root.resolve()
+    finally:
+        release_first.set()
         window.close()
         window.deleteLater()
         qt_app.processEvents()
@@ -3442,7 +5312,15 @@ def test_open_catalog_shows_shallow_tree_until_directory_discovery_finishes(tmp_
             self.tasks: list[FakeTask] = []
             self.discovery_task: FakeTask | None = None
 
-        def discover_directories(self, task_root: Path, *, interactive: bool = True) -> FakeTask:
+        def discover_directories(
+            self,
+            task_root: Path,
+            *,
+            interactive: bool = True,
+            expected_root_identity: tuple[int, int] | None = None,
+            expected_storage_identity: object | None = None,
+        ) -> FakeTask:
+            del expected_root_identity, expected_storage_identity
             task = FakeTask(f"Discovering folders {task_root.name}", task_root, None, interactive=interactive)
             self.discovery_task = task
             self.tasks.append(task)
@@ -3455,17 +5333,38 @@ def test_open_catalog_shows_shallow_tree_until_directory_discovery_finishes(tmp_
             *,
             interactive: bool = True,
             force: bool = False,
+            expected_root_identity: tuple[int, int] | None = None,
+            expected_storage_identity: object | None = None,
         ) -> FakeTask:
+            del expected_root_identity, expected_storage_identity
             task = FakeTask(f"Indexing {dir_rel or task_root.name}", task_root, dir_rel, interactive=interactive)
             self.tasks.append(task)
             return task
 
-        def refresh_catalog(self, task_root: Path, *, interactive: bool = False, force: bool = False) -> FakeTask:
+        def refresh_catalog(
+            self,
+            task_root: Path,
+            *,
+            interactive: bool = False,
+            force: bool = False,
+            expected_root_identity: tuple[int, int] | None = None,
+            expected_storage_identity: object | None = None,
+        ) -> FakeTask:
+            del expected_root_identity, expected_storage_identity
             task = FakeTask(f"Refreshing catalog {task_root.name}", task_root, None, interactive=interactive)
             self.tasks.append(task)
             return task
 
-        def prune_thumbnails(self, task_root: Path, *, interactive: bool = False, force: bool = False) -> FakeTask:
+        def prune_thumbnails(
+            self,
+            task_root: Path,
+            *,
+            interactive: bool = False,
+            force: bool = False,
+            expected_root_identity: tuple[int, int] | None = None,
+            expected_storage_identity: object | None = None,
+        ) -> FakeTask:
+            del expected_root_identity, expected_storage_identity
             task = FakeTask(f"Pruning thumbnails {task_root.name}", task_root, None, interactive=interactive)
             self.tasks.append(task)
             return task
@@ -3496,20 +5395,27 @@ def test_open_catalog_shows_shallow_tree_until_directory_discovery_finishes(tmp_
 
         window.open_catalog(root)
 
+        assert fake_indexer.tasks[0].dir_rel == ""
+        assert fake_indexer.tasks[0].interactive is True
+        assert fake_indexer.tasks[1] is fake_indexer.discovery_task
+        assert fake_indexer.discovery_task is not None
+        assert fake_indexer.discovery_task.interactive is False
+
         root_item = window.tree.topLevelItem(0)
         assert root_item is not None
-        top_item = root_item.child(0)
-        assert top_item is not None
-        assert top_item.data(0, DIR_REL_ROLE) == "top"
-        nested_item = top_item.child(0)
-        assert nested_item is None
+        assert not any(
+            root_item.child(index).data(0, DIR_REL_ROLE) == "top"
+            for index in range(root_item.childCount())
+        )
         assert root.resolve() in window._shallow_tree_roots
-        assert "Discovering folders" in window.progress_label.text()
+        assert "Indexing" in window.progress_label.text()
+        settle_virtual_view_tasks(window, qt_app)
         assert [record.dir_rel for record in window.model.images if isinstance(record, DirectoryRecord)] == ["top"]
 
         for task in fake_indexer.tasks:
             task.finish()
         window._poll_indexer()
+        settle_tree_build_tasks(window, qt_app)
 
         root_item = window.tree.topLevelItem(0)
         assert root_item is not None
@@ -3529,6 +5435,426 @@ def test_open_catalog_shows_shallow_tree_until_directory_discovery_finishes(tmp_
         qt_app.processEvents()
 
 
+def test_duplicate_list_dialog_loads_matches_off_the_ui_thread(tmp_path: Path, monkeypatch) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    Image.new("RGB", (8, 8), (10, 20, 30)).save(root / "one.jpg")
+    Image.new("RGB", (8, 8), (10, 20, 30)).save(root / "two.jpg")
+    started = Event()
+    release = Event()
+    with Catalog(root) as catalog:
+        catalog.refresh()
+        source = catalog.get_image("one.jpg", include_blob=False)
+        target = catalog.get_image("two.jpg", include_blob=False)
+        assert source is not None
+        assert target is not None
+
+        def slow_matches(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+            started.set()
+            assert release.wait(timeout=5)
+            return DuplicateMatchGroups(exact=(target,), very_similar=())
+
+        monkeypatch.setattr(DuplicateListDialog, "_load_matches", staticmethod(slow_matches))
+        started_at = monotonic()
+        dialog = DuplicateListDialog(catalog, source, None, lambda _rel_path: None)
+        try:
+            assert monotonic() - started_at < 0.1
+            assert "Loading" in dialog.list_widget.item(0).text()
+            assert started.wait(timeout=1)
+            release.set()
+            deadline = monotonic() + 2
+            while dialog.matches is None and monotonic() < deadline:
+                qt_app.processEvents()
+                sleep(0.01)
+            assert dialog.matches is not None
+            assert any(
+                dialog.list_widget.item(row).data(Qt.ItemDataRole.UserRole) == "two.jpg"
+                for row in range(dialog.list_widget.count())
+            )
+        finally:
+            release.set()
+            dialog.close()
+            dialog.deleteLater()
+            qt_app.processEvents()
+
+
+def test_duplicate_list_dialog_cancels_query_and_bounds_rendered_matches(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    Image.new("RGB", (8, 8), (10, 20, 30)).save(root / "one.jpg")
+    Image.new("RGB", (8, 8), (20, 30, 40)).save(root / "two.jpg")
+    query_started = Event()
+    query_canceled = Event()
+
+    with Catalog(root) as catalog:
+        catalog.refresh()
+        source = catalog.get_image("one.jpg", include_blob=False)
+        target = catalog.get_image("two.jpg", include_blob=False)
+        assert source is not None
+        assert target is not None
+
+        def blocked_matches(
+            _root: Path,
+            _expected_root_identity: tuple[int, int],
+            _expected_storage_identity: object,
+            _rel_path: str,
+            cancel_event: Event,
+        ):
+            query_started.set()
+            assert cancel_event.wait(timeout=5)
+            query_canceled.set()
+            return DuplicateMatchGroups()
+
+        monkeypatch.setattr(DuplicateListDialog, "_load_matches", staticmethod(blocked_matches))
+        blocked = DuplicateListDialog(catalog, source, None, lambda _rel_path: None)
+        try:
+            assert query_started.wait(timeout=1)
+            blocked.reject()
+            qt_app.processEvents()
+            assert query_canceled.wait(timeout=1)
+        finally:
+            blocked.close()
+            blocked.deleteLater()
+            qt_app.processEvents()
+
+        matches = DuplicateMatchGroups(
+            exact=(target,) * (DuplicateListDialog.MAX_MATCHES_PER_SECTION + 37),
+            very_similar=(),
+        )
+        dialog = DuplicateListDialog(catalog, source, matches, lambda _rel_path: None)
+        try:
+            deadline = monotonic() + 2
+            while dialog._match_specs and monotonic() < deadline:
+                qt_app.processEvents()
+                sleep(0.01)
+            assert len(dialog.matches.exact) == DuplicateListDialog.MAX_MATCHES_PER_SECTION
+            assert dialog.list_widget.count() <= DuplicateListDialog.MAX_MATCHES_PER_SECTION + 4
+            assert str(DuplicateListDialog.MAX_MATCHES_PER_SECTION + 37) in dialog.list_widget.item(0).text()
+        finally:
+            dialog.close()
+            dialog.deleteLater()
+            qt_app.processEvents()
+
+
+def test_catalog_tags_dialog_load_is_async_and_materialization_is_bounded(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    started = Event()
+    release = Event()
+
+    def blocked_tags(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        started.set()
+        assert release.wait(timeout=5)
+        return [f"tag-{index}" for index in range(CatalogTagsDialog.MAX_VISIBLE_TAGS)], True
+
+    monkeypatch.setattr(CatalogTagsDialog, "_load_catalog_tags", staticmethod(blocked_tags))
+    with Catalog(root) as catalog:
+        started_at = monotonic()
+        dialog = CatalogTagsDialog(catalog)
+        try:
+            assert monotonic() - started_at < 0.1
+            assert started.wait(timeout=1)
+            release.set()
+            deadline = monotonic() + 2
+            while dialog._read_future is not None and monotonic() < deadline:
+                qt_app.processEvents()
+                sleep(0.01)
+            # One non-interactive footer follows the bounded tag page.
+            assert dialog.list_widget.count() == CatalogTagsDialog.MAX_VISIBLE_TAGS + 1
+        finally:
+            release.set()
+            dialog.close()
+            dialog.deleteLater()
+            qt_app.processEvents()
+
+
+def test_catalog_tags_dialog_stages_additions_without_writing_on_ui_thread(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    with Catalog(root) as catalog:
+        writes: list[tuple[str, ...]] = []
+        monkeypatch.setattr(
+            catalog,
+            "define_tags",
+            lambda names: writes.append(tuple(names)),
+        )
+        dialog = CatalogTagsDialog(catalog)
+        try:
+            dialog.entry.setText('Travel, "Black and White", travel')
+            dialog.add_tags()
+
+            assert writes == []
+            assert dialog.requested_tags() == ("Travel", "Black and White")
+            visible = [
+                dialog.list_widget.item(row).text()
+                for row in range(dialog.list_widget.count())
+            ]
+            assert "Travel" in visible
+            assert "Black and White" in visible
+        finally:
+            dialog.close()
+            dialog.deleteLater()
+            qt_app.processEvents()
+
+
+def test_catalog_tag_additions_wait_in_protected_worker_lane(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    window = MainWindow()
+    release = Event()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+
+        class FakeCatalogTagsDialog:
+            def __init__(self, *_args, **_kwargs) -> None:  # type: ignore[no-untyped-def]
+                pass
+
+            def exec(self) -> int:
+                return int(QDialog.DialogCode.Rejected)
+
+            def requested_tags(self) -> tuple[str, ...]:
+                return ("Queued",)
+
+            def deleteLater(self) -> None:
+                pass
+
+        monkeypatch.setattr("marnwick.ui.CatalogTagsDialog", FakeCatalogTagsDialog)
+        release, blocker = block_mutation_lane(window, catalog.root)
+
+        started_at = monotonic()
+        window.open_catalog_tags(catalog.root)
+        assert monotonic() - started_at < 0.1
+        assert catalog.list_tags() == []
+
+        release.set()
+        blocker.result(timeout=2)
+        settle_move_payload_task(window, qt_app)
+        assert catalog.list_tags() == ["Queued"]
+    finally:
+        release.set()
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        window.indexer.shutdown()
+        window.workspace.close()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_image_tag_update_waits_in_protected_worker_lane(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    Image.new("RGB", (8, 8), (10, 20, 30)).save(root / "image.jpg")
+    window = MainWindow()
+    release = Event()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        catalog.refresh()
+        record = catalog.get_image("image.jpg", include_blob=False)
+        assert record is not None
+        expected_identity = catalog.file_identity("image.jpg")
+        window.current_catalog = catalog
+        window.current_dir_rel = ""
+        window.model.set_images(catalog, [record])
+        select_thumbnail_rows(window, [0])
+
+        class FakeTagDialog:
+            def __init__(self, *_args, **_kwargs) -> None:  # type: ignore[no-untyped-def]
+                self.loaded_file_identity = expected_identity
+
+            def exec(self) -> int:
+                return int(QDialog.DialogCode.Accepted)
+
+            def selected_tags(self) -> list[str]:
+                return ["Queued"]
+
+            def deleteLater(self) -> None:
+                pass
+
+        monkeypatch.setattr("marnwick.ui.TagDialog", FakeTagDialog)
+        release, blocker = block_mutation_lane(window, catalog.root)
+
+        started_at = monotonic()
+        window.open_tag_dialog_for_selection()
+        assert monotonic() - started_at < 0.1
+        assert catalog.get_image_tags("image.jpg") == []
+
+        release.set()
+        blocker.result(timeout=2)
+        settle_move_payload_task(window, qt_app)
+        assert catalog.get_image_tags("image.jpg") == ["Queued"]
+    finally:
+        release.set()
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        window.indexer.shutdown()
+        window.workspace.close()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_queued_tag_write_rejects_a_replacement_catalog_root(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    Image.new("RGB", (8, 8), (10, 20, 30)).save(root / "image.jpg")
+    errors: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        "marnwick.ui.show_error",
+        lambda _parent, title, detail: errors.append((title, str(detail))),
+    )
+    window = MainWindow()
+    release = Event()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        original = window.workspace.open_catalog(root)
+        original.refresh()
+        release, blocker = block_mutation_lane(window, original.root)
+
+        queued = window.queue_image_tags(original, "image.jpg", ["Must Not Cross"])
+        assert queued is not None
+        displaced = tmp_path / "displaced-catalog"
+        root.rename(displaced)
+        root.mkdir()
+        Image.new("RGB", (8, 8), (200, 30, 40)).save(root / "image.jpg")
+        with Catalog(root) as replacement:
+            replacement.refresh()
+            assert replacement.root_identity != original.root_identity
+            window.current_catalog = None
+            release.set()
+            blocker.result(timeout=2)
+            settle_move_payload_task(window, qt_app)
+
+            assert replacement.get_image_tags("image.jpg") == []
+            assert (root / "image.jpg").is_file()
+        assert errors and errors[-1][0] == "Image Tags"
+        assert "replaced" in errors[-1][1]
+    finally:
+        release.set()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_queued_tag_write_rejects_replacement_image(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    image_path = root / "image.jpg"
+    replacement = tmp_path / "replacement.jpg"
+    Image.new("RGB", (8, 8), (10, 20, 30)).save(image_path)
+    Image.new("RGB", (9, 9), (200, 30, 40)).save(replacement)
+    errors: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        "marnwick.ui.show_error",
+        lambda _parent, title, detail: errors.append((title, str(detail))),
+    )
+    window = MainWindow()
+    release = Event()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        catalog.refresh()
+        expected_identity = catalog.file_identity("image.jpg")
+        release, blocker = block_mutation_lane(window, catalog.root)
+        queued = window.queue_image_tags(
+            catalog,
+            "image.jpg",
+            ["Must Not Cross"],
+            expected_identity=expected_identity,
+        )
+        assert queued is not None
+        os.replace(replacement, image_path)
+
+        release.set()
+        blocker.result(timeout=2)
+        settle_move_payload_task(window, qt_app)
+
+        assert catalog.get_image_tags("image.jpg") == []
+        assert errors and errors[-1][0] == "Image Tags"
+        assert "changed" in errors[-1][1]
+    finally:
+        release.set()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_catalog_settings_update_waits_in_protected_worker_lane(tmp_path: Path) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    window = MainWindow()
+    release = Event()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        original = catalog.settings
+        updated = CatalogSettings(
+            thumbnail_native_size=original.thumbnail_native_size + 64,
+            prune_parallelism=original.prune_parallelism + 1,
+        )
+        window.current_catalog = catalog
+        window.current_dir_rel = ""
+        release, blocker = block_mutation_lane(window, catalog.root)
+
+        started_at = monotonic()
+        window.apply_catalog_settings(catalog, updated)
+        assert monotonic() - started_at < 0.1
+        assert catalog.settings == original
+
+        release.set()
+        blocker.result(timeout=2)
+        settle_move_payload_task(window, qt_app)
+        assert catalog.settings == updated
+        with Catalog.open_reader(catalog.root) as reader:
+            assert reader.settings == updated
+    finally:
+        release.set()
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        window.indexer.shutdown()
+        window.workspace.close()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
 def test_logs_dialog_displays_catalog_logs_and_copies_line(tmp_path: Path) -> None:
     qt_app = app()
     root = tmp_path / "catalog"
@@ -3538,6 +5864,10 @@ def test_logs_dialog_displays_catalog_logs_and_copies_line(tmp_path: Path) -> No
         dialog = LogsDialog([catalog])
         try:
             assert dialog.copy_buttons
+            deadline = monotonic() + 2
+            while dialog.text.toPlainText() == "Loading logs…" and monotonic() < deadline:
+                qt_app.processEvents()
+                sleep(0.01)
 
             dialog.copy_buttons[0].click()
 
@@ -3546,6 +5876,40 @@ def test_logs_dialog_displays_catalog_logs_and_copies_line(tmp_path: Path) -> No
             assert "File edit saved: one.jpg" in copied
         finally:
             qt_app.clipboard().clear()
+            dialog.close()
+            dialog.deleteLater()
+            qt_app.processEvents()
+
+
+def test_logs_dialog_bounds_text_and_does_not_build_a_widget_per_line(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    huge_text = "log line\n" * (LogsDialog.MAX_DISPLAY_CHARS // 2)
+    monkeypatch.setattr(
+        LogsDialog,
+        "_load_logs",
+        staticmethod(lambda _catalogs, _cancel_event: huge_text),
+    )
+
+    with Catalog(root) as catalog:
+        started_at = monotonic()
+        dialog = LogsDialog([catalog])
+        try:
+            assert monotonic() - started_at < 0.1
+            deadline = monotonic() + 2
+            while dialog.text.toPlainText() == "Loading logs…" and monotonic() < deadline:
+                qt_app.processEvents()
+                sleep(0.01)
+            rendered = dialog.text.toPlainText()
+            assert len(rendered) <= LogsDialog.MAX_DISPLAY_CHARS
+            assert rendered.endswith("[log output truncated]")
+            # A single text document remains cheap to scroll even when the
+            # backing logs contain thousands of lines.
+            assert len(dialog.copy_buttons) == 1
+        finally:
             dialog.close()
             dialog.deleteLater()
             qt_app.processEvents()
@@ -3577,7 +5941,10 @@ def test_directory_properties_dialog_counts_files_and_copies_path(tmp_path: Path
             assert not dialog.is_counting()
             assert dialog.image_count_label.text() == "2"
             assert dialog.other_count_label.text() == "2"
-            assert dialog.image_size_bytes >= 2048
+            assert dialog.image_size_bytes == (
+                (target / "image.jpg").stat().st_size
+                + (target / "nested" / "nested.jpg").stat().st_size
+            )
 
             dialog.copy_path()
 
@@ -3586,6 +5953,60 @@ def test_directory_properties_dialog_counts_files_and_copies_path(tmp_path: Path
             qt_app.clipboard().clear()
             dialog.close()
             dialog.deleteLater()
+            qt_app.processEvents()
+
+
+def test_directory_properties_blocked_scan_never_blocks_ui_or_later_dialog(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    blocked_root = tmp_path / "blocked"
+    fast_root = tmp_path / "fast"
+    blocked_root.mkdir()
+    fast_root.mkdir()
+    (fast_root / "note.txt").write_text("ready")
+    started = Event()
+    release = Event()
+    real_scandir = os.scandir
+
+    def selectively_blocked_scandir(path):  # type: ignore[no-untyped-def]
+        if Path(path) == blocked_root:
+            started.set()
+            assert release.wait(timeout=5)
+        return real_scandir(path)
+
+    with Catalog(blocked_root) as blocked_catalog, Catalog(fast_root) as fast_catalog:
+        monkeypatch.setattr("marnwick.ui.os.scandir", selectively_blocked_scandir)
+        started_at = monotonic()
+        blocked_dialog = DirectoryPropertiesDialog(blocked_catalog, "")
+        fast_dialog = None
+        try:
+            assert monotonic() - started_at < 0.1
+            assert started.wait(timeout=1)
+            heartbeat = Event()
+            QTimer.singleShot(0, heartbeat.set)
+            qt_app.processEvents()
+            assert heartbeat.is_set()
+
+            blocked_dialog.close()
+            qt_app.processEvents()
+            # Each properties dialog owns a discardable worker, so the old
+            # blocked syscall cannot consume a lane needed by the next dialog.
+            fast_dialog = DirectoryPropertiesDialog(fast_catalog, "")
+            deadline = monotonic() + 2
+            while fast_dialog.is_counting() and monotonic() < deadline:
+                qt_app.processEvents()
+                sleep(0.01)
+            assert not fast_dialog.is_counting()
+            assert fast_dialog.other_count_label.text() == "1"
+        finally:
+            release.set()
+            blocked_dialog.close()
+            blocked_dialog.deleteLater()
+            if fast_dialog is not None:
+                fast_dialog.close()
+                fast_dialog.deleteLater()
             qt_app.processEvents()
 
 
@@ -3626,6 +6047,10 @@ def test_catalog_properties_include_database_size(tmp_path: Path) -> None:
         catalog.refresh()
         dialog = DirectoryPropertiesDialog(catalog, "")
         try:
+            deadline = monotonic() + 2
+            while dialog.is_counting() and monotonic() < deadline:
+                qt_app.processEvents()
+                sleep(0.01)
             assert dialog.database_size_label.text() == format_bytes(catalog.catalog_database_size_bytes())
         finally:
             dialog.close()
@@ -3750,6 +6175,7 @@ def test_virtual_directory_tree_loads_tag_and_duplicate_aggregates(tmp_path: Pat
         window.current_catalog = catalog
         window.current_dir_rel = ""
         window.rebuild_tree()
+        settle_tree_build_tasks(window, qt_app)
 
         root_item = window.tree.topLevelItem(0)
         assert root_item is not None
@@ -3898,6 +6324,10 @@ def test_incremental_tree_rebuild_yields_between_batches(tmp_path: Path, monkeyp
 
         root_item = window.tree.topLevelItem(0)
         assert root_item is not None
+        first_turn_deadline = monotonic() + 1.0
+        while root_item.childCount() == 0 and monotonic() < first_turn_deadline:
+            qt_app.processEvents()
+            sleep(0.001)
         assert root_item.childCount() == 1
         assert root_item.child(0).data(0, DIR_REL_ROLE) == "a"
         assert window._tree_build_task is not None
@@ -3905,6 +6335,7 @@ def test_incremental_tree_rebuild_yields_between_batches(tmp_path: Path, monkeyp
         deadline = monotonic() + 1.0
         while window._tree_build_task is not None and monotonic() < deadline:
             qt_app.processEvents()
+            sleep(0.001)
 
         assert window._tree_build_task is None
         selected = window.tree.currentItem()
@@ -3918,6 +6349,236 @@ def test_incremental_tree_rebuild_yields_between_batches(tmp_path: Path, monkeyp
         window.idle_timer.stop()
         window.indexer.shutdown()
         window.workspace.close()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_blocked_tree_page_keeps_navigation_and_qt_event_loop_responsive(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    (root / "target").mkdir(parents=True)
+    started = Event()
+    release = Event()
+    window = MainWindow()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        catalog.remember_directory("target")
+        window.current_catalog = catalog
+        window.current_dir_rel = ""
+        window._shallow_tree_roots.add(catalog.root)
+        window.rebuild_tree()
+        window._shallow_tree_roots.discard(catalog.root)
+        root_item = window.tree.topLevelItem(0)
+        assert root_item is not None
+        original_worker = window._read_tree_page_worker
+
+        def blocked_worker(*args, **kwargs):  # type: ignore[no-untyped-def]
+            started.set()
+            assert release.wait(timeout=5)
+            return original_worker(*args, **kwargs)
+
+        monkeypatch.setattr(window, "_read_tree_page_worker", blocked_worker)
+        monkeypatch.setattr(window, "load_current_directory", lambda **_kwargs: None)
+        monkeypatch.setattr(window, "queue_directory_index", lambda *_args, **_kwargs: None)
+        window._start_incremental_tree_rebuild(catalog, reason="blocked-test")
+        assert started.wait(timeout=1)
+
+        heartbeat = Event()
+        QTimer.singleShot(0, heartbeat.set)
+        started_at = monotonic()
+        window.navigate_to_directory("target")
+
+        assert monotonic() - started_at < 0.25
+        qt_app.processEvents()
+        assert heartbeat.is_set()
+        assert window.tree.topLevelItem(0) is root_item
+        selected = window.tree.currentItem()
+        assert selected is not None
+        assert selected.data(0, DIR_REL_ROLE) == "target"
+        assert window._tree_build_task is not None
+        assert window._tree_build_task.page_future is not None
+        assert window.progress_label.text().startswith("Loading folder tree")
+
+        release.set()
+        settle_tree_build_tasks(window, qt_app, timeout=5)
+    finally:
+        release.set()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_current_catalog_tree_preempts_blocked_older_catalog_page(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    first_root = tmp_path / "first"
+    second_root = tmp_path / "second"
+    first_root.mkdir()
+    second_root.mkdir()
+    first_started = Event()
+    release_first = Event()
+    second_started = Event()
+    second_finished = Event()
+    window = MainWindow()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        first = window.workspace.open_catalog(first_root)
+        second = window.workspace.open_catalog(second_root)
+        first.remember_directory("first-child")
+        second.remember_directory("second-child")
+        window.current_catalog = first
+        window.current_dir_rel = ""
+        window._shallow_tree_roots.update({first.root, second.root})
+        window.rebuild_tree()
+        window._shallow_tree_roots.difference_update({first.root, second.root})
+        original_worker = window._read_tree_page_worker
+
+        def ordered_worker(
+            task_root: Path,
+            expected_root_identity: tuple[int, int],
+            expected_storage_identity: object,
+            generation: int,
+            offset: int,
+            cancel_event: Event,
+        ):  # type: ignore[no-untyped-def]
+            if task_root == first.root:
+                first_started.set()
+                assert release_first.wait(timeout=5)
+            else:
+                second_started.set()
+            result = original_worker(
+                task_root,
+                expected_root_identity,
+                expected_storage_identity,
+                generation,
+                offset,
+                cancel_event,
+            )
+            if task_root == second.root:
+                second_finished.set()
+            return result
+
+        monkeypatch.setattr(window, "_read_tree_page_worker", ordered_worker)
+        window._start_incremental_tree_rebuild(first, reason="old-catalog")
+        assert first_started.wait(timeout=1)
+
+        window.current_catalog = second
+        window._request_incremental_tree_rebuild(second, reason="current-catalog")
+
+        assert window._tree_build_task is not None
+        assert window._tree_build_task.catalog is second
+        assert second_started.wait(timeout=1)
+        assert second_finished.wait(timeout=1)
+        assert not release_first.is_set()
+        deadline = monotonic() + 2
+        while "second-child" not in window._tree_item_maps.get(second.root, {}) and monotonic() < deadline:
+            qt_app.processEvents()
+            sleep(0.001)
+        assert "second-child" in window._tree_item_maps[second.root]
+
+        release_first.set()
+        settle_tree_build_tasks(window, qt_app, timeout=5)
+    finally:
+        release_first.set()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_programmatic_navigation_ensures_tree_path_without_full_rebuild(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    nested = root / "album" / "nested"
+    nested.mkdir(parents=True)
+    Image.new("RGB", (8, 8), (10, 20, 30)).save(nested / "one.png")
+    window = MainWindow()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        catalog.refresh()
+        window.current_catalog = catalog
+        window.current_dir_rel = ""
+        window.rebuild_tree()
+        settle_tree_build_tasks(window, qt_app)
+        root_item = window._tree_item_for_root(catalog.root)
+        assert root_item is not None
+        monkeypatch.setattr(
+            window,
+            "rebuild_tree",
+            lambda: pytest.fail("ordinary navigation rebuilt the whole tree"),
+        )
+
+        window.navigate_to_directory("album/nested")
+        settle_virtual_view_tasks(window, qt_app)
+        assert window._tree_item_for_root(catalog.root) is root_item
+        selected = window.tree.currentItem()
+        assert selected is not None
+        assert selected.data(0, DIR_REL_ROLE) == "album/nested"
+
+        window.navigate_to_image("album/nested/one.png")
+        settle_virtual_view_tasks(window, qt_app)
+        assert window._tree_item_for_root(catalog.root) is root_item
+        assert window.selected_rel_paths() == ["album/nested/one.png"]
+    finally:
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_deep_tree_build_limits_item_work_per_event_turn(tmp_path: Path, monkeypatch) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    window = MainWindow()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        monkeypatch.setattr("marnwick.ui.TREE_BUILD_BATCH_SIZE", 7)
+        monkeypatch.setattr("marnwick.ui.TREE_BUILD_BUDGET_SECONDS", 999.0)
+        catalog = window.workspace.open_catalog(root)
+        paths: list[str] = []
+        current = ""
+        for index in range(80):
+            current = f"{current}/level-{index:03d}" if current else f"level-{index:03d}"
+            paths.append(current)
+            catalog.remember_directory(current)
+        window.current_catalog = catalog
+        window.current_dir_rel = paths[-1]
+        processed_per_turn: list[int] = []
+        original_continue = window._continue_incremental_tree_rebuild
+
+        def counted_continue(generation: int | None = None) -> None:
+            task = window._tree_build_task
+            before = task.processed if task is not None else 0
+            original_continue(generation)
+            if task is not None:
+                processed_per_turn.append(task.processed - before)
+
+        monkeypatch.setattr(window, "_continue_incremental_tree_rebuild", counted_continue)
+        window._start_incremental_tree_rebuild(catalog, reason="deep-test")
+        settle_tree_build_tasks(window, qt_app, timeout=5)
+
+        nonzero_turns = [count for count in processed_per_turn if count]
+        assert nonzero_turns
+        assert max(nonzero_turns) <= 7
+        assert len(nonzero_turns) >= 10
+        selected = window.tree.currentItem()
+        assert selected is not None
+        assert selected.data(0, DIR_REL_ROLE) == paths[-1]
+    finally:
         window.close()
         window.deleteLater()
         qt_app.processEvents()
@@ -4030,6 +6691,7 @@ def test_delete_confirmation_remains_bound_to_originating_catalog(tmp_path: Path
         window.current_catalog = first
         window.current_dir_rel = ""
         window.load_current_directory()
+        settle_virtual_view_tasks(window, qt_app)
         window.select_rel_path("same.jpg")
 
         def switch_catalog_during_confirmation(_parent, _count: int) -> bool:
@@ -4040,10 +6702,54 @@ def test_delete_confirmation_remains_bound_to_originating_catalog(tmp_path: Path
 
         monkeypatch.setattr("marnwick.ui.ask_delete_files", switch_catalog_during_confirmation)
         window.delete_selected()
+        settle_delete_confirmation_tasks(window, qt_app)
         settle_delete_payload_task(window, qt_app)
 
         assert not (first_root / "same.jpg").exists()
         assert (second_root / "same.jpg").is_file()
+    finally:
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_background_catalog_mutation_does_not_reset_current_catalog_pane(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    first_root = tmp_path / "first"
+    second_root = tmp_path / "second"
+    first_root.mkdir()
+    second_root.mkdir()
+    Image.new("RGB", (8, 8), (10, 20, 30)).save(second_root / "visible.jpg")
+    window = MainWindow()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        first = window.workspace.open_catalog(first_root)
+        second = window.workspace.open_catalog(second_root)
+        second.refresh()
+        window.current_catalog = second
+        window.current_dir_rel = ""
+        window.load_current_directory()
+        settle_virtual_view_tasks(window, qt_app)
+        model_images = window.model.images
+        pane_generation = window._physical_pane_generation
+        incremental_roots: list[Path] = []
+        monkeypatch.setattr(
+            window,
+            "_request_incremental_tree_rebuild",
+            lambda catalog, **_kwargs: incremental_roots.append(catalog.root),
+        )
+
+        window._refresh_after_move_payload({first.root})
+        window._refresh_after_file_delete({first.root})
+
+        assert window.current_catalog is second
+        assert window.model.images is model_images
+        assert window._physical_pane_generation == pane_generation
+        assert incremental_roots == [first.root, first.root]
     finally:
         window.close()
         window.deleteLater()
@@ -4079,6 +6785,7 @@ def test_pending_move_stays_hidden_after_navigating_away_and_back(tmp_path: Path
             root,
             "dest",
         )
+        settle_mutation_identity_preflights(window, qt_app)
         window.current_dir_rel = "other"
         window.load_current_directory()
         window.current_dir_rel = "source"
@@ -4129,6 +6836,7 @@ def test_pending_directory_move_hides_descendant_images_in_physical_and_virtual_
             root,
             "dest",
         )
+        settle_mutation_identity_preflights(window, qt_app)
 
         window.load_current_directory()
         assert "source" not in [
@@ -4158,14 +6866,19 @@ def test_catalog_restore_failure_is_retained_without_blocking_startup(tmp_path: 
     config_path = tmp_path / "config.json"
     save_config(AppConfig(catalogs=[str(root)]), config_path)
 
-    def fail_open(_workspace, _root):  # type: ignore[no-untyped-def]
+    def fail_open(_window, _root):  # type: ignore[no-untyped-def]
         raise OSError("catalog is locked")
 
-    monkeypatch.setattr("marnwick.ui.Workspace.open_catalog", fail_open)
+    monkeypatch.setattr(MainWindow, "_open_catalog_worker", fail_open)
     window = MainWindow(config_path=config_path)
     try:
         window.progress_timer.stop()
         window.idle_timer.stop()
+        deadline = monotonic() + 2
+        while "Could not restore catalog" not in window.progress_label.text() and monotonic() < deadline:
+            qt_app.processEvents()
+            window._poll_indexer()
+            sleep(0.01)
         assert window.workspace.catalogs == []
         assert window.current_app_config().catalogs == [str(root)]
         assert "Could not restore catalog" in window.progress_label.text()
@@ -4191,7 +6904,14 @@ def test_directory_discovery_retries_after_prior_cancellations(tmp_path: Path, m
         window._directory_discovery_retry_at[catalog.root] = 0.0
         scheduled: list[IndexTask] = []
 
-        def discover(task_root: Path, *, interactive: bool = True) -> IndexTask:
+        def discover(
+            task_root: Path,
+            *,
+            interactive: bool = True,
+            expected_root_identity: tuple[int, int] | None = None,
+            expected_storage_identity: object | None = None,
+        ) -> IndexTask:
+            del expected_root_identity, expected_storage_identity
             task = IndexTask(
                 "Discovering folders",
                 task_root,
@@ -4229,29 +6949,51 @@ def test_rebuild_tree_acquires_known_directories_only_in_bounded_pages(tmp_path:
         window.idle_timer.stop()
         catalog = window.workspace.open_catalog(root)
         window.current_catalog = catalog
-        window._shallow_tree_roots.discard(catalog.root)
+        window._shallow_tree_roots.add(catalog.root)
         directories = ["", *(f"dir-{index:04d}" for index in range(1200))]
-        calls: list[tuple[int | None, int]] = []
+        calls: list[tuple[int, int, int]] = []
+        tag_calls: list[int] = []
+        ui_thread = get_ident()
 
-        def known_directories(*, limit: int | None = None, offset: int = 0) -> list[str]:
-            calls.append((limit, offset))
-            if limit is None:
-                raise AssertionError("the complete tree was materialized on the GUI thread")
+        def known_directories(
+            _catalog: Catalog,
+            _prefix: str,
+            *,
+            limit: int,
+            offset: int = 0,
+            descending: bool = False,
+            cancel_check=None,
+        ) -> list[str]:
+            del descending
+            assert get_ident() != ui_thread
+            if cancel_check is not None:
+                cancel_check()
+            calls.append((limit, offset, get_ident()))
             return directories[offset : offset + limit]
 
-        monkeypatch.setattr(catalog, "known_directory_count", lambda: len(directories))
-        monkeypatch.setattr(catalog, "list_known_directories", known_directories)
+        monkeypatch.setattr(Catalog, "list_known_directories_with_prefix_page", known_directories)
+
+        def list_tags(_catalog: Catalog) -> list[str]:
+            assert get_ident() != ui_thread
+            tag_calls.append(get_ident())
+            return []
+
+        monkeypatch.setattr(Catalog, "list_tags", list_tags)
 
         window.rebuild_tree()
         assert calls == []
-        window._pending_tree_rebuilds.clear()
+        window._shallow_tree_roots.discard(catalog.root)
         window._start_incremental_tree_rebuild(catalog, reason="test")
         deadline = monotonic() + 3.0
         while (window._tree_build_task is not None or window._pending_tree_rebuilds) and monotonic() < deadline:
             qt_app.processEvents()
+            sleep(0.001)
 
         assert calls
-        assert all(limit == 400 for limit, _offset in calls)
+        assert all(limit == 400 for limit, _offset, _thread in calls)
+        # Tree tag loading uses its own LIMIT query so an adversarial tag set
+        # cannot be materialized by the legacy unbounded list_tags helper.
+        assert tag_calls == []
         assert window._tree_build_task is None
     finally:
         window.close()
@@ -4291,6 +7033,1105 @@ def test_fullscreen_edit_refuses_replacement_created_after_preview(tmp_path: Pat
             qt_app.processEvents()
 
 
+def test_fullscreen_queued_edit_returns_immediately_without_reloading(tmp_path: Path, monkeypatch) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    Image.new("RGB", (8, 4), (10, 20, 30)).save(root / "image.png")
+    started = Event()
+    release = Event()
+    window = MainWindow()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        catalog.refresh()
+        window.current_catalog = catalog
+        original_worker = window._save_image_edit_worker
+
+        def slow_worker(*args, **kwargs):  # type: ignore[no-untyped-def]
+            started.set()
+            assert release.wait(timeout=5)
+            return original_worker(*args, **kwargs)
+
+        monkeypatch.setattr(window, "_save_image_edit_worker", slow_worker)
+        viewer = FullscreenViewer(
+            catalog,
+            ImageNavigator.sequential(["image.png"], "image.png"),
+            window,
+        )
+        try:
+            settle_viewer_load(viewer, qt_app)
+            monkeypatch.setattr("marnwick.ui.ask_save_edits", lambda _parent: "save")
+            monkeypatch.setattr(viewer, "load_current", lambda: pytest.fail("queued save reloaded image"))
+            viewer.operations.append(EditOperation("rotate_right"))
+
+            started_at = monotonic()
+            assert viewer.confirm_pending_edits()
+            assert monotonic() - started_at < 0.25
+            assert started.wait(timeout=1)
+            assert window._move_payload_tasks
+            assert not window._move_payload_tasks[0].future.done()
+        finally:
+            release.set()
+            settle_move_payload_task(window, qt_app, timeout=5)
+            viewer.operations.clear()
+            viewer.close()
+            viewer.deleteLater()
+    finally:
+        release.set()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_fullscreen_async_navigation_ignores_blocked_stale_load(tmp_path: Path, monkeypatch) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    Image.new("RGB", (8, 8), (220, 10, 10)).save(root / "first.png")
+    Image.new("RGB", (8, 8), (10, 220, 10)).save(root / "second.png")
+    started = Event()
+    release = Event()
+    original_loader = FullscreenViewer._load_viewer_image
+
+    def blocked_loader(catalog: Catalog, rel_path: str):  # type: ignore[no-untyped-def]
+        if rel_path == "first.png":
+            started.set()
+            assert release.wait(timeout=5)
+        return original_loader(catalog, rel_path)
+
+    monkeypatch.setattr(FullscreenViewer, "_load_viewer_image", staticmethod(blocked_loader))
+    window = MainWindow()
+    viewer = None
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        catalog.refresh()
+        window.current_catalog = catalog
+        viewer = FullscreenViewer(
+            catalog,
+            ImageNavigator.sequential(["first.png", "second.png"], "first.png"),
+            window,
+        )
+        assert started.wait(timeout=1)
+
+        viewer.navigator.index = 1
+        started_at = monotonic()
+        viewer.load_current()
+        assert monotonic() - started_at < 0.1
+        settle_viewer_load(viewer, qt_app, timeout=2)
+
+        pixel = viewer.base_pixmap.toImage().pixelColor(0, 0)
+        assert pixel.green() > 180
+        assert pixel.red() < 80
+
+        release.set()
+        deadline = monotonic() + 0.2
+        while monotonic() < deadline:
+            qt_app.processEvents()
+            sleep(0.01)
+        pixel = viewer.base_pixmap.toImage().pixelColor(0, 0)
+        assert pixel.green() > 180
+        assert viewer.navigator.current == "second.png"
+    finally:
+        release.set()
+        if viewer is not None:
+            viewer.close()
+            viewer.deleteLater()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_fullscreen_navigation_starts_while_preview_workers_are_blocked(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    Image.new("RGB", (8, 8), (10, 220, 10)).save(root / "image.png")
+    release = Event()
+    previews_started = Event()
+    load_started = Event()
+    preview_calls: list[int] = []
+    window = MainWindow()
+    viewer = None
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        catalog.refresh()
+        viewer = FullscreenViewer(
+            catalog,
+            ImageNavigator.sequential(["image.png"], "image.png"),
+            window,
+        )
+        settle_viewer_load(viewer, qt_app)
+
+        def blocked_preview() -> None:
+            preview_calls.append(1)
+            if len(preview_calls) == 2:
+                previews_started.set()
+            assert release.wait(timeout=5)
+
+        viewer._preview_executor.submit(blocked_preview)
+        viewer._preview_executor.submit(blocked_preview)
+        assert previews_started.wait(timeout=1)
+        original_loader = viewer._load_viewer_image
+
+        def observed_loader(catalog_arg: Catalog, rel_path: str):  # type: ignore[no-untyped-def]
+            load_started.set()
+            return original_loader(catalog_arg, rel_path)
+
+        monkeypatch.setattr(viewer, "_load_viewer_image", observed_loader)
+        viewer.load_current()
+
+        assert load_started.wait(timeout=1)
+    finally:
+        release.set()
+        if viewer is not None:
+            viewer.close()
+            viewer.deleteLater()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_fullscreen_new_preview_generation_bypasses_blocked_stale_decode(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    Image.new("RGB", (1200, 800), (10, 20, 30)).save(root / "image.png")
+    stale_started = Event()
+    latest_started = Event()
+    release_stale = Event()
+    original = FullscreenViewer._render_preview_worker
+
+    def block_first_generation(*args, **kwargs):  # type: ignore[no-untyped-def]
+        operations = args[2]
+        if len(operations) == 1:
+            stale_started.set()
+            assert release_stale.wait(timeout=5)
+        else:
+            latest_started.set()
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        FullscreenViewer,
+        "_render_preview_worker",
+        staticmethod(block_first_generation),
+    )
+    window = MainWindow()
+    viewer = None
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        catalog.refresh()
+        viewer = FullscreenViewer(
+            catalog,
+            ImageNavigator.sequential(["image.png"], "image.png"),
+            window,
+        )
+        settle_viewer_load(viewer, qt_app)
+
+        viewer.operations.append(EditOperation("rotate_right"))
+        viewer.render_preview()
+        assert stale_started.wait(timeout=1)
+
+        viewer.operations.append(EditOperation("flip_horizontal"))
+        started_at = monotonic()
+        viewer.render_preview()
+
+        assert latest_started.wait(timeout=1)
+        assert monotonic() - started_at < 1.0
+        deadline = monotonic() + 3
+        while viewer._preview_future is not None and monotonic() < deadline:
+            qt_app.processEvents()
+            viewer._settle_preview_render()
+            sleep(0.01)
+        assert viewer._preview_future is None
+        assert viewer.preview_image_current
+
+        # Closing must abandon, rather than join, the still-blocked stale
+        # native read.
+        viewer.operations.clear()
+        started_at = monotonic()
+        viewer.close()
+        assert monotonic() - started_at < 0.1
+    finally:
+        release_stale.set()
+        if viewer is not None:
+            viewer.operations.clear()
+            viewer.close()
+            viewer.deleteLater()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_fullscreen_max_zoom_keeps_display_source_bounded(tmp_path: Path) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    # The async viewer should retain full image coordinates while handing the
+    # GUI only an interactively bounded source raster.
+    Image.new("RGB", (5000, 100), (10, 20, 30)).save(root / "wide.png")
+    window = MainWindow()
+    viewer = None
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        catalog.refresh()
+        viewer = FullscreenViewer(
+            catalog,
+            ImageNavigator.sequential(["wide.png"], "wide.png"),
+            window,
+        )
+        settle_viewer_load(viewer, qt_app)
+        viewer.label.resize(800, 600)
+
+        assert viewer.image_coordinate_size == (5000, 100)
+        assert max(viewer.base_pixmap.width(), viewer.base_pixmap.height()) <= 4096
+        source_size = viewer.base_pixmap.size()
+        viewer.zoom_level = viewer.MAX_ZOOM
+        viewer._fit_pixmap()
+
+        assert viewer.displayed_image_rect().width() > viewer.label.width()
+        assert viewer.label.display_pixmap().size() == source_size
+    finally:
+        if viewer is not None:
+            viewer.close()
+            viewer.deleteLater()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_failed_edit_backup_survives_preview_error_until_success(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    Image.new("RGB", (80, 40), (10, 20, 30)).save(root / "image.png")
+    retained = (EditOperation("rotate_right"),)
+    errors: list[str] = []
+    original = FullscreenViewer._render_preview_worker
+
+    def fail_preview(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        raise ValueError("preview failed")
+
+    monkeypatch.setattr(FullscreenViewer, "_render_preview_worker", staticmethod(fail_preview))
+    monkeypatch.setattr(
+        "marnwick.ui.show_error",
+        lambda _parent, _title, message: errors.append(str(message)),
+    )
+    window = MainWindow()
+    viewer = None
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        catalog.refresh()
+        key = (catalog.root, "image.png")
+        window._failed_image_edits[key] = retained
+        viewer = FullscreenViewer(
+            catalog,
+            ImageNavigator.sequential(["image.png"], "image.png"),
+            window,
+        )
+        settle_viewer_load(viewer, qt_app)
+        deadline = monotonic() + 2
+        while viewer._preview_future is not None and monotonic() < deadline:
+            qt_app.processEvents()
+            viewer._settle_preview_render()
+            sleep(0.01)
+
+        assert tuple(viewer.operations) == retained
+        assert window._failed_image_edits[key] == retained
+        assert errors == ["preview failed"]
+
+        monkeypatch.setattr(
+            FullscreenViewer,
+            "_render_preview_worker",
+            staticmethod(original),
+        )
+        viewer.render_preview()
+        deadline = monotonic() + 3
+        while viewer._preview_future is not None and monotonic() < deadline:
+            qt_app.processEvents()
+            viewer._settle_preview_render()
+            sleep(0.01)
+
+        assert viewer.preview_image_current
+        assert tuple(viewer.operations) == retained
+        assert key not in window._failed_image_edits
+    finally:
+        if viewer is not None:
+            viewer.operations.clear()
+            viewer.close()
+            viewer.deleteLater()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_fullscreen_gif_revalidates_identity_before_starting_movie(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    path = root / "animated.gif"
+    replacement = root / "replacement.gif"
+    first_frames = [
+        Image.new("RGB", (16, 16), (255, 0, 0)),
+        Image.new("RGB", (16, 16), (0, 0, 255)),
+    ]
+    second_frames = [
+        Image.new("RGB", (17, 17), (0, 255, 0)),
+        Image.new("RGB", (17, 17), (255, 255, 0)),
+    ]
+    first_frames[0].save(path, save_all=True, append_images=first_frames[1:], duration=50, loop=0)
+    second_frames[0].save(
+        replacement,
+        save_all=True,
+        append_images=second_frames[1:],
+        duration=50,
+        loop=0,
+    )
+    decoded = Event()
+    release_result = Event()
+    original = FullscreenViewer._load_viewer_image
+
+    def pause_after_verified_decode(catalog: Catalog, rel_path: str):  # type: ignore[no-untyped-def]
+        result = original(catalog, rel_path)
+        decoded.set()
+        assert release_result.wait(timeout=5)
+        return result
+
+    monkeypatch.setattr(
+        FullscreenViewer,
+        "_load_viewer_image",
+        staticmethod(pause_after_verified_decode),
+    )
+    window = MainWindow()
+    viewer = None
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        catalog.refresh()
+        viewer = FullscreenViewer(
+            catalog,
+            ImageNavigator.sequential(["animated.gif"], "animated.gif"),
+            window,
+        )
+        assert decoded.wait(timeout=1)
+        os.replace(replacement, path)
+        release_result.set()
+        settle_viewer_load(viewer, qt_app)
+
+        assert viewer.movie is None
+        assert not viewer.base_pixmap.isNull()
+    finally:
+        release_result.set()
+        if viewer is not None:
+            viewer.close()
+            viewer.deleteLater()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_stalled_save_does_not_block_a_different_catalog(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    first_root = tmp_path / "first"
+    second_root = tmp_path / "second"
+    first_root.mkdir()
+    second_root.mkdir()
+    Image.new("RGB", (8, 4), (10, 20, 30)).save(first_root / "image.png")
+    Image.new("RGB", (8, 4), (40, 50, 60)).save(second_root / "image.png")
+    first_started = Event()
+    second_started = Event()
+    release_first = Event()
+    window = MainWindow()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        first = window.workspace.open_catalog(first_root)
+        second = window.workspace.open_catalog(second_root)
+        original_worker = window._save_image_edit_worker
+
+        def controlled_worker(root, *args, **kwargs):  # type: ignore[no-untyped-def]
+            if root == first.root:
+                first_started.set()
+                assert release_first.wait(timeout=5)
+            else:
+                second_started.set()
+            return original_worker(root, *args, **kwargs)
+
+        monkeypatch.setattr(window, "_save_image_edit_worker", controlled_worker)
+        first_task = window.queue_image_edit(
+            first,
+            "image.png",
+            [EditOperation("rotate_right")],
+            preserve_file_dates=False,
+            expected_identity=snapshot_image_file_identity(first_root / "image.png"),
+        )
+        assert first_started.wait(timeout=1)
+
+        second_task = window.queue_image_edit(
+            second,
+            "image.png",
+            [EditOperation("rotate_right")],
+            preserve_file_dates=False,
+            expected_identity=snapshot_image_file_identity(second_root / "image.png"),
+        )
+        assert second_started.wait(timeout=1)
+        second_task.future.result(timeout=3)
+        assert not first_task.future.done()
+
+        heartbeat = Event()
+        QTimer.singleShot(0, heartbeat.set)
+        qt_app.processEvents()
+        assert heartbeat.is_set()
+    finally:
+        release_first.set()
+        settle_move_payload_task(window, qt_app, timeout=8)
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_failed_queued_edit_is_retained_and_restored(tmp_path: Path, monkeypatch) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    path = root / "image.png"
+    replacement = root / "replacement.png"
+    Image.new("RGB", (8, 4), (10, 20, 30)).save(path)
+    Image.new("RGB", (8, 4), (200, 10, 20)).save(replacement)
+    window = MainWindow()
+    viewer = None
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        monkeypatch.setattr("marnwick.ui.show_error", lambda *_args: None)
+        monkeypatch.setattr("marnwick.ui.ask_save_edits", lambda _parent: "save")
+        catalog = window.workspace.open_catalog(root)
+        catalog.refresh()
+        window.current_catalog = catalog
+        viewer = FullscreenViewer(
+            catalog,
+            ImageNavigator.sequential(["image.png"], "image.png"),
+            window,
+        )
+        settle_viewer_load(viewer, qt_app)
+        assert viewer.loaded_file_identity is not None
+        os.replace(replacement, path)
+        viewer.operations.append(EditOperation("rotate_right"))
+
+        assert viewer.confirm_pending_edits()
+        settle_move_payload_task(window, qt_app, timeout=5)
+
+        assert (catalog.root, "image.png") in window._failed_image_edits
+        viewer.load_current()
+        settle_viewer_load(viewer, qt_app)
+        deadline = monotonic() + 3
+        while viewer._preview_future is not None and monotonic() < deadline:
+            qt_app.processEvents()
+            viewer._settle_preview_render()
+            sleep(0.01)
+        assert [operation.name for operation in viewer.operations] == ["rotate_right"]
+        assert (catalog.root, "image.png") not in window._failed_image_edits
+    finally:
+        if viewer is not None:
+            viewer.operations.clear()
+            viewer.close()
+            viewer.deleteLater()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_close_requires_explicit_discard_of_failed_image_edits(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    window = MainWindow()
+    window.show()
+    qt_app.processEvents()
+    key = (root.resolve(), "image.png")
+    window._failed_image_edits[key] = (EditOperation("rotate_right"),)
+    try:
+        monkeypatch.setattr(
+            "marnwick.ui.ask_discard_failed_edits_on_exit",
+            lambda _parent, _count: False,
+        )
+
+        assert window.close() is False
+        assert window.isVisible()
+        assert key in window._failed_image_edits
+
+        monkeypatch.setattr(
+            "marnwick.ui.ask_discard_failed_edits_on_exit",
+            lambda _parent, _count: True,
+        )
+        assert window.close() is True
+        assert not window._failed_image_edits
+    finally:
+        window._failed_image_edits.clear()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_failed_save_dialog_is_owned_by_visible_editor(tmp_path: Path, monkeypatch) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    owner = QDialog()
+    owner.show()
+    window = MainWindow()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        task = IndexTask(
+            "Saving image edit",
+            root,
+            "",
+            interactive=True,
+            idle_sleep_seconds=0.0,
+            preemptible=False,
+        )
+        future: Future[MovePayloadResult] = Future()
+        future.set_exception(OSError("encode failed"))
+        window._move_payload_tasks.append(
+            MovePayloadTask(
+                dest_root=root.resolve(),
+                dest_dir_rel="",
+                affected_roots={root.resolve()},
+                task=task,
+                future=future,
+                started_at=monotonic(),
+                target_images=((root.resolve(), "image.png"),),
+                completion_verb="Saved",
+                error_title="Save Image",
+                dedicated_executor=True,
+                edit_operations=(EditOperation("rotate_right"),),
+                edit_owner=owner,
+            )
+        )
+        shown: list[QDialog] = []
+        monkeypatch.setattr(
+            "marnwick.ui.show_error",
+            lambda parent, _title, _detail: shown.append(parent),
+        )
+
+        window._settle_move_payload_task()
+
+        assert shown == [owner]
+    finally:
+        window._failed_image_edits.clear()
+        owner.close()
+        owner.deleteLater()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_committed_save_warning_reconciles_without_replaying_operations(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    path = root / "image.png"
+    path.touch()
+    window = MainWindow()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        operations = (EditOperation("rotate_right"),)
+
+        committed_proof = CommittedImageProof(1, 2, 1, 3, 4, "a" * 64)
+
+        def committed_save(*_args, **_kwargs) -> None:  # type: ignore[no-untyped-def]
+            error = ImageSaveCommittedError("image saved; recovery cleanup failed")
+            error.committed_proof = committed_proof
+            raise error
+
+        monkeypatch.setattr("marnwick.ui.apply_operations_to_file_with_proof", committed_save)
+        monkeypatch.setattr(Catalog, "mutation_path", lambda _catalog, _rel_path: path)
+        task = IndexTask(
+            "Saving image edit",
+            root,
+            "",
+            interactive=True,
+            idle_sleep_seconds=0.0,
+            preemptible=False,
+        )
+        result = window._save_image_edit_worker(
+            root.resolve(),
+            "image.png",
+            operations,
+            False,
+            None,
+            None,
+            task,
+        )
+        assert result.moved == 1
+        assert result.warning == "image saved; recovery cleanup failed"
+        assert result.target_proofs == {"image.png": committed_proof.as_catalog_proof()}
+        assert task.snapshot().done
+        assert task.snapshot().error is None
+
+        future: Future[MovePayloadResult] = Future()
+        future.set_result(result)
+        move_task = MovePayloadTask(
+            dest_root=root.resolve(),
+            dest_dir_rel="",
+            affected_roots={root.resolve()},
+            task=task,
+            future=future,
+            started_at=monotonic(),
+            target_images=((root.resolve(), "image.png"),),
+            completion_verb="Saved",
+            error_title="Save Image",
+            dedicated_executor=True,
+            edit_operations=operations,
+        )
+        window._move_payload_tasks.append(move_task)
+        reconciled = []
+        reconcile_task = IndexTask(
+            "Updating saved image",
+            root,
+            "",
+            interactive=False,
+            idle_sleep_seconds=0.0,
+            preemptible=False,
+        )
+        monkeypatch.setattr(window.workspace, "catalog_for_root", lambda _root: object())
+        monkeypatch.setattr(
+            window,
+            "_submit_image_reconciliation",
+            lambda context: reconciled.append(context) or reconcile_task,
+        )
+        warnings: list[tuple[str, str]] = []
+        monkeypatch.setattr(
+            "marnwick.ui.show_error",
+            lambda _parent, title, detail: warnings.append((title, detail)),
+        )
+
+        window._settle_move_payload_task()
+
+        assert len(reconciled) == 1
+        assert reconciled[0].rel_path == "image.png"
+        assert (root.resolve(), "image.png") not in window._failed_image_edits
+        assert warnings and warnings[0][0] == "Save Image Warning"
+    finally:
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_saved_image_reconciliation_indexes_with_committed_proof_without_pre_hash(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "catalog"
+    root.mkdir()
+    Image.new("RGB", (20, 10), (10, 20, 30)).save(root / "image.png")
+    with Catalog(root) as catalog:
+        assert catalog.index_image("image.png") is not None
+        proof = catalog.file_proof("image.png")
+
+    real_index = Catalog.index_image
+    received_proofs: list[object] = []
+
+    def capture_index(
+        catalog: Catalog,
+        rel_path: str,
+        cancel_check=None,
+        *,
+        force: bool = False,
+        expected_proof=None,
+    ):  # type: ignore[no-untyped-def]
+        received_proofs.append(expected_proof)
+        return real_index(
+            catalog,
+            rel_path,
+            cancel_check,
+            force=force,
+            expected_proof=expected_proof,
+        )
+
+    monkeypatch.setattr(Catalog, "index_image", capture_index)
+    monkeypatch.setattr(
+        Catalog,
+        "file_proof",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("reconciliation performed a redundant full-file proof hash")
+        ),
+    )
+    task = IndexTask(
+        "Updating saved image",
+        root,
+        "",
+        interactive=False,
+        idle_sleep_seconds=0.0,
+        preemptible=False,
+    )
+
+    MainWindow._reconcile_saved_image_worker(  # type: ignore[arg-type]
+        None,
+        root.resolve(),
+        "image.png",
+        proof,
+        task,
+    )
+
+    assert received_proofs == [proof]
+    assert task.snapshot().done
+    assert task.snapshot().error is None
+
+
+def test_delete_waits_for_overlapping_queued_image_save(tmp_path: Path, monkeypatch) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    Image.new("RGB", (8, 4), (10, 20, 30)).save(root / "image.png")
+    release = Event()
+    window = MainWindow()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        monkeypatch.setattr("marnwick.ui.show_error", lambda *_args: None)
+        catalog = window.workspace.open_catalog(root)
+        catalog.refresh()
+        original_worker = window._save_image_edit_worker
+
+        def slow_worker(*args, **kwargs):  # type: ignore[no-untyped-def]
+            assert release.wait(timeout=5)
+            return original_worker(*args, **kwargs)
+
+        monkeypatch.setattr(window, "_save_image_edit_worker", slow_worker)
+        identity = snapshot_image_file_identity(root / "image.png")
+        mutation = window.queue_image_edit(
+            catalog,
+            "image.png",
+            [EditOperation("rotate_right")],
+            preserve_file_dates=False,
+            expected_identity=identity,
+        )
+        release.set()
+        deadline = monotonic() + 5
+        while not mutation.future.done() and monotonic() < deadline:
+            sleep(0.01)
+        assert mutation.future.done()
+        # Exercise the narrow interval after file encoding completes but
+        # before the GUI has queued catalog reconciliation.
+        window.queue_delete_images(
+            catalog,
+            ["image.png"],
+            expected_identities=catalog.file_identities(["image.png"]),
+            wipe=False,
+            remove_from_current_view=False,
+        )
+
+        assert window._deferred_delete_requests
+        assert not window._delete_payload_tasks
+        settle_move_payload_task(window, qt_app, timeout=5)
+        deadline = monotonic() + 5
+        while not window._delete_payload_tasks and monotonic() < deadline:
+            qt_app.processEvents()
+            window._poll_indexer()
+            sleep(0.01)
+        assert window._delete_payload_tasks
+        settle_delete_payload_task(window, qt_app, timeout=5)
+        assert not (root / "image.png").exists()
+    finally:
+        release.set()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_delete_uses_committed_save_proof_while_reconciliation_is_active(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    image_path = root / "image.png"
+    Image.new("RGB", (8, 4), (10, 20, 30)).save(image_path)
+    reconcile_started = Event()
+    release_reconcile = Event()
+    window = MainWindow()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        monkeypatch.setattr("marnwick.ui.show_error", lambda *_args: None)
+        catalog = window.workspace.open_catalog(root)
+        catalog.refresh()
+        old_catalog_identity = catalog.file_identity("image.png")
+        original_reconcile = window._reconcile_saved_image_worker
+
+        def slow_reconcile(*args, **kwargs):  # type: ignore[no-untyped-def]
+            reconcile_started.set()
+            assert release_reconcile.wait(timeout=5)
+            return original_reconcile(*args, **kwargs)
+
+        monkeypatch.setattr(window, "_reconcile_saved_image_worker", slow_reconcile)
+        mutation = window.queue_image_edit(
+            catalog,
+            "image.png",
+            [EditOperation("rotate_right")],
+            preserve_file_dates=False,
+            expected_identity=snapshot_image_file_identity(image_path),
+        )
+        mutation.future.result(timeout=5)
+        window._settle_move_payload_task()
+        assert reconcile_started.wait(timeout=1)
+
+        # Simulate a delete confirmation that began before the edit committed.
+        window.queue_delete_images(
+            catalog,
+            ["image.png"],
+            expected_identities={"image.png": old_catalog_identity},
+            wipe=False,
+            remove_from_current_view=False,
+        )
+
+        assert len(window._deferred_delete_requests) == 1
+        request = window._deferred_delete_requests[0]
+        assert "image.png" not in request.expected_identities
+        assert "image.png" in request.expected_proofs
+
+        release_reconcile.set()
+        deadline = monotonic() + 8
+        while image_path.exists() and monotonic() < deadline:
+            qt_app.processEvents()
+            window._poll_indexer()
+            sleep(0.01)
+        window._poll_indexer()
+        assert not image_path.exists()
+    finally:
+        release_reconcile.set()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_delete_rejects_unindexed_image_replaced_after_confirmation_snapshot(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    path = root / "image.png"
+    replacement = tmp_path / "replacement.png"
+    Image.new("RGB", (8, 8), (200, 10, 10)).save(path)
+    Image.new("RGB", (8, 8), (10, 20, 220)).save(replacement)
+    window = MainWindow()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        window.current_catalog = catalog
+        window.current_dir_rel = ""
+        window.load_current_directory()
+        settle_virtual_view_tasks(window, qt_app)
+        record = next(item for item in window.model.images if isinstance(item, ImageRecord))
+        assert record.id == -1
+
+        def replace_then_confirm(_parent, _count: int) -> bool:  # type: ignore[no-untyped-def]
+            os.replace(replacement, path)
+            return True
+
+        monkeypatch.setattr("marnwick.ui.ask_delete_files", replace_then_confirm)
+        monkeypatch.setattr("marnwick.ui.show_error", lambda *_args: None)
+
+        window.delete_selected(catalog=catalog, rel_paths=["image.png"])
+        settle_delete_confirmation_tasks(window, qt_app)
+        assert window._delete_payload_tasks
+        settle_delete_payload_task(window, qt_app, timeout=5)
+
+        assert path.is_file()
+        with Image.open(path) as image:
+            assert image.getpixel((0, 0)) == (10, 20, 220)
+    finally:
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_directory_delete_rejects_replacement_made_during_confirmation(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    target = root / "target"
+    replacement = tmp_path / "replacement"
+    target.mkdir(parents=True)
+    replacement.mkdir()
+    Image.new("RGB", (4, 4), (200, 10, 10)).save(target / "old.png")
+    Image.new("RGB", (4, 4), (10, 20, 220)).save(replacement / "new.png")
+    displaced = tmp_path / "displaced"
+    window = MainWindow()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        catalog.refresh()
+        window.current_catalog = catalog
+        window.current_dir_rel = ""
+        window.load_current_directory()
+
+        def replace_then_confirm(_parent, _path: Path) -> bool:  # type: ignore[no-untyped-def]
+            target.rename(displaced)
+            replacement.rename(target)
+            return True
+
+        monkeypatch.setattr("marnwick.ui.ask_delete_directory", replace_then_confirm)
+        monkeypatch.setattr("marnwick.ui.show_error", lambda *_args: None)
+
+        window.delete_directory(catalog.root, "target")
+        settle_delete_confirmation_tasks(window, qt_app)
+        assert window._move_payload_tasks
+        settle_move_payload_task(window, qt_app, timeout=5)
+        settle_virtual_view_tasks(window, qt_app)
+
+        assert (target / "new.png").is_file()
+        assert any(
+            isinstance(record, DirectoryRecord) and record.dir_rel == "target"
+            for record in window.model.images
+        )
+    finally:
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_timing_event_write_is_off_the_ui_thread(tmp_path: Path, monkeypatch) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    started = Event()
+    release = Event()
+    window = MainWindow()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+
+        def slow_write(*_args, **_kwargs) -> None:  # type: ignore[no-untyped-def]
+            started.set()
+            assert release.wait(timeout=5)
+
+        monkeypatch.setattr(window, "_write_timing_event", slow_write)
+        started_at = monotonic()
+        window._append_timing_event(catalog.root, "test")
+
+        assert monotonic() - started_at < 0.1
+        assert started.wait(timeout=1)
+    finally:
+        release.set()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_queued_timing_event_rejects_a_replaced_catalog_state(
+    tmp_path: Path,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    replacement_root = tmp_path / "replacement"
+    root.mkdir()
+    window = MainWindow()
+    started = Event()
+    release = Event()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        with Catalog(replacement_root):
+            pass
+        replacement_state = replacement_root / ".marnwick"
+        replacement_timing = replacement_state / "timings.json"
+        replacement_payload = b'{"replacement": true}\n'
+        replacement_timing.write_bytes(replacement_payload)
+
+        def hold_timing_lane() -> None:
+            started.set()
+            assert release.wait(timeout=5)
+
+        blocker = window.timing_executor.submit(hold_timing_lane)
+        assert started.wait(timeout=2)
+        window._append_timing_event(catalog.root, "must-not-reach-replacement")
+
+        displaced_state = root / ".marnwick-displaced"
+        catalog.state_dir.rename(displaced_state)
+        replacement_state.rename(catalog.state_dir)
+        release.set()
+        blocker.result(timeout=2)
+        marker = window.timing_executor.submit(lambda: None)
+        marker.result(timeout=2)
+
+        assert (catalog.state_dir / "timings.json").read_bytes() == replacement_payload
+    finally:
+        release.set()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_missing_configured_catalog_is_not_recreated(tmp_path: Path) -> None:
+    qt_app = app()
+    missing = tmp_path / "missing"
+    config_path = tmp_path / "config.json"
+    save_config(AppConfig(catalogs=[str(missing)]), config_path)
+    window = MainWindow(config_path=config_path)
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        settle_initial_config_load(window, qt_app)
+        deadline = monotonic() + 2.0
+        while window._catalog_open_tasks and monotonic() < deadline:
+            window._settle_catalog_open_tasks()
+            qt_app.processEvents()
+            sleep(0.01)
+
+        assert not missing.exists()
+        assert str(missing) in window.current_app_config().catalogs
+    finally:
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
 def test_thumbnail_selection_is_remembered_per_directory(tmp_path: Path) -> None:
     qt_app = app()
     root = tmp_path / "catalog"
@@ -4307,12 +8148,15 @@ def test_thumbnail_selection_is_remembered_per_directory(tmp_path: Path) -> None
         window.current_catalog = catalog
         window.current_dir_rel = "first"
         window.load_current_directory()
+        settle_virtual_view_tasks(window, qt_app)
         window.select_rel_path("first/a.jpg")
         window.current_dir_rel = "second"
         window.load_current_directory()
+        settle_virtual_view_tasks(window, qt_app)
         window.select_rel_path("second/b.jpg")
         window.current_dir_rel = "first"
         window.load_current_directory()
+        settle_virtual_view_tasks(window, qt_app)
 
         assert window.selected_rel_paths() == ["first/a.jpg"]
     finally:
@@ -4321,7 +8165,7 @@ def test_thumbnail_selection_is_remembered_per_directory(tmp_path: Path) -> None
         qt_app.processEvents()
 
 
-def test_subtick_directory_index_completion_reloads_current_view(tmp_path: Path) -> None:
+def test_unindexed_directory_shows_placeholders_then_reloads_completed_index(tmp_path: Path) -> None:
     qt_app = app()
     root = tmp_path / "catalog"
     root.mkdir()
@@ -4334,15 +8178,67 @@ def test_subtick_directory_index_completion_reloads_current_view(tmp_path: Path)
         window.current_catalog = catalog
         window.current_dir_rel = ""
         window.load_current_directory()
-        assert window.model.images == []
+        settle_virtual_view_tasks(window, qt_app)
+        assert [record.rel_path for record in window.model.images if isinstance(record, ImageRecord)] == ["new.jpg"]
+        assert window.model.images[0].id == -1
 
         window.queue_directory_index(catalog, "")
         task = window._directory_index_tasks[(catalog.root, "")]
         task.wait(timeout=5)
         window._poll_indexer()
+        settle_virtual_view_tasks(window, qt_app)
 
         assert [record.rel_path for record in window.model.images if isinstance(record, ImageRecord)] == ["new.jpg"]
     finally:
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_unindexed_placeholders_appear_before_blocked_directory_index_finishes(
+    tmp_path: Path,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    Image.new("RGB", (8, 8), (10, 20, 30)).save(root / "new.jpg")
+    release = Event()
+    started = Event()
+    window = MainWindow()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        task = IndexTask(
+            "Blocked directory index",
+            catalog.root,
+            "",
+            interactive=True,
+            idle_sleep_seconds=0.0,
+            preemptible=False,
+        )
+
+        def blocked_index() -> None:
+            started.set()
+            assert release.wait(timeout=5)
+            task.mark_done()
+
+        future = window.file_move_executor.submit(blocked_index)
+        task.bind_future(future)
+        window._directory_index_tasks[(catalog.root, "")] = task
+        assert started.wait(timeout=1)
+        window.current_catalog = catalog
+        window.current_dir_rel = ""
+
+        window.load_current_directory()
+        settle_virtual_view_tasks(window, qt_app)
+
+        assert not future.done()
+        images = [record for record in window.model.images if isinstance(record, ImageRecord)]
+        assert [record.rel_path for record in images] == ["new.jpg"]
+        assert images[0].id == -1
+    finally:
+        release.set()
         window.close()
         window.deleteLater()
         qt_app.processEvents()
@@ -4375,7 +8271,7 @@ def test_dismissing_child_tree_context_menu_does_not_open_catalog_tags(tmp_path:
         catalog.remember_directory("child")
         window.rebuild_tree()
         window.show()
-        qt_app.processEvents()
+        settle_tree_build_tasks(window, qt_app)
         child = window.tree.topLevelItem(0).child(0)
         assert child is not None
         monkeypatch.setattr("marnwick.ui.QMenu", DismissedMenu)
@@ -4424,10 +8320,1472 @@ def test_large_physical_view_is_built_off_ui_thread(tmp_path: Path, monkeypatch)
 
         window.load_current_directory()
 
-        assert window.model.images == []
         assert window._virtual_view_tasks
         settle_virtual_view_tasks(window, qt_app)
         assert [record.rel_path for record in window.model.images if isinstance(record, ImageRecord)] == ["one.jpg"]
+    finally:
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_quick_physical_preview_publishes_before_full_worker_finishes(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    Image.new("RGB", (8, 8), (10, 20, 30)).save(root / "one.jpg")
+    full_started = Event()
+    release = Event()
+    window = MainWindow()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        original_worker = window._physical_view_worker
+
+        def blocked_full(*args, **kwargs):  # type: ignore[no-untyped-def]
+            full_started.set()
+            assert release.wait(timeout=5)
+            return original_worker(*args, **kwargs)
+
+        monkeypatch.setattr(window, "_physical_view_worker", blocked_full)
+        window.current_catalog = catalog
+        window.current_dir_rel = ""
+        window.load_current_directory()
+        assert full_started.wait(timeout=1)
+        deadline = monotonic() + 2
+        while not window.model.images and monotonic() < deadline:
+            qt_app.processEvents()
+            window._settle_virtual_view_tasks()
+            sleep(0.01)
+
+        assert [record.rel_path for record in window.model.images] == ["one.jpg"]
+        assert any(
+            task.kind == "physical" and not task.future.done()
+            for task in window._virtual_view_tasks.values()
+        )
+        release.set()
+        settle_virtual_view_tasks(window, qt_app, timeout=5)
+        assert window.model.is_paged
+        assert [record.rel_path for record in window.model.images] == ["one.jpg"]
+    finally:
+        release.set()
+        settle_virtual_view_tasks(window, qt_app, timeout=5)
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_full_physical_result_keeps_later_filesystem_preview_placeholder(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    Image.new("RGB", (8, 8), (10, 20, 30)).save(root / "indexed.png")
+    preview_started = Event()
+    release_preview = Event()
+    window = MainWindow()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        catalog.refresh()
+        Image.new("RGB", (8, 8), (40, 50, 60)).save(root / "new.png")
+        original_preview = window._quick_physical_view_worker
+
+        def blocked_preview(*args, **kwargs):  # type: ignore[no-untyped-def]
+            preview_started.set()
+            assert release_preview.wait(timeout=5)
+            result = original_preview(*args, **kwargs)
+            # Model a bounded/partial preview that observed the new file but
+            # omitted an already indexed row. Completion order must not make
+            # that indexed thumbnail disappear.
+            result.images = [record for record in result.images if record.rel_path == "new.png"]
+            return result
+
+        monkeypatch.setattr(window, "_quick_physical_view_worker", blocked_preview)
+        window.current_catalog = catalog
+        window.current_dir_rel = ""
+        window.load_current_directory()
+        assert preview_started.wait(timeout=1)
+
+        deadline = monotonic() + 2
+        while not window.model.is_paged and monotonic() < deadline:
+            qt_app.processEvents()
+            window._settle_virtual_view_tasks()
+            sleep(0.01)
+        assert window.model.is_paged
+        assert [record.rel_path for record in window.model.images] == ["indexed.png"]
+        assert isinstance(window.model.images[0], ImageRecord)
+        assert window.model.images[0].id != -1
+
+        release_preview.set()
+        settle_virtual_view_tasks(window, qt_app, timeout=5)
+        assert window.model.is_paged
+        assert [record.rel_path for record in window.model.images] == [
+            "indexed.png",
+            "new.png",
+        ]
+    finally:
+        release_preview.set()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_index_progress_coalesces_reload_behind_inflight_physical_view(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    Image.new("RGB", (8, 8), (10, 20, 30)).save(root / "new.jpg")
+    first_started = Event()
+    release_first = Event()
+    calls: list[tuple[int, Event]] = []
+    window = MainWindow()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        original_worker = window._physical_view_worker
+
+        def blocked_first(
+            task_root: Path,
+            expected_root_identity: tuple[int, int],
+            expected_storage_identity: object,
+            dir_rel: str,
+            sort_value: str,
+            fingerprint: int,
+            cancel_event: Event,
+        ) -> VirtualViewResult:
+            calls.append((fingerprint, cancel_event))
+            if len(calls) == 1:
+                first_started.set()
+                assert release_first.wait(timeout=5)
+            return original_worker(
+                task_root,
+                expected_root_identity,
+                expected_storage_identity,
+                dir_rel,
+                sort_value,
+                fingerprint,
+                cancel_event,
+            )
+
+        monkeypatch.setattr(window, "_physical_view_worker", blocked_first)
+        progress_task = IndexTask(
+            "Indexing directory",
+            catalog.root,
+            "",
+            interactive=True,
+            idle_sleep_seconds=0.0,
+            preemptible=False,
+        )
+        progress_task.update(1, 2, "newly-indexed.jpg")
+        monkeypatch.setattr(window.indexer, "active_snapshots", lambda: [progress_task.snapshot()])
+        window.current_catalog = catalog
+        window.current_dir_rel = ""
+        window.load_current_directory()
+        assert first_started.wait(timeout=1)
+        generation = window._physical_pane_generation
+
+        for _ in range(8):
+            window._poll_indexer()
+            qt_app.processEvents()
+
+        assert window._physical_pane_generation == generation
+        assert len(calls) == 1
+        assert not calls[0][1].is_set()
+        assert window._pending_physical_progress_reload == (
+            catalog.root,
+            "",
+            window.current_sort,
+        )
+
+        release_first.set()
+        settle_virtual_view_tasks(window, qt_app, timeout=5)
+
+        assert len(calls) == 2
+        assert window._physical_pane_generation == generation + 1
+        assert not window._pending_physical_progress_reload
+        assert [record.rel_path for record in window.model.images] == ["new.jpg"]
+    finally:
+        release_first.set()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_rapid_large_directory_navigation_does_not_reuse_or_wait_for_stale_load(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    (root / "a").mkdir(parents=True)
+    (root / "b").mkdir()
+    first_a_started = Event()
+    release_first_a = Event()
+    calls: list[str] = []
+    window = MainWindow()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        window.current_catalog = catalog
+        monkeypatch.setattr(Catalog, "directory_pane_record_count", lambda *_args: 401)
+
+        def record(dir_rel: str, marker: int) -> ImageRecord:
+            return ImageRecord(
+                id=marker,
+                catalog_root=root,
+                rel_path=f"{dir_rel}/latest.jpg",
+                dir_rel=dir_rel,
+                filename="latest.jpg",
+                size_bytes=1,
+                mtime_ns=1,
+                width=1,
+                height=1,
+                aspect_ratio=1.0,
+                thumb_width=1,
+                thumb_height=1,
+            )
+
+        def worker(
+            task_root: Path,
+            _expected_root_identity: tuple[int, int],
+            _expected_storage_identity: object,
+            dir_rel: str,
+            sort_value: str,
+            fingerprint: int,
+            cancel_event: Event,
+        ) -> VirtualViewResult:
+            calls.append(dir_rel)
+            invocation = calls.count(dir_rel)
+            if dir_rel == "a" and invocation == 1:
+                first_a_started.set()
+                assert release_first_a.wait(timeout=5)
+            elif cancel_event.wait(timeout=0.03):
+                raise IndexTaskCancelled()
+            return VirtualViewResult(
+                root=task_root,
+                kind="physical",
+                value=dir_rel,
+                sort_order=SortOrder(sort_value),
+                fingerprint=fingerprint,
+                images=[record(dir_rel, invocation)],
+                duration_ms=1.0,
+            )
+
+        monkeypatch.setattr(window, "_physical_view_worker", worker)
+        window.current_dir_rel = "a"
+        window.load_current_directory()
+        assert first_a_started.wait(timeout=1)
+
+        window._cancel_virtual_view_tasks(root)
+        window.current_dir_rel = "b"
+        window.load_current_directory()
+        window._cancel_virtual_view_tasks(root)
+        window.current_dir_rel = "a"
+        window.load_current_directory()
+
+        deadline = monotonic() + 1.0
+        while calls.count("a") < 2 and monotonic() < deadline:
+            qt_app.processEvents()
+            sleep(0.01)
+        assert calls.count("a") == 2
+
+        release_first_a.set()
+        settle_virtual_view_tasks(window, qt_app, timeout=5)
+        assert [record.rel_path for record in window.model.images] == ["a/latest.jpg"]
+    finally:
+        release_first_a.set()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_thumbnail_model_retries_placeholder_thumbnails_in_bounded_refreshes(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    image_path = root / "one.png"
+    Image.new("RGB", (4, 4), (10, 20, 30)).save(image_path)
+    thumbnail_bytes = image_path.read_bytes()
+    with Catalog(root) as catalog:
+        record = ImageRecord(
+            id=-1,
+            catalog_root=root,
+            rel_path="one.png",
+            dir_rel="",
+            filename="one.png",
+            size_bytes=image_path.stat().st_size,
+            mtime_ns=image_path.stat().st_mtime_ns,
+            width=0,
+            height=0,
+            aspect_ratio=0.0,
+            thumb_width=0,
+            thumb_height=0,
+        )
+        calls = 0
+
+        def thumbnail(_root: Path, _rel_path: str, _embedded: bytes | None) -> QImage | None:
+            nonlocal calls
+            calls += 1
+            return None if calls == 1 else QImage.fromData(thumbnail_bytes)
+
+        model = ThumbnailModel()
+        try:
+            monkeypatch.setattr(model, "_load_thumbnail_image", thumbnail)
+            model.set_images(catalog, [record])
+            first = model.data(model.index(0, 0), Qt.ItemDataRole.DecorationRole)
+            assert isinstance(first, QPixmap)
+            deadline = monotonic() + 2
+            while calls < 1 and monotonic() < deadline:
+                qt_app.processEvents()
+                sleep(0.01)
+            assert calls == 1
+
+            model.refresh_pending_thumbnails(limit=1)
+            deadline = monotonic() + 2
+            while "one.png" in model._pending_thumbnail_rels and monotonic() < deadline:
+                qt_app.processEvents()
+                sleep(0.01)
+            second = model.data(model.index(0, 0), Qt.ItemDataRole.DecorationRole)
+
+            assert isinstance(second, QPixmap)
+            assert calls == 2
+            assert "one.png" not in model._pending_thumbnail_rels
+        finally:
+            model.close()
+
+
+def test_thumbnail_model_does_not_block_or_apply_stale_directory_loads(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    first_path = root / "first.png"
+    second_path = root / "second.png"
+    Image.new("RGB", (4, 4), (200, 10, 10)).save(first_path)
+    Image.new("RGB", (4, 4), (10, 200, 10)).save(second_path)
+    started = Event()
+    release = Event()
+
+    def record(path: Path) -> ImageRecord:
+        return ImageRecord(
+            id=1,
+            catalog_root=root,
+            rel_path=path.name,
+            dir_rel="",
+            filename=path.name,
+            size_bytes=path.stat().st_size,
+            mtime_ns=path.stat().st_mtime_ns,
+            width=4,
+            height=4,
+            aspect_ratio=1.0,
+            thumb_width=4,
+            thumb_height=4,
+        )
+
+    with Catalog(root) as catalog:
+        def thumbnail(_root: Path, rel_path: str, _embedded: bytes | None) -> QImage | None:
+            if rel_path == "first.png":
+                started.set()
+                assert release.wait(timeout=5)
+                return QImage.fromData(first_path.read_bytes())
+            return QImage.fromData(second_path.read_bytes())
+
+        model = ThumbnailModel()
+        try:
+            monkeypatch.setattr(model, "_load_thumbnail_image", thumbnail)
+            model.set_images(catalog, [record(first_path)])
+            started_at = monotonic()
+            placeholder = model.data(model.index(0, 0), Qt.ItemDataRole.DecorationRole)
+            assert monotonic() - started_at < 0.1
+            assert isinstance(placeholder, QPixmap)
+            assert started.wait(timeout=1)
+
+            model.set_images(catalog, [record(second_path)])
+            model.data(model.index(0, 0), Qt.ItemDataRole.DecorationRole)
+            deadline = monotonic() + 2
+            while "second.png" in model._pending_thumbnail_rels and monotonic() < deadline:
+                qt_app.processEvents()
+                sleep(0.01)
+
+            assert "second.png" not in model._pending_thumbnail_rels
+            assert "first.png" not in model._pixmap_cache
+        finally:
+            release.set()
+            model.close()
+
+
+def test_thumbnail_model_uses_a_bounded_executor_across_blocked_generations(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    path = root / "image.png"
+    Image.new("RGB", (4, 4), (10, 20, 30)).save(path)
+    release = Event()
+    started = Event()
+    calls: list[str] = []
+
+    with Catalog(root) as catalog:
+        record = ImageRecord(
+            id=1,
+            catalog_root=root,
+            rel_path="image.png",
+            dir_rel="",
+            filename="image.png",
+            size_bytes=path.stat().st_size,
+            mtime_ns=path.stat().st_mtime_ns,
+            width=4,
+            height=4,
+            aspect_ratio=1.0,
+            thumb_width=4,
+            thumb_height=4,
+        )
+        model = ThumbnailModel()
+
+        def blocked(_root: Path, rel_path: str, _embedded: bytes | None) -> QImage | None:
+            calls.append(rel_path)
+            started.set()
+            assert release.wait(timeout=5)
+            return QImage.fromData(path.read_bytes())
+
+        monkeypatch.setattr(model, "_load_thumbnail_image", blocked)
+        try:
+            baseline_threads = {
+                thread.ident
+                for thread in enumerate_threads()
+                if thread.name.startswith("marnwick-thumbnail_")
+            }
+            for _ in range(30):
+                model.set_images(catalog, [record])
+                model.data(model.index(0, 0), Qt.ItemDataRole.DecorationRole)
+            assert started.wait(timeout=1)
+            deadline = monotonic() + 1
+            while len(calls) < 4 and monotonic() < deadline:
+                sleep(0.01)
+
+            live_generation_threads = {
+                thread.ident
+                for thread in enumerate_threads()
+                if thread.name.startswith("marnwick-thumbnail_")
+                and thread.ident not in baseline_threads
+            }
+            # Count process-wide threads, not merely the current executor's
+            # private set: replacing pools used to make the old blocked lanes
+            # invisible while leaking one generation of threads at a time.
+            assert len(live_generation_threads) <= 8
+        finally:
+            release.set()
+            model.close()
+            qt_app.processEvents()
+
+
+def test_large_thumbnail_model_indexes_are_built_off_the_gui_thread(tmp_path: Path) -> None:
+    qt_app = app()
+    records = [
+        DirectoryRecord(tmp_path, f"dir-{index:06d}", f"dir-{index:06d}")
+        for index in range(50_000)
+    ]
+    model = ThumbnailModel()
+    try:
+        started_at = monotonic()
+        model.set_images(None, records)
+
+        assert monotonic() - started_at < 0.2
+        assert model.rowCount() == 400
+        assert model.record_indexes_pending
+        deadline = monotonic() + 3
+        while model.record_indexes_pending and monotonic() < deadline:
+            qt_app.processEvents()
+            sleep(0.01)
+        assert not model.record_indexes_pending
+        assert len(model._row_by_key) <= model.rowCount()
+        model.locate_rows_for_keys({("directory", "dir-049999")})
+        deadline = monotonic() + 3
+        while model.record_indexes_pending and monotonic() < deadline:
+            qt_app.processEvents()
+            sleep(0.01)
+        assert model.row_for_key(("directory", "dir-049999")) == 49_999
+    finally:
+        model.close()
+
+
+def test_latest_thumbnail_generation_starts_while_old_workers_are_blocked(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    release = Event()
+    old_started = Event()
+    latest_started = Event()
+    old_calls: list[str] = []
+    with Catalog(root) as catalog:
+        model = ThumbnailModel()
+
+        def blocked(_root: Path, rel_path: str, _blob: bytes | None) -> QImage | None:
+            if rel_path.startswith("old-"):
+                old_calls.append(rel_path)
+                if len(old_calls) == 4:
+                    old_started.set()
+                assert release.wait(timeout=5)
+                return None
+            latest_started.set()
+            return QImage(1, 1, QImage.Format.Format_RGB32)
+
+        monkeypatch.setattr(model, "_load_thumbnail_image", blocked)
+        old_records = [
+            ImageRecord(
+                index,
+                root,
+                f"old-{index}.jpg",
+                "",
+                f"old-{index}.jpg",
+                1,
+                1,
+                1,
+                1,
+                1.0,
+                1,
+                1,
+            )
+            for index in range(4)
+        ]
+        latest = ImageRecord(99, root, "latest.jpg", "", "latest.jpg", 1, 1, 1, 1, 1.0, 1, 1)
+        try:
+            model.set_images(catalog, old_records)
+            for row in range(4):
+                model.data(model.index(row, 0), Qt.ItemDataRole.DecorationRole)
+            assert old_started.wait(timeout=1)
+
+            model.set_images(catalog, [latest])
+            model.data(model.index(0, 0), Qt.ItemDataRole.DecorationRole)
+
+            assert latest_started.wait(timeout=1)
+        finally:
+            release.set()
+            model.close()
+            qt_app.processEvents()
+
+
+def test_thumbnail_retry_and_pixmap_caches_are_bounded(tmp_path: Path) -> None:
+    qt_app = app()
+    model = ThumbnailModel()
+    try:
+        for index in range(MAX_THUMBNAIL_PIXMAP_CACHE_ITEMS + 100):
+            model._cache_pixmap(f"image-{index}.jpg", QPixmap(2, 2))
+        for index in range(MAX_PENDING_THUMBNAIL_RETRIES + 100):
+            model._mark_thumbnail_pending(f"pending-{index}.jpg")
+
+        assert len(model._pixmap_cache) <= MAX_THUMBNAIL_PIXMAP_CACHE_ITEMS
+        assert len(model._pending_thumbnail_rels) <= MAX_PENDING_THUMBNAIL_RETRIES
+    finally:
+        model.close()
+        qt_app.processEvents()
+
+
+def test_missing_indexed_thumbnail_queues_one_targeted_repair(tmp_path: Path) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    Image.new("RGB", (16, 12), (10, 20, 30)).save(root / "image.jpg")
+    window = MainWindow()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        catalog.index_image("image.jpg", force=True)
+        window.current_catalog = catalog
+        record = catalog.get_image("image.jpg", include_blob=False)
+        assert record is not None
+        row = catalog._conn.execute(
+            "SELECT thumb_rel_path FROM images WHERE rel_path = ?",
+            ("image.jpg",),
+        ).fetchone()
+        assert row is not None and row["thumb_rel_path"]
+        cache_path = catalog.state_dir / str(row["thumb_rel_path"])
+        cache_path.unlink()
+        window.model.set_images(catalog, [record])
+
+        window.model.data(window.model.index(0, 0), Qt.ItemDataRole.DecorationRole)
+        deadline = monotonic() + 5
+        while monotonic() < deadline:
+            qt_app.processEvents()
+            window._poll_indexer()
+            if (
+                cache_path.is_file()
+                and not window._thumbnail_repair_tasks
+                and "image.jpg" not in window.model._pending_thumbnail_rels
+            ):
+                break
+            sleep(0.01)
+
+        assert cache_path.is_file()
+        assert not window._thumbnail_repair_tasks
+        assert "image.jpg" not in window.model._pending_thumbnail_rels
+    finally:
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_fullscreen_preview_render_is_async_and_generation_gates_edits(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    Image.new("RGB", (1200, 800), (10, 20, 30)).save(root / "image.jpg")
+    started = Event()
+    release = Event()
+    original = FullscreenViewer._render_preview_worker
+
+    def blocked(*args, **kwargs):  # type: ignore[no-untyped-def]
+        started.set()
+        assert release.wait(timeout=5)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(FullscreenViewer, "_render_preview_worker", staticmethod(blocked))
+    with Catalog(root) as catalog:
+        viewer = FullscreenViewer(catalog, ImageNavigator.sequential(["image.jpg"], "image.jpg"))
+        try:
+            started_at = monotonic()
+            viewer.apply_instant_operation("rotate_right")
+            assert monotonic() - started_at < 0.1
+            assert started.wait(timeout=1)
+
+            viewer.apply_instant_operation("flip_horizontal")
+            assert [operation.name for operation in viewer.operations] == ["rotate_right"]
+
+            release.set()
+            deadline = monotonic() + 5
+            while viewer._preview_future is not None and monotonic() < deadline:
+                qt_app.processEvents()
+                viewer._settle_preview_render()
+                sleep(0.01)
+            assert viewer._preview_future is None
+            assert viewer.image_coordinate_size == (800, 1200)
+        finally:
+            release.set()
+            viewer.operations.clear()
+            viewer.close()
+            viewer.deleteLater()
+            qt_app.processEvents()
+
+
+def test_fullscreen_two_consecutive_saves_reload_identity_and_gate_pending_edits(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    path = root / "image.png"
+    Image.new("RGB", (8, 4), (10, 20, 30)).save(path)
+    window = MainWindow()
+    viewer = None
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        catalog.refresh()
+        window.current_catalog = catalog
+        viewer = FullscreenViewer(
+            catalog,
+            ImageNavigator.sequential(["image.png"], "image.png"),
+            window,
+        )
+        settle_viewer_load(viewer, qt_app)
+        monkeypatch.setattr("marnwick.ui.ask_save_edits", lambda _parent: "save")
+
+        first_identity = viewer.loaded_file_identity
+        viewer.operations.append(EditOperation("rotate_right"))
+        assert viewer.confirm_pending_edits()
+        assert "image.png" in viewer._pending_save_rels
+        viewer.apply_instant_operation("flip_horizontal")
+        assert viewer.operations == []
+
+        settle_saved_image(window, viewer, qt_app)
+        assert "image.png" not in viewer._pending_save_rels
+        assert viewer.loaded_file_identity is not None
+        assert viewer.loaded_file_identity != first_identity
+
+        viewer.operations.append(EditOperation("rotate_right"))
+        assert viewer.confirm_pending_edits()
+        settle_saved_image(window, viewer, qt_app)
+
+        with Image.open(path) as image:
+            assert image.size == (8, 4)
+    finally:
+        if viewer is not None:
+            viewer.operations.clear()
+            viewer.close()
+            viewer.deleteLater()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_restore_waits_for_overlapping_pending_image_save(tmp_path: Path, monkeypatch) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    trash = root / TRASH_DIR_NAME / "batch"
+    trash.mkdir(parents=True)
+    rel_path = f"{TRASH_DIR_NAME}/batch/image.png"
+    Image.new("RGB", (8, 4), (10, 20, 30)).save(root / rel_path)
+    release = Event()
+    window = MainWindow()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        catalog.refresh()
+        original_worker = window._save_image_edit_worker
+
+        def slow_worker(*args, **kwargs):  # type: ignore[no-untyped-def]
+            assert release.wait(timeout=5)
+            return original_worker(*args, **kwargs)
+
+        monkeypatch.setattr(window, "_save_image_edit_worker", slow_worker)
+        window.queue_image_edit(
+            catalog,
+            rel_path,
+            [EditOperation("rotate_right")],
+            preserve_file_dates=False,
+            expected_identity=snapshot_image_file_identity(root / rel_path),
+        )
+
+        window._queue_restore_records(catalog, (("directory", f"{TRASH_DIR_NAME}/batch"),))
+
+        assert len(window._move_payload_tasks) == 1
+        assert "pending image save" in window.progress_label.text()
+        assert (root / rel_path).is_file()
+    finally:
+        release.set()
+        settle_move_payload_task(window, qt_app, timeout=5)
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_initial_tree_and_shallow_folder_scans_have_strict_entry_budgets(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    window = MainWindow()
+
+    class FakeEntry:
+        name = "flat-image.jpg"
+
+        def is_dir(self, *, follow_symlinks: bool = True) -> bool:
+            return False
+
+    class FakeScandir:
+        def __init__(self) -> None:
+            self.examined = 0
+
+        def __enter__(self):  # type: ignore[no-untyped-def]
+            return self
+
+        def __exit__(self, *_args):  # type: ignore[no-untyped-def]
+            return None
+
+        def __iter__(self):  # type: ignore[no-untyped-def]
+            return self
+
+        def __next__(self) -> FakeEntry:
+            if self.examined >= 100_000:
+                raise StopIteration
+            self.examined += 1
+            return FakeEntry()
+
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        scans: list[FakeScandir] = []
+
+        def fake_scandir(_path: Path) -> FakeScandir:
+            scan = FakeScandir()
+            scans.append(scan)
+            return scan
+
+        monkeypatch.setattr("marnwick.ui.os.scandir", fake_scandir)
+        started_at = monotonic()
+        assert window._initial_tree_directory_rels(catalog) == []
+        assert window._shallow_child_directories(catalog, "") == []
+
+        assert monotonic() - started_at < 0.1
+        # Initial tree construction is now purely in-memory. Only the worker
+        # shallow-pane preview touches the directory, under a strict budget.
+        assert len(scans) == 1
+        assert all(scan.examined <= 513 for scan in scans)
+    finally:
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_paged_thumbnail_model_fetches_bounded_pages_and_stops_stale_mutation_cursor(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "catalog"
+    root.mkdir()
+    catalog = Catalog(root)
+    model = ThumbnailModel()
+
+    def image_record(index: int) -> ImageRecord:
+        filename = f"image-{index:03d}.png"
+        return ImageRecord(
+            id=index,
+            catalog_root=root,
+            rel_path=filename,
+            dir_rel="",
+            filename=filename,
+            size_bytes=1,
+            mtime_ns=index,
+            width=1,
+            height=1,
+            aspect_ratio=1.0,
+            thumb_width=1,
+            thumb_height=1,
+        )
+
+    records = [image_record(index) for index in range(6)]
+    requested_offsets: list[int] = []
+    try:
+        model.set_paged_images(
+            catalog,
+            records[:2],
+            total_records=6,
+            total_images=6,
+            next_offset=2,
+            has_more=True,
+            request_page=requested_offsets.append,
+        )
+        assert model.rowCount() == 2
+        assert model.canFetchMore()
+
+        model.fetchMore()
+        model.fetchMore()
+        assert requested_offsets == [2]
+        assert not model.canFetchMore()
+        assert model.append_page(
+            records[2:4],
+            expected_offset=2,
+            next_offset=4,
+            has_more=True,
+            total_records=6,
+            total_images=6,
+        )
+        assert [record.rel_path for record in model.images] == [
+            record.rel_path for record in records[:4]
+        ]
+        assert model.canFetchMore()
+
+        # Removing a loaded row invalidates OFFSET causality. The UI may keep
+        # the remaining thumbnails visible, but it must reload a fresh cursor
+        # rather than skip the row that shifted into the old offset.
+        model.replace_loaded_records(records[1:4])
+        assert [record.rel_path for record in model.images] == [
+            record.rel_path for record in records[1:4]
+        ]
+        assert not model.canFetchMore()
+    finally:
+        model.close()
+        catalog.close()
+
+
+def test_physical_view_worker_returns_one_counted_snapshot_page(tmp_path: Path) -> None:
+    root = tmp_path / "catalog"
+    (root / "a").mkdir(parents=True)
+    (root / "b").mkdir()
+    Image.new("RGB", (1, 1), (1, 2, 3)).save(root / "one.png")
+    Image.new("RGB", (1, 1), (4, 5, 6)).save(root / "two.png")
+    catalog = Catalog(root)
+    try:
+        catalog.refresh()
+        first = MainWindow._physical_view_worker(
+            object(),  # type: ignore[arg-type]
+            catalog.root,
+            catalog.root_identity,
+            catalog.storage_identity,
+            "",
+            SortOrder.NAME_ASC.value,
+            17,
+            Event(),
+            0,
+            2,
+        )
+        second = MainWindow._physical_view_worker(
+            object(),  # type: ignore[arg-type]
+            catalog.root,
+            catalog.root_identity,
+            catalog.storage_identity,
+            "",
+            SortOrder.NAME_ASC.value,
+            17,
+            Event(),
+            first.next_offset,
+            2,
+        )
+
+        assert len(first.images) == 2
+        assert first.total_records == 4
+        assert first.total_images == 2
+        assert first.next_offset == 2
+        assert first.has_more
+        assert len(second.images) == 2
+        assert second.next_offset == 4
+        assert not second.has_more
+        assert {
+            record.rel_path for record in [*first.images, *second.images]
+        } == {"a", "b", "one.png", "two.png"}
+    finally:
+        catalog.close()
+
+
+def test_automatic_tree_materialization_is_capped(tmp_path: Path, monkeypatch) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    window = MainWindow()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        directories = [f"folder-{index:04d}" for index in range(100)]
+        monkeypatch.setattr(ui_module, "MAX_AUTOMATIC_TREE_ITEMS", 15)
+        monkeypatch.setattr(ui_module, "TREE_BUILD_BATCH_SIZE", 5)
+        monkeypatch.setattr(ui_module, "TREE_BUILD_BUDGET_SECONDS", 999.0)
+
+        def synthetic_page(
+            task_root: Path,
+            _identity: tuple[int, int],
+            _storage_identity: object,
+            generation: int,
+            offset: int,
+            _cancel_event: Event,
+        ):
+            page = directories[offset : offset + ui_module.TREE_BUILD_BATCH_SIZE]
+            return ui_module.TreePageResult(
+                root=task_root,
+                generation=generation,
+                offset=offset,
+                directories=page,
+                tags=() if offset == 0 else None,
+            )
+
+        monkeypatch.setattr(window, "_read_tree_page_worker", synthetic_page)
+        window._start_incremental_tree_rebuild(catalog, reason="bounded-test")
+        settle_tree_build_tasks(window, qt_app)
+
+        item_map = window._tree_item_maps[catalog.root]
+        assert len(item_map) == 15
+        assert len(item_map) < len(directories)
+    finally:
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_expanded_tree_branch_loads_direct_children_in_explicit_pages(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    window = MainWindow()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        for index in range(5):
+            catalog.remember_directory(f"child-{index}")
+        window._shallow_tree_roots.add(catalog.root)
+        window.rebuild_tree()
+        monkeypatch.setattr(ui_module, "TREE_CHILD_PAGE_SIZE", 2)
+        root_item = window._tree_item_for_root(catalog.root)
+        assert root_item is not None
+
+        window._request_tree_children(root_item)
+        deadline = monotonic() + 2
+        while window._tree_children_tasks and monotonic() < deadline:
+            qt_app.processEvents()
+            window._settle_tree_children_tasks()
+            sleep(0.001)
+        assert not window._tree_children_tasks
+        assert {key for key in window._tree_item_maps[catalog.root] if key} == {
+            "child-0",
+            "child-1",
+        }
+        sentinel = next(
+            root_item.child(index)
+            for index in range(root_item.childCount())
+            if root_item.child(index).data(0, ui_module.TREE_LOAD_MORE_ROLE) is not None
+        )
+        assert sentinel.data(0, ui_module.TREE_LOAD_MORE_ROLE) == 2
+
+        window._directory_clicked(sentinel)
+        deadline = monotonic() + 2
+        while window._tree_children_tasks and monotonic() < deadline:
+            qt_app.processEvents()
+            window._settle_tree_children_tasks()
+            sleep(0.001)
+        assert not window._tree_children_tasks
+        assert {key for key in window._tree_item_maps[catalog.root] if key} == {
+            "child-0",
+            "child-1",
+            "child-2",
+            "child-3",
+        }
+    finally:
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_tree_load_more_tags_reaches_tags_beyond_initial_bound(tmp_path: Path) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    window = MainWindow()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        catalog.define_tags(f"tag-{index:04d}" for index in range(505))
+        window.current_catalog = catalog
+        window.current_dir_rel = ""
+        window.rebuild_tree()
+        settle_tree_build_tasks(window, qt_app, timeout=5)
+
+        tags_root = find_virtual_tree_root(window).child(0)
+        assert tags_root is not None
+        visible_tags = [
+            tags_root.child(index).data(0, VIRTUAL_VALUE_ROLE)
+            for index in range(tags_root.childCount())
+            if tags_root.child(index).data(0, VIRTUAL_KIND_ROLE) == VIRTUAL_KIND_TAG
+        ]
+        assert len(visible_tags) == ui_module.MAX_TREE_TAG_ITEMS
+        sentinel = next(
+            tags_root.child(index)
+            for index in range(tags_root.childCount())
+            if tags_root.child(index).data(0, ui_module.TREE_LOAD_MORE_TAGS_ROLE)
+            is not None
+        )
+
+        window._directory_clicked(sentinel)
+        deadline = monotonic() + 3
+        while window._tree_tags_tasks and monotonic() < deadline:
+            qt_app.processEvents()
+            window._settle_tree_tags_tasks()
+            sleep(0.001)
+        assert not window._tree_tags_tasks
+        visible_tags = [
+            tags_root.child(index).data(0, VIRTUAL_VALUE_ROLE)
+            for index in range(tags_root.childCount())
+            if tags_root.child(index).data(0, VIRTUAL_KIND_ROLE) == VIRTUAL_KIND_TAG
+        ]
+        assert len(visible_tags) == 505
+        assert "tag-0504" in visible_tags
+        assert all(
+            tags_root.child(index).data(0, ui_module.TREE_LOAD_MORE_TAGS_ROLE) is None
+            for index in range(tags_root.childCount())
+        )
+    finally:
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_incremental_tree_refresh_reconciles_deleted_child_with_one_bounded_page(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    (root / "a-stale").mkdir(parents=True)
+    (root / "b-keep").mkdir()
+    window = MainWindow()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        catalog.refresh_directory("")
+        window.current_catalog = catalog
+        window.current_dir_rel = ""
+        window.rebuild_tree()
+        settle_tree_build_tasks(window, qt_app)
+        deadline = monotonic() + 3
+        while window._tree_children_tasks and monotonic() < deadline:
+            qt_app.processEvents()
+            window._settle_tree_children_tasks()
+            sleep(0.001)
+        assert not window._tree_children_tasks
+        assert "a-stale" in window._tree_item_maps[catalog.root]
+
+        (root / "a-stale").rmdir()
+        catalog.refresh_directory("")
+        child_page_offsets: list[int] = []
+        original_child_worker = window._read_tree_children_page_worker
+
+        def counted_child_page(*args, **kwargs):  # type: ignore[no-untyped-def]
+            child_page_offsets.append(int(args[4]))
+            return original_child_worker(*args, **kwargs)
+
+        monkeypatch.setattr(window, "_read_tree_children_page_worker", counted_child_page)
+        window._start_incremental_tree_rebuild(catalog, reason="external-delete")
+        settle_tree_build_tasks(window, qt_app)
+        deadline = monotonic() + 3
+        while window._tree_children_tasks and monotonic() < deadline:
+            qt_app.processEvents()
+            window._settle_tree_children_tasks()
+            sleep(0.001)
+
+        assert child_page_offsets == [0]
+        assert "a-stale" not in window._tree_item_maps[catalog.root]
+        assert "b-keep" in window._tree_item_maps[catalog.root]
+    finally:
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_random_paged_viewer_crosses_page_boundary_without_repeats(tmp_path: Path) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    for filename, color in [
+        ("a.png", (1, 2, 3)),
+        ("b.png", (4, 5, 6)),
+        ("c.png", (7, 8, 9)),
+    ]:
+        Image.new("RGB", (2, 2), color).save(root / filename)
+    catalog = Catalog(root)
+    calls: list[tuple[int, int]] = []
+
+    def load_page(offset: int, limit: int, _cancel_event: Event):
+        calls.append((offset, limit))
+        return ui_module.ViewerNavigationPage(
+            # A repeated row is possible across a live OFFSET snapshot. It must
+            # never make the randomized navigator show the same image twice.
+            rel_paths=["a.png", "b.png", "c.png"],
+            next_offset=3,
+            has_more=False,
+            total_images=3,
+        )
+
+    navigator = ui_module.PagedImageNavigator(
+        order=["a.png"],
+        index=0,
+        next_offset=1,
+        has_more=True,
+        total_count=3,
+        page_loader=load_page,
+        random_mode=True,
+    )
+    viewer = FullscreenViewer(catalog, navigator)
+    try:
+        settle_viewer_load(viewer, qt_app)
+        viewer.navigate(1)
+        deadline = monotonic() + 2
+        while viewer._navigation_page_future is not None and monotonic() < deadline:
+            qt_app.processEvents()
+            viewer._settle_navigation_page()
+            sleep(0.001)
+        viewer._settle_navigation_page()
+        settle_viewer_load(viewer, qt_app)
+
+        assert calls == [(1, ui_module.PANE_QUERY_PAGE_SIZE)]
+        assert navigator.current in {"b.png", "c.png"}
+        assert set(navigator.order) == {"a.png", "b.png", "c.png"}
+        assert len(navigator.order) == len(set(navigator.order))
+        assert not viewer._load_closed
+    finally:
+        viewer._shutdown_async_load()
+        viewer.deleteLater()
+        catalog.close()
+        qt_app.processEvents()
+
+
+def test_viewer_load_churn_has_process_wide_thread_cap_and_latest_recovers(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    Image.new("RGB", (2, 2), (11, 22, 33)).save(root / "image.png")
+    release = Event()
+    all_workers_started = Event()
+    started_calls: list[int] = []
+    original = FullscreenViewer._load_viewer_image
+
+    def blocked_load(catalog: Catalog, rel_path: str):  # type: ignore[no-untyped-def]
+        started_calls.append(1)
+        if len(started_calls) >= 8:
+            all_workers_started.set()
+        assert release.wait(timeout=5)
+        return original(catalog, rel_path)
+
+    monkeypatch.setattr(
+        FullscreenViewer,
+        "_load_viewer_image",
+        staticmethod(blocked_load),
+    )
+    window = MainWindow()
+    viewers: list[FullscreenViewer] = []
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        catalog.refresh()
+        for _ in range(24):
+            viewers.append(
+                FullscreenViewer(
+                    catalog,
+                    ImageNavigator.sequential(["image.png"], "image.png"),
+                    window,
+                )
+            )
+        assert all_workers_started.wait(timeout=1)
+        latest = viewers[-1]
+        assert latest._load_future is not None
+        assert latest._load_future.done()
+        assert isinstance(latest._load_future.exception(), ui_module.ExecutorSaturatedError)
+        assert latest._pending_load_request is not None
+        assert len(
+            [
+                thread
+                for thread in enumerate_threads()
+                if thread.name.startswith("marnwick-viewer-load_")
+            ]
+        ) <= 8
+
+        for viewer in viewers[:-1]:
+            viewer._shutdown_async_load()
+            viewer.deleteLater()
+        release.set()
+        deadline = monotonic() + 5
+        while latest.base_pixmap.isNull() and monotonic() < deadline:
+            qt_app.processEvents()
+            latest._settle_async_load()
+            sleep(0.005)
+
+        assert not latest.base_pixmap.isNull()
+        assert latest._pending_load_request is None
+        pixel = latest.base_pixmap.toImage().pixelColor(0, 0)
+        assert (pixel.red(), pixel.green(), pixel.blue()) == (11, 22, 33)
+    finally:
+        release.set()
+        for viewer in viewers:
+            viewer._shutdown_async_load()
+            viewer.deleteLater()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_viewer_preview_churn_has_process_wide_thread_cap_and_latest_recovers(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    Image.new("RGB", (8, 4), (20, 30, 40)).save(root / "image.png")
+    release = Event()
+    all_workers_started = Event()
+    started_calls: list[int] = []
+    original = FullscreenViewer._render_preview_worker
+
+    def blocked_preview(*args, **kwargs):  # type: ignore[no-untyped-def]
+        started_calls.append(1)
+        if len(started_calls) >= 8:
+            all_workers_started.set()
+        assert release.wait(timeout=5)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        FullscreenViewer,
+        "_render_preview_worker",
+        staticmethod(blocked_preview),
+    )
+    catalog = Catalog(root)
+    viewers: list[FullscreenViewer] = []
+    try:
+        for _ in range(24):
+            viewer = FullscreenViewer(
+                catalog,
+                ImageNavigator.sequential(["image.png"], "image.png"),
+            )
+            viewer.operations.append(EditOperation("rotate_right"))
+            viewer.render_preview()
+            viewers.append(viewer)
+        assert all_workers_started.wait(timeout=1)
+        latest = viewers[-1]
+        assert latest._preview_future is not None
+        assert latest._preview_future.done()
+        assert isinstance(latest._preview_future.exception(), ui_module.ExecutorSaturatedError)
+        assert latest._pending_preview_request is not None
+        assert len(
+            [
+                thread
+                for thread in enumerate_threads()
+                if thread.name.startswith("marnwick-viewer-preview_")
+            ]
+        ) <= 8
+
+        for viewer in viewers[:-1]:
+            viewer.operations.clear()
+            viewer._shutdown_async_load()
+            viewer.deleteLater()
+        release.set()
+        deadline = monotonic() + 5
+        while not latest.preview_image_current and monotonic() < deadline:
+            qt_app.processEvents()
+            latest._settle_preview_render()
+            sleep(0.005)
+
+        assert latest.preview_image_current
+        assert latest._pending_preview_request is None
+        assert latest.image_coordinate_size == (4, 8)
+    finally:
+        release.set()
+        for viewer in viewers:
+            viewer.operations.clear()
+            viewer._shutdown_async_load()
+            viewer.deleteLater()
+        catalog.close()
+        qt_app.processEvents()
+
+
+def test_viewer_page_churn_has_process_wide_thread_cap_and_latest_recovers(
+    tmp_path: Path,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    Image.new("RGB", (2, 2), (1, 2, 3)).save(root / "a.png")
+    Image.new("RGB", (2, 2), (4, 5, 6)).save(root / "b.png")
+    release = Event()
+    all_workers_started = Event()
+    started_calls: list[int] = []
+    catalog = Catalog(root)
+    viewers: list[FullscreenViewer] = []
+
+    def blocked_page(_offset: int, _limit: int, _cancel_event: Event):
+        started_calls.append(1)
+        if len(started_calls) >= 4:
+            all_workers_started.set()
+        assert release.wait(timeout=5)
+        return ui_module.ViewerNavigationPage(
+            rel_paths=["b.png"],
+            next_offset=2,
+            has_more=False,
+            total_images=2,
+        )
+
+    try:
+        for _ in range(12):
+            navigator = ui_module.PagedImageNavigator(
+                order=["a.png"],
+                index=0,
+                next_offset=1,
+                has_more=True,
+                total_count=2,
+                page_loader=blocked_page,
+            )
+            viewer = FullscreenViewer(catalog, navigator)
+            viewer.navigate(1)
+            viewers.append(viewer)
+        assert all_workers_started.wait(timeout=1)
+        latest = viewers[-1]
+        assert latest._navigation_page_future is not None
+        assert latest._navigation_page_future.done()
+        assert isinstance(
+            latest._navigation_page_future.exception(),
+            ui_module.ExecutorSaturatedError,
+        )
+        assert len(
+            [
+                thread
+                for thread in enumerate_threads()
+                if thread.name.startswith("marnwick-viewer-page_")
+            ]
+        ) <= 4
+
+        for viewer in viewers[:-1]:
+            viewer._shutdown_async_load()
+            viewer.deleteLater()
+        release.set()
+        deadline = monotonic() + 5
+        while latest.navigator.current != "b.png" and monotonic() < deadline:
+            qt_app.processEvents()
+            latest._settle_navigation_page()
+            sleep(0.005)
+
+        assert latest.navigator.current == "b.png"
+        assert latest._navigation_page_future is None
+        assert not latest._load_closed
+    finally:
+        release.set()
+        for viewer in viewers:
+            viewer._shutdown_async_load()
+            viewer.deleteLater()
+        catalog.close()
+        qt_app.processEvents()
+
+
+def test_preferences_catalog_additions_use_async_open(tmp_path: Path, monkeypatch) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    window = MainWindow()
+    calls: list[Path] = []
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        monkeypatch.setattr(
+            window,
+            "open_catalog",
+            lambda *_args, **_kwargs: pytest.fail("preferences used synchronous catalog open"),
+        )
+        monkeypatch.setattr(
+            window,
+            "open_catalog_async",
+            lambda path, **_kwargs: calls.append(path),
+        )
+
+        window.sync_catalogs_to_config([str(root)])
+
+        assert calls == [root.resolve()]
     finally:
         window.close()
         window.deleteLater()

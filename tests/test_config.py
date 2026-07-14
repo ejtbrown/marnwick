@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import errno
 import json
 import os
 import stat
+import time
 from pathlib import Path
 
 import pytest
@@ -158,3 +160,86 @@ def test_save_config_refuses_hard_linked_lock_file(tmp_path: Path) -> None:
 
     assert target.read_bytes() == b"unchanged"
     assert not path.exists()
+
+
+def test_save_config_lock_contention_times_out_without_changing_config(tmp_path: Path) -> None:
+    path = tmp_path / "config.json"
+    save_config(AppConfig(catalogs=["existing"]), path)
+    original = path.read_bytes()
+    contender = AppConfig(catalogs=["replacement"])
+
+    with config_module._config_write_lock(path, timeout=0.1):
+        started = time.monotonic()
+        with pytest.raises(TimeoutError, match="timed out waiting for configuration lock"):
+            save_config(contender, path, lock_timeout=0.04)
+        elapsed = time.monotonic() - started
+
+    assert elapsed < 0.5
+    assert path.read_bytes() == original
+    assert contender.catalogs == ["replacement"]
+    assert contender._loaded_catalogs is None
+
+
+@pytest.mark.parametrize("timeout", [-1, float("inf"), float("nan"), True])
+def test_save_config_rejects_invalid_lock_timeout_before_touching_disk(
+    tmp_path: Path,
+    timeout: float,
+) -> None:
+    path = tmp_path / "missing" / "config.json"
+
+    with pytest.raises(ValueError, match="lock timeout"):
+        save_config(AppConfig(), path, lock_timeout=timeout)
+
+    assert not path.parent.exists()
+
+
+def test_load_config_rejects_oversized_file_without_parsing_it(tmp_path: Path) -> None:
+    path = tmp_path / "config.json"
+    path.write_bytes(
+        b'{"catalogs":["must-not-load"],"padding":"'
+        + b"x" * config_module.MAX_CONFIG_BYTES
+        + b'"}'
+    )
+
+    assert load_config(path) == AppConfig()
+
+
+def test_save_config_rejects_oversized_payload_without_replacing_file(tmp_path: Path) -> None:
+    path = tmp_path / "config.json"
+    save_config(AppConfig(catalogs=["existing"]), path)
+    original = path.read_bytes()
+
+    with pytest.raises(OSError) as raised:
+        save_config(AppConfig(catalogs=["x" * config_module.MAX_CONFIG_BYTES]), path)
+
+    assert raised.value.errno == errno.EFBIG
+    assert path.read_bytes() == original
+
+
+def test_config_file_symlink_is_not_read_or_replaced(tmp_path: Path) -> None:
+    target = tmp_path / "target.json"
+    target.write_text(json.dumps({"catalogs": ["secret"]}), encoding="utf-8")
+    path = tmp_path / "config.json"
+    path.symlink_to(target)
+
+    assert load_config(path) == AppConfig()
+    with pytest.raises(OSError, match="configuration file must not be a symbolic link"):
+        save_config(AppConfig(catalogs=["replacement"]), path)
+
+    assert path.is_symlink()
+    assert json.loads(target.read_text(encoding="utf-8"))["catalogs"] == ["secret"]
+
+
+def test_config_file_hard_link_is_not_read_or_replaced(tmp_path: Path) -> None:
+    target = tmp_path / "target.json"
+    target.write_text(json.dumps({"catalogs": ["shared"]}), encoding="utf-8")
+    path = tmp_path / "config.json"
+    os.link(target, path)
+    original = target.read_bytes()
+
+    assert load_config(path) == AppConfig()
+    with pytest.raises(OSError, match="configuration file must not be hard-linked"):
+        save_config(AppConfig(catalogs=["replacement"]), path)
+
+    assert path.samefile(target)
+    assert target.read_bytes() == original

@@ -1,8 +1,15 @@
 from __future__ import annotations
 
+from collections.abc import Callable
+from concurrent.futures import Future
+from contextlib import suppress
+from dataclasses import dataclass
+import errno
 import json
-from pathlib import Path
+import os
+from pathlib import Path, PurePosixPath, PureWindowsPath
 import secrets
+import stat
 from time import monotonic
 from typing import TYPE_CHECKING
 
@@ -10,11 +17,24 @@ from PySide6.QtCore import QObject, QTimer
 from PySide6.QtNetwork import QHostAddress, QTcpServer, QTcpSocket
 from PySide6.QtWidgets import QApplication
 
+from .async_utils import AbandonableThreadPoolExecutor
+from .catalog import (
+    Catalog,
+    CatalogStorageIdentity,
+    QUERY_PAGE_MAX_OFFSET,
+    QUERY_PAGE_MAX_SIZE,
+)
 from .models import DirectoryRecord
 
 if TYPE_CHECKING:
     from .indexer import IndexProgressSnapshot
     from .ui import MainWindow
+
+
+@dataclass(frozen=True, slots=True)
+class _PendingRead:
+    socket: QTcpSocket
+    request_id: object
 
 
 class DebugCommandServer(QObject):
@@ -25,6 +45,10 @@ class DebugCommandServer(QObject):
     max_connections = 4
     max_page_size = 1000
     max_tail = 1000
+    max_lines_per_turn = 8
+    max_read_bytes_per_turn = 64 * 1024
+    max_timing_file_bytes = 8 * 1024 * 1024
+    max_output_buffer_bytes = 16 * 1024 * 1024
 
     def __init__(
         self,
@@ -36,6 +60,11 @@ class DebugCommandServer(QObject):
         max_connections: int | None = None,
         max_page_size: int | None = None,
         max_tail: int | None = None,
+        max_lines_per_turn: int | None = None,
+        max_read_bytes_per_turn: int | None = None,
+        max_pending_reads: int | None = None,
+        max_timing_file_bytes: int | None = None,
+        max_output_buffer_bytes: int | None = None,
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent or window)
@@ -43,18 +72,73 @@ class DebugCommandServer(QObject):
         self.token = token or secrets.token_urlsafe(24)
         self.max_line_bytes = max(1, int(max_line_bytes or self.max_line_bytes))
         self.max_connections = max(1, int(max_connections or self.max_connections))
-        self.max_page_size = max(1, int(max_page_size or self.max_page_size))
+        self.max_page_size = min(
+            QUERY_PAGE_MAX_SIZE,
+            max(1, int(max_page_size or self.max_page_size)),
+        )
         self.max_tail = max(1, int(max_tail or self.max_tail))
+        self.max_lines_per_turn = max(1, int(max_lines_per_turn or self.max_lines_per_turn))
+        self.max_read_bytes_per_turn = max(
+            1,
+            int(max_read_bytes_per_turn or self.max_read_bytes_per_turn),
+        )
+        self.max_pending_reads = max(
+            1,
+            int(max_pending_reads or (self.max_connections * 4)),
+        )
+        self.max_timing_file_bytes = max(
+            1,
+            int(max_timing_file_bytes or self.max_timing_file_bytes),
+        )
+        self.max_output_buffer_bytes = max(
+            1024,
+            int(max_output_buffer_bytes or self.max_output_buffer_bytes),
+        )
         self.server = QTcpServer(self)
         self.server.newConnection.connect(self._accept_connections)
         self._buffers: dict[QTcpSocket, bytearray] = {}
+        self._scheduled_socket_drains: set[QTcpSocket] = set()
+        self._read_executor = AbandonableThreadPoolExecutor(
+            max_workers=2,
+            thread_name_prefix="marnwick-debug-read",
+            max_pending=self.max_pending_reads,
+        )
+        self._pending_reads: dict[Future[object], _PendingRead] = {}
+        self._read_timer = QTimer(self)
+        self._read_timer.setInterval(10)
+        self._read_timer.timeout.connect(self._settle_reads)
+        self._closed = False
         if not self.server.listen(QHostAddress.SpecialAddress.LocalHost, port):
+            self._read_executor.shutdown(wait=False, cancel_futures=True)
             raise OSError(self.server.errorString())
+        application = QApplication.instance()
+        if application is not None:
+            application.aboutToQuit.connect(self.close)
 
     def port(self) -> int:
         return int(self.server.serverPort())
 
+    def close(self) -> None:
+        """Stop accepting work without waiting for a slow diagnostic read."""
+
+        if self._closed:
+            return
+        self._closed = True
+        self._read_timer.stop()
+        self.server.close()
+        for future in list(self._pending_reads):
+            future.cancel()
+        self._pending_reads.clear()
+        self._read_executor.shutdown(wait=False, cancel_futures=True)
+        for socket in list(self._buffers):
+            with suppress(RuntimeError):
+                socket.disconnectFromHost()
+        self._buffers.clear()
+        self._scheduled_socket_drains.clear()
+
     def _accept_connections(self) -> None:
+        if self._closed:
+            return
         while self.server.hasPendingConnections():
             socket = self.server.nextPendingConnection()
             if socket is None:
@@ -70,25 +154,103 @@ class DebugCommandServer(QObject):
 
     def _drop_socket(self, socket: QTcpSocket) -> None:
         self._buffers.pop(socket, None)
+        self._scheduled_socket_drains.discard(socket)
+        for future, pending in list(self._pending_reads.items()):
+            if pending.socket is not socket:
+                continue
+            self._pending_reads.pop(future, None)
+            future.cancel()
+        if not self._pending_reads:
+            self._read_timer.stop()
         try:
             socket.deleteLater()
         except RuntimeError:
             return
 
     def _read_socket(self, socket: QTcpSocket) -> None:
-        buffer = self._buffers.setdefault(socket, bytearray())
-        buffer.extend(bytes(socket.readAll()))
-        if len(buffer) > self.max_line_bytes:
-            self._write_response(socket, {"id": None, "ok": False, "error": "debug request too large"})
-            self._buffers.pop(socket, None)
-            socket.disconnectFromHost()
+        if self._closed or socket not in self._buffers:
             return
-        while b"\n" in buffer:
-            line, _, rest = buffer.partition(b"\n")
-            buffer[:] = rest
-            if not line.strip():
+        # A readyRead signal may arrive while a continuation is already queued.
+        # Let the queued turn own the socket so one chatty client cannot obtain
+        # multiple back-to-back drains in the same event-loop iteration.
+        if socket in self._scheduled_socket_drains:
+            return
+        self._process_socket_turn(socket)
+
+    def _process_socket_turn(self, socket: QTcpSocket) -> None:
+        buffer = self._buffers.get(socket)
+        if buffer is None:
+            return
+        lines_seen = 0
+        read_remaining = self.max_read_bytes_per_turn
+        while lines_seen < self.max_lines_per_turn:
+            newline_at = buffer.find(b"\n")
+            if newline_at >= 0:
+                if newline_at > self.max_line_bytes:
+                    self._reject_oversized_request(socket)
+                    return
+                line = bytes(buffer[:newline_at])
+                del buffer[: newline_at + 1]
+                lines_seen += 1
+                if line.strip():
+                    self._handle_line(socket, line)
+                if socket not in self._buffers:
+                    return
                 continue
-            self._handle_line(socket, line)
+            if len(buffer) > self.max_line_bytes:
+                self._reject_oversized_request(socket)
+                return
+            if read_remaining <= 0:
+                break
+            try:
+                available = int(socket.bytesAvailable())
+            except RuntimeError:
+                self._drop_socket(socket)
+                return
+            if available <= 0:
+                break
+            read_size = min(available, read_remaining)
+            try:
+                chunk = bytes(socket.read(read_size))
+            except RuntimeError:
+                self._drop_socket(socket)
+                return
+            if not chunk:
+                break
+            buffer.extend(chunk)
+            read_remaining -= len(chunk)
+
+        newline_at = buffer.find(b"\n")
+        if newline_at > self.max_line_bytes or (newline_at < 0 and len(buffer) > self.max_line_bytes):
+            self._reject_oversized_request(socket)
+            return
+        try:
+            more_socket_bytes = socket.bytesAvailable() > 0
+        except RuntimeError:
+            self._drop_socket(socket)
+            return
+        if newline_at >= 0 or more_socket_bytes:
+            self._schedule_socket_drain(socket)
+
+    def _schedule_socket_drain(self, socket: QTcpSocket) -> None:
+        if socket not in self._buffers or socket in self._scheduled_socket_drains:
+            return
+        self._scheduled_socket_drains.add(socket)
+        QTimer.singleShot(0, lambda socket=socket: self._continue_socket_drain(socket))
+
+    def _continue_socket_drain(self, socket: QTcpSocket) -> None:
+        self._scheduled_socket_drains.discard(socket)
+        if not self._closed and socket in self._buffers:
+            self._process_socket_turn(socket)
+
+    def _reject_oversized_request(self, socket: QTcpSocket) -> None:
+        self._write_response(socket, {"id": None, "ok": False, "error": "debug request too large"})
+        self._buffers.pop(socket, None)
+        self._scheduled_socket_drains.discard(socket)
+        try:
+            socket.disconnectFromHost()
+        except RuntimeError:
+            return
 
     def _handle_line(self, socket: QTcpSocket, line: bytes) -> None:
         request_id: object = None
@@ -106,15 +268,133 @@ class DebugCommandServer(QObject):
             params = request.get("params") or {}
             if not isinstance(params, dict):
                 raise ValueError("request params must be an object")
+            read_job = self._prepare_read_job(command, params)
+            if read_job is not None:
+                self._submit_read(socket, request_id, read_job)
+                return
             result = self._execute(command, params)
         except Exception as error:
             self._write_response(socket, {"id": request_id, "ok": False, "error": str(error)})
             return
         self._write_response(socket, {"id": request_id, "ok": True, "result": result})
 
+    def _prepare_read_job(
+        self,
+        command: str,
+        params: dict[str, object],
+    ) -> Callable[[], object] | None:
+        if command == "directories":
+            catalog = self._catalog_for_params(params)
+            assert catalog is not None
+            prefix = params.get("prefix", "")
+            if not isinstance(prefix, str):
+                raise ValueError("prefix must be a string")
+            limit = self._bounded_int(
+                params.get("limit"),
+                default=500,
+                minimum=0,
+                maximum=self.max_page_size,
+            )
+            offset = self._bounded_int(
+                params.get("offset"),
+                default=0,
+                minimum=0,
+                maximum=QUERY_PAGE_MAX_OFFSET,
+            )
+            root = catalog.root
+            expected_root_identity = catalog.root_identity
+            expected_storage_identity = catalog.storage_identity
+            return lambda: self._directory_page_worker(
+                root,
+                expected_root_identity,
+                expected_storage_identity,
+                prefix,
+                limit,
+                offset,
+            )
+        if command == "timings":
+            root = self._timings_root(params)
+            tail = self._bounded_int(
+                params.get("tail"),
+                default=100,
+                minimum=0,
+                maximum=self.max_tail,
+            )
+            max_bytes = self.max_timing_file_bytes
+            return lambda: self._timings_worker(root, tail, max_bytes)
+        return None
+
+    def _submit_read(
+        self,
+        socket: QTcpSocket,
+        request_id: object,
+        worker: Callable[[], object],
+    ) -> None:
+        if len(self._pending_reads) >= self.max_pending_reads:
+            raise RuntimeError("too many pending debug reads")
+        socket_pending = sum(1 for pending in self._pending_reads.values() if pending.socket is socket)
+        if socket_pending >= max(1, self.max_pending_reads // self.max_connections):
+            raise RuntimeError("too many pending debug reads for this connection")
+        future = self._read_executor.submit(worker)
+        self._pending_reads[future] = _PendingRead(socket, request_id)
+        self._read_timer.start()
+
+    def _settle_reads(self) -> None:
+        settled = 0
+        for future, pending in list(self._pending_reads.items()):
+            if settled >= self.max_lines_per_turn or not future.done():
+                continue
+            settled += 1
+            self._pending_reads.pop(future, None)
+            if pending.socket not in self._buffers or future.cancelled():
+                continue
+            try:
+                result = future.result()
+            except Exception as error:
+                self._write_response(
+                    pending.socket,
+                    {"id": pending.request_id, "ok": False, "error": str(error)},
+                )
+            else:
+                self._write_response(
+                    pending.socket,
+                    {"id": pending.request_id, "ok": True, "result": result},
+                )
+        if not self._pending_reads:
+            self._read_timer.stop()
+
     def _write_response(self, socket: QTcpSocket, payload: dict[str, object]) -> None:
-        socket.write((json.dumps(payload, sort_keys=True) + "\n").encode("utf-8"))
-        socket.flush()
+        try:
+            encoded = (json.dumps(payload, sort_keys=True) + "\n").encode("utf-8")
+        except (TypeError, ValueError) as error:
+            encoded = (
+                json.dumps(
+                    {"id": payload.get("id"), "ok": False, "error": str(error)},
+                    sort_keys=True,
+                )
+                + "\n"
+            ).encode("utf-8")
+        if len(encoded) > self.max_output_buffer_bytes:
+            encoded = (
+                json.dumps(
+                    {
+                        "id": payload.get("id"),
+                        "ok": False,
+                        "error": "debug response is too large",
+                    },
+                    sort_keys=True,
+                )
+                + "\n"
+            ).encode("utf-8")
+        try:
+            if socket.bytesToWrite() + len(encoded) > self.max_output_buffer_bytes:
+                socket.abort()
+                self._drop_socket(socket)
+                return
+            socket.write(encoded)
+            socket.flush()
+        except RuntimeError:
+            self._drop_socket(socket)
 
     def _execute(self, command: str, params: dict[str, object]) -> object:
         if command == "ping":
@@ -196,8 +476,6 @@ class DebugCommandServer(QObject):
         if not isinstance(path_value, str):
             raise ValueError("path is required")
         path = Path(path_value).expanduser()
-        if not path.is_dir():
-            raise ValueError(f"catalog path does not exist: {path}")
         selected_at = monotonic()
         self.window.defer_open_catalog(
             path,
@@ -209,49 +487,85 @@ class DebugCommandServer(QObject):
 
     def _navigate(self, params: dict[str, object]) -> dict[str, object]:
         catalog = self._catalog_for_params(params)
+        assert catalog is not None
         dir_rel_value = params.get("dir_rel", "")
         if not isinstance(dir_rel_value, str):
             raise ValueError("dir_rel must be a string")
-        if dir_rel_value:
-            try:
-                directory = catalog.mutation_path(dir_rel_value)
-            except (OSError, ValueError) as error:
-                raise ValueError(f"unknown directory: {dir_rel_value}") from error
-            if not directory.is_dir():
-                raise ValueError(f"unknown directory: {dir_rel_value}")
-        idle_task = self.window._idle_index_tasks.get(catalog.root)
-        if idle_task is not None and not idle_task.snapshot().done:
-            self.window._resume_idle_refresh_roots.add(catalog.root)
-        self.window.indexer.cancel_idle_tasks(catalog.root)
-        self.window.indexer.cancel_directory_tasks(catalog.root, keep_dir_rel=dir_rel_value)
-        self.window.current_catalog = catalog
-        self.window.current_dir_rel = dir_rel_value
-        self.window.load_current_directory()
-        self.window.queue_directory_index(catalog, dir_rel_value)
-        return {"root": str(catalog.root), "dir_rel": dir_rel_value, "visible_items": self.window.model.rowCount()}
+        self._validate_directory_rel(dir_rel_value)
+        root = catalog.root
+
+        def transition() -> None:
+            if self.window.workspace.catalog_for_exact_root(root) is not catalog:
+                return
+            self.window.navigate_to_directory(dir_rel_value, catalog=catalog)
+
+        QTimer.singleShot(0, transition)
+        return {"root": str(root), "dir_rel": dir_rel_value, "queued": True}
+
+    @staticmethod
+    def _validate_directory_rel(dir_rel: str) -> None:
+        if not dir_rel:
+            return
+        if "\x00" in dir_rel:
+            raise ValueError("dir_rel contains a NUL byte")
+        if dir_rel == "." or "\\" in dir_rel or PureWindowsPath(dir_rel).drive:
+            raise ValueError("dir_rel must be a normalized relative path")
+        relative = PurePosixPath(dir_rel)
+        if relative.is_absolute() or relative.as_posix() != dir_rel:
+            raise ValueError("dir_rel must be a normalized relative path")
+        if any(part in {"", ".", ".."} for part in relative.parts):
+            raise ValueError("dir_rel must stay inside the catalog")
+        if relative.parts and relative.parts[0].casefold() == ".marnwick":
+            raise ValueError("dir_rel cannot select catalog state")
 
     def _directories(self, params: dict[str, object]) -> dict[str, object]:
         catalog = self._catalog_for_params(params)
+        assert catalog is not None
         prefix = params.get("prefix", "")
         if not isinstance(prefix, str):
             raise ValueError("prefix must be a string")
         limit = self._bounded_int(params.get("limit"), default=500, minimum=0, maximum=self.max_page_size)
-        offset = self._bounded_int(params.get("offset"), default=0, minimum=0, maximum=10**9)
-        if prefix:
-            # Prefix filtering is debug-only. The unfiltered path uses bounded
-            # SQL paging so large inventories do not freeze the GUI thread.
-            directories = [
-                item
-                for item in catalog.list_known_directories()
-                if item == prefix or item.startswith(f"{prefix}/")
-            ]
-            total = len(directories)
-            page = directories[offset : offset + limit]
-        else:
-            total = catalog.known_directory_count()
-            page = catalog.list_known_directories(limit=limit, offset=offset)
+        offset = self._bounded_int(
+            params.get("offset"),
+            default=0,
+            minimum=0,
+            maximum=QUERY_PAGE_MAX_OFFSET,
+        )
+        return self._directory_page_worker(
+            catalog.root,
+            catalog.root_identity,
+            catalog.storage_identity,
+            prefix,
+            limit,
+            offset,
+        )
+
+    @staticmethod
+    def _directory_page_worker(
+        root: Path,
+        expected_root_identity: tuple[int, int],
+        expected_storage_identity: CatalogStorageIdentity,
+        prefix: str,
+        limit: int,
+        offset: int,
+    ) -> dict[str, object]:
+        with Catalog.open_reader(
+            root,
+            expected_root_identity=expected_root_identity,
+            expected_storage_identity=expected_storage_identity,
+        ) as catalog:
+            if prefix:
+                total = catalog.known_directory_prefix_count(prefix)
+                page = catalog.list_known_directories_with_prefix_page(
+                    prefix,
+                    limit=limit,
+                    offset=offset,
+                )
+            else:
+                total = catalog.known_directory_count()
+                page = catalog.list_known_directories(limit=limit, offset=offset)
         return {
-            "root": str(catalog.root),
+            "root": str(root),
             "offset": offset,
             "limit": limit,
             "total": total,
@@ -278,29 +592,69 @@ class DebugCommandServer(QObject):
         }
 
     def _timings(self, params: dict[str, object]) -> dict[str, object]:
+        root = self._timings_root(params)
+        tail = self._bounded_int(params.get("tail"), default=100, minimum=0, maximum=self.max_tail)
+        return self._timings_worker(root, tail, self.max_timing_file_bytes)
+
+    def _timings_root(self, params: dict[str, object]) -> Path:
         catalog = self._catalog_for_params(params, required=False)
         root_value = params.get("root")
         if catalog is not None:
-            root = catalog.root
+            return catalog.root
         elif isinstance(root_value, str):
-            root = Path(root_value).expanduser()
-        else:
-            raise ValueError("root is required when no catalog is selected")
+            return Path(root_value).expanduser()
+        raise ValueError("root is required when no catalog is selected")
+
+    @staticmethod
+    def _timings_worker(root: Path, tail: int, max_bytes: int) -> dict[str, object]:
         timings_path = root / ".marnwick" / "timings.json"
         try:
-            payload = json.loads(timings_path.read_text(encoding="utf-8"))
-        except FileNotFoundError:
+            flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(timings_path, flags)
+        except OSError as error:
+            if error.errno == errno.ENOENT:
+                return {"root": str(root), "events": []}
+            raise
+        try:
+            opened = os.fstat(fd)
+            if not stat.S_ISREG(opened.st_mode):
+                raise ValueError("timings path is not a regular file")
+            if opened.st_size > max_bytes:
+                raise ValueError("timings file is too large")
+            chunks: list[bytes] = []
+            remaining = max_bytes + 1
+            while remaining > 0:
+                chunk = os.read(fd, min(64 * 1024, remaining))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+        finally:
+            os.close(fd)
+        data = b"".join(chunks)
+        if len(data) > max_bytes:
+            raise ValueError("timings file is too large")
+        if not data:
             payload = {"version": 1, "events": []}
-        events = payload.get("events", [])
+        else:
+            payload = json.loads(data.decode("utf-8"))
+        events = payload.get("events", []) if isinstance(payload, dict) else []
         if not isinstance(events, list):
             events = []
-        tail = self._bounded_int(params.get("tail"), default=100, minimum=0, maximum=self.max_tail)
         return {"root": str(root), "events": events[-tail:] if tail else []}
 
-    def _catalog_for_params(self, params: dict[str, object], *, required: bool = True):
+    def _catalog_for_params(
+        self,
+        params: dict[str, object],
+        *,
+        required: bool = True,
+    ) -> Catalog | None:
         root_value = params.get("root")
         if isinstance(root_value, str):
-            catalog = self.window.workspace.catalog_for_root(Path(root_value).expanduser())
+            candidate = Path(root_value).expanduser()
+            catalog = self.window.workspace.catalog_for_exact_root(candidate)
+            if catalog is None and not candidate.is_absolute():
+                catalog = self.window.workspace.catalog_for_exact_root(candidate.absolute())
         else:
             catalog = self.window.current_catalog
         if catalog is None and required:

@@ -5,12 +5,15 @@ import ctypes
 from dataclasses import dataclass, field
 from datetime import datetime
 import errno
+import heapq
 import hashlib
 import io
 import json
 import os
 import queue
+import secrets
 import shutil
+import signal
 import sqlite3
 import stat as stat_module
 # Helpers are invoked with shell=False and resolved absolute paths.
@@ -20,9 +23,8 @@ import threading
 import time
 import sys
 from collections import defaultdict
-from collections.abc import Callable, Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from PIL import Image, ImageOps
@@ -67,23 +69,37 @@ VIDEO_EXTENSIONS = {
 ProgressCallback = Callable[[int, int | None, str], None]
 CancelCallback = Callable[[], None]
 DirectoryIdentity = tuple[int, int, int, int]
+CatalogFileIdentity = tuple[int, int, int, int, int, int]
+CatalogFileProof = tuple[int, int, int, int, int, str]
+CatalogObjectIdentity = tuple[int, int]
+CatalogStorageIdentity = tuple[CatalogObjectIdentity, CatalogObjectIdentity]
 SCAN_PROGRESS_INTERVAL = 64
+DISCOVERY_WRITE_BATCH_SIZE = 512
+DIRECTORY_RECORD_TRANSFER_BATCH_SIZE = 256
 HASH_CHUNK_SIZE = 1024 * 1024
+SHRED_TIMEOUT_SECONDS = 15.0
+SHUTIL_RMTREE_AVOIDS_SYMLINK_ATTACKS = bool(
+    getattr(shutil.rmtree, "avoids_symlink_attacks", False)
+)
 FIND_POLL_INTERVAL_SECONDS = 0.02
 LOG_FILE_NAME = "marnwick.log"
 MAX_LOG_BYTES = 1024 * 1024
+MAX_THUMBNAIL_FILE_BYTES = 32 * 1024 * 1024
 DIRECTORY_TREE_CACHE_FILE_NAME = "directory-tree.json"
+DIRECTORY_TREE_CACHE_FLAT_COUNT = 4096
+DIRECTORY_TREE_CACHE_SYNC_LIMIT = 1024
 THUMBNAIL_DIR_NAME = "thumbnails"
 THUMBNAIL_FILE_SUFFIX = ".jpg"
 SQL_LIKE_ESCAPE = "\\"
 SQLITE_VARIABLE_BATCH_SIZE = 500
 PRUNE_BATCH_SIZE = 512
 INDEX_QUEUE_DEPTH = 20
-INDEX_PIPELINE_MIN_IMAGES = 3
 PIPELINE_SENTINEL = object()
 FOLDER_PREVIEW_SCAN_LIMIT = 256
 DIRECTORY_PANE_WORK_COUNT_CAP = 401
-SIMILARITY_FEATURE_VERSION = 1
+QUERY_PAGE_MAX_SIZE = 1000
+QUERY_PAGE_MAX_OFFSET = 100_000_000
+SIMILARITY_FEATURE_VERSION = 2
 SIMILARITY_DHASH_HEX_LENGTH = 16
 EXACT_IMAGE_HASH_HEX_LENGTH = 64
 VERY_SIMILAR_HASH_DISTANCE = 8
@@ -144,16 +160,110 @@ def _rename_noreplace(source: Path, destination: Path) -> None:
             error_number = ctypes.get_errno()
             if error_number not in {errno.ENOSYS, errno.ENOTSUP, errno.EINVAL}:
                 raise OSError(error_number, os.strerror(error_number), destination)
-    if source.is_file() or source.is_symlink():
-        os.link(source, destination, follow_symlinks=False)
-        source.unlink()
-        return
-    if os.path.lexists(destination):
-        raise FileExistsError(destination)
-    # POSIX rename may replace an empty destination directory created between
-    # the check above and the syscall. Without an atomic NOREPLACE primitive,
-    # fail closed rather than overwrite another actor's directory.
-    raise OSError(errno.ENOTSUP, "atomic no-replace directory rename is unavailable", destination)
+    # link()+unlink() is not an atomic rename: a replacement can take over the
+    # source pathname between those syscalls and then be unlinked as if it were
+    # the object we linked. Plain POSIX rename can overwrite a raced destination.
+    # When the platform exposes neither renameat2 nor renamex_np, fail closed for
+    # every entry type rather than turn a move into a data-loss race.
+    raise OSError(errno.ENOTSUP, "atomic no-replace rename is unavailable", destination)
+
+
+def _rename_noreplace_at(
+    source_dir_fd: int,
+    source_name: str,
+    destination_dir_fd: int,
+    destination_name: str,
+) -> None:
+    """Atomically rename names relative to already-pinned parent directories."""
+
+    if sys.platform.startswith("linux"):
+        libc = ctypes.CDLL(None, use_errno=True)
+        renameat2 = getattr(libc, "renameat2", None)
+        if renameat2 is not None:
+            renameat2.argtypes = [
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_uint,
+            ]
+            renameat2.restype = ctypes.c_int
+            result = renameat2(
+                source_dir_fd,
+                os.fsencode(source_name),
+                destination_dir_fd,
+                os.fsencode(destination_name),
+                1,
+            )
+            if result == 0:
+                return
+            error_number = ctypes.get_errno()
+            raise OSError(error_number, os.strerror(error_number), destination_name)
+    if sys.platform == "darwin":
+        libc = ctypes.CDLL(None, use_errno=True)
+        renameatx_np = getattr(libc, "renameatx_np", None)
+        if renameatx_np is not None:
+            renameatx_np.argtypes = [
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_uint,
+            ]
+            renameatx_np.restype = ctypes.c_int
+            if (
+                renameatx_np(
+                    source_dir_fd,
+                    os.fsencode(source_name),
+                    destination_dir_fd,
+                    os.fsencode(destination_name),
+                    0x00000004,
+                )
+                == 0
+            ):
+                return
+            error_number = ctypes.get_errno()
+            raise OSError(error_number, os.strerror(error_number), destination_name)
+    raise OSError(
+        errno.ENOTSUP,
+        "atomic descriptor-relative no-replace rename is unavailable",
+        destination_name,
+    )
+
+
+def _run_shred_bounded(command: Sequence[str]) -> None:
+    """Run shred without ever waiting indefinitely for a wedged child.
+
+    ``subprocess.run(timeout=...)`` kills and then performs an unbounded wait;
+    a process stuck in uninterruptible filesystem I/O can therefore still hang
+    its caller. Here timeout handling sends a non-blocking hard kill and leaves
+    a daemon reaper to wait for the kernel asynchronously.
+    """
+
+    process = subprocess.Popen(  # nosec B603 - absolute executable from shutil.which
+        list(command),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=os.name != "nt",
+    )
+    try:
+        return_code = process.wait(timeout=SHRED_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        if os.name != "nt":
+            with suppress(OSError, ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+        else:
+            with suppress(OSError):
+                process.kill()
+        threading.Thread(
+            target=process.wait,
+            name="marnwick-shred-reaper",
+            daemon=True,
+        ).start()
+        raise
+    if return_code:
+        raise subprocess.CalledProcessError(return_code, list(command))
 
 
 def _lock_catalog_file(path: Path) -> None:
@@ -270,6 +380,20 @@ def descendant_like_pattern(rel_path: str) -> str:
     return f"{escape_sql_like(rel_path)}/%"
 
 
+def descendant_range_bounds(rel_path: str) -> tuple[str, str]:
+    """Return case-sensitive BINARY bounds for descendants of a path.
+
+    SQLite LIKE is ASCII-case-insensitive unless a connection-wide pragma is
+    changed. Catalog paths must remain distinct on case-sensitive filesystems,
+    so destructive prefix operations use this slash-to-zero half-open range
+    instead of LIKE. ``/`` immediately precedes ``0`` in Unicode/UTF-8 order.
+    """
+
+    if not rel_path:
+        raise ValueError("root descendants require an unfiltered query")
+    return f"{rel_path}/", f"{rel_path}0"
+
+
 def is_trash_rel_path(rel_path: str) -> bool:
     return rel_path == TRASH_DIR_NAME or rel_path.startswith(f"{TRASH_DIR_NAME}/")
 
@@ -317,6 +441,7 @@ class ThumbnailPruneResult:
 class DuplicateDeletionChoice:
     keep: ImageRecord
     delete: tuple[ImageRecord, ...]
+    delete_identities: tuple[tuple[str, CatalogFileIdentity], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -349,6 +474,7 @@ class ImageReadJob:
     rel_path: str
     path: Path
     stat: os.stat_result
+    changed_ns: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -358,9 +484,18 @@ class ImageSkipJob:
 
 @dataclass(frozen=True, slots=True)
 class ThumbnailWriteJob:
-    rel_path: str
+    source: ImageReadJob
     thumb_rel_path: str
     thumb_blob: bytes
+    thumb_width: int
+    thumb_height: int
+    thumb_size_px: int
+    image_hash: str
+    thumb_cache_key: str
+    width: int
+    height: int
+    perceptual_hash: str
+    color_signature: bytes
 
 
 @dataclass(frozen=True, slots=True)
@@ -390,8 +525,32 @@ class FlatDirectoryTreeCache:
     directories: tuple[str, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class _DirectoryContentScanResult:
+    child_dir_count: int
+    entry_hash: str | None
+    children_changed: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _FileCopyProof:
+    source_identity: CatalogFileIdentity
+    content_hash: str
+
+
+@dataclass(frozen=True, slots=True)
+class _DirectoryCopyProof:
+    source_root_identity: tuple[int, int, int, int, int]
+    source_identity_hash: str
+    content_hash: str
+
+
 class CatalogRefreshUnstableError(RuntimeError):
     """Raised when a catalog changes throughout every refresh attempt."""
+
+
+class ImageChangedDuringIndexError(OSError):
+    """A transient source replacement invalidated an in-progress index read."""
 
 
 @dataclass(slots=True)
@@ -404,7 +563,16 @@ class HammingBKTreeNode:
 class Catalog:
     """SQLite-backed, self-contained state for one photo catalog."""
 
-    def __init__(self, root: Path, settings: CatalogSettings | None = None) -> None:
+    def __init__(
+        self,
+        root: Path,
+        settings: CatalogSettings | None = None,
+        *,
+        create_root: bool = True,
+        initialize_state: bool = True,
+        expected_root_identity: tuple[int, int] | None = None,
+        expected_storage_identity: CatalogStorageIdentity | None = None,
+    ) -> None:
         self.root = root.expanduser().resolve()
         self.state_dir = self.root / ".marnwick"
         self.db_path = self.state_dir / "catalog.sqlite3"
@@ -414,10 +582,34 @@ class Catalog:
         self.catalog_lock_path = self.state_dir / CATALOG_LOCK_FILE_NAME
         self._closed = False
         self._catalog_lock_acquired = False
-        self.root.mkdir(parents=True, exist_ok=True)
+        self._read_only = False
+        self._settings_cache: CatalogSettings | None = None
+        if create_root:
+            self.root.mkdir(parents=True, exist_ok=True)
+        root_stat = self.root.lstat()
+        if stat_module.S_ISLNK(root_stat.st_mode) or not stat_module.S_ISDIR(root_stat.st_mode):
+            raise NotADirectoryError(self.root)
+        self._root_identity = (int(root_stat.st_dev), int(root_stat.st_ino))
+        if expected_root_identity is not None and self._root_identity != expected_root_identity:
+            raise OSError(f"catalog root was replaced before it could be opened: {self.root}")
         if self.state_dir.is_symlink():
             raise ValueError("catalog state directory must not be a symbolic link")
-        self.state_dir.mkdir(parents=True, exist_ok=True)
+        if initialize_state:
+            self.state_dir.mkdir(exist_ok=True)
+        state_stat = self.state_dir.lstat()
+        if stat_module.S_ISLNK(state_stat.st_mode) or not stat_module.S_ISDIR(
+            state_stat.st_mode
+        ):
+            raise NotADirectoryError(self.state_dir)
+        self._state_identity = self._object_identity(state_stat)
+        if (
+            expected_storage_identity is not None
+            and self._state_identity != expected_storage_identity[0]
+        ):
+            raise OSError(
+                f"catalog state directory was replaced before it could be opened: {self.state_dir}"
+            )
+        self._assert_catalog_root_identity()
         if self.state_dir.is_symlink():
             raise ValueError("catalog state directory must not be a symbolic link")
         for state_path in (
@@ -430,6 +622,33 @@ class Catalog:
             self.catalog_lock_path,
         ):
             self._assert_safe_state_entry(state_path)
+        if not initialize_state:
+            db_stat = self.db_path.lstat()
+            if not stat_module.S_ISREG(db_stat.st_mode):
+                raise ValueError("catalog database must be an existing regular file")
+        pre_open_database_identity: CatalogObjectIdentity | None = None
+        try:
+            db_stat = self.db_path.lstat()
+        except FileNotFoundError:
+            if expected_storage_identity is not None:
+                raise OSError(
+                    f"catalog database was replaced before it could be opened: {self.db_path}"
+                )
+        else:
+            if (
+                stat_module.S_ISLNK(db_stat.st_mode)
+                or not stat_module.S_ISREG(db_stat.st_mode)
+                or db_stat.st_nlink > 1
+            ):
+                raise ValueError("catalog database must be a single-link regular file")
+            pre_open_database_identity = self._object_identity(db_stat)
+            if (
+                expected_storage_identity is not None
+                and pre_open_database_identity != expected_storage_identity[1]
+            ):
+                raise OSError(
+                    f"catalog database was replaced before it could be opened: {self.db_path}"
+                )
         _lock_catalog_file(self.catalog_lock_path)
         self._catalog_lock_acquired = True
         try:
@@ -438,6 +657,25 @@ class Catalog:
             self._db_lock = threading.RLock()
             self._configure_connection()
             self._init_schema()
+            database_stat = self.db_path.lstat()
+            if (
+                stat_module.S_ISLNK(database_stat.st_mode)
+                or not stat_module.S_ISREG(database_stat.st_mode)
+                or database_stat.st_nlink > 1
+            ):
+                raise ValueError("catalog database must be a single-link regular file")
+            self._database_identity = self._object_identity(database_stat)
+            if (
+                pre_open_database_identity is not None
+                and self._database_identity != pre_open_database_identity
+            ) or (
+                expected_storage_identity is not None
+                and self._database_identity != expected_storage_identity[1]
+            ):
+                raise OSError(
+                    f"catalog database was replaced while it was being opened: {self.db_path}"
+                )
+            self._assert_catalog_storage_identity()
             if settings is not None:
                 self.set_settings(settings)
             elif self._get_setting("thumbnail_native_size") is None:
@@ -453,12 +691,545 @@ class Catalog:
             self._catalog_lock_acquired = False
             raise
 
+    @classmethod
+    def open_reader(
+        cls,
+        root: Path,
+        *,
+        expected_root_identity: tuple[int, int] | None = None,
+        expected_storage_identity: CatalogStorageIdentity | None = None,
+    ) -> "Catalog":
+        """Open an existing catalog through a lightweight read-only connection.
+
+        Pane, tree, and diagnostic reads must not run schema initialization,
+        switch journal modes, or recreate a root that disappeared after work
+        was queued.  The owning workspace keeps the process catalog lock; this
+        connection is intentionally query-only and has a short busy timeout so
+        stale UI work can be canceled promptly.
+        """
+
+        reader = cls.__new__(cls)
+        reader.root = root.expanduser().resolve(strict=True)
+        root_stat = reader.root.lstat()
+        if stat_module.S_ISLNK(root_stat.st_mode) or not stat_module.S_ISDIR(root_stat.st_mode):
+            raise NotADirectoryError(reader.root)
+        reader._root_identity = (int(root_stat.st_dev), int(root_stat.st_ino))
+        if (
+            expected_root_identity is not None
+            and reader._root_identity != expected_root_identity
+        ):
+            raise OSError(f"catalog root was replaced before it could be read: {reader.root}")
+        reader.state_dir = reader.root / ".marnwick"
+        reader.db_path = reader.state_dir / "catalog.sqlite3"
+        reader.log_path = reader.state_dir / LOG_FILE_NAME
+        reader.directory_tree_cache_path = reader.state_dir / DIRECTORY_TREE_CACHE_FILE_NAME
+        reader.thumbnail_dir = reader.state_dir / THUMBNAIL_DIR_NAME
+        reader.catalog_lock_path = reader.state_dir / CATALOG_LOCK_FILE_NAME
+        reader._closed = False
+        reader._catalog_lock_acquired = False
+        reader._read_only = True
+        reader._settings_cache = None
+        state_stat = reader.state_dir.lstat()
+        if stat_module.S_ISLNK(state_stat.st_mode) or not stat_module.S_ISDIR(state_stat.st_mode):
+            raise ValueError("catalog state directory must be an existing directory")
+        reader._state_identity = reader._object_identity(state_stat)
+        if (
+            expected_storage_identity is not None
+            and reader._state_identity != expected_storage_identity[0]
+        ):
+            raise OSError(
+                f"catalog state directory was replaced before it could be read: {reader.state_dir}"
+            )
+        for state_path in (
+            reader.db_path,
+            reader.db_path.with_name(f"{reader.db_path.name}-wal"),
+            reader.db_path.with_name(f"{reader.db_path.name}-shm"),
+            reader.log_path,
+            reader.directory_tree_cache_path,
+            reader.thumbnail_dir,
+            reader.catalog_lock_path,
+        ):
+            reader._assert_safe_state_entry(state_path)
+        db_stat = reader.db_path.lstat()
+        if (
+            stat_module.S_ISLNK(db_stat.st_mode)
+            or not stat_module.S_ISREG(db_stat.st_mode)
+            or db_stat.st_nlink > 1
+        ):
+            raise ValueError("catalog database must be a single-link regular file")
+        reader._database_identity = reader._object_identity(db_stat)
+        if (
+            expected_storage_identity is not None
+            and reader._database_identity != expected_storage_identity[1]
+        ):
+            raise OSError(
+                f"catalog database was replaced before it could be read: {reader.db_path}"
+            )
+        reader._assert_catalog_root_identity()
+        reader._assert_catalog_storage_identity()
+        reader._conn = sqlite3.connect(
+            f"{reader.db_path.as_uri()}?mode=ro",
+            uri=True,
+            isolation_level=None,
+            check_same_thread=False,
+            timeout=0.25,
+        )
+        try:
+            reader._conn.row_factory = sqlite3.Row
+            reader._db_lock = threading.RLock()
+            reader._conn.execute("PRAGMA query_only = ON")
+            reader._conn.execute("PRAGMA foreign_keys = ON")
+            reader._conn.execute("PRAGMA busy_timeout = 250")
+            # Fail now, rather than much later in a pane worker, when this is
+            # not an initialized Marnwick database.
+            reader._conn.execute("SELECT 1 FROM settings LIMIT 1").fetchone()
+            reader._assert_catalog_storage_identity()
+        except BaseException:
+            reader._conn.close()
+            raise
+        return reader
+
+    @classmethod
+    def open_writer(
+        cls,
+        root: Path,
+        *,
+        expected_root_identity: tuple[int, int] | None = None,
+        expected_storage_identity: CatalogStorageIdentity | None = None,
+    ) -> "Catalog":
+        """Open an initialized catalog for recurring background writes.
+
+        The primary :class:`Catalog` constructor owns catalog creation and
+        migrations.  Short-lived index and mutation workers should not repeat
+        that work every time they need their own SQLite connection.  This
+        mode opens the existing database with ``mode=rw``, validates the
+        minimum schema it relies on, and never creates or migrates state.
+        """
+
+        writer = cls.__new__(cls)
+        writer.root = root.expanduser().resolve(strict=True)
+        root_stat = writer.root.lstat()
+        if stat_module.S_ISLNK(root_stat.st_mode) or not stat_module.S_ISDIR(
+            root_stat.st_mode
+        ):
+            raise NotADirectoryError(writer.root)
+        writer._root_identity = (int(root_stat.st_dev), int(root_stat.st_ino))
+        if (
+            expected_root_identity is not None
+            and writer._root_identity != expected_root_identity
+        ):
+            raise OSError(
+                f"catalog root was replaced before it could be opened for writing: {writer.root}"
+            )
+        writer.state_dir = writer.root / ".marnwick"
+        writer.db_path = writer.state_dir / "catalog.sqlite3"
+        writer.log_path = writer.state_dir / LOG_FILE_NAME
+        writer.directory_tree_cache_path = (
+            writer.state_dir / DIRECTORY_TREE_CACHE_FILE_NAME
+        )
+        writer.thumbnail_dir = writer.state_dir / THUMBNAIL_DIR_NAME
+        writer.catalog_lock_path = writer.state_dir / CATALOG_LOCK_FILE_NAME
+        writer._closed = False
+        writer._catalog_lock_acquired = False
+        writer._read_only = False
+        writer._settings_cache = None
+        state_stat = writer.state_dir.lstat()
+        if stat_module.S_ISLNK(state_stat.st_mode) or not stat_module.S_ISDIR(
+            state_stat.st_mode
+        ):
+            raise ValueError("catalog state directory must be an existing directory")
+        writer._state_identity = writer._object_identity(state_stat)
+        if (
+            expected_storage_identity is not None
+            and writer._state_identity != expected_storage_identity[0]
+        ):
+            raise OSError(
+                "catalog state directory was replaced before it could be opened for writing: "
+                f"{writer.state_dir}"
+            )
+        for state_path in (
+            writer.db_path,
+            writer.db_path.with_name(f"{writer.db_path.name}-wal"),
+            writer.db_path.with_name(f"{writer.db_path.name}-shm"),
+            writer.log_path,
+            writer.directory_tree_cache_path,
+            writer.thumbnail_dir,
+            writer.catalog_lock_path,
+        ):
+            writer._assert_safe_state_entry(state_path)
+        db_stat = writer.db_path.lstat()
+        if (
+            stat_module.S_ISLNK(db_stat.st_mode)
+            or not stat_module.S_ISREG(db_stat.st_mode)
+            or db_stat.st_nlink > 1
+        ):
+            raise ValueError("catalog database must be a single-link regular file")
+        writer._database_identity = writer._object_identity(db_stat)
+        if (
+            expected_storage_identity is not None
+            and writer._database_identity != expected_storage_identity[1]
+        ):
+            raise OSError(
+                f"catalog database was replaced before it could be opened for writing: {writer.db_path}"
+            )
+        writer._assert_catalog_root_identity()
+        writer._assert_catalog_storage_identity()
+        _lock_catalog_file(writer.catalog_lock_path)
+        writer._catalog_lock_acquired = True
+        try:
+            writer._conn = sqlite3.connect(
+                f"{writer.db_path.as_uri()}?mode=rw",
+                uri=True,
+                isolation_level=None,
+                check_same_thread=False,
+                timeout=5.0,
+            )
+            writer._conn.row_factory = sqlite3.Row
+            writer._db_lock = threading.RLock()
+            writer._conn.execute("PRAGMA busy_timeout = 5000")
+            writer._conn.execute("PRAGMA foreign_keys = ON")
+            writer._conn.execute("PRAGMA temp_store = MEMORY")
+            writer._conn.execute("PRAGMA mmap_size = 268435456")
+            writer._conn.execute("PRAGMA cache_size = -131072")
+            # Validate an initialized, current-enough catalog without running
+            # CREATE TABLE, ALTER TABLE, or journal-mode negotiation.
+            settings_row = writer._conn.execute(
+                "SELECT value FROM settings WHERE key = 'thumbnail_native_size'"
+            ).fetchone()
+            if settings_row is None:
+                raise sqlite3.DatabaseError(
+                    "catalog database has not been initialized"
+                )
+            writer._conn.execute(
+                "SELECT rel_path, dir_rel, thumb_rel_path FROM images LIMIT 0"
+            )
+            writer._conn.execute(
+                "SELECT dir_rel, parent_dir_rel FROM directories LIMIT 0"
+            )
+            writer._assert_catalog_storage_identity()
+        except BaseException:
+            connection = getattr(writer, "_conn", None)
+            if connection is not None:
+                with suppress(Exception):
+                    connection.close()
+            _unlock_catalog_file(writer.catalog_lock_path)
+            writer._catalog_lock_acquired = False
+            raise
+        return writer
+
+    @classmethod
+    def open_filesystem_handle(
+        cls,
+        root: Path,
+        *,
+        expected_root_identity: tuple[int, int] | None = None,
+    ) -> "Catalog":
+        """Open only the guarded path surface for file-worker operations.
+
+        Image encoding does not need SQLite.  Avoiding schema and lock work
+        keeps the fast static-image path fast and lets the worker validate the
+        selected root without creating catalog state as a side effect.
+        """
+
+        handle = cls.__new__(cls)
+        handle.root = root.expanduser().resolve(strict=True)
+        root_stat = handle.root.lstat()
+        if stat_module.S_ISLNK(root_stat.st_mode) or not stat_module.S_ISDIR(
+            root_stat.st_mode
+        ):
+            raise NotADirectoryError(handle.root)
+        handle._root_identity = (int(root_stat.st_dev), int(root_stat.st_ino))
+        if (
+            expected_root_identity is not None
+            and handle._root_identity != expected_root_identity
+        ):
+            raise OSError(
+                f"catalog root was replaced before file work started: {handle.root}"
+            )
+        handle.state_dir = handle.root / ".marnwick"
+        handle.db_path = handle.state_dir / "catalog.sqlite3"
+        handle.log_path = handle.state_dir / LOG_FILE_NAME
+        handle.directory_tree_cache_path = (
+            handle.state_dir / DIRECTORY_TREE_CACHE_FILE_NAME
+        )
+        handle.thumbnail_dir = handle.state_dir / THUMBNAIL_DIR_NAME
+        handle.catalog_lock_path = handle.state_dir / CATALOG_LOCK_FILE_NAME
+        handle._closed = False
+        handle._catalog_lock_acquired = False
+        handle._read_only = True
+        handle._settings_cache = None
+        handle._conn = None
+        handle._db_lock = threading.RLock()
+        return handle
+
+    def _assert_catalog_root_identity(self) -> None:
+        try:
+            root_stat = self.root.lstat()
+        except OSError as error:
+            raise FileNotFoundError(f"catalog root is unavailable: {self.root}") from error
+        if (
+            not stat_module.S_ISDIR(root_stat.st_mode)
+            or stat_module.S_ISLNK(root_stat.st_mode)
+            or (int(root_stat.st_dev), int(root_stat.st_ino)) != self._root_identity
+        ):
+            raise OSError(f"catalog root was replaced while open: {self.root}")
+
+    @staticmethod
+    def _object_identity(entry_stat: os.stat_result) -> CatalogObjectIdentity:
+        return int(entry_stat.st_dev), int(entry_stat.st_ino)
+
+    @classmethod
+    def assert_storage_identity(
+        cls,
+        root: Path,
+        *,
+        expected_root_identity: CatalogObjectIdentity,
+        expected_storage_identity: CatalogStorageIdentity,
+    ) -> None:
+        """Fail closed unless ``root`` still names the captured catalog state.
+
+        SQLite connections remain attached to an inode after its pathname is
+        renamed.  Path-based cache/log writes do not.  Guard both the state
+        directory and database pathname so a queued worker cannot combine the
+        old connection with a newly installed ``.marnwick`` tree.
+        """
+
+        lexical_root = root.expanduser().absolute()
+        try:
+            root_stat = lexical_root.lstat()
+            state_dir = lexical_root / ".marnwick"
+            state_stat = state_dir.lstat()
+            database_path = state_dir / "catalog.sqlite3"
+            database_stat = database_path.lstat()
+        except OSError as error:
+            raise FileNotFoundError(
+                f"catalog storage is unavailable: {lexical_root}"
+            ) from error
+        if (
+            stat_module.S_ISLNK(root_stat.st_mode)
+            or not stat_module.S_ISDIR(root_stat.st_mode)
+            or cls._object_identity(root_stat) != expected_root_identity
+        ):
+            raise OSError(f"catalog root was replaced while open: {lexical_root}")
+        if (
+            stat_module.S_ISLNK(state_stat.st_mode)
+            or not stat_module.S_ISDIR(state_stat.st_mode)
+            or cls._object_identity(state_stat) != expected_storage_identity[0]
+        ):
+            raise OSError(
+                f"catalog state directory was replaced while open: {state_dir}"
+            )
+        if (
+            stat_module.S_ISLNK(database_stat.st_mode)
+            or not stat_module.S_ISREG(database_stat.st_mode)
+            or database_stat.st_nlink > 1
+            or cls._object_identity(database_stat) != expected_storage_identity[1]
+        ):
+            raise OSError(
+                f"catalog database was replaced while open: {database_path}"
+            )
+
+    def _assert_catalog_storage_identity(self) -> None:
+        self.assert_storage_identity(
+            self.root,
+            expected_root_identity=self._root_identity,
+            expected_storage_identity=(
+                self._state_identity,
+                self._database_identity,
+            ),
+        )
+
+    def _assert_writable(self) -> None:
+        """Reject mutations through reader/path-only or closed handles."""
+
+        if self._closed:
+            raise RuntimeError("catalog handle is closed")
+        if self._read_only or self._conn is None:
+            raise PermissionError("catalog handle is read-only")
+
+    @property
+    def root_identity(self) -> tuple[int, int]:
+        """Filesystem identity captured when this catalog handle was opened."""
+
+        return self._root_identity
+
+    @property
+    def state_identity(self) -> CatalogObjectIdentity:
+        """Identity of the live catalog's ``.marnwick`` directory."""
+
+        return self._state_identity
+
+    @property
+    def database_identity(self) -> CatalogObjectIdentity:
+        """Identity of the SQLite database opened by this handle."""
+
+        return self._database_identity
+
+    @property
+    def storage_identity(self) -> CatalogStorageIdentity:
+        """Captured state-directory and database identities for queued work."""
+
+        return self._state_identity, self._database_identity
+
+    def _mkdir_catalog_path(self, path: Path) -> None:
+        """Create descendants one level at a time without recreating the root."""
+
+        self._assert_catalog_root_identity()
+        try:
+            relative_parts = path.relative_to(self.root).parts
+        except ValueError as error:
+            raise ValueError("catalog directory is outside the catalog root") from error
+        current = self.root
+        for part in relative_parts:
+            current = current / part
+            try:
+                current_stat = current.lstat()
+            except FileNotFoundError:
+                current.mkdir()
+                current_stat = current.lstat()
+            if stat_module.S_ISLNK(current_stat.st_mode) or not stat_module.S_ISDIR(
+                current_stat.st_mode
+            ):
+                raise NotADirectoryError(current)
+        self._assert_catalog_root_identity()
+
+    @contextmanager
+    def _open_catalog_directory_fd(self, directory: Path) -> Iterator[int | None]:
+        """Pin a catalog directory without following a raced ancestor symlink.
+
+        Windows does not expose Python's ``dir_fd`` operations, so callers
+        retain their identity-checked path fallback there.  On POSIX each
+        descendant is opened relative to the preceding descriptor with
+        ``O_NOFOLLOW`` and ``O_DIRECTORY``.
+        """
+
+        if os.name == "nt" or not hasattr(os, "O_DIRECTORY"):
+            yield None
+            return
+        try:
+            relative_parts = directory.relative_to(self.root).parts
+        except ValueError as error:
+            raise ValueError("catalog directory is outside the catalog root") from error
+        self._validate_catalog_entry_parts(relative_parts)
+        flags = (
+            os.O_RDONLY
+            | os.O_DIRECTORY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        fd = os.open(self.root, flags)
+        try:
+            root_stat = os.fstat(fd)
+            if (
+                not stat_module.S_ISDIR(root_stat.st_mode)
+                or (int(root_stat.st_dev), int(root_stat.st_ino))
+                != self._root_identity
+            ):
+                raise OSError(f"catalog root was replaced while opening a mutation: {self.root}")
+            for part in relative_parts:
+                next_fd = os.open(part, flags, dir_fd=fd)
+                os.close(fd)
+                fd = next_fd
+                current_stat = os.fstat(fd)
+                if not stat_module.S_ISDIR(current_stat.st_mode):
+                    raise NotADirectoryError(directory)
+            self._assert_catalog_root_identity()
+            yield fd
+        finally:
+            with suppress(OSError):
+                os.close(fd)
+
+    def _directory_fd_still_names_path(self, fd: int, directory: Path) -> bool:
+        try:
+            with self._open_catalog_directory_fd(directory) as current_fd:
+                if current_fd is None:
+                    return True
+                opened = os.fstat(fd)
+                current = os.fstat(current_fd)
+                return (opened.st_dev, opened.st_ino) == (current.st_dev, current.st_ino)
+        except (OSError, ValueError):
+            return False
+
+    def _rename_catalog_entry_noreplace(
+        self,
+        source: Path,
+        destination: Path,
+        *,
+        dest_catalog: "Catalog | None" = None,
+        expected_source_identity: Sequence[int] | None = None,
+    ) -> None:
+        """Rename an entry through pinned parents where the OS supports it."""
+
+        destination_owner = self if dest_catalog is None else dest_catalog
+        if os.name == "nt" or not hasattr(os, "O_DIRECTORY"):
+            _rename_noreplace(source, destination)
+            return
+        with self._open_catalog_directory_fd(source.parent) as source_fd:
+            with destination_owner._open_catalog_directory_fd(
+                destination.parent
+            ) as destination_fd:
+                if source_fd is None or destination_fd is None:
+                    _rename_noreplace(source, destination)
+                    return
+                source_stat = os.stat(
+                    source.name,
+                    dir_fd=source_fd,
+                    follow_symlinks=False,
+                )
+                if expected_source_identity is not None and (
+                    int(source_stat.st_dev),
+                    int(source_stat.st_ino),
+                ) != (
+                    int(expected_source_identity[0]),
+                    int(expected_source_identity[1]),
+                ):
+                    raise OSError(f"mutation source changed before rename: {source}")
+                _rename_noreplace_at(
+                    source_fd,
+                    source.name,
+                    destination_fd,
+                    destination.name,
+                )
+                try:
+                    moved_stat = os.stat(
+                        destination.name,
+                        dir_fd=destination_fd,
+                        follow_symlinks=False,
+                    )
+                    if (moved_stat.st_dev, moved_stat.st_ino) != (
+                        source_stat.st_dev,
+                        source_stat.st_ino,
+                    ):
+                        raise OSError("renamed catalog entry has the wrong identity")
+                    if not self._directory_fd_still_names_path(
+                        source_fd, source.parent
+                    ) or not destination_owner._directory_fd_still_names_path(
+                        destination_fd, destination.parent
+                    ):
+                        raise OSError(
+                            "catalog ancestor changed while rename was in progress"
+                        )
+                except BaseException as validation_error:
+                    try:
+                        _rename_noreplace_at(
+                            destination_fd,
+                            destination.name,
+                            source_fd,
+                            source.name,
+                        )
+                    except OSError as rollback_error:
+                        raise OSError(
+                            f"rename validation failed; entry was retained at {destination}"
+                        ) from rollback_error
+                    raise validation_error
     def close(self) -> None:
         if self._closed:
             return
         self._closed = True
         try:
-            self._conn.close()
+            connection = self._conn
+            if connection is not None:
+                connection.close()
         finally:
             if self._catalog_lock_acquired:
                 _unlock_catalog_file(self.catalog_lock_path)
@@ -501,29 +1272,49 @@ class Catalog:
 
     @property
     def settings(self) -> CatalogSettings:
-        thumbnail_size = self._get_setting("thumbnail_native_size")
-        prune_parallelism = self._get_setting("prune_parallelism")
-        return CatalogSettings(
-            thumbnail_native_size=int(thumbnail_size or 512),
-            prune_parallelism=max(1, int(prune_parallelism or 4)),
-        )
+        cached = self._settings_cache
+        if cached is not None:
+            return cached
+        with self._db_lock:
+            cached = self._settings_cache
+            if cached is None:
+                rows = {
+                    str(row["key"]): str(row["value"])
+                    for row in self._conn.execute(
+                        """
+                        SELECT key, value
+                        FROM settings
+                        WHERE key IN ('thumbnail_native_size', 'prune_parallelism')
+                        """
+                    )
+                }
+                cached = CatalogSettings(
+                    thumbnail_native_size=int(rows.get("thumbnail_native_size", "512")),
+                    prune_parallelism=max(1, int(rows.get("prune_parallelism", "4"))),
+                )
+                self._settings_cache = cached
+        return cached
 
     def set_settings(self, settings: CatalogSettings) -> None:
+        self._assert_writable()
         if settings.thumbnail_native_size < 64:
             raise ValueError("thumbnail_native_size must be at least 64")
         if settings.prune_parallelism < 1:
             raise ValueError("prune_parallelism must be at least 1")
-        self._set_setting("thumbnail_native_size", str(settings.thumbnail_native_size))
-        self._set_setting("prune_parallelism", str(settings.prune_parallelism))
+        with self._database_savepoint("set_catalog_settings"):
+            self._set_setting("thumbnail_native_size", str(settings.thumbnail_native_size))
+            self._set_setting("prune_parallelism", str(settings.prune_parallelism))
+        self._settings_cache = settings
 
     def append_log(self, message: str, *, level: str = "INFO") -> None:
+        self._assert_writable()
         timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
         safe_level = " ".join(level.upper().split()) or "INFO"
         safe_message = " ".join(str(message).splitlines())
         line = f"{timestamp} {safe_level} {safe_message}\n"
         try:
+            self._assert_catalog_storage_identity()
             self._assert_safe_state_entry(self.log_path)
-            self.state_dir.mkdir(parents=True, exist_ok=True)
             flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
             if hasattr(os, "O_NOFOLLOW"):
                 flags |= os.O_NOFOLLOW
@@ -538,13 +1329,23 @@ class Catalog:
             return
 
     def read_log_lines(self) -> list[str]:
+        fd = -1
         try:
             self._assert_safe_state_entry(self.log_path)
-            data = self.log_path.read_bytes()
+            flags = os.O_RDONLY
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            fd = os.open(self.log_path, flags)
+            file_size = os.fstat(fd).st_size
+            start = max(0, file_size - MAX_LOG_BYTES)
+            os.lseek(fd, start, os.SEEK_SET)
+            data = os.read(fd, MAX_LOG_BYTES)
         except (OSError, ValueError):
             return []
-        if len(data) > MAX_LOG_BYTES:
-            data = data[-MAX_LOG_BYTES:]
+        finally:
+            if fd >= 0:
+                os.close(fd)
+        if start:
             first_newline = data.find(b"\n")
             if first_newline >= 0:
                 data = data[first_newline + 1 :]
@@ -624,35 +1425,93 @@ class Catalog:
 
     def _write_thumbnail_rel_file(self, thumb_rel_path: str, thumb_blob: bytes) -> None:
         target = self.thumbnail_abs_path(thumb_rel_path)
-        if target.is_file() and self._thumbnail_file_is_valid(target):
-            return
-        target.unlink(missing_ok=True)
-        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            if target.is_file() and target.stat().st_size == len(thumb_blob):
+                if target.read_bytes() == thumb_blob:
+                    return
+        except OSError:
+            pass
+        self._mkdir_catalog_path(target.parent)
         fd, temp_name = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=target.parent)
         temp = Path(temp_name)
         try:
             with os.fdopen(fd, "wb") as handle:
                 handle.write(thumb_blob)
-            temp.rename(target)
+            # A valid-looking but mismatched content-addressed file is poison,
+            # not a cache hit. Atomically replace it with the deterministic
+            # bytes derived from the verified source descriptor.
+            os.replace(temp, target)
         finally:
             temp.unlink(missing_ok=True)
 
     def _read_thumbnail_file(self, thumb_rel_path: str | None) -> bytes | None:
         if not thumb_rel_path:
             return None
+        fd = -1
+        opened_stat: os.stat_result | None = None
         try:
             path = self.thumbnail_abs_path(thumb_rel_path)
-            data = path.read_bytes()
+            flags = os.O_RDONLY
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            fd = os.open(path, flags)
+            opened_stat = os.fstat(fd)
+            if (
+                not stat_module.S_ISREG(opened_stat.st_mode)
+                or opened_stat.st_size < 0
+                or opened_stat.st_size > MAX_THUMBNAIL_FILE_BYTES
+            ):
+                data = b""
+            else:
+                remaining = int(opened_stat.st_size) + 1
+                chunks: list[bytes] = []
+                while remaining > 0:
+                    chunk = os.read(fd, min(remaining, 1024 * 1024))
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    remaining -= len(chunk)
+                data = b"".join(chunks)
+                final_stat = os.fstat(fd)
+                if (
+                    (final_stat.st_dev, final_stat.st_ino)
+                    != (opened_stat.st_dev, opened_stat.st_ino)
+                    or final_stat.st_size != opened_stat.st_size
+                    or len(data) != opened_stat.st_size
+                ):
+                    return None
             # This is a foreground/UI read. Full Pillow decoding here doubles
             # thumbnail decode work; background refresh/prune paths perform the
             # authoritative validation. JPEG framing cheaply rejects truncated
             # and obviously corrupt cache entries in the meantime.
             if not self._thumbnail_blob_looks_like_jpeg(data):
-                path.unlink(missing_ok=True)
+                if not self._read_only:
+                    self._unlink_thumbnail_if_same_file(path, opened_stat)
                 return None
             return data
         except (OSError, ValueError):
             return None
+        finally:
+            if fd >= 0:
+                os.close(fd)
+
+    @staticmethod
+    def _unlink_thumbnail_if_same_file(path: Path, opened_stat: os.stat_result | None) -> None:
+        """Remove only the single-link cache inode that was actually inspected."""
+
+        if opened_stat is None or opened_stat.st_nlink != 1:
+            return
+        try:
+            current_stat = path.lstat()
+        except FileNotFoundError:
+            return
+        if (
+            stat_module.S_ISREG(current_stat.st_mode)
+            and current_stat.st_nlink == 1
+            and (current_stat.st_dev, current_stat.st_ino)
+            == (opened_stat.st_dev, opened_stat.st_ino)
+        ):
+            path.unlink(missing_ok=True)
 
     def _thumbnail_file_is_valid(self, path: Path) -> bool:
         try:
@@ -674,19 +1533,28 @@ class Catalog:
         return len(data) >= 4 and data.startswith(b"\xff\xd8") and data.endswith(b"\xff\xd9")
 
     def _thumbnail_blob_for_row(self, row: sqlite3.Row, rel_path: str) -> bytes | None:
-        thumb_blob = self._read_thumbnail_file(row["thumb_rel_path"])
+        original_thumb_rel_path = row["thumb_rel_path"]
+        thumb_blob = self._read_thumbnail_file(original_thumb_rel_path)
         if thumb_blob is not None:
             return thumb_blob
         legacy_blob = row["thumb_blob"]
+        if self._read_only:
+            # Reader connections are used by disposable UI queries.  They may
+            # consume an old inline thumbnail, but repair belongs to an index
+            # writer: attempting migration here would both stall the pane and
+            # fail under PRAGMA query_only.
+            return None if legacy_blob is None else bytes(legacy_blob)
         if legacy_blob is None:
             # Visible-row reads must stay cheap. The missing/corrupt file has
             # already been removed and the background directory refresh or
             # thumbnail prune will rebuild it.
+            self._clear_stale_thumbnail_reference(rel_path, original_thumb_rel_path)
             return None
         try:
             path = self.abs_path(rel_path)
             self._ensure_existing_thumbnail_file(rel_path, path, row)
         except Exception:
+            self._clear_stale_thumbnail_reference(rel_path, original_thumb_rel_path)
             return bytes(legacy_blob)
         updated = self._conn.execute(
             "SELECT thumb_rel_path FROM images WHERE rel_path = ?",
@@ -695,9 +1563,32 @@ class Catalog:
         migrated_blob = self._read_thumbnail_file(
             updated["thumb_rel_path"] if updated is not None else row["thumb_rel_path"]
         )
-        return migrated_blob if migrated_blob is not None else bytes(legacy_blob)
+        if migrated_blob is not None:
+            return migrated_blob
+        self._clear_stale_thumbnail_reference(rel_path, original_thumb_rel_path)
+        return bytes(legacy_blob)
+
+    def _clear_stale_thumbnail_reference(
+        self,
+        rel_path: str,
+        thumb_rel_path: object,
+    ) -> None:
+        if self._read_only or not thumb_rel_path:
+            return
+        with self._db_lock:
+            self._conn.execute(
+                """
+                UPDATE images
+                SET thumb_rel_path = NULL,
+                    thumb_size_px = 0
+                WHERE rel_path = ? AND thumb_rel_path = ?
+                """,
+                (rel_path, str(thumb_rel_path)),
+            )
 
     def _ensure_existing_thumbnail_file(self, rel_path: str, path: Path, row: sqlite3.Row) -> bool:
+        if self._read_only:
+            return False
         thumb_rel_path = row["thumb_rel_path"]
         thumb_cache_key = row["thumb_cache_key"]
         thumb_size_px = int(row["thumb_size_px"] or self.settings.thumbnail_native_size)
@@ -781,25 +1672,43 @@ class Catalog:
         return thumb_rel_paths
 
     def _remove_unreferenced_thumbnail_files(self, thumb_rel_paths: Iterable[str]) -> None:
-        for thumb_rel_path in set(path for path in thumb_rel_paths if path):
-            row = self._conn.execute(
-                "SELECT 1 FROM images WHERE thumb_rel_path = ? LIMIT 1",
-                (thumb_rel_path,),
-            ).fetchone()
-            if row is not None:
+        # Callers such as subtree deletion may supply millions of cache keys.
+        # Deduplicate one bounded window at a time instead of constructing a
+        # catalog-sized Python set. Rechecking a duplicate from a later window
+        # is harmless and still bounded.
+        pending: set[str] = set()
+
+        def remove_pending() -> None:
+            for thumb_rel_path in pending:
+                row = self._conn.execute(
+                    "SELECT 1 FROM images WHERE thumb_rel_path = ? LIMIT 1",
+                    (thumb_rel_path,),
+                ).fetchone()
+                if row is not None:
+                    continue
+                try:
+                    path = self.thumbnail_abs_path(thumb_rel_path)
+                except ValueError:
+                    continue
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
+                except OSError as error:
+                    self.append_log(f"Thumbnail cleanup error for {thumb_rel_path}: {error}", level="ERROR")
+                    continue
+                self._remove_empty_thumbnail_parents(path.parent)
+
+        for raw_thumb_rel_path in thumb_rel_paths:
+            if not raw_thumb_rel_path:
                 continue
-            try:
-                path = self.thumbnail_abs_path(thumb_rel_path)
-            except ValueError:
+            pending.add(str(raw_thumb_rel_path))
+            if len(pending) < PRUNE_BATCH_SIZE:
                 continue
-            try:
-                path.unlink()
-            except FileNotFoundError:
-                pass
-            except OSError as error:
-                self.append_log(f"Thumbnail cleanup error for {thumb_rel_path}: {error}", level="ERROR")
-                continue
-            self._remove_empty_thumbnail_parents(path.parent)
+            remove_pending()
+            pending.clear()
+        if pending:
+            remove_pending()
 
     def _prune_orphan_thumbnail_files(
         self,
@@ -845,59 +1754,187 @@ class Catalog:
                 continue
         return removed
 
+    def _parallel_prune_results(
+        self,
+        jobs: Iterable[dict[str, object] | Path],
+        process: Callable[
+            ["Catalog", dict[str, object] | Path],
+            ThumbnailPruneRowResult | int,
+        ],
+        *,
+        workers: int,
+        cancel_check: CancelCallback | None,
+        thread_name_prefix: str,
+    ) -> Iterator[ThumbnailPruneRowResult | int]:
+        """Run bounded prune units on daemon workers with owned connections.
+
+        The outer index task may be abandoned when a disconnected filesystem
+        traps a native call.  These workers must therefore be daemons rather
+        than ``ThreadPoolExecutor`` threads, which Python joins indefinitely at
+        interpreter exit.  Each worker owns and closes its SQLite connection;
+        cancellation never closes a connection out from under a running row.
+        """
+
+        worker_count = max(1, int(workers))
+        admission_limit = max(1, worker_count * 4)
+        job_queue: queue.Queue[dict[str, object] | Path] = queue.Queue(
+            maxsize=admission_limit
+        )
+        result_queue: queue.Queue[ThumbnailPruneRowResult | int] = queue.Queue(
+            maxsize=admission_limit
+        )
+        stop_event = threading.Event()
+        error_lock = threading.Lock()
+        first_error: list[BaseException] = []
+
+        def remember_error(error: BaseException) -> None:
+            with error_lock:
+                if not first_error:
+                    first_error.append(error)
+            stop_event.set()
+
+        def raise_if_stopped() -> None:
+            if cancel_check is not None:
+                cancel_check()
+            with error_lock:
+                error = first_error[0] if first_error else None
+            if error is not None:
+                raise error
+
+        def publish_result(result: ThumbnailPruneRowResult | int) -> bool:
+            while not stop_event.is_set():
+                try:
+                    result_queue.put(result, timeout=0.05)
+                    return True
+                except queue.Full:
+                    continue
+            return False
+
+        def worker() -> None:
+            worker_catalog: Catalog | None = None
+            try:
+                while not stop_event.is_set():
+                    try:
+                        job = job_queue.get(timeout=0.05)
+                    except queue.Empty:
+                        continue
+                    if worker_catalog is None:
+                        worker_catalog = Catalog.open_writer(
+                            self.root,
+                            expected_root_identity=self.root_identity,
+                            expected_storage_identity=self.storage_identity,
+                        )
+                    if cancel_check is not None:
+                        cancel_check()
+                    if not publish_result(process(worker_catalog, job)):
+                        return
+            except BaseException as error:
+                remember_error(error)
+            finally:
+                if worker_catalog is not None:
+                    with suppress(Exception):
+                        worker_catalog.close()
+
+        threads = [
+            threading.Thread(
+                target=worker,
+                name=f"{thread_name_prefix}-{index}",
+                daemon=True,
+            )
+            for index in range(worker_count)
+        ]
+        for thread in threads:
+            thread.start()
+
+        outstanding = 0
+        completed = False
+        try:
+            for job in jobs:
+                raise_if_stopped()
+                while outstanding >= admission_limit:
+                    while True:
+                        raise_if_stopped()
+                        try:
+                            result = result_queue.get(timeout=0.05)
+                        except queue.Empty:
+                            continue
+                        break
+                    outstanding -= 1
+                    yield result
+                while True:
+                    raise_if_stopped()
+                    try:
+                        job_queue.put(job, timeout=0.05)
+                    except queue.Full:
+                        continue
+                    outstanding += 1
+                    break
+            while outstanding:
+                raise_if_stopped()
+                try:
+                    result = result_queue.get(timeout=0.05)
+                except queue.Empty:
+                    continue
+                outstanding -= 1
+                yield result
+            completed = True
+        finally:
+            stop_event.set()
+            if completed:
+                for thread in threads:
+                    thread.join()
+            else:
+                # A canceled/stuck prune must not turn cancellation into a
+                # second indefinite wait. Healthy workers observe stop within
+                # one queue poll; native-blocked daemon workers are abandoned.
+                for thread in threads:
+                    thread.join(timeout=0.1)
+
     def _prune_orphan_thumbnail_files_parallel(
         self,
         workers: int,
         cancel_check: CancelCallback | None = None,
     ) -> int:
-        path_queue: queue.Queue[Path | object] = queue.Queue(maxsize=max(1, workers * 8))
         removed = 0
-        removed_lock = threading.Lock()
+        def process_path(
+            catalog: Catalog,
+            raw_path: dict[str, object] | Path,
+        ) -> int:
+            assert isinstance(raw_path, Path)
+            path = raw_path
+            if cancel_check is not None:
+                cancel_check()
+            try:
+                thumb_rel_path = path.relative_to(catalog.state_dir).as_posix()
+            except ValueError:
+                return 0
+            row = catalog._conn.execute(
+                "SELECT 1 FROM images WHERE thumb_rel_path = ? LIMIT 1",
+                (thumb_rel_path,),
+            ).fetchone()
+            if row is not None:
+                return 0
+            try:
+                path.unlink()
+            except OSError as error:
+                catalog.append_log(f"Thumbnail prune error for {thumb_rel_path}: {error}", level="ERROR")
+                return 0
+            return 1
 
-        def worker() -> None:
-            nonlocal removed
-            with Catalog(self.root) as catalog:
-                while True:
-                    item = path_queue.get()
-                    if item is PIPELINE_SENTINEL:
-                        return
-                    if not isinstance(item, Path):
-                        continue
-                    try:
-                        thumb_rel_path = item.relative_to(catalog.state_dir).as_posix()
-                    except ValueError:
-                        continue
-                    row = catalog._conn.execute(
-                        "SELECT 1 FROM images WHERE thumb_rel_path = ? LIMIT 1",
-                        (thumb_rel_path,),
-                    ).fetchone()
-                    if row is not None:
-                        continue
-                    try:
-                        item.unlink()
-                    except OSError as error:
-                        catalog.append_log(f"Thumbnail prune error for {thumb_rel_path}: {error}", level="ERROR")
-                        continue
-                    with removed_lock:
-                        removed += 1
-
-        threads = [
-            threading.Thread(target=worker, name=f"marnwick-prune-orphan-{index}", daemon=True)
-            for index in range(workers)
-        ]
-        for thread in threads:
-            thread.start()
-        try:
-            for path in self.thumbnail_dir.rglob("*"):
-                if cancel_check is not None:
-                    cancel_check()
-                if path.is_file():
-                    self._force_queue_put(path_queue, path)
-        finally:
-            for _ in threads:
-                self._force_queue_put(path_queue, PIPELINE_SENTINEL)
-            for thread in threads:
-                thread.join()
+        paths = (
+            path
+            for path in self.thumbnail_dir.rglob("*")
+            if path.is_file()
+        )
+        for result in self._parallel_prune_results(
+            paths,
+            process_path,
+            workers=workers,
+            cancel_check=cancel_check,
+            thread_name_prefix="marnwick-prune-orphan",
+        ):
+            assert isinstance(result, int)
+            removed += result
         for dirpath, _, _ in os.walk(self.thumbnail_dir, topdown=False):
             if cancel_check is not None:
                 cancel_check()
@@ -945,6 +1982,7 @@ class Catalog:
         return None if row is None else str(row["find_hash"])
 
     def save_catalog_find_hash(self, cancel_check: CancelCallback | None = None) -> str:
+        self._assert_writable()
         find_hash = self.save_directory_find_hash("", cancel_check, complete=True)
         self._save_catalog_find_hash_value(find_hash)
         return find_hash
@@ -974,6 +2012,100 @@ class Catalog:
             return None, False
         return None if row["find_hash"] is None else str(row["find_hash"]), bool(row["find_hash_complete"])
 
+    def stored_directory_entry_hash(self, dir_rel: str) -> str | None:
+        row = self._conn.execute(
+            "SELECT entry_find_hash FROM directories WHERE dir_rel = ?",
+            (dir_rel,),
+        ).fetchone()
+        return None if row is None or row["entry_find_hash"] is None else str(row["entry_find_hash"])
+
+    def save_directory_entry_hash(
+        self,
+        dir_rel: str,
+        entry_hash: str,
+        *,
+        remember_directory: bool = True,
+    ) -> None:
+        self._assert_writable()
+        if remember_directory:
+            self._remember_directory(dir_rel)
+        self._conn.execute(
+            """
+            UPDATE directories
+            SET entry_find_hash = ?, entry_hash_at_ns = ?
+            WHERE dir_rel = ?
+            """,
+            (entry_hash, time.time_ns(), dir_rel),
+        )
+
+    def directory_entry_find_hash(
+        self,
+        dir_rel: str,
+        cancel_check: CancelCallback | None = None,
+    ) -> str:
+        """Fingerprint only entries directly visible in one directory pane.
+
+        Entry digests are combined as an order-independent multiset, avoiding
+        both recursive subtree walks and an unbounded sort/materialization for
+        directories containing very many files.
+        """
+        directory = self.abs_path(dir_rel) if dir_rel else self.root
+        digest_sum = 0
+        digest_xor = 0
+        count = 0
+        modulus = 1 << 256
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                if cancel_check is not None:
+                    cancel_check()
+                if entry.name == ".marnwick":
+                    continue
+                value, _ = self._directory_entry_hash_value(entry)
+                digest_sum = (digest_sum + value) % modulus
+                digest_xor ^= value
+                count += 1
+        return self._combined_directory_entry_hash(count, digest_sum, digest_xor)
+
+    def _directory_entry_hash_value(
+        self,
+        entry: os.DirEntry[str],
+    ) -> tuple[int, os.stat_result | None]:
+        try:
+            entry_stat = entry.stat(follow_symlinks=False)
+            changed_ns = self._path_change_time_ns(Path(entry.path), entry_stat)
+            metadata = (
+                f"{entry_stat.st_mode} {entry_stat.st_size} "
+                f"{entry_stat.st_mtime_ns} {changed_ns} "
+            ).encode("ascii")
+        except OSError as error:
+            entry_stat = None
+            metadata = f"error:{error.errno or 0} ".encode("ascii")
+        item_digest = hashlib.sha256(
+            metadata + entry.name.encode("utf-8", errors="surrogateescape")
+        ).digest()
+        return int.from_bytes(item_digest, "big"), entry_stat
+
+    @staticmethod
+    def _combined_directory_entry_hash(
+        count: int,
+        digest_sum: int,
+        digest_xor: int,
+    ) -> str:
+        combined = (
+            count.to_bytes(8, "big", signed=False)
+            + digest_sum.to_bytes(32, "big")
+            + digest_xor.to_bytes(32, "big")
+        )
+        return hashlib.sha256(combined).hexdigest()
+
+    def directory_entry_hash_matches(
+        self,
+        dir_rel: str,
+        cancel_check: CancelCallback | None = None,
+    ) -> bool:
+        stored_hash = self.stored_directory_entry_hash(dir_rel)
+        return stored_hash is not None and self.directory_entry_find_hash(dir_rel, cancel_check) == stored_hash
+
     def save_directory_find_hash(
         self,
         dir_rel: str,
@@ -982,6 +2114,7 @@ class Catalog:
         complete: bool = False,
         find_hash: str | None = None,
     ) -> str:
+        self._assert_writable()
         self._remember_directory(dir_rel)
         value = find_hash if find_hash is not None else self.directory_find_hash(dir_rel, cancel_check)
         self._conn.execute(
@@ -1093,13 +2226,15 @@ class Catalog:
         directory = self.abs_path(dir_rel) if dir_rel else self.root
         find_bin = shutil.which("find")
         md5_bin = shutil.which("md5sum")
-        if find_bin is not None and md5_bin is not None:
+        sort_bin = shutil.which("sort")
+        if find_bin is not None and md5_bin is not None and sort_bin is not None:
             try:
                 return self._directory_find_hash_subprocess(
                     directory,
                     cancel_check,
                     find_bin=find_bin,
                     md5_bin=md5_bin,
+                    sort_bin=sort_bin,
                 )
             except OSError:
                 pass
@@ -1204,6 +2339,7 @@ class Catalog:
         Mutations must instead act on the exact directory entry the user selected: a
         stale entry replaced by a symlink must never redirect delete or move work.
         """
+        self._assert_catalog_root_identity()
         rel = Path(rel_path)
         if rel.is_absolute() or any(part in {"", ".", ".."} for part in rel.parts):
             raise ValueError("catalog entry path must be relative and normalized")
@@ -1263,6 +2399,122 @@ class Catalog:
         row = self._conn.execute("SELECT COUNT(*) AS count FROM directories").fetchone()
         return 0 if row is None else int(row["count"])
 
+    def known_child_directory_count(
+        self,
+        parent_dir_rel: str = "",
+        *,
+        cancel_check: CancelCallback | None = None,
+    ) -> int:
+        """Count indexed direct child directories without materializing paths."""
+
+        if cancel_check is not None:
+            cancel_check()
+        root_filter = "AND dir_rel != ''" if not parent_dir_rel else ""
+        with self._sqlite_cancel_progress(cancel_check):
+            row = self._conn.execute(
+                f"""
+                SELECT COUNT(*) AS count
+                FROM directories
+                WHERE parent_dir_rel = ? {root_filter}
+                """,
+                (parent_dir_rel,),
+            ).fetchone()
+        return 0 if row is None else int(row["count"])
+
+    def list_known_child_directories_page(
+        self,
+        parent_dir_rel: str = "",
+        *,
+        limit: int,
+        offset: int = 0,
+        descending: bool = False,
+        cancel_check: CancelCallback | None = None,
+    ) -> list[str]:
+        """Return one deterministic, bounded page of indexed direct children."""
+
+        limit, offset = self._validate_query_page(limit, offset)
+        direction = "DESC" if descending else "ASC"
+        root_filter = "AND dir_rel != ''" if not parent_dir_rel else ""
+        with self._sqlite_cancel_progress(cancel_check):
+            rows = self._conn.execute(
+                f"""
+                SELECT dir_rel
+                FROM directories
+                WHERE parent_dir_rel = ? {root_filter}
+                ORDER BY dir_rel COLLATE NOCASE {direction}, dir_rel {direction}
+                LIMIT ? OFFSET ?
+                """,
+                (parent_dir_rel, limit, offset),
+            )
+            return [
+                str(row["dir_rel"])
+                for row in self._iter_cursor_rows(rows, cancel_check)
+            ]
+
+    def known_directory_prefix_count(
+        self,
+        prefix: str,
+        *,
+        cancel_check: CancelCallback | None = None,
+    ) -> int:
+        """Count known directory strings beginning with a literal prefix."""
+
+        if cancel_check is not None:
+            cancel_check()
+        pattern = f"{escape_sql_like(prefix)}%"
+        with self._sqlite_cancel_progress(cancel_check):
+            row = self._conn.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM directories
+                WHERE dir_rel LIKE ? ESCAPE '\\'
+                """,
+                (pattern,),
+            ).fetchone()
+        return 0 if row is None else int(row["count"])
+
+    def list_known_directories_with_prefix_page(
+        self,
+        prefix: str,
+        *,
+        limit: int,
+        offset: int = 0,
+        descending: bool = False,
+        cancel_check: CancelCallback | None = None,
+    ) -> list[str]:
+        """Return a bounded page for a literal known-directory text prefix."""
+
+        limit, offset = self._validate_query_page(limit, offset)
+        direction = "DESC" if descending else "ASC"
+        pattern = f"{escape_sql_like(prefix)}%"
+        with self._sqlite_cancel_progress(cancel_check):
+            rows = self._conn.execute(
+                f"""
+                SELECT dir_rel
+                FROM directories
+                WHERE dir_rel LIKE ? ESCAPE '\\'
+                ORDER BY dir_rel COLLATE NOCASE {direction}, dir_rel {direction}
+                LIMIT ? OFFSET ?
+                """,
+                (pattern, limit, offset),
+            )
+            return [
+                str(row["dir_rel"])
+                for row in self._iter_cursor_rows(rows, cancel_check)
+            ]
+
+    @staticmethod
+    def _validate_query_page(limit: int, offset: int) -> tuple[int, int]:
+        if type(limit) is not int or not 0 <= limit <= QUERY_PAGE_MAX_SIZE:
+            raise ValueError(
+                f"limit must be an integer between 0 and {QUERY_PAGE_MAX_SIZE}"
+            )
+        if type(offset) is not int or not 0 <= offset <= QUERY_PAGE_MAX_OFFSET:
+            raise ValueError(
+                f"offset must be an integer between 0 and {QUERY_PAGE_MAX_OFFSET}"
+            )
+        return limit, offset
+
     def list_cached_directories(self) -> list[str]:
         cached = self._read_directory_tree_cache()
         if cached is None:
@@ -1302,8 +2554,19 @@ class Catalog:
         ]
         return sorted(children, key=lambda item: item.casefold())
 
-    def save_directory_tree_cache(self, dir_rels: Iterable[str] | None = None) -> None:
+    def save_directory_tree_cache(
+        self,
+        dir_rels: Iterable[str] | None = None,
+        *,
+        cancel_check: CancelCallback | None = None,
+    ) -> None:
+        self._assert_writable()
+        if dir_rels is None and self.known_directory_count() > DIRECTORY_TREE_CACHE_FLAT_COUNT:
+            self._write_flat_directory_tree_cache(cancel_check)
+            return
         directories = self.list_known_directories() if dir_rels is None else list(dir_rels)
+        if cancel_check is not None:
+            cancel_check()
         normalized = sorted({item for item in directories if item}, key=lambda item: item.casefold())
         # A flat payload avoids Python/JSON recursion limits on legitimate deeply
         # nested catalogs. The reader remains compatible with version 1 caches.
@@ -1327,21 +2590,69 @@ class Catalog:
         }
         self._write_directory_tree_cache_payload(payload)
 
+    def _write_flat_directory_tree_cache(
+        self,
+        cancel_check: CancelCallback | None = None,
+    ) -> None:
+        """Stream a large flat cache without materializing every path twice."""
+        self._assert_safe_state_entry(self.directory_tree_cache_path)
+        temp = self.directory_tree_cache_path.with_name(
+            f"{self.directory_tree_cache_path.name}.{os.getpid()}.{time.time_ns()}.tmp"
+        )
+        self._assert_catalog_root_identity()
+        if not self.state_dir.is_dir():
+            raise FileNotFoundError(self.state_dir)
+        try:
+            with temp.open("w", encoding="utf-8") as handle:
+                handle.write(
+                    '{"version":2,"generated_at_ns":'
+                    f"{time.time_ns()},\"directories\":["
+                )
+                first = True
+                with self._sqlite_cancel_progress(cancel_check):
+                    rows = self._conn.execute(
+                        """
+                        SELECT dir_rel FROM directories
+                        WHERE dir_rel != ''
+                        ORDER BY dir_rel COLLATE NOCASE, dir_rel
+                        """
+                    )
+                    for row in self._iter_cursor_rows(rows, cancel_check):
+                        if not first:
+                            handle.write(",")
+                        handle.write(json.dumps(str(row["dir_rel"]), ensure_ascii=False))
+                        first = False
+                handle.write("]}\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            temp.replace(self.directory_tree_cache_path)
+        finally:
+            temp.unlink(missing_ok=True)
+
     def _write_directory_tree_cache_payload(self, payload: object) -> None:
         self._assert_safe_state_entry(self.directory_tree_cache_path)
         temp = self.directory_tree_cache_path.with_name(
             f"{self.directory_tree_cache_path.name}.{os.getpid()}.{time.time_ns()}.tmp"
         )
-        self.state_dir.mkdir(parents=True, exist_ok=True)
+        self._assert_catalog_root_identity()
+        if not self.state_dir.is_dir():
+            raise FileNotFoundError(self.state_dir)
         try:
             temp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
             temp.replace(self.directory_tree_cache_path)
         finally:
             temp.unlink(missing_ok=True)
 
-    def _save_directory_tree_cache_safely(self) -> None:
+    def _save_directory_tree_cache_safely(
+        self,
+        *,
+        cancel_check: CancelCallback | None = None,
+        allow_expensive: bool = False,
+    ) -> None:
+        if not allow_expensive and self.known_directory_count() > DIRECTORY_TREE_CACHE_SYNC_LIMIT:
+            return
         try:
-            self.save_directory_tree_cache()
+            self.save_directory_tree_cache(cancel_check=cancel_check)
         except (OSError, TypeError, ValueError, RecursionError) as error:
             self.append_log(f"Directory tree cache update failed: {error}", level="WARNING")
 
@@ -1488,6 +2799,7 @@ class Catalog:
         *,
         force: bool = True,
     ) -> bool:
+        self._assert_writable()
         # Reuse the initial currentness fingerprint as the first stability
         # fingerprint. A stale non-forced refresh therefore needs two full tree
         # hashes (before/after), rather than hashing once to detect staleness and
@@ -1532,11 +2844,14 @@ class Catalog:
             before_hash = after_hash
         if not stable:
             self.append_log("Catalog changed repeatedly during refresh; scheduling another refresh", level="WARNING")
-            self._save_directory_tree_cache_safely()
+            self._save_directory_tree_cache_safely(cancel_check=cancel_check)
             raise CatalogRefreshUnstableError(
                 "catalog changed throughout every refresh attempt; retry when filesystem activity settles"
             )
-        self._save_directory_tree_cache_safely()
+        self._save_directory_tree_cache_safely(
+            cancel_check=cancel_check,
+            allow_expensive=True,
+        )
         self.append_log("Catalog refresh complete")
         return refreshed
 
@@ -1551,6 +2866,7 @@ class Catalog:
         progress: ProgressCallback | None = None,
         cancel_check: CancelCallback | None = None,
     ) -> int:
+        self._assert_writable()
         if progress is not None:
             progress(0, None, f"Finding folders in {self.root.name or self.root}")
         find_bin = shutil.which("find")
@@ -1563,7 +2879,10 @@ class Catalog:
             count = self._discover_directories_python(progress, cancel_check)
         if progress is not None:
             progress(count, count, "Folder discovery complete")
-        self._save_directory_tree_cache_safely()
+        self._save_directory_tree_cache_safely(
+            cancel_check=cancel_check,
+            allow_expensive=True,
+        )
         self.append_log(f"Folder discovery complete: {count} folders")
         return count
 
@@ -1575,50 +2894,81 @@ class Catalog:
         force: bool,
     ) -> bool:
         refreshed = False
-        known_dirs = set(self.list_known_directories())
-        known_dirs.add("")
-        total_dirs = max(1, len(known_dirs))
+        total_dirs = max(1, self.known_directory_count())
         processed_dirs = 0
-        stack: list[tuple[str, bool]] = [("", False)]
+        pending_table = f"refresh_pending_{threading.get_ident()}_{time.time_ns()}"
+        with self._db_lock:
+            self._conn.execute(
+                f"CREATE TEMP TABLE {pending_table}(seq INTEGER PRIMARY KEY AUTOINCREMENT, dir_rel TEXT UNIQUE)"
+            )
+            self._conn.execute(f"INSERT INTO {pending_table}(dir_rel) VALUES ('')")
         if progress is not None:
             progress(0, total_dirs, ".")
-        while stack:
-            dir_rel, save_hash = stack.pop()
-            if cancel_check is not None:
-                cancel_check()
-            if save_hash:
-                # Catalog stability is certified once at the root by refresh().
-                # Hashing every nested subtree here is quadratic for deep trees.
-                continue
-            if not force and self.directory_hash_matches(dir_rel, cancel_check, require_complete=True):
+        try:
+            while True:
+                with self._db_lock:
+                    pending = self._conn.execute(
+                        f"SELECT seq, dir_rel FROM {pending_table} ORDER BY seq DESC LIMIT 1"
+                    ).fetchone()
+                    if pending is not None:
+                        self._conn.execute(
+                            f"DELETE FROM {pending_table} WHERE seq = ?",
+                            (int(pending["seq"]),),
+                        )
+                if pending is None:
+                    break
+                dir_rel = str(pending["dir_rel"])
+                if cancel_check is not None:
+                    cancel_check()
+                if not force and self.directory_hash_matches(dir_rel, cancel_check, require_complete=True):
+                    if progress is not None:
+                        progress(processed_dirs, total_dirs, dir_rel or ".")
+                    processed_dirs += 1
+                    if progress is not None:
+                        progress(processed_dirs, total_dirs, dir_rel or ".")
+                    continue
                 if progress is not None:
                     progress(processed_dirs, total_dirs, dir_rel or ".")
+                scan_result = self._refresh_directory_contents(
+                    dir_rel,
+                    None,
+                    cancel_check,
+                    prune_missing_children=True,
+                    force=force,
+                    directory_prepared=True,
+                )
+                if scan_result.entry_hash is not None:
+                    self.save_directory_entry_hash(
+                        dir_rel,
+                        scan_result.entry_hash,
+                        remember_directory=False,
+                    )
+                with self._db_lock:
+                    self._conn.execute(
+                        f"""
+                        INSERT OR IGNORE INTO {pending_table}(dir_rel)
+                        SELECT dir_rel
+                        FROM directories
+                        WHERE parent_dir_rel = ? AND dir_rel != ?
+                        ORDER BY dir_rel COLLATE NOCASE DESC
+                        """,
+                        (dir_rel, dir_rel),
+                    )
+                    pending_count = int(
+                        self._conn.execute(
+                            f"SELECT COUNT(*) AS count FROM {pending_table}"
+                        ).fetchone()["count"]
+                    )
+                total_dirs = max(total_dirs, processed_dirs + pending_count + 1)
                 processed_dirs += 1
                 if progress is not None:
                     progress(processed_dirs, total_dirs, dir_rel or ".")
-                continue
-            if progress is not None:
-                progress(processed_dirs, total_dirs, dir_rel or ".")
-            child_dirs = self._refresh_directory_contents(
-                dir_rel,
-                None,
-                cancel_check,
-                prune_missing_children=True,
-                force=force,
-            )
-            for child_dir in child_dirs:
-                if child_dir not in known_dirs:
-                    known_dirs.add(child_dir)
-                    total_dirs += 1
-            processed_dirs += 1
-            if progress is not None:
-                progress(processed_dirs, total_dirs, dir_rel or ".")
-            refreshed = True
-            stack.append((dir_rel, True))
-            for child_dir in reversed(child_dirs):
-                stack.append((child_dir, False))
+                refreshed = True
+        finally:
+            with self._db_lock:
+                self._conn.execute(f"DROP TABLE IF EXISTS {pending_table}")
         if progress is not None:
-            progress(processed_dirs, total_dirs, "Catalog scan complete")
+            progress(processed_dirs, processed_dirs, "Catalog scan complete")
         return refreshed
 
     def _refresh_directory_contents(
@@ -1629,96 +2979,217 @@ class Catalog:
         *,
         prune_missing_children: bool,
         force: bool = False,
-    ) -> list[str]:
+        directory_prepared: bool = False,
+    ) -> _DirectoryContentScanResult:
         dir_path = self.abs_path(dir_rel) if dir_rel else self.root
         if not dir_path.is_dir():
             self._delete_directory_records(dir_rel)
-            return []
-        self._remember_directory(dir_rel)
+            return _DirectoryContentScanResult(0, None, True)
+        directory_was_known = self._conn.execute(
+            "SELECT 1 FROM directories WHERE dir_rel = ?",
+            (dir_rel,),
+        ).fetchone() is not None
+        if not directory_was_known and directory_prepared:
+            # Catalog traversal reaches parents before children, so one direct
+            # row is sufficient here. Expanding every ancestor again for each
+            # level makes a depth-N chain perform O(N^2) database writes.
+            self._remember_discovered_directories([dir_rel])
+        elif not directory_prepared:
+            self._remember_directory(dir_rel)
         if progress is not None:
             progress(0, None, f"Finding images in {dir_rel or '.'}")
-        image_rel_paths: list[str] = []
-        uncertain_rel_paths: set[str] = set()
-        child_dirs: list[str] = []
-        known_children = set(self._direct_child_directories(dir_rel)) if prune_missing_children else set()
         scanned = 0
-        try:
-            with os.scandir(dir_path) as entries:
-                for entry in entries:
-                    if cancel_check is not None:
-                        cancel_check()
-                    scanned += 1
-                    rel_path: str | None = None
-                    try:
-                        if entry.is_dir(follow_symlinks=False):
-                            if entry.name != ".marnwick":
-                                child_rel = self.rel_path(Path(entry.path))
-                                self._remember_directory(child_rel)
-                                child_dirs.append(child_rel)
-                        elif is_image_name(entry.name) and entry.is_file(follow_symlinks=False):
-                            rel_path = self.rel_path(Path(entry.path))
-                    except (OSError, UnicodeError):
-                        uncertain_rel = f"{dir_rel}/{entry.name}" if dir_rel else entry.name
-                        if self._sqlite_text_safe(uncertain_rel):
-                            if is_image_name(entry.name):
-                                uncertain_rel_paths.add(uncertain_rel)
-                            if uncertain_rel in known_children:
-                                child_dirs.append(uncertain_rel)
-                        rel_path = None
-                    if rel_path is not None and self._sqlite_text_safe(rel_path):
-                        image_rel_paths.append(rel_path)
-                    if progress is not None and scanned % SCAN_PROGRESS_INTERVAL == 0:
-                        progress(len(image_rel_paths), None, dir_rel or ".")
-        except OSError:
-            return []
-        if prune_missing_children:
-            self._delete_missing_child_directories(dir_rel, child_dirs)
-        total = len(image_rel_paths)
-        if progress is not None:
-            progress(0, total, dir_rel or ".")
-        seen: set[str] = set(image_rel_paths)
-        seen.update(uncertain_rel_paths)
-        if len(image_rel_paths) >= INDEX_PIPELINE_MIN_IMAGES:
-            self.index_images_pipeline(image_rel_paths, progress, cancel_check, force=force)
-        else:
-            for processed, rel_path in enumerate(image_rel_paths, start=1):
-                if cancel_check is not None:
-                    cancel_check()
-                try:
-                    try:
-                        self.index_image(rel_path, cancel_check=cancel_check, force=force)
-                    except TypeError as error:
-                        # Preserve compatibility with lightweight test/client
-                        # wrappers written before the optional force keyword.
-                        if "force" not in str(error):
-                            raise
-                        self.index_image(rel_path, cancel_check=cancel_check)
-                except Exception as error:
-                    if cancel_check is not None:
-                        cancel_check()
-                    self.append_log(f"Indexing error for {rel_path}: {error}", level="ERROR")
+        digest_sum = 0
+        digest_xor = 0
+        entry_count = 0
+        scan_complete = False
+        indexed_count = 0
+        progress_lock = threading.Lock()
+        modulus = 1 << 256
+        scan_table = f"directory_scan_{threading.get_ident()}_{time.time_ns()}"
+        with self._db_lock:
+            self._conn.execute(
+                f"CREATE TEMP TABLE {scan_table}(rel_path TEXT PRIMARY KEY, kind INTEGER NOT NULL) WITHOUT ROWID"
+            )
+        pending_scan_rows: list[tuple[str, int]] = []
+
+        def flush_scan_rows() -> None:
+            if not pending_scan_rows:
+                return
+            with self._db_lock:
+                self._conn.executemany(
+                    f"INSERT OR REPLACE INTO {scan_table}(rel_path, kind) VALUES (?, ?)",
+                    pending_scan_rows,
+                )
+            pending_scan_rows.clear()
+
+        def discovered_image_paths() -> Iterator[str]:
+            nonlocal digest_sum, digest_xor, entry_count, scanned, scan_complete
+            try:
+                with os.scandir(dir_path) as entries:
+                    for entry in entries:
+                        if cancel_check is not None:
+                            cancel_check()
+                        if entry.name == ".marnwick":
+                            continue
+                        scanned += 1
+                        value, entry_stat = self._directory_entry_hash_value(entry)
+                        digest_sum = (digest_sum + value) % modulus
+                        digest_xor ^= value
+                        entry_count += 1
+                        rel_path: str | None = None
+                        try:
+                            if entry_stat is not None:
+                                is_directory = stat_module.S_ISDIR(entry_stat.st_mode)
+                                is_file = stat_module.S_ISREG(entry_stat.st_mode)
+                            else:
+                                is_directory = entry.is_dir(follow_symlinks=False)
+                                is_file = not is_directory and entry.is_file(follow_symlinks=False)
+                            if is_directory:
+                                child_rel = self._rel_path_without_resolve(Path(entry.path))
+                                if self._sqlite_text_safe(child_rel):
+                                    pending_scan_rows.append((child_rel, 2))
+                            elif is_image_name(entry.name) and is_file:
+                                rel_path = self._rel_path_without_resolve(Path(entry.path))
+                        except (OSError, UnicodeError):
+                            uncertain_rel = f"{dir_rel}/{entry.name}" if dir_rel else entry.name
+                            if self._sqlite_text_safe(uncertain_rel):
+                                pending_scan_rows.append((uncertain_rel, 3))
+                            rel_path = None
+                        if rel_path is not None and self._sqlite_text_safe(rel_path):
+                            pending_scan_rows.append((rel_path, 1))
+                            yield rel_path
+                        if len(pending_scan_rows) >= DISCOVERY_WRITE_BATCH_SIZE:
+                            flush_scan_rows()
+                        if progress is not None and scanned % SCAN_PROGRESS_INTERVAL == 0:
+                            with progress_lock:
+                                progress(indexed_count, None, dir_rel or ".")
+            except OSError:
+                return
+            flush_scan_rows()
+            scan_complete = True
+
+        def index_progress(processed: int, _total: int | None, current: str) -> None:
+            nonlocal indexed_count
+            with progress_lock:
+                indexed_count = processed
                 if progress is not None:
-                    progress(processed, total, rel_path)
-        existing = {
-            row["rel_path"]
-            for row in self._conn.execute("SELECT rel_path FROM images WHERE dir_rel = ?", (dir_rel,))
-        }
-        stale = existing - seen
-        if stale:
-            self._delete_db_records(stale)
-        stale_failures = {
-            str(row["rel_path"])
-            for row in self._conn.execute(
-                "SELECT rel_path FROM image_index_failures WHERE dir_rel = ?",
+                    progress(processed, None, current)
+
+        # The bounded reader/thumbnail queues apply backpressure to scandir, so
+        # a large fresh directory starts publishing rows and thumbnail files
+        # after only a small first window instead of after full enumeration.
+        try:
+            self.index_images_pipeline(
+                discovered_image_paths(),
+                index_progress if progress is not None else None,
+                cancel_check,
+                force=force,
+                directories_prepared=True,
+            )
+            if not scan_complete:
+                return _DirectoryContentScanResult(0, None, False)
+
+            with self._db_lock:
+                child_count = int(
+                    self._conn.execute(
+                        f"SELECT COUNT(*) AS count FROM {scan_table} WHERE kind = 2"
+                    ).fetchone()["count"]
+                )
+                total = int(
+                    self._conn.execute(
+                        f"SELECT COUNT(*) AS count FROM {scan_table} WHERE kind = 1"
+                    ).fetchone()["count"]
+                )
+                changed_row = self._conn.execute(
+                    f"""
+                    SELECT 1
+                    FROM directories AS known
+                    WHERE known.parent_dir_rel = ?
+                        AND known.dir_rel != ?
+                        AND NOT EXISTS (
+                            SELECT 1 FROM {scan_table} AS scanned
+                            WHERE scanned.rel_path = known.dir_rel AND scanned.kind IN (2, 3)
+                        )
+                    UNION ALL
+                    SELECT 1
+                    FROM {scan_table} AS scanned
+                    WHERE scanned.kind = 2
+                        AND NOT EXISTS (
+                            SELECT 1 FROM directories AS known
+                            WHERE known.dir_rel = scanned.rel_path
+                                AND known.parent_dir_rel = ?
+                        )
+                    LIMIT 1
+                    """,
+                    (dir_rel, dir_rel, dir_rel),
+                ).fetchone()
+                children_changed = not directory_was_known or changed_row is not None
+                self._conn.execute(
+                    f"""
+                    INSERT INTO directories(dir_rel, parent_dir_rel, scanned_at_ns)
+                    SELECT rel_path, ?, ? FROM {scan_table} WHERE kind = 2
+                    ON CONFLICT(dir_rel) DO UPDATE SET
+                        parent_dir_rel = excluded.parent_dir_rel,
+                        scanned_at_ns = excluded.scanned_at_ns
+                    """,
+                    (dir_rel, time.time_ns()),
+                )
+
+            if prune_missing_children:
+                stale_children = self._conn.execute(
+                    f"""
+                    SELECT dir_rel
+                    FROM directories AS known
+                    WHERE known.parent_dir_rel = ?
+                        AND known.dir_rel != ?
+                        AND NOT EXISTS (
+                            SELECT 1 FROM {scan_table} AS scanned
+                            WHERE scanned.rel_path = known.dir_rel AND scanned.kind IN (2, 3)
+                        )
+                    """,
+                    (dir_rel, dir_rel),
+                )
+                for row in self._iter_cursor_rows(stale_children, cancel_check):
+                    self._delete_directory_records(str(row["dir_rel"]))
+
+            stale_images = self._conn.execute(
+                f"""
+                SELECT rel_path
+                FROM images AS existing
+                WHERE existing.dir_rel = ?
+                    AND NOT EXISTS (
+                        SELECT 1 FROM {scan_table} AS scanned
+                        WHERE scanned.rel_path = existing.rel_path AND scanned.kind IN (1, 3)
+                    )
+                """,
                 (dir_rel,),
             )
-        } - seen
-        if stale_failures:
-            self._conn.executemany(
-                "DELETE FROM image_index_failures WHERE rel_path = ?",
-                [(rel_path,) for rel_path in stale_failures],
+            while True:
+                stale_batch = [str(row["rel_path"]) for row in stale_images.fetchmany(PRUNE_BATCH_SIZE)]
+                if not stale_batch:
+                    break
+                self._delete_db_records(stale_batch)
+
+            self._conn.execute(
+                f"""
+                DELETE FROM image_index_failures
+                WHERE dir_rel = ?
+                    AND NOT EXISTS (
+                        SELECT 1 FROM {scan_table} AS scanned
+                        WHERE scanned.rel_path = image_index_failures.rel_path
+                            AND scanned.kind IN (1, 3)
+                    )
+                """,
+                (dir_rel,),
             )
-        return child_dirs
+            if progress is not None:
+                progress(total, total, dir_rel or ".")
+            entry_hash = self._combined_directory_entry_hash(entry_count, digest_sum, digest_xor)
+            return _DirectoryContentScanResult(child_count, entry_hash, children_changed)
+        finally:
+            with self._db_lock:
+                self._conn.execute(f"DROP TABLE IF EXISTS {scan_table}")
 
     def _sqlite_text_safe(self, value: str) -> bool:
         try:
@@ -1729,22 +3200,35 @@ class Catalog:
 
     def index_images_pipeline(
         self,
-        rel_paths: Sequence[str],
+        rel_paths: Iterable[str],
         progress: ProgressCallback | None = None,
         cancel_check: CancelCallback | None = None,
         *,
         force: bool = False,
+        directories_prepared: bool = False,
     ) -> None:
+        self._assert_writable()
         image_queue: queue.Queue[ImageReadJob | ImageSkipJob | object] = queue.Queue(maxsize=INDEX_QUEUE_DEPTH)
         thumbnail_queue: queue.Queue[ThumbnailWriteJob | object] = queue.Queue(maxsize=INDEX_QUEUE_DEPTH)
-        total = len(rel_paths)
+        total = len(rel_paths) if isinstance(rel_paths, Sequence) else None
         processed = 0
         processed_lock = threading.Lock()
         first_error: list[BaseException] = []
+        processor_finished = threading.Event()
+        writer_finished = threading.Event()
+        prepared_directories: set[str] = set()
 
         def remember_error(error: BaseException) -> None:
             if not first_error:
                 first_error.append(error)
+
+        def report_processed(rel_path: str) -> None:
+            nonlocal processed
+            with processed_lock:
+                processed += 1
+                current_processed = processed
+            if progress is not None:
+                progress(current_processed, total, rel_path)
 
         def put_with_cancel(target: queue.Queue[object], item: object) -> None:
             while True:
@@ -1758,20 +3242,35 @@ class Catalog:
                 except queue.Full:
                     continue
 
-        def put_sentinel(target: queue.Queue[object]) -> None:
-            while True:
+        def put_sentinel(
+            target: queue.Queue[object],
+            consumer_finished: threading.Event,
+        ) -> None:
+            # An upstream error does not mean the consumer has stopped.  If a
+            # full bounded queue loses its sentinel while the consumer is
+            # still draining it, that consumer will block forever once the
+            # queued work is exhausted.  Keep trying until either the marker
+            # is accepted or the consumer explicitly reports that it exited.
+            while not consumer_finished.is_set():
                 try:
                     target.put(PIPELINE_SENTINEL, timeout=0.05)
                     return
                 except queue.Full:
-                    if first_error:
-                        return
+                    continue
 
         def reader() -> None:
             try:
                 for rel_path in rel_paths:
                     if cancel_check is not None:
                         cancel_check()
+                    if not directories_prepared:
+                        dir_rel = Path(rel_path).parent.as_posix()
+                        if dir_rel == ".":
+                            dir_rel = ""
+                        if dir_rel not in prepared_directories:
+                            with self._db_lock:
+                                self._remember_directory(dir_rel)
+                            prepared_directories.add(dir_rel)
                     path = self.abs_path(rel_path)
                     if not path.exists() or not path.is_file() or not is_image_path(path):
                         with self._db_lock:
@@ -1780,8 +3279,8 @@ class Catalog:
                         continue
                     try:
                         stat = path.stat()
-                        retry_failure = force and self._image_index_failure_exists(rel_path)
-                        if self._image_row_is_current(rel_path, stat) and not retry_failure:
+                        changed_ns = self._path_change_time_ns(path, stat)
+                        if not force and self._image_row_is_current(rel_path, stat):
                             put_with_cancel(image_queue, ImageSkipJob(rel_path))
                             continue
                         if not force and self._image_index_failure_is_current(rel_path, stat):
@@ -1791,14 +3290,16 @@ class Catalog:
                         self.append_log(f"Indexing error for {rel_path}: {error}", level="ERROR")
                         put_with_cancel(image_queue, ImageSkipJob(rel_path))
                         continue
-                    put_with_cancel(image_queue, ImageReadJob(rel_path, path, stat))
+                    put_with_cancel(
+                        image_queue,
+                        ImageReadJob(rel_path, path, stat, changed_ns),
+                    )
             except BaseException as error:
                 remember_error(error)
             finally:
-                put_sentinel(image_queue)
+                put_sentinel(image_queue, processor_finished)
 
         def processor() -> None:
-            nonlocal processed
             try:
                 while True:
                     item = image_queue.get()
@@ -1808,25 +3309,71 @@ class Catalog:
                         rel_path = item.rel_path
                     elif isinstance(item, ImageReadJob):
                         rel_path = item.rel_path
-                        try:
-                            self._index_read_job(item, thumbnail_queue, put_with_cancel, cancel_check)
-                        except Exception as error:
-                            if cancel_check is not None:
-                                cancel_check()
-                            self.append_log(f"Indexing error for {item.rel_path}: {error}", level="ERROR")
-                            with self._db_lock:
-                                self._remember_index_failure(item.rel_path, item.stat, error)
+                        current_job = item
+                        published = False
+                        for attempt in range(2):
+                            try:
+                                self._index_read_job(
+                                    current_job,
+                                    thumbnail_queue,
+                                    put_with_cancel,
+                                    cancel_check,
+                                )
+                            except ImageChangedDuringIndexError as error:
+                                if cancel_check is not None:
+                                    cancel_check()
+                                if attempt == 0:
+                                    try:
+                                        retry_stat = current_job.path.lstat()
+                                        if not stat_module.S_ISREG(retry_stat.st_mode):
+                                            raise OSError("replacement is not a regular file")
+                                        current_job = ImageReadJob(
+                                            current_job.rel_path,
+                                            current_job.path,
+                                            retry_stat,
+                                            self._path_change_time_ns(current_job.path, retry_stat),
+                                        )
+                                    except OSError:
+                                        pass
+                                    else:
+                                        continue
+                                self.append_log(
+                                    f"Indexing deferred for changing image {item.rel_path}: {error}",
+                                    level="WARNING",
+                                )
+                                break
+                            except Exception as error:
+                                if first_error:
+                                    raise first_error[0]
+                                if cancel_check is not None:
+                                    cancel_check()
+                                self.append_log(f"Indexing error for {item.rel_path}: {error}", level="ERROR")
+                                with self._db_lock:
+                                    self._remember_index_failure(
+                                        current_job.rel_path,
+                                        current_job.stat,
+                                        error,
+                                        changed_ns=current_job.changed_ns,
+                                        remember_directory=False,
+                                    )
+                                break
+                            else:
+                                published = True
+                                break
+                        if published:
+                            # The writer publishes progress only after both the
+                            # cache file and its database row are visible.
+                            continue
                     else:
                         continue
-                    with processed_lock:
-                        processed += 1
-                        current_processed = processed
-                    if progress is not None:
-                        progress(current_processed, total, rel_path)
+                    report_processed(rel_path)
             except BaseException as error:
                 remember_error(error)
             finally:
-                put_sentinel(thumbnail_queue)
+                try:
+                    put_sentinel(thumbnail_queue, writer_finished)
+                finally:
+                    processor_finished.set()
 
         def writer() -> None:
             try:
@@ -1837,13 +3384,43 @@ class Catalog:
                     if not isinstance(item, ThumbnailWriteJob):
                         continue
                     try:
+                        # Avoid even publishing an orphan cache file for a job
+                        # that became stale while it waited in the writer
+                        # queue.  _commit_indexed_image_job repeats this check
+                        # immediately before the row update to close the
+                        # subsequent thumbnail-write window as well.
+                        self._assert_index_job_current(item.source)
                         self._write_thumbnail_rel_file(item.thumb_rel_path, item.thumb_blob)
+                        self._commit_indexed_image_job(item)
+                        report_processed(item.source.rel_path)
+                    except ImageChangedDuringIndexError as error:
+                        self.append_log(
+                            f"Indexing retry after queued image replacement for "
+                            f"{item.source.rel_path}: {error}",
+                            level="WARNING",
+                        )
+                        # The processor has already moved on and may have sent
+                        # its sentinel, so retry synchronously on this writer
+                        # rather than attempting to reinsert work behind that
+                        # sentinel. index_image performs its own stable-open
+                        # verification and safely defers a still-changing file.
+                        self.index_image(
+                            item.source.rel_path,
+                            cancel_check=cancel_check,
+                            force=True,
+                        )
+                        report_processed(item.source.rel_path)
                     except Exception as error:
-                        self.append_log(f"Thumbnail write error for {item.rel_path}: {error}", level="ERROR")
+                        self.append_log(
+                            f"Thumbnail publication error for {item.source.rel_path}: {error}",
+                            level="ERROR",
+                        )
                         remember_error(error)
                         return
             except BaseException as error:
                 remember_error(error)
+            finally:
+                writer_finished.set()
 
         threads = [
             threading.Thread(target=reader, name="marnwick-index-reader", daemon=True),
@@ -1856,14 +3433,6 @@ class Catalog:
             thread.join()
         if first_error:
             raise first_error[0]
-
-    def _force_queue_put(self, target: queue.Queue[object], item: object) -> None:
-        while True:
-            try:
-                target.put(item, timeout=0.05)
-                return
-            except queue.Full:
-                continue
 
     def _image_row_is_current(self, rel_path: str, stat: os.stat_result) -> bool:
         changed_ns = self._path_change_time_ns(self.abs_path(rel_path), stat)
@@ -1924,13 +3493,22 @@ class Catalog:
                 (rel_path,),
             ).fetchone() is not None
 
-    def _remember_index_failure(self, rel_path: str, stat: os.stat_result, error: BaseException | str) -> None:
+    def _remember_index_failure(
+        self,
+        rel_path: str,
+        stat: os.stat_result,
+        error: BaseException | str,
+        *,
+        changed_ns: int | None = None,
+        remember_directory: bool = True,
+    ) -> None:
         error_text = " ".join(str(error).split()) or error.__class__.__name__
         error_hash = hashlib.sha256(error_text.encode("utf-8", errors="replace")).hexdigest()
         dir_rel = Path(rel_path).parent.as_posix()
         if dir_rel == ".":
             dir_rel = ""
-        self._remember_directory(dir_rel)
+        if remember_directory:
+            self._remember_directory(dir_rel)
         self._conn.execute(
             """
             INSERT INTO image_index_failures(
@@ -1955,7 +3533,11 @@ class Catalog:
                 Path(rel_path).name,
                 stat.st_size,
                 stat.st_mtime_ns,
-                self._path_change_time_ns(self.abs_path(rel_path), stat),
+                (
+                    changed_ns
+                    if changed_ns is not None
+                    else self._path_change_time_ns(self.abs_path(rel_path), stat)
+                ),
                 self.settings.thumbnail_native_size,
                 error_text[:1000],
                 error_hash,
@@ -1993,12 +3575,38 @@ class Catalog:
             thumb_height,
             perceptual_hash,
             color_signature,
-        ) = self._read_image_metadata_and_thumbnail(job.path)
-        image_hash, thumb_cache_key = self._image_file_hashes(job.path, cancel_check)
+            image_hash,
+            thumb_cache_key,
+        ) = self._read_image_metadata_thumbnail_and_hash(job, cancel_check)
         thumb_rel_path = self._thumbnail_rel_path(thumb_cache_key, self.settings.thumbnail_native_size)
-        queue_put(thumbnail_queue, ThumbnailWriteJob(job.rel_path, thumb_rel_path, thumb_blob))
+        queue_put(
+            thumbnail_queue,
+            ThumbnailWriteJob(
+                source=job,
+                thumb_rel_path=thumb_rel_path,
+                thumb_blob=thumb_blob,
+                thumb_width=thumb_width,
+                thumb_height=thumb_height,
+                thumb_size_px=self.settings.thumbnail_native_size,
+                image_hash=image_hash,
+                thumb_cache_key=thumb_cache_key,
+                width=width,
+                height=height,
+                perceptual_hash=perceptual_hash,
+                color_signature=color_signature,
+            ),
+        )
+
+    def _commit_indexed_image_job(self, item: ThumbnailWriteJob) -> None:
+        job = item.source
         old_thumb_rel_paths = set()
         with self._db_lock:
+            # Decoding and hashing happen ahead of this writer on a bounded
+            # queue.  A pathname can still be replaced while the completed
+            # job waits for earlier thumbnails to be published.  Revalidate
+            # at the actual database publication boundary so an old thumbnail
+            # and hash are never stamped with a replacement file's pathname.
+            self._assert_index_job_current(job)
             existing = self._conn.execute(
                 "SELECT thumb_rel_path FROM images WHERE rel_path = ?",
                 (job.rel_path,),
@@ -2008,8 +3616,7 @@ class Catalog:
             dir_rel = Path(job.rel_path).parent.as_posix()
             if dir_rel == ".":
                 dir_rel = ""
-            self._remember_directory(dir_rel)
-            aspect_ratio = width / height if height else 0.0
+            aspect_ratio = item.width / item.height if item.height else 0.0
             self._conn.execute(
                 """
                 INSERT INTO images (
@@ -2052,25 +3659,44 @@ class Catalog:
                     job.stat.st_size,
                     job.stat.st_mtime_ns,
                     job.stat.st_mtime_ns,
-                    self._path_change_time_ns(job.path, job.stat),
-                    image_hash,
-                    width,
-                    height,
+                    job.changed_ns,
+                    item.image_hash,
+                    item.width,
+                    item.height,
                     aspect_ratio,
-                    perceptual_hash,
-                    color_signature,
+                    item.perceptual_hash,
+                    item.color_signature,
                     SIMILARITY_FEATURE_VERSION,
                     None,
-                    thumb_rel_path,
-                    thumb_cache_key,
-                    thumb_width,
-                    thumb_height,
-                    self.settings.thumbnail_native_size,
+                    item.thumb_rel_path,
+                    item.thumb_cache_key,
+                    item.thumb_width,
+                    item.thumb_height,
+                    item.thumb_size_px,
                     time.time_ns(),
                 ),
             )
             self._clear_index_failure(job.rel_path)
-            self._remove_unreferenced_thumbnail_files(old_thumb_rel_paths - {thumb_rel_path})
+            self._remove_unreferenced_thumbnail_files(
+                old_thumb_rel_paths - {item.thumb_rel_path}
+            )
+
+    def _assert_index_job_current(self, job: ImageReadJob) -> None:
+        try:
+            current = job.path.lstat()
+            current_changed_ns = self._path_change_time_ns(job.path, current)
+        except OSError as error:
+            raise ImageChangedDuringIndexError(
+                f"image changed before thumbnail publication: {job.rel_path}"
+            ) from error
+        if (
+            not stat_module.S_ISREG(current.st_mode)
+            or not self._index_stat_matches_job(current, job)
+            or current_changed_ns != job.changed_ns
+        ):
+            raise ImageChangedDuringIndexError(
+                f"image changed before thumbnail publication: {job.rel_path}"
+            )
 
     def refresh_directory(
         self,
@@ -2080,36 +3706,51 @@ class Catalog:
         *,
         force: bool = True,
     ) -> bool:
+        self._assert_writable()
         dir_path = self.abs_path(dir_rel) if dir_rel else self.root
         if not dir_path.is_dir():
             self._delete_directory_records(dir_rel)
             return False
-        if not force and self.directory_hash_matches(dir_rel, cancel_check):
-            if progress is not None:
-                progress(0, 0, "Directory up to date")
-            return False
+        if not force:
+            stored_hash = self.stored_directory_entry_hash(dir_rel)
+            if (
+                stored_hash is not None
+                and self.directory_entry_find_hash(dir_rel, cancel_check) == stored_hash
+            ):
+                if progress is not None:
+                    progress(0, 0, "Directory up to date")
+                return False
         stable_hash: str | None = None
+        children_changed = False
         for _ in range(3):
-            before_hash = self.directory_find_hash(dir_rel, cancel_check)
-            self._refresh_directory_contents(
+            scan_result = self._refresh_directory_contents(
                 dir_rel,
                 progress,
                 cancel_check,
                 prune_missing_children=True,
                 force=force,
             )
-            after_hash = self.directory_find_hash(dir_rel, cancel_check)
-            if before_hash == after_hash:
+            children_changed = children_changed or scan_result.children_changed
+            after_hash = self.directory_entry_find_hash(dir_rel, cancel_check)
+            if scan_result.entry_hash == after_hash:
                 stable_hash = after_hash
                 break
         if stable_hash is not None:
-            self.save_directory_find_hash(dir_rel, cancel_check, complete=False, find_hash=stable_hash)
+            self.save_directory_entry_hash(
+                dir_rel,
+                stable_hash,
+                remember_directory=False,
+            )
         else:
             self._conn.execute(
-                "UPDATE directories SET find_hash = NULL, find_hash_complete = 0, hash_at_ns = 0 WHERE dir_rel = ?",
+                "UPDATE directories SET entry_find_hash = NULL, entry_hash_at_ns = 0 WHERE dir_rel = ?",
                 (dir_rel,),
             )
-        self._save_directory_tree_cache_safely()
+            raise CatalogRefreshUnstableError(
+                f"directory changed throughout every refresh attempt: {dir_rel or '.'}"
+            )
+        if children_changed:
+            self._save_directory_tree_cache_safely(cancel_check=cancel_check)
         if progress is not None:
             progress(1, 1, "Directory scan complete")
         return True
@@ -2120,18 +3761,52 @@ class Catalog:
         cancel_check: CancelCallback | None = None,
         *,
         force: bool = False,
+        expected_proof: CatalogFileProof | None = None,
     ) -> ImageRecord | None:
+        self._assert_writable()
+        if expected_proof is not None and (
+            not isinstance(expected_proof, tuple)
+            or len(expected_proof) != 6
+            or any(
+                isinstance(value, bool) or not isinstance(value, int)
+                for value in expected_proof[:5]
+            )
+            or not is_exact_image_hash(expected_proof[5])
+        ):
+            raise ValueError("expected image proof is malformed")
         path = self.abs_path(rel_path)
         if not path.exists() or not path.is_file() or not is_image_path(path):
+            if expected_proof is not None:
+                raise ImageChangedDuringIndexError(
+                    f"proved image disappeared before indexing: {rel_path}"
+                )
             self._delete_db_records([rel_path])
             return None
         try:
-            stat = path.stat()
+            stat = path.lstat() if expected_proof is not None else path.stat()
         except OSError as error:
+            if expected_proof is not None:
+                raise ImageChangedDuringIndexError(
+                    f"proved image changed before indexing: {rel_path}"
+                ) from error
             self.append_log(f"Indexing error for {rel_path}: {error}", level="ERROR")
             return None
+        if expected_proof is not None:
+            try:
+                current_identity = self._catalog_file_identity(path, stat)
+            except OSError as error:
+                raise ImageChangedDuringIndexError(
+                    f"proved image changed before indexing: {rel_path}"
+                ) from error
+            if current_identity[:5] != expected_proof[:5]:
+                raise ImageChangedDuringIndexError(
+                    f"proved image was replaced before indexing: {rel_path}"
+                )
+            # A proof-aware call must always perform the stable descriptor read
+            # and content hash below; the ordinary unchanged-row fast path does
+            # not establish that the pathname still contains the proved bytes.
+            force = True
         changed_ns = self._path_change_time_ns(path, stat)
-        retry_failure = force and self._image_index_failure_exists(rel_path)
         if not force and self._image_index_failure_is_current(rel_path, stat):
             return None
         existing = self._conn.execute(
@@ -2157,6 +3832,7 @@ class Catalog:
         ).fetchone()
         thumbnail_ready = (
             existing is not None
+            and not force
             and self._ensure_existing_thumbnail_file(rel_path, path, existing)
         )
         if (
@@ -2166,14 +3842,22 @@ class Catalog:
             and int(existing["ctime_ns"]) == changed_ns
             and int(existing["thumb_size_px"]) == self.settings.thumbnail_native_size
             and thumbnail_ready
-            and not retry_failure
+            and not force
         ):
             if not is_exact_image_hash(existing["image_hash"]) or existing["thumb_cache_key"] is None:
                 try:
-                    image_hash, thumb_cache_key = self._image_file_hashes(path, cancel_check)
+                    image_hash, thumb_cache_key = self._image_file_hashes_stable(
+                        ImageReadJob(rel_path, path, stat, changed_ns),
+                        cancel_check,
+                    )
                 except OSError:
                     self.append_log(f"Indexing error for {rel_path}: could not read image file", level="ERROR")
-                    self._remember_index_failure(rel_path, stat, "could not read image file")
+                    self._remember_index_failure(
+                        rel_path,
+                        stat,
+                        "could not read image file",
+                        changed_ns=changed_ns,
+                    )
                     return None
                 self._update_file_identity(
                     rel_path,
@@ -2186,6 +3870,7 @@ class Catalog:
             if self._image_similarity_features_current(existing):
                 return self.get_image(rel_path, include_blob=False)
 
+        job = ImageReadJob(rel_path, path, stat, changed_ns)
         try:
             (
                 width,
@@ -2195,18 +3880,36 @@ class Catalog:
                 thumb_height,
                 perceptual_hash,
                 color_signature,
-            ) = self._read_image_metadata_and_thumbnail(path)
-            image_hash, thumb_cache_key = self._image_file_hashes(path, cancel_check)
+                image_hash,
+                thumb_cache_key,
+            ) = self._read_image_metadata_thumbnail_and_hash(job, cancel_check)
+            if expected_proof is not None and image_hash != expected_proof[5]:
+                raise ImageChangedDuringIndexError(
+                    f"image content does not match committed proof: {rel_path}"
+                )
+            if expected_proof is not None:
+                self._assert_index_job_current(job)
             thumb_rel_path = self._write_thumbnail_file(
                 thumb_cache_key,
                 self.settings.thumbnail_native_size,
                 thumb_blob,
             )
+            if expected_proof is not None:
+                # Close the thumbnail-write window before publishing the row.
+                self._assert_index_job_current(job)
+        except ImageChangedDuringIndexError as error:
+            self.append_log(
+                f"Indexing deferred for changing image {rel_path}: {error}",
+                level="WARNING",
+            )
+            if expected_proof is not None:
+                raise
+            return None
         except Exception as error:
             if cancel_check is not None:
                 cancel_check()
             self.append_log(f"Indexing error for {rel_path}: {error}", level="ERROR")
-            self._remember_index_failure(rel_path, stat, error)
+            self._remember_index_failure(rel_path, stat, error, changed_ns=changed_ns)
             return None
 
         old_thumb_rel_paths = set()
@@ -2290,7 +3993,7 @@ class Catalog:
         offset: int = 0,
         cancel_check: CancelCallback | None = None,
     ) -> list[ImageRecord]:
-        order_clause = SQL_SORT_ORDER[sort_order]
+        order_clause = self._deterministic_image_order_clause(sort_order)
         columns = self._image_columns(include_blobs)
         sql = f"""
             SELECT {columns}
@@ -2305,6 +4008,52 @@ class Catalog:
         with self._sqlite_cancel_progress(cancel_check):
             rows = self._iter_cursor_rows(self._conn.execute(sql, params), cancel_check)
             return [self._row_to_record(row, include_blob=include_blobs) for row in rows]
+
+    def image_count(
+        self,
+        dir_rel: str = "",
+        *,
+        cancel_check: CancelCallback | None = None,
+    ) -> int:
+        """Count indexed images physically located directly in one directory."""
+
+        if cancel_check is not None:
+            cancel_check()
+        with self._sqlite_cancel_progress(cancel_check):
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS count FROM images WHERE dir_rel = ?",
+                (dir_rel,),
+            ).fetchone()
+        return 0 if row is None else int(row["count"])
+
+    def list_images_page(
+        self,
+        dir_rel: str = "",
+        sort_order: SortOrder = SortOrder.NAME_ASC,
+        *,
+        limit: int,
+        offset: int = 0,
+        include_blobs: bool = False,
+        cancel_check: CancelCallback | None = None,
+    ) -> list[ImageRecord]:
+        """Return one validated page of indexed direct physical images."""
+
+        limit, offset = self._validate_query_page(limit, offset)
+        return self.list_images(
+            dir_rel,
+            sort_order,
+            include_blobs=include_blobs,
+            limit=limit,
+            offset=offset,
+            cancel_check=cancel_check,
+        )
+
+    @staticmethod
+    def _deterministic_image_order_clause(sort_order: SortOrder) -> str:
+        # The shared clauses preserve the UI's historical primary ordering.
+        # Binary rel_path is the final tie-breaker when NOCASE considers two
+        # distinct catalog paths equal.
+        return f"{SQL_SORT_ORDER[sort_order]}, rel_path ASC"
 
     def _iter_cursor_rows(
         self,
@@ -2417,7 +4166,7 @@ class Catalog:
         offset: int = 0,
         cancel_check: CancelCallback | None = None,
     ) -> list[ImageRecord]:
-        order_clause = SQL_SORT_ORDER[sort_order]
+        order_clause = self._deterministic_image_order_clause(sort_order)
         columns = self._image_columns(include_blobs)
         sql = f"""
             SELECT {columns}
@@ -2438,6 +4187,48 @@ class Catalog:
             rows = self._iter_cursor_rows(self._conn.execute(sql, params), cancel_check)
             return [self._row_to_record(row, include_blob=include_blobs) for row in rows]
 
+    def tag_image_count(
+        self,
+        tag_name: str,
+        *,
+        cancel_check: CancelCallback | None = None,
+    ) -> int:
+        """Count indexed images assigned to a normalized tag name."""
+
+        if cancel_check is not None:
+            cancel_check()
+        with self._sqlite_cancel_progress(cancel_check):
+            row = self._conn.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM image_tags
+                JOIN tags ON tags.id = image_tags.tag_id
+                WHERE tags.normalized = ?
+                """,
+                (normalize_tag(tag_name),),
+            ).fetchone()
+        return 0 if row is None else int(row["count"])
+
+    def list_images_for_tag_page(
+        self,
+        tag_name: str,
+        sort_order: SortOrder = SortOrder.NAME_ASC,
+        *,
+        limit: int,
+        offset: int = 0,
+        include_blobs: bool = False,
+        cancel_check: CancelCallback | None = None,
+    ) -> list[ImageRecord]:
+        limit, offset = self._validate_query_page(limit, offset)
+        return self.list_images_for_tag(
+            tag_name,
+            sort_order,
+            include_blobs=include_blobs,
+            limit=limit,
+            offset=offset,
+            cancel_check=cancel_check,
+        )
+
     def list_duplicate_images(
         self,
         sort_order: SortOrder = SortOrder.NAME_ASC,
@@ -2447,7 +4238,7 @@ class Catalog:
         offset: int = 0,
         cancel_check: CancelCallback | None = None,
     ) -> list[ImageRecord]:
-        order_clause = SQL_SORT_ORDER[sort_order]
+        order_clause = self._deterministic_image_order_clause(sort_order)
         columns = self._image_columns(include_blobs)
         sql = f"""
             SELECT {columns}
@@ -2455,27 +4246,29 @@ class Catalog:
             WHERE image_hash IS NOT NULL
                 AND length(image_hash) = ?
                 AND rel_path != ?
-                AND rel_path NOT LIKE ? ESCAPE '\\'
+                AND NOT (rel_path >= ? AND rel_path < ?)
                 AND image_hash IN (
                     SELECT image_hash
                     FROM images
                     WHERE image_hash IS NOT NULL
                         AND length(image_hash) = ?
                         AND rel_path != ?
-                        AND rel_path NOT LIKE ? ESCAPE '\\'
+                        AND NOT (rel_path >= ? AND rel_path < ?)
                     GROUP BY image_hash
                     HAVING COUNT(*) > 1
                 )
             ORDER BY image_hash COLLATE NOCASE ASC, {order_clause}
         """
-        trash_like = descendant_like_pattern(TRASH_DIR_NAME)
+        trash_start, trash_end = descendant_range_bounds(TRASH_DIR_NAME)
         params: list[object] = [
             EXACT_IMAGE_HASH_HEX_LENGTH,
             TRASH_DIR_NAME,
-            trash_like,
+            trash_start,
+            trash_end,
             EXACT_IMAGE_HASH_HEX_LENGTH,
             TRASH_DIR_NAME,
-            trash_like,
+            trash_start,
+            trash_end,
         ]
         if limit is not None:
             sql += " LIMIT ? OFFSET ?"
@@ -2483,6 +4276,67 @@ class Catalog:
         with self._sqlite_cancel_progress(cancel_check):
             rows = self._iter_cursor_rows(self._conn.execute(sql, params), cancel_check)
             return [self._row_to_record(row, include_blob=include_blobs) for row in rows]
+
+    def exact_duplicate_image_count(
+        self,
+        *,
+        cancel_check: CancelCallback | None = None,
+    ) -> int:
+        """Count indexed non-trash images belonging to an exact-hash group."""
+
+        if cancel_check is not None:
+            cancel_check()
+        trash_start, trash_end = descendant_range_bounds(TRASH_DIR_NAME)
+        with self._sqlite_cancel_progress(cancel_check):
+            row = self._conn.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM images
+                WHERE image_hash IS NOT NULL
+                    AND length(image_hash) = ?
+                    AND rel_path != ?
+                    AND NOT (rel_path >= ? AND rel_path < ?)
+                    AND image_hash IN (
+                        SELECT image_hash
+                        FROM images
+                        WHERE image_hash IS NOT NULL
+                            AND length(image_hash) = ?
+                            AND rel_path != ?
+                            AND NOT (rel_path >= ? AND rel_path < ?)
+                        GROUP BY image_hash
+                        HAVING COUNT(*) > 1
+                    )
+                """,
+                (
+                    EXACT_IMAGE_HASH_HEX_LENGTH,
+                    TRASH_DIR_NAME,
+                    trash_start,
+                    trash_end,
+                    EXACT_IMAGE_HASH_HEX_LENGTH,
+                    TRASH_DIR_NAME,
+                    trash_start,
+                    trash_end,
+                ),
+            ).fetchone()
+        return 0 if row is None else int(row["count"])
+
+    def list_exact_duplicate_images_page(
+        self,
+        sort_order: SortOrder = SortOrder.NAME_ASC,
+        *,
+        limit: int,
+        offset: int = 0,
+        include_blobs: bool = False,
+        cancel_check: CancelCallback | None = None,
+    ) -> list[ImageRecord]:
+        limit, offset = self._validate_query_page(limit, offset)
+        return self.list_duplicate_images(
+            sort_order,
+            include_blobs=include_blobs,
+            limit=limit,
+            offset=offset,
+            cancel_check=cancel_check,
+        )
 
     def exact_duplicate_image_groups(
         self,
@@ -2508,7 +4362,14 @@ class Catalog:
         record = self.get_image(rel_path, include_blob=False)
         if record is None:
             return DuplicateMatchGroups()
-        exact = tuple(self._exact_duplicate_matches_for_image(record, sort_order, include_blobs=include_blobs))
+        exact = tuple(
+            self._exact_duplicate_matches_for_image(
+                record,
+                sort_order,
+                include_blobs=include_blobs,
+                cancel_check=cancel_check,
+            )
+        )
         very_similar = tuple(
             self._very_similar_matches_for_image(
                 record,
@@ -2525,23 +4386,28 @@ class Catalog:
         sort_order: SortOrder,
         *,
         include_blobs: bool,
+        cancel_check: CancelCallback | None = None,
     ) -> list[ImageRecord]:
         if not is_exact_image_hash(record.image_hash):
             return []
         order_clause = SQL_SORT_ORDER[sort_order]
         columns = self._image_columns(include_blobs)
-        rows = self._conn.execute(
-            f"""
-            SELECT {columns}
-            FROM images
-            WHERE image_hash = ?
-                AND length(image_hash) = ?
-                AND rel_path != ?
-            ORDER BY {order_clause}
-            """,
-            (record.image_hash, EXACT_IMAGE_HASH_HEX_LENGTH, record.rel_path),
-        ).fetchall()
-        return [self._row_to_record(row, include_blob=include_blobs) for row in rows]
+        with self._sqlite_cancel_progress(cancel_check):
+            rows = self._conn.execute(
+                f"""
+                SELECT {columns}
+                FROM images
+                WHERE image_hash = ?
+                    AND length(image_hash) = ?
+                    AND rel_path != ?
+                ORDER BY {order_clause}
+                """,
+                (record.image_hash, EXACT_IMAGE_HASH_HEX_LENGTH, record.rel_path),
+            )
+            return [
+                self._row_to_record(row, include_blob=include_blobs)
+                for row in self._iter_cursor_rows(rows, cancel_check)
+            ]
 
     def list_very_similar_images(
         self,
@@ -2552,6 +4418,13 @@ class Catalog:
         offset: int = 0,
         cancel_check: CancelCallback | None = None,
     ) -> list[ImageRecord]:
+        """Materialize global similarity components, then apply limit/offset.
+
+        Very-similar grouping is intentionally not exposed as a query-backed
+        page: component membership depends on the full feature set. Callers
+        should run this separately from the bounded exact/database panes.
+        """
+
         ordered = [
             record
             for group in self.very_similar_image_groups(
@@ -2579,7 +4452,11 @@ class Catalog:
         if not components:
             return []
         selected_ids = [image_id for component in components for image_id in component]
-        records = self._records_for_image_ids(selected_ids, include_blobs=include_blobs)
+        records = self._records_for_image_ids(
+            selected_ids,
+            include_blobs=include_blobs,
+            cancel_check=cancel_check,
+        )
         record_by_id = {record.id: record for record in records}
         sort_key = self._record_sort_key(sort_order)
         reverse = self._record_sort_reverse(sort_order)
@@ -2611,7 +4488,11 @@ class Catalog:
                 cancel_check()
             if row.id != target.id and self._rows_are_very_similar(target, row):
                 matched_ids.append(row.id)
-        records = self._records_for_image_ids(matched_ids, include_blobs=include_blobs)
+        records = self._records_for_image_ids(
+            matched_ids,
+            include_blobs=include_blobs,
+            cancel_check=cancel_check,
+        )
         sort_key = self._record_sort_key(sort_order)
         records.sort(key=sort_key, reverse=self._record_sort_reverse(sort_order))
         return records
@@ -2627,9 +4508,26 @@ class Catalog:
             if cancel_check is not None:
                 cancel_check()
             keeper = self._preferred_duplicate_keeper(group)
-            delete = tuple(record for record in group if record.rel_path != keeper.rel_path)
+            delete_records: list[ImageRecord] = []
+            delete_identities: list[tuple[str, CatalogFileIdentity]] = []
+            for record in group:
+                if record.rel_path == keeper.rel_path:
+                    continue
+                try:
+                    identity = self.file_identity(record.rel_path)
+                except (OSError, ValueError):
+                    continue
+                delete_records.append(record)
+                delete_identities.append((record.rel_path, identity))
+            delete = tuple(delete_records)
             if delete:
-                choices.append(DuplicateDeletionChoice(keeper, delete))
+                choices.append(
+                    DuplicateDeletionChoice(
+                        keeper,
+                        delete,
+                        tuple(delete_identities),
+                    )
+                )
         return DuplicateDeletionPlan(mode=mode, choices=tuple(choices))
 
     def move_duplicate_images_to_trash(
@@ -2639,6 +4537,7 @@ class Catalog:
         progress_callback: ProgressCallback | None = None,
         cancel_check: CancelCallback | None = None,
     ) -> DuplicateDeletionResult:
+        self._assert_writable()
         if progress_callback is not None:
             progress_callback(0, None, "Finding duplicate groups")
         if cancel_check is not None:
@@ -2652,6 +4551,7 @@ class Catalog:
         self._ensure_trash_directory()
         try:
             for choice in plan.choices:
+                expected_by_path = dict(choice.delete_identities)
                 for record in choice.delete:
                     if cancel_check is not None:
                         cancel_check()
@@ -2667,6 +4567,7 @@ class Catalog:
                     result = self._move_image_to_rel_path(
                         record.rel_path,
                         trash_rel_path_for_original(record.rel_path),
+                        expected_identity=expected_by_path.get(record.rel_path),
                     )
                     moved += 1
                     affected_dirs.add(record.dir_rel)
@@ -2743,6 +4644,7 @@ class Catalog:
         progress_callback: ProgressCallback | None = None,
         cancel_check: CancelCallback | None = None,
     ) -> DuplicateDeletionResult:
+        self._assert_writable()
         return self.move_duplicate_images_to_trash(
             mode,
             progress_callback=progress_callback,
@@ -2832,9 +4734,10 @@ class Catalog:
         if not include_trash:
             trash_filter = """
                 AND rel_path != ?
-                AND rel_path NOT LIKE ? ESCAPE '\\'
+                AND NOT (rel_path >= ? AND rel_path < ?)
             """
-            params.extend([TRASH_DIR_NAME, descendant_like_pattern(TRASH_DIR_NAME)])
+            trash_start, trash_end = descendant_range_bounds(TRASH_DIR_NAME)
+            params.extend([TRASH_DIR_NAME, trash_start, trash_end])
         features: list[SimilarityFeatureRow] = []
         with self._sqlite_cancel_progress(cancel_check):
             rows = self._conn.execute(
@@ -2896,7 +4799,7 @@ class Catalog:
             if cancel_check is not None:
                 cancel_check()
             if root is not None:
-                for candidate in self._bk_tree_query(
+                for candidate in self._iter_bk_tree_query(
                     root,
                     row.perceptual_hash,
                     VERY_SIMILAR_HASH_DISTANCE,
@@ -2961,7 +4864,23 @@ class Catalog:
         *,
         cancel_check: CancelCallback | None = None,
     ) -> list[SimilarityFeatureRow]:
-        matches: list[SimilarityFeatureRow] = []
+        return list(
+            self._iter_bk_tree_query(
+                node,
+                hash_value,
+                max_distance,
+                cancel_check=cancel_check,
+            )
+        )
+
+    def _iter_bk_tree_query(
+        self,
+        node: HammingBKTreeNode,
+        hash_value: int,
+        max_distance: int,
+        *,
+        cancel_check: CancelCallback | None = None,
+    ) -> Iterator[SimilarityFeatureRow]:
         pending = [node]
         while pending:
             if cancel_check is not None:
@@ -2969,7 +4888,10 @@ class Catalog:
             current = pending.pop()
             distance = self._hamming_distance(hash_value, current.hash_value)
             if distance <= max_distance:
-                matches.extend(current.rows)
+                for index, row in enumerate(current.rows):
+                    if cancel_check is not None and index % 256 == 0:
+                        cancel_check()
+                    yield row
             low = distance - max_distance
             high = distance + max_distance
             pending.extend(
@@ -2977,12 +4899,17 @@ class Catalog:
                 for edge, child in reversed(list(current.children.items()))
                 if low <= edge <= high
             )
-        return matches
 
     def _hamming_distance(self, left: int, right: int) -> int:
         return (left ^ right).bit_count()
 
-    def _records_for_image_ids(self, image_ids: Sequence[int], *, include_blobs: bool) -> list[ImageRecord]:
+    def _records_for_image_ids(
+        self,
+        image_ids: Sequence[int],
+        *,
+        include_blobs: bool,
+        cancel_check: CancelCallback | None = None,
+    ) -> list[ImageRecord]:
         if not image_ids:
             return []
         columns = self._image_columns(include_blobs)
@@ -2995,16 +4922,22 @@ class Catalog:
             )
         variable_limit = max(1, variable_limit)
         for chunk_start in range(0, len(image_ids), variable_limit):
+            if cancel_check is not None:
+                cancel_check()
             chunk = image_ids[chunk_start : chunk_start + variable_limit]
-            rows = self._conn.execute(
-                f"""
-                SELECT {columns}
-                FROM images
-                WHERE id IN ({",".join("?" for _ in chunk)})
-                """,
-                chunk,
-            ).fetchall()
-            records.extend(self._row_to_record(row, include_blob=include_blobs) for row in rows)
+            with self._sqlite_cancel_progress(cancel_check):
+                rows = self._conn.execute(
+                    f"""
+                    SELECT {columns}
+                    FROM images
+                    WHERE id IN ({",".join("?" for _ in chunk)})
+                    """,
+                    chunk,
+                )
+                records.extend(
+                    self._row_to_record(row, include_blob=include_blobs)
+                    for row in self._iter_cursor_rows(rows, cancel_check)
+                )
         return records
 
     def list_images_with_placeholders(
@@ -3051,25 +4984,259 @@ class Catalog:
         *,
         include_previews: bool = True,
         include_filesystem_preview_fallback: bool = True,
+        limit: int | None = None,
+        offset: int = 0,
+        cancel_check: CancelCallback | None = None,
+    ) -> list[DirectoryRecord]:
+        if limit is not None:
+            return self.list_child_directories_page(
+                dir_rel,
+                sort_order,
+                limit=limit,
+                offset=offset,
+                include_previews=include_previews,
+                include_filesystem_preview_fallback=include_filesystem_preview_fallback,
+                cancel_check=cancel_check,
+            )
+        if offset:
+            raise ValueError("offset requires a bounded limit")
+        child_rels = self._direct_child_directories(dir_rel, cancel_check=cancel_check)
+        return self._directory_records_for_child_rels(
+            child_rels,
+            sort_order,
+            include_previews=include_previews,
+            include_filesystem_preview_fallback=include_filesystem_preview_fallback,
+            cancel_check=cancel_check,
+        )
+
+    def list_child_directories_page(
+        self,
+        dir_rel: str = "",
+        sort_order: SortOrder = SortOrder.NAME_ASC,
+        *,
+        limit: int,
+        offset: int = 0,
+        include_previews: bool = True,
+        include_filesystem_preview_fallback: bool = True,
+        cancel_check: CancelCallback | None = None,
+    ) -> list[DirectoryRecord]:
+        """Return one globally ordered, bounded direct-child page.
+
+        Name ordering uses the indexed parent relation directly. Size and
+        aspect ordering aggregate every candidate subtree in SQLite *before*
+        LIMIT/OFFSET, avoiding the incorrect page-then-sort behavior. Directory
+        dates come from the filesystem, so a bounded top-k retains only the
+        prefix needed for the requested page while it scans candidates.
+        """
+
+        limit, offset = self._validate_query_page(limit, offset)
+        if cancel_check is not None:
+            cancel_check()
+        if limit == 0:
+            return []
+        aggregates: dict[str, tuple[int, float]] | None = None
+        mtimes: dict[str, int] | None = None
+        if sort_order in {SortOrder.NAME_ASC, SortOrder.NAME_DESC}:
+            child_rels = self.list_known_child_directories_page(
+                dir_rel,
+                limit=limit,
+                offset=offset,
+                descending=sort_order == SortOrder.NAME_DESC,
+                cancel_check=cancel_check,
+            )
+        elif sort_order in {
+            SortOrder.SIZE_ASC,
+            SortOrder.SIZE_DESC,
+            SortOrder.ASPECT_ASC,
+            SortOrder.ASPECT_DESC,
+        }:
+            child_rels, aggregates = self._aggregate_child_directory_page(
+                dir_rel,
+                sort_order,
+                limit=limit,
+                offset=offset,
+                cancel_check=cancel_check,
+            )
+        else:
+            child_rels, mtimes = self._dated_child_directory_page(
+                dir_rel,
+                sort_order,
+                limit=limit,
+                offset=offset,
+                cancel_check=cancel_check,
+            )
+        return self._directory_records_for_child_rels(
+            child_rels,
+            sort_order,
+            include_previews=include_previews,
+            include_filesystem_preview_fallback=include_filesystem_preview_fallback,
+            aggregate_overrides=aggregates,
+            mtime_overrides=mtimes,
+            cancel_check=cancel_check,
+        )
+
+    def _aggregate_child_directory_page(
+        self,
+        parent_dir_rel: str,
+        sort_order: SortOrder,
+        *,
+        limit: int,
+        offset: int,
+        cancel_check: CancelCallback | None,
+    ) -> tuple[list[str], dict[str, tuple[int, float]]]:
+        metric = (
+            "size_bytes"
+            if sort_order in {SortOrder.SIZE_ASC, SortOrder.SIZE_DESC}
+            else "aspect_ratio"
+        )
+        direction = "DESC" if self._record_sort_reverse(sort_order) else "ASC"
+        if parent_dir_rel:
+            remainder_expression = "substr(images.dir_rel, length(?) + 2)"
+            scope_clause = "images.dir_rel >= ? AND images.dir_rel < ?"
+            child_rel_expression = "? || '/' || child_name"
+            query_params: list[object] = [
+                parent_dir_rel,
+                f"{parent_dir_rel}/",
+                f"{parent_dir_rel}0",
+                parent_dir_rel,
+            ]
+        else:
+            remainder_expression = "images.dir_rel"
+            scope_clause = "images.dir_rel != ''"
+            child_rel_expression = "child_name"
+            query_params = []
+        with self._sqlite_cancel_progress(cancel_check):
+            cursor = self._conn.execute(
+                f"""
+                WITH child AS (
+                    SELECT dir_rel
+                    FROM directories
+                    WHERE parent_dir_rel = ? AND dir_rel != ''
+                ), candidate_images AS (
+                    SELECT {remainder_expression} AS remainder,
+                        images.file_size_bytes,
+                        images.aspect_ratio
+                    FROM images
+                    WHERE {scope_clause}
+                ), image_children AS (
+                    SELECT CASE
+                               WHEN instr(remainder, '/') = 0 THEN remainder
+                               ELSE substr(remainder, 1, instr(remainder, '/') - 1)
+                           END AS child_name,
+                           file_size_bytes,
+                           aspect_ratio
+                    FROM candidate_images
+                    WHERE remainder != ''
+                ), image_aggregates AS (
+                    SELECT {child_rel_expression} AS dir_rel,
+                        COALESCE(SUM(file_size_bytes), 0) AS size_bytes,
+                        CASE WHEN COUNT(*) = 0 THEN 0.0
+                             ELSE COALESCE(SUM(aspect_ratio), 0.0) / COUNT(*)
+                        END AS aspect_ratio
+                    FROM image_children
+                    GROUP BY child_name
+                ), aggregate_rows AS (
+                    SELECT child.dir_rel,
+                        COALESCE(image_aggregates.size_bytes, 0) AS size_bytes,
+                        COALESCE(image_aggregates.aspect_ratio, 0.0) AS aspect_ratio
+                    FROM child
+                    LEFT JOIN image_aggregates ON image_aggregates.dir_rel = child.dir_rel
+                )
+                SELECT dir_rel, size_bytes, aspect_ratio
+                FROM aggregate_rows
+                ORDER BY {metric} {direction}, dir_rel COLLATE NOCASE {direction}, dir_rel {direction}
+                LIMIT ? OFFSET ?
+                """,
+                [parent_dir_rel, *query_params, limit, offset],
+            )
+            rows = list(self._iter_cursor_rows(cursor, cancel_check))
+        child_rels = [str(row["dir_rel"]) for row in rows]
+        aggregates = {
+            str(row["dir_rel"]): (
+                int(row["size_bytes"] or 0),
+                float(row["aspect_ratio"] or 0.0),
+            )
+            for row in rows
+        }
+        return child_rels, aggregates
+
+    def _dated_child_directory_page(
+        self,
+        parent_dir_rel: str,
+        sort_order: SortOrder,
+        *,
+        limit: int,
+        offset: int,
+        cancel_check: CancelCallback | None,
+    ) -> tuple[list[str], dict[str, int]]:
+        prefix_count = limit + offset
+
+        def candidates() -> Iterator[tuple[str, int]]:
+            with self._sqlite_cancel_progress(cancel_check):
+                cursor = self._conn.execute(
+                    """
+                    SELECT dir_rel
+                    FROM directories
+                    WHERE parent_dir_rel = ? AND dir_rel != ''
+                    """,
+                    (parent_dir_rel,),
+                )
+                for row in self._iter_cursor_rows(cursor, cancel_check):
+                    child_rel = str(row["dir_rel"])
+                    try:
+                        child_stat = self.abs_path(child_rel).stat()
+                    except OSError:
+                        mtime_ns = 0
+                    else:
+                        mtime_ns = int(child_stat.st_mtime_ns)
+                    yield child_rel, mtime_ns
+
+        key = lambda item: (  # noqa: E731 - local key documents tuple parity
+            item[1],
+            Path(item[0]).name.casefold(),
+            item[0].casefold(),
+        )
+        if sort_order == SortOrder.DATE_DESC:
+            selected = heapq.nlargest(prefix_count, candidates(), key=key)
+        else:
+            selected = heapq.nsmallest(prefix_count, candidates(), key=key)
+        page = selected[offset : offset + limit]
+        return [item[0] for item in page], {item[0]: item[1] for item in page}
+
+    def _directory_records_for_child_rels(
+        self,
+        child_rels: Sequence[str],
+        sort_order: SortOrder,
+        *,
+        include_previews: bool,
+        include_filesystem_preview_fallback: bool,
+        aggregate_overrides: Mapping[str, tuple[int, float]] | None = None,
+        mtime_overrides: Mapping[str, int] | None = None,
         cancel_check: CancelCallback | None = None,
     ) -> list[DirectoryRecord]:
         records: list[DirectoryRecord] = []
-        child_rels = self._direct_child_directories(dir_rel, cancel_check=cancel_check)
-        aggregates = self._child_directory_image_aggregates(
-            dir_rel,
-            child_rels,
-            cancel_check=cancel_check,
+        aggregates = (
+            dict(aggregate_overrides)
+            if aggregate_overrides is not None
+            else self._child_directory_image_aggregates(
+                "",
+                child_rels,
+                cancel_check=cancel_check,
+            )
         )
         for child_rel in child_rels:
             if cancel_check is not None:
                 cancel_check()
             path = self.abs_path(child_rel)
-            try:
-                stat = path.stat()
-            except OSError:
-                stat_mtime = 0
+            if mtime_overrides is not None and child_rel in mtime_overrides:
+                stat_mtime = int(mtime_overrides[child_rel])
             else:
-                stat_mtime = stat.st_mtime_ns
+                try:
+                    stat = path.stat()
+                except OSError:
+                    stat_mtime = 0
+                else:
+                    stat_mtime = stat.st_mtime_ns
             size_bytes, aspect_ratio = aggregates.get(child_rel, (0, 0.0))
             preview_items = (
                 tuple(
@@ -3077,6 +5244,7 @@ class Catalog:
                         child_rel,
                         limit=4,
                         include_filesystem_fallback=include_filesystem_preview_fallback,
+                        cancel_check=cancel_check,
                     )
                 )
                 if include_previews
@@ -3104,61 +5272,56 @@ class Catalog:
         *,
         cancel_check: CancelCallback | None = None,
     ) -> dict[str, tuple[int, float]]:
-        """Aggregate indexed descendants for all direct children in one query."""
+        """Aggregate only selected child subtrees in bounded SQL batches."""
         if not child_rels:
             return {}
-        prefix = f"{parent_dir_rel}/" if parent_dir_rel else ""
-        with self._sqlite_cancel_progress(cancel_check):
-            if parent_dir_rel:
-                descendant_start = f"{parent_dir_rel}/"
-                descendant_end = f"{parent_dir_rel}0"
-                rows = self._conn.execute(
-                    """
-                    SELECT dir_rel,
-                        SUM(file_size_bytes) AS size_bytes,
-                        SUM(aspect_ratio) AS aspect_sum,
-                        COUNT(*) AS image_count
-                    FROM images
-                    WHERE dir_rel >= ? AND dir_rel < ?
-                    GROUP BY dir_rel
-                    """,
-                    (descendant_start, descendant_end),
-                )
-            else:
-                rows = self._conn.execute(
-                    """
-                    SELECT dir_rel,
-                        SUM(file_size_bytes) AS size_bytes,
-                        SUM(aspect_ratio) AS aspect_sum,
-                        COUNT(*) AS image_count
-                    FROM images
-                    WHERE dir_rel != ''
-                    GROUP BY dir_rel
-                    """
-                )
-            aggregate_rows = list(self._iter_cursor_rows(rows, cancel_check))
-        totals: dict[str, list[float | int]] = {
-            child_rel: [0, 0.0, 0]
-            for child_rel in child_rels
-        }
-        for row in aggregate_rows:
-            actual_dir_rel = str(row["dir_rel"])
-            remainder = actual_dir_rel[len(prefix) :]
-            child_name = remainder.split("/", 1)[0]
-            child_rel = f"{prefix}{child_name}" if prefix else child_name
-            total = totals.get(child_rel)
-            if total is None:
-                continue
-            total[0] = int(total[0]) + int(row["size_bytes"] or 0)
-            total[1] = float(total[1]) + float(row["aspect_sum"] or 0.0)
-            total[2] = int(total[2]) + int(row["image_count"] or 0)
-        return {
-            child_rel: (
-                int(total[0]),
-                float(total[1]) / int(total[2]) if int(total[2]) else 0.0,
+        del parent_dir_rel  # The selected rel paths are already fully qualified.
+        variable_limit = SQLITE_VARIABLE_BATCH_SIZE
+        if hasattr(self._conn, "getlimit"):
+            variable_limit = min(
+                variable_limit,
+                self._conn.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER),
             )
-            for child_rel, total in totals.items()
-        }
+        batch_size = max(1, variable_limit // 3)
+        totals: dict[str, tuple[int, float]] = {}
+        for start in range(0, len(child_rels), batch_size):
+            if cancel_check is not None:
+                cancel_check()
+            chunk = child_rels[start : start + batch_size]
+            values_clause = ",".join("(?, ?, ?)" for _ in chunk)
+            params: list[str] = []
+            for child_rel in chunk:
+                params.extend((child_rel, f"{child_rel}/", f"{child_rel}0"))
+            with self._sqlite_cancel_progress(cancel_check):
+                rows = self._conn.execute(
+                    f"""
+                    WITH selected(child_rel, descendant_start, descendant_end) AS (
+                        VALUES {values_clause}
+                    )
+                    SELECT selected.child_rel,
+                        COALESCE(SUM(images.file_size_bytes), 0) AS size_bytes,
+                        COALESCE(SUM(images.aspect_ratio), 0.0) AS aspect_sum,
+                        COUNT(images.id) AS image_count
+                    FROM selected
+                    LEFT JOIN images
+                        ON images.dir_rel = selected.child_rel
+                        OR (
+                            images.dir_rel >= selected.descendant_start
+                            AND images.dir_rel < selected.descendant_end
+                        )
+                    GROUP BY selected.child_rel
+                    """,
+                    params,
+                )
+                for row in self._iter_cursor_rows(rows, cancel_check):
+                    image_count = int(row["image_count"] or 0)
+                    totals[str(row["child_rel"])] = (
+                        int(row["size_bytes"] or 0),
+                        float(row["aspect_sum"] or 0.0) / image_count
+                        if image_count
+                        else 0.0,
+                    )
+        return totals
 
     def folder_preview_items_under(
         self,
@@ -3166,28 +5329,45 @@ class Catalog:
         *,
         limit: int = 4,
         include_filesystem_fallback: bool = True,
+        cancel_check: CancelCallback | None = None,
     ) -> list[FolderPreviewRecord]:
         previews = [
             FolderPreviewRecord("image", blob)
-            for blob in self.thumbnail_blobs_under(dir_rel, limit=limit)
+            for blob in self.thumbnail_blobs_under(
+                dir_rel,
+                limit=limit,
+                cancel_check=cancel_check,
+            )
         ]
         if len(previews) >= limit or not include_filesystem_fallback:
             return previews[:limit]
-        seen_image_paths = {
-            str(row["rel_path"])
-            for row in self._conn.execute(
-                """
-                SELECT rel_path
-                FROM images
-                WHERE dir_rel = ? OR dir_rel LIKE ? ESCAPE '\\'
-                ORDER BY rel_path COLLATE NOCASE ASC
-                LIMIT ?
-                """,
-                (dir_rel, descendant_like_pattern(dir_rel), limit),
-            )
-        }
+        if dir_rel:
+            directory_filter = "dir_rel = ? OR (dir_rel >= ? AND dir_rel < ?)"
+            directory_params: list[object] = [dir_rel, f"{dir_rel}/", f"{dir_rel}0"]
+        else:
+            directory_filter = "1 = 1"
+            directory_params = []
+        with self._sqlite_cancel_progress(cancel_check):
+            seen_image_paths = {
+                str(row["rel_path"])
+                for row in self._iter_cursor_rows(
+                    self._conn.execute(
+                        f"""
+                        SELECT rel_path
+                        FROM images
+                        WHERE {directory_filter}
+                        ORDER BY rel_path COLLATE NOCASE ASC
+                        LIMIT ?
+                        """,
+                        [*directory_params, limit],
+                    ),
+                    cancel_check,
+                )
+            }
         directory = self.abs_path(dir_rel) if dir_rel else self.root
-        for scanned, path in enumerate(self._preview_candidate_files(directory)):
+        for scanned, path in enumerate(
+            self._preview_candidate_files(directory, cancel_check=cancel_check)
+        ):
             if scanned >= FOLDER_PREVIEW_SCAN_LIMIT:
                 break
             if len(previews) >= limit:
@@ -3204,30 +5384,77 @@ class Catalog:
                 previews.append(FolderPreviewRecord("other"))
         return previews[:limit]
 
-    def _preview_candidate_files(self, directory: Path) -> Iterable[Path]:
-        for dirpath, dirnames, filenames in os.walk(directory):
-            dirnames[:] = sorted(name for name in dirnames if name != ".marnwick")
-            for filename in sorted(filenames, key=str.casefold):
-                yield Path(dirpath) / filename
+    def _preview_candidate_files(
+        self,
+        directory: Path,
+        *,
+        cancel_check: CancelCallback | None = None,
+    ) -> Iterable[Path]:
+        pending = [directory]
+        remaining_entries = FOLDER_PREVIEW_SCAN_LIMIT
+        while pending and remaining_entries > 0:
+            if cancel_check is not None:
+                cancel_check()
+            current = pending.pop()
+            child_directories: list[Path] = []
+            child_files: list[Path] = []
+            try:
+                with os.scandir(current) as entries:
+                    for entry in entries:
+                        if cancel_check is not None:
+                            cancel_check()
+                        remaining_entries -= 1
+                        if remaining_entries < 0:
+                            return
+                        try:
+                            if entry.is_dir(follow_symlinks=False):
+                                if entry.name != ".marnwick":
+                                    child_directories.append(Path(entry.path))
+                            elif entry.is_file(follow_symlinks=False):
+                                child_files.append(Path(entry.path))
+                        except OSError:
+                            continue
+            except OSError:
+                continue
+            child_files.sort(key=lambda path: path.name.casefold())
+            child_directories.sort(key=lambda path: path.name.casefold())
+            yield from child_files
+            pending.extend(reversed(child_directories))
 
-    def thumbnail_blobs_under(self, dir_rel: str, *, limit: int = 4) -> list[bytes]:
-        nested_like = descendant_like_pattern(dir_rel)
-        rows = self._conn.execute(
-            """
-            SELECT rel_path, thumb_rel_path, thumb_cache_key, thumb_size_px, image_hash, thumb_blob
-            FROM images
-            WHERE (dir_rel = ? OR dir_rel LIKE ? ESCAPE '\\')
-                AND (thumb_rel_path IS NOT NULL OR thumb_blob IS NOT NULL)
-            ORDER BY rel_path COLLATE NOCASE ASC
-            LIMIT ?
-            """,
-            (dir_rel, nested_like, limit),
-        )
+    def thumbnail_blobs_under(
+        self,
+        dir_rel: str,
+        *,
+        limit: int = 4,
+        cancel_check: CancelCallback | None = None,
+    ) -> list[bytes]:
+        if limit <= 0:
+            return []
+        if dir_rel:
+            directory_filter = "dir_rel = ? OR (dir_rel >= ? AND dir_rel < ?)"
+            directory_params: list[object] = [dir_rel, f"{dir_rel}/", f"{dir_rel}0"]
+        else:
+            directory_filter = "1 = 1"
+            directory_params = []
         blobs: list[bytes] = []
-        for row in rows:
-            blob = self._thumbnail_blob_for_row(row, str(row["rel_path"]))
-            if blob is not None:
-                blobs.append(blob)
+        with self._sqlite_cancel_progress(cancel_check):
+            rows = self._conn.execute(
+                f"""
+                SELECT rel_path, thumb_rel_path, thumb_cache_key, thumb_size_px, image_hash,
+                       CASE WHEN length(thumb_blob) <= ? THEN thumb_blob ELSE NULL END AS thumb_blob
+                FROM images
+                WHERE ({directory_filter})
+                    AND (thumb_rel_path IS NOT NULL OR thumb_blob IS NOT NULL)
+                ORDER BY dir_rel ASC, filename COLLATE NOCASE ASC, rel_path COLLATE NOCASE ASC
+                """,
+                [MAX_THUMBNAIL_FILE_BYTES, *directory_params],
+            )
+            for row in self._iter_cursor_rows(rows, cancel_check):
+                blob = self._thumbnail_blob_for_row(row, str(row["rel_path"]))
+                if blob is not None:
+                    blobs.append(blob)
+                    if len(blobs) >= limit:
+                        break
         return blobs
 
     def get_image(self, rel_path: str, *, include_blob: bool = True) -> ImageRecord | None:
@@ -3247,11 +5474,12 @@ class Catalog:
     def get_thumbnail_blob(self, rel_path: str) -> bytes | None:
         row = self._conn.execute(
             """
-            SELECT rel_path, thumb_rel_path, thumb_cache_key, thumb_size_px, image_hash, thumb_blob
+            SELECT rel_path, thumb_rel_path, thumb_cache_key, thumb_size_px, image_hash,
+                   CASE WHEN length(thumb_blob) <= ? THEN thumb_blob ELSE NULL END AS thumb_blob
             FROM images
             WHERE rel_path = ?
             """,
-            (rel_path,),
+            (MAX_THUMBNAIL_FILE_BYTES, rel_path),
         ).fetchone()
         if row is None:
             return None
@@ -3259,28 +5487,33 @@ class Catalog:
 
     def indexed_image_sizes_under(self, dir_rel: str) -> dict[str, int]:
         if dir_rel:
-            nested_like = descendant_like_pattern(dir_rel)
+            descendant_start, descendant_end = descendant_range_bounds(dir_rel)
             rows = self._conn.execute(
                 """
                 SELECT rel_path, file_size_bytes
                 FROM images
-                WHERE dir_rel = ? OR dir_rel LIKE ? ESCAPE '\\'
+                WHERE dir_rel = ? OR (dir_rel >= ? AND dir_rel < ?)
                 """,
-                (dir_rel, nested_like),
+                (dir_rel, descendant_start, descendant_end),
             )
         else:
             rows = self._conn.execute("SELECT rel_path, file_size_bytes FROM images")
         return {str(row["rel_path"]): int(row["file_size_bytes"]) for row in rows}
 
     def _indexed_image_size_under(self, dir_rel: str) -> int:
-        nested_like = descendant_like_pattern(dir_rel)
+        if not dir_rel:
+            row = self._conn.execute(
+                "SELECT COALESCE(SUM(file_size_bytes), 0) AS total FROM images"
+            ).fetchone()
+            return 0 if row is None else int(row["total"])
+        descendant_start, descendant_end = descendant_range_bounds(dir_rel)
         row = self._conn.execute(
             """
             SELECT COALESCE(SUM(file_size_bytes), 0) AS total
             FROM images
-            WHERE dir_rel = ? OR dir_rel LIKE ? ESCAPE '\\'
+            WHERE dir_rel = ? OR (dir_rel >= ? AND dir_rel < ?)
             """,
-            (dir_rel, nested_like),
+            (dir_rel, descendant_start, descendant_end),
         ).fetchone()
         return 0 if row is None else int(row["total"])
 
@@ -3296,6 +5529,11 @@ class Catalog:
         return int(row["count"] if row is not None else 0)
 
     def define_tags(self, names: Iterable[str]) -> list[str]:
+        self._assert_writable()
+        with self._database_savepoint("define_tags"):
+            return self._define_tags_in_transaction(names)
+
+    def _define_tags_in_transaction(self, names: Iterable[str]) -> list[str]:
         stored: list[str] = []
         for name in names:
             clean = " ".join(name.strip().split())
@@ -3323,31 +5561,49 @@ class Catalog:
             for row in self._conn.execute("SELECT name FROM tags ORDER BY name COLLATE NOCASE ASC")
         ]
 
-    def set_image_tags(self, rel_path: str, names: Iterable[str], *, replace: bool = True) -> list[str]:
-        record = self.get_image(rel_path, include_blob=False)
-        if record is None:
-            record = self.index_image(rel_path)
-        if record is None:
-            raise FileNotFoundError(rel_path)
-        defined = self.define_tags(names)
-        if replace:
-            self._conn.execute("DELETE FROM image_tags WHERE image_id = ?", (record.id,))
-        for name in defined:
-            tag_id = self._conn.execute(
-                "SELECT id FROM tags WHERE normalized = ?",
-                (normalize_tag(name),),
-            ).fetchone()["id"]
-            self._conn.execute(
-                """
-                INSERT INTO image_tags(image_id, tag_id)
-                VALUES (?, ?)
-                ON CONFLICT(image_id, tag_id) DO NOTHING
-                """,
-                (record.id, tag_id),
-            )
-        return self.get_image_tags(rel_path)
+    def set_image_tags(
+        self,
+        rel_path: str,
+        names: Iterable[str],
+        *,
+        replace: bool = True,
+        expected_identity: CatalogFileIdentity | None = None,
+    ) -> list[str]:
+        self._assert_writable()
+        with self._database_savepoint("set_image_tags"):
+            if expected_identity is not None and self.file_identity(rel_path) != expected_identity:
+                raise OSError(f"image changed after tag editing began: {rel_path}")
+            record = self.get_image(rel_path, include_blob=False)
+            if record is None:
+                record = self.index_image(rel_path)
+            if record is None:
+                raise FileNotFoundError(rel_path)
+            defined = self._define_tags_in_transaction(names)
+            if replace:
+                self._conn.execute("DELETE FROM image_tags WHERE image_id = ?", (record.id,))
+            for name in defined:
+                tag_id = self._conn.execute(
+                    "SELECT id FROM tags WHERE normalized = ?",
+                    (normalize_tag(name),),
+                ).fetchone()["id"]
+                self._conn.execute(
+                    """
+                    INSERT INTO image_tags(image_id, tag_id)
+                    VALUES (?, ?)
+                    ON CONFLICT(image_id, tag_id) DO NOTHING
+                    """,
+                    (record.id, tag_id),
+                )
+            stored = self.get_image_tags(rel_path)
+            # Roll the database savepoint back if the file was replaced while
+            # this mutation was executing.  Tags must stay attached to the
+            # image the user actually inspected, not a successor at its path.
+            if expected_identity is not None and self.file_identity(rel_path) != expected_identity:
+                raise OSError(f"image changed while tags were being updated: {rel_path}")
+            return stored
 
     def apply_tag_entry(self, rel_path: str, csv_text: str) -> list[str]:
+        self._assert_writable()
         names = parse_tag_entry(csv_text)
         return self.set_image_tags(rel_path, names, replace=False)
 
@@ -3376,9 +5632,12 @@ class Catalog:
         dest_dir_rel: str = "",
         *,
         wipe_on_delete: bool = False,
+        expected_identities: Mapping[str, CatalogFileIdentity] | None = None,
         progress_callback: ProgressCallback | None = None,
         cancel_check: CancelCallback | None = None,
     ) -> list[MoveResult]:
+        self._assert_writable()
+        dest_catalog._assert_writable()
         if self.root != dest_catalog.root and is_trash_rel_path(dest_dir_rel):
             raise ValueError("cannot move items into another catalog's trash")
         total = len(rel_paths)
@@ -3390,7 +5649,7 @@ class Catalog:
             if dest_dir_rel
             else dest_catalog.root
         )
-        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest_catalog._mkdir_catalog_path(dest_dir)
         dest_catalog._remember_directory(dest_dir_rel)
         results: list[MoveResult] = []
         impacted_dirs: dict[Catalog, set[str]] = {self: set(), dest_catalog: set()}
@@ -3402,7 +5661,7 @@ class Catalog:
             source_path = self._mutation_path(rel_path, allow_missing_leaf=True)
             source_dir_rel = self._parent_dir_rel(rel_path)
             try:
-                source_stat = source_path.stat()
+                source_stat = source_path.lstat()
             except FileNotFoundError:
                 self._delete_db_records([rel_path])
                 processed += 1
@@ -3411,52 +5670,99 @@ class Catalog:
                 continue
             if not stat_module.S_ISREG(source_stat.st_mode):
                 raise ValueError(f"image move source is not a regular file: {rel_path}")
+            source_identity = self._catalog_file_identity(source_path, source_stat)
+            expected_identity = (
+                expected_identities.get(rel_path)
+                if expected_identities is not None
+                else None
+            )
+            if expected_identity is not None and source_identity != expected_identity:
+                raise OSError(f"image changed after move was confirmed: {rel_path}")
+            self._refresh_stale_source_row_before_move(rel_path, source_path, source_stat)
             if self.root == dest_catalog.root and source_dir_rel == dest_dir_rel:
                 processed += 1
                 if progress_callback is not None:
                     progress_callback(processed, total, rel_path)
                 continue
-            dest_path, copied_for_move = self._move_file_no_clobber(
+            dest_path, copy_proof = self._move_file_no_clobber(
                 source_path,
                 dest_dir / source_path.name,
+                expected_source_identity=source_identity,
+                dest_catalog=dest_catalog,
             )
             dest_rel_path = dest_catalog.rel_path(dest_path)
-            source_removed = not copied_for_move
+            source_removed = copy_proof is None
+            source_tags = self.get_image_tags(rel_path)
             try:
                 if self.root == dest_catalog.root:
-                    self._move_db_record_in_place(rel_path, dest_rel_path, dest_catalog)
+                    self._move_db_record_in_place(
+                        rel_path,
+                        dest_rel_path,
+                        dest_catalog,
+                        remember_directory=False,
+                    )
                     if is_inside_trash_rel_path(dest_rel_path) and not is_trash_rel_path(rel_path):
                         self._remember_trash_item(dest_rel_path, rel_path, "image")
                     elif is_inside_trash_rel_path(rel_path) and not is_inside_trash_rel_path(dest_rel_path):
                         self._forget_trash_item(rel_path)
                     elif is_inside_trash_rel_path(rel_path) and is_inside_trash_rel_path(dest_rel_path):
                         self._move_trash_item_mapping(rel_path, dest_rel_path, "image")
-                    if copied_for_move:
-                        self._delete_file(source_path, wipe=wipe_on_delete)
+                    if copy_proof is not None:
+                        self._cleanup_copied_file_source(
+                            source_path,
+                            dest_path,
+                            copy_proof,
+                            wipe=wipe_on_delete,
+                        )
                         source_removed = True
                 else:
-                    if copied_for_move:
+                    if copy_proof is not None:
                         dest_catalog._delete_db_records([dest_rel_path])
-                        self._copy_db_record_to_catalog(rel_path, dest_rel_path, dest_catalog)
-                        self._delete_file(source_path, wipe=wipe_on_delete)
+                        self._copy_db_record_to_catalog(
+                            rel_path,
+                            dest_rel_path,
+                            dest_catalog,
+                            remember_directory=False,
+                        )
+                        self._cleanup_copied_file_source(
+                            source_path,
+                            dest_path,
+                            copy_proof,
+                            wipe=wipe_on_delete,
+                        )
                         source_removed = True
                         self._delete_db_records([rel_path])
                     else:
-                        self._transfer_db_record(rel_path, dest_rel_path, dest_catalog)
+                        self._transfer_db_record(
+                            rel_path,
+                            dest_rel_path,
+                            dest_catalog,
+                            remember_directory=False,
+                        )
             except Exception:
-                if copied_for_move and not source_removed:
+                if copy_proof is not None and not source_removed:
                     # A completed destination copy is the recovery copy. Keep it
                     # when source cleanup fails; duplicate data is safer than loss.
                     if self.root == dest_catalog.root:
                         with suppress(Exception):
                             self._move_db_record_in_place(dest_rel_path, rel_path, self)
                             self.index_image(dest_rel_path, force=True)
+                    else:
+                        with suppress(Exception):
+                            recovered = dest_catalog.index_image(dest_rel_path, force=True)
+                            if recovered is not None:
+                                dest_catalog.set_image_tags(dest_rel_path, source_tags, replace=True)
                     self._forget_trash_item(dest_rel_path)
-                elif not copied_for_move:
+                elif copy_proof is None:
                     # A rename is reversible. Put the file and records back when
                     # subsequent bookkeeping fails.
                     with suppress(Exception):
-                        _rename_noreplace(dest_path, source_path)
+                        dest_catalog._rename_catalog_entry_noreplace(
+                            dest_path,
+                            source_path,
+                            dest_catalog=self,
+                            expected_source_identity=source_identity,
+                        )
                     if self.root == dest_catalog.root:
                         with suppress(Exception):
                             self._move_db_record_in_place(dest_rel_path, rel_path, self)
@@ -3476,12 +5782,48 @@ class Catalog:
                 catalog._save_directory_tree_cache_safely()
         return results
 
-    def restore_image_from_trash(self, rel_path: str) -> MoveResult:
+    def _refresh_stale_source_row_before_move(
+        self,
+        rel_path: str,
+        path: Path,
+        source_stat: os.stat_result,
+    ) -> None:
+        row = self._conn.execute(
+            """
+            SELECT file_size_bytes, modified_at_ns, ctime_ns
+            FROM images
+            WHERE rel_path = ?
+            """,
+            (rel_path,),
+        ).fetchone()
+        if row is None:
+            return
+        changed_ns = self._path_change_time_ns(path, source_stat)
+        if (
+            int(row["file_size_bytes"]) == source_stat.st_size
+            and int(row["modified_at_ns"]) == source_stat.st_mtime_ns
+            and int(row["ctime_ns"]) == changed_ns
+        ):
+            return
+        if self.index_image(rel_path, force=True) is None:
+            raise OSError(f"image changed and could not be re-indexed before move: {rel_path}")
+
+    def restore_image_from_trash(
+        self,
+        rel_path: str,
+        *,
+        expected_identity: CatalogFileIdentity | None = None,
+    ) -> MoveResult:
+        self._assert_writable()
         if not is_inside_trash_rel_path(rel_path):
             raise ValueError("image is not inside the trash directory")
         dest_rel_path = self._trash_original_rel_path(rel_path, "image") or original_rel_path_for_trash(rel_path)
         source_dir_rel = self._parent_dir_rel(rel_path)
-        result = self._move_image_to_rel_path(rel_path, dest_rel_path)
+        result = self._move_image_to_rel_path(
+            rel_path,
+            dest_rel_path,
+            expected_identity=expected_identity,
+        )
         self._forget_trash_item(rel_path)
         self.update_hashes_after_targeted_move(
             {
@@ -3493,12 +5835,22 @@ class Catalog:
         self.append_log(f"Restored image {rel_path} to {result.dest_rel_path}")
         return result
 
-    def restore_directory_from_trash(self, dir_rel: str) -> MoveResult:
+    def restore_directory_from_trash(
+        self,
+        dir_rel: str,
+        *,
+        expected_identity: DirectoryIdentity | None = None,
+    ) -> MoveResult:
+        self._assert_writable()
         if not is_inside_trash_rel_path(dir_rel):
             raise ValueError("directory is not inside the trash directory")
         dest_dir_rel = self._trash_original_rel_path(dir_rel, "directory") or original_rel_path_for_trash(dir_rel)
         source_parent_rel = self._parent_dir_rel(dir_rel)
-        result = self._move_directory_to_rel_path(dir_rel, dest_dir_rel)
+        result = self._move_directory_to_rel_path(
+            dir_rel,
+            dest_dir_rel,
+            expected_identity=expected_identity,
+        )
         self._forget_trash_items_under(dir_rel)
         self.update_hashes_after_targeted_move(
             {
@@ -3518,9 +5870,12 @@ class Catalog:
         dest_dir_rel: str = "",
         *,
         wipe_on_delete: bool = False,
+        expected_identities: Mapping[str, DirectoryIdentity] | None = None,
         progress_callback: ProgressCallback | None = None,
         cancel_check: CancelCallback | None = None,
     ) -> list[MoveResult]:
+        self._assert_writable()
+        dest_catalog._assert_writable()
         if self.root != dest_catalog.root and is_trash_rel_path(dest_dir_rel):
             raise ValueError("cannot move items into another catalog's trash")
         sorted_dir_rels = sorted(set(dir_rels), key=lambda value: value.count("/"))
@@ -3533,7 +5888,7 @@ class Catalog:
             if dest_dir_rel
             else dest_catalog.root
         )
-        dest_parent.mkdir(parents=True, exist_ok=True)
+        dest_catalog._mkdir_catalog_path(dest_parent)
         dest_catalog._remember_directory(dest_dir_rel)
         results: list[MoveResult] = []
         impacted_dirs: dict[Catalog, set[str]] = {self: set(), dest_catalog: set()}
@@ -3552,7 +5907,7 @@ class Catalog:
             source_path = self._mutation_path(dir_rel, allow_missing_leaf=True)
             source_parent_rel = self._parent_dir_rel(dir_rel)
             try:
-                source_stat = source_path.stat()
+                source_stat = source_path.lstat()
             except FileNotFoundError:
                 self._delete_directory_records(dir_rel)
                 processed += 1
@@ -3561,53 +5916,93 @@ class Catalog:
                 continue
             if not stat_module.S_ISDIR(source_stat.st_mode):
                 raise ValueError(f"directory move source is not a directory: {dir_rel}")
+            current_identity = (
+                int(source_stat.st_dev),
+                int(source_stat.st_ino),
+                int(source_stat.st_mtime_ns),
+                self._path_change_time_ns(source_path, source_stat),
+            )
+            expected_identity = (
+                expected_identities.get(dir_rel)
+                if expected_identities is not None
+                else None
+            )
+            if expected_identity is not None and current_identity != expected_identity:
+                raise OSError(f"directory changed after move was confirmed: {dir_rel}")
             if self.root == dest_catalog.root and source_parent_rel == dest_dir_rel:
                 processed += 1
                 if progress_callback is not None:
                     progress_callback(processed, total, dir_rel)
                 continue
-            dest_path, copied_for_move = self._move_directory_no_clobber(
+            dest_path, copy_proof = self._move_directory_no_clobber(
                 source_path,
                 dest_parent / source_path.name,
+                expected_source_identity=current_identity,
+                dest_catalog=dest_catalog,
             )
             dest_rel_path = dest_catalog.rel_path(dest_path)
-            source_removed = not copied_for_move
+            source_removed = copy_proof is None
             try:
                 if self.root == dest_catalog.root:
-                    self._move_directory_records_in_place(dir_rel, dest_rel_path)
+                    self._move_directory_records_in_place(
+                        dir_rel,
+                        dest_rel_path,
+                        cancel_check=cancel_check,
+                    )
                     if is_inside_trash_rel_path(dest_rel_path) and not is_trash_rel_path(dir_rel):
                         self._remember_trash_item(dest_rel_path, dir_rel, "directory")
                     elif is_inside_trash_rel_path(dir_rel) and not is_inside_trash_rel_path(dest_rel_path):
                         self._forget_trash_items_under(dir_rel)
                     elif is_inside_trash_rel_path(dir_rel) and is_inside_trash_rel_path(dest_rel_path):
                         self._move_trash_item_mappings_under(dir_rel, dest_rel_path)
-                    if copied_for_move:
-                        if wipe_on_delete:
-                            self._wipe_directory_files(source_path)
-                        shutil.rmtree(source_path)
+                    if copy_proof is not None:
+                        self._cleanup_copied_directory_source(
+                            source_path,
+                            dest_path,
+                            copy_proof,
+                            wipe=wipe_on_delete,
+                        )
                         source_removed = True
                 else:
-                    if copied_for_move:
+                    if copy_proof is not None:
                         dest_catalog._delete_directory_records(dest_rel_path)
-                        self._copy_directory_records(dir_rel, dest_rel_path, dest_catalog)
-                        if wipe_on_delete:
-                            self._wipe_directory_files(source_path)
-                        shutil.rmtree(source_path)
+                        self._copy_directory_records(
+                            dir_rel,
+                            dest_rel_path,
+                            dest_catalog,
+                            cancel_check=cancel_check,
+                        )
+                        self._cleanup_copied_directory_source(
+                            source_path,
+                            dest_path,
+                            copy_proof,
+                            wipe=wipe_on_delete,
+                        )
                         source_removed = True
                         self._delete_directory_records(dir_rel)
                     else:
-                        self._transfer_directory_records(dir_rel, dest_rel_path, dest_catalog)
+                        self._transfer_directory_records(
+                            dir_rel,
+                            dest_rel_path,
+                            dest_catalog,
+                            cancel_check=cancel_check,
+                        )
             except Exception:
-                if copied_for_move and not source_removed:
+                if copy_proof is not None and not source_removed:
                     # Preserve the complete copy. If cleanup was partial, refresh
                     # the remaining source subtree so both on-disk copies are
                     # represented rather than deleting the recovery copy.
                     if self.root == dest_catalog.root and source_path.exists():
                         with suppress(Exception):
                             self.refresh_directory(dir_rel, force=True)
-                elif not copied_for_move:
+                elif copy_proof is None:
                     with suppress(Exception):
-                        _rename_noreplace(dest_path, source_path)
+                        dest_catalog._rename_catalog_entry_noreplace(
+                            dest_path,
+                            source_path,
+                            dest_catalog=self,
+                            expected_source_identity=current_identity,
+                        )
                     if self.root == dest_catalog.root:
                         with suppress(Exception):
                             self._move_directory_records_in_place(dest_rel_path, dir_rel)
@@ -3635,9 +6030,12 @@ class Catalog:
         rel_paths: Sequence[str],
         *,
         wipe: bool = False,
+        expected_identities: Mapping[str, CatalogFileIdentity] | None = None,
+        expected_proofs: Mapping[str, CatalogFileProof] | None = None,
         progress_callback: ProgressCallback | None = None,
         cancel_check: CancelCallback | None = None,
     ) -> int:
+        self._assert_writable()
         entries = [
             (rel_path, self._mutation_path(rel_path, allow_missing_leaf=True))
             for rel_path in rel_paths
@@ -3667,7 +6065,7 @@ class Catalog:
                 if progress_callback is not None:
                     progress_callback(processed, total, rel_path)
                 try:
-                    path_stat = path.stat()
+                    path_stat = path.lstat()
                 except FileNotFoundError:
                     path_stat = None
                 if path_stat is not None and stat_module.S_ISREG(path_stat.st_mode):
@@ -3675,6 +6073,16 @@ class Catalog:
                         rel_path,
                         path,
                         wipe=wipe,
+                        expected_identity=(
+                            expected_identities.get(rel_path)
+                            if expected_identities is not None
+                            else None
+                        ),
+                        expected_proof=(
+                            expected_proofs.get(rel_path)
+                            if expected_proofs is not None
+                            else None
+                        ),
                         cancel_check=cancel_check,
                     )
                     affected_dirs.add(self._parent_dir_rel(rel_path))
@@ -3710,31 +6118,47 @@ class Catalog:
         path: Path,
         *,
         wipe: bool,
+        expected_identity: CatalogFileIdentity | None,
+        expected_proof: CatalogFileProof | None,
         cancel_check: CancelCallback | None,
     ) -> None:
         """Atomically isolate and verify a file before destructive deletion."""
+
+        if expected_proof is not None:
+            current_identity, current_hash = self._stable_regular_file_hash(
+                path,
+                cancel_check,
+            )
+            if (
+                current_identity[:5] != expected_proof[:5]
+                or current_hash != expected_proof[5]
+            ):
+                raise OSError(f"image changed after the edit was committed: {rel_path}")
+        else:
+            current_identity = self._catalog_file_identity(path)
+        if expected_identity is not None and current_identity != expected_identity:
+            raise OSError(f"image changed after deletion was confirmed: {rel_path}")
 
         row = self._conn.execute(
             "SELECT image_hash FROM images WHERE rel_path = ?",
             (rel_path,),
         ).fetchone()
-        expected_hash = (
+        expected_hash = expected_proof[5] if expected_proof is not None else (
             str(row["image_hash"])
             if row is not None and is_exact_image_hash(row["image_hash"])
             else None
         )
-        fd, quarantine_name = tempfile.mkstemp(
-            prefix=f".{path.name}.",
-            suffix=".marnwick-delete",
-            dir=path.parent,
+        quarantine = self._quarantine_catalog_entry(
+            path,
+            ".marnwick-delete",
+            expected_source_identity=current_identity,
         )
-        os.close(fd)
-        quarantine = Path(quarantine_name)
-        quarantine.unlink()
-        _rename_noreplace(path, quarantine)
         try:
+            quarantined_identity = self._catalog_file_identity(quarantine)
+            if quarantined_identity[:5] != current_identity[:5]:
+                raise OSError(f"image changed while deletion was starting: {rel_path}")
             if expected_hash is not None:
-                actual_hash, _ = self._image_file_hashes(quarantine, cancel_check)
+                _, actual_hash = self._stable_regular_file_hash(quarantine, cancel_check)
                 if actual_hash != expected_hash:
                     raise OSError(
                         f"image changed since it was indexed; refresh before deleting: {rel_path}"
@@ -3743,7 +6167,12 @@ class Catalog:
         except BaseException:
             if quarantine.exists() or quarantine.is_symlink():
                 try:
-                    _rename_noreplace(quarantine, path)
+                    rollback_identity = self._catalog_file_identity(quarantine)
+                    self._rename_catalog_entry_noreplace(
+                        quarantine,
+                        path,
+                        expected_source_identity=rollback_identity,
+                    )
                 except OSError as restore_error:
                     raise OSError(
                         f"delete failed and the original was retained at {quarantine}"
@@ -3752,7 +6181,7 @@ class Catalog:
 
     def _ensure_trash_directory(self) -> None:
         trash_path = self.root / TRASH_DIR_NAME
-        trash_path.mkdir(parents=True, exist_ok=True)
+        self._mkdir_catalog_path(trash_path)
         self._remember_directory(TRASH_DIR_NAME)
 
     def _remember_trash_item(self, trash_rel_path: str, original_rel_path: str, kind: str) -> None:
@@ -3785,10 +6214,14 @@ class Catalog:
         self._conn.execute("DELETE FROM trash_items WHERE trash_rel_path = ?", (trash_rel_path,))
 
     def _forget_trash_items_under(self, dir_rel: str) -> None:
-        nested_like = descendant_like_pattern(dir_rel)
+        descendant_start, descendant_end = descendant_range_bounds(dir_rel)
         self._conn.execute(
-            "DELETE FROM trash_items WHERE trash_rel_path = ? OR trash_rel_path LIKE ? ESCAPE '\\'",
-            (dir_rel, nested_like),
+            """
+            DELETE FROM trash_items
+            WHERE trash_rel_path = ?
+                OR (trash_rel_path >= ? AND trash_rel_path < ?)
+            """,
+            (dir_rel, descendant_start, descendant_end),
         )
 
     def _move_trash_item_mapping(self, source_rel_path: str, dest_rel_path: str, kind: str) -> None:
@@ -3799,74 +6232,131 @@ class Catalog:
         self._remember_trash_item(dest_rel_path, original, kind)
 
     def _move_trash_item_mappings_under(self, source_dir_rel: str, dest_dir_rel: str) -> None:
-        nested_like = descendant_like_pattern(source_dir_rel)
-        rows = self._conn.execute(
+        descendant_start, descendant_end = descendant_range_bounds(source_dir_rel)
+        suffix_start = len(source_dir_rel) + 1
+        self._conn.execute(
             """
-            SELECT trash_rel_path, original_rel_path, kind
-            FROM trash_items
-            WHERE trash_rel_path = ? OR trash_rel_path LIKE ? ESCAPE '\\'
+            UPDATE trash_items
+            SET trash_rel_path = ? || substr(trash_rel_path, ?),
+                moved_at_ns = ?
+            WHERE trash_rel_path = ?
+                OR (trash_rel_path >= ? AND trash_rel_path < ?)
             """,
-            (source_dir_rel, nested_like),
-        ).fetchall()
-        self._forget_trash_items_under(source_dir_rel)
-        for row in rows:
-            new_rel_path = self._replace_prefix(str(row["trash_rel_path"]), source_dir_rel, dest_dir_rel)
-            self._remember_trash_item(new_rel_path, str(row["original_rel_path"]), str(row["kind"]))
+            (
+                dest_dir_rel,
+                suffix_start,
+                time.time_ns(),
+                source_dir_rel,
+                descendant_start,
+                descendant_end,
+            ),
+        )
 
-    def _move_image_to_rel_path(self, source_rel_path: str, dest_rel_path: str) -> MoveResult:
+    def _move_image_to_rel_path(
+        self,
+        source_rel_path: str,
+        dest_rel_path: str,
+        *,
+        expected_identity: CatalogFileIdentity | None = None,
+    ) -> MoveResult:
         if not source_rel_path or source_rel_path == dest_rel_path:
             raise ValueError("source and destination must be different image paths")
         source_path = self._mutation_path(source_rel_path)
         try:
-            source_stat = source_path.stat()
+            source_stat = source_path.lstat()
         except FileNotFoundError:
             self._delete_db_records([source_rel_path])
             raise FileNotFoundError(source_path)
         if not stat_module.S_ISREG(source_stat.st_mode):
             raise ValueError(f"image move source is not a regular file: {source_rel_path}")
+        source_identity = self._catalog_file_identity(source_path, source_stat)
+        if expected_identity is not None and source_identity != expected_identity:
+            raise OSError(f"image changed after move was confirmed: {source_rel_path}")
+        self._refresh_stale_source_row_before_move(source_rel_path, source_path, source_stat)
         dest_path = self._mutation_path(dest_rel_path, allow_missing_leaf=True)
-        dest_path.parent.mkdir(parents=True, exist_ok=True)
-        dest_path, copied_for_move = self._move_file_no_clobber(source_path, dest_path)
+        self._mkdir_catalog_path(dest_path.parent)
+        dest_path, copy_proof = self._move_file_no_clobber(
+            source_path,
+            dest_path,
+            expected_source_identity=source_identity,
+        )
         actual_dest_rel_path = self.rel_path(dest_path)
         try:
             self._remember_directory(self._parent_dir_rel(actual_dest_rel_path))
-            self._move_db_record_in_place(source_rel_path, actual_dest_rel_path, self)
+            self._move_db_record_in_place(
+                source_rel_path,
+                actual_dest_rel_path,
+                self,
+                remember_directory=False,
+            )
             if is_inside_trash_rel_path(actual_dest_rel_path) and not is_trash_rel_path(source_rel_path):
                 self._remember_trash_item(actual_dest_rel_path, source_rel_path, "image")
             elif is_inside_trash_rel_path(source_rel_path) and not is_inside_trash_rel_path(actual_dest_rel_path):
                 self._forget_trash_item(source_rel_path)
             elif is_inside_trash_rel_path(source_rel_path) and is_inside_trash_rel_path(actual_dest_rel_path):
                 self._move_trash_item_mapping(source_rel_path, actual_dest_rel_path, "image")
-            if copied_for_move:
-                source_path.unlink()
+            if copy_proof is not None:
+                self._cleanup_copied_file_source(
+                    source_path,
+                    dest_path,
+                    copy_proof,
+                    wipe=False,
+                )
         except Exception:
-            if copied_for_move:
+            if copy_proof is not None:
                 if source_path.exists():
                     with suppress(Exception):
-                        self._move_db_record_in_place(actual_dest_rel_path, source_rel_path, self)
+                        self._move_db_record_in_place(
+                            actual_dest_rel_path,
+                            source_rel_path,
+                            self,
+                            remember_directory=False,
+                        )
                         self.index_image(actual_dest_rel_path, force=True)
             else:
                 with suppress(Exception):
-                    _rename_noreplace(dest_path, source_path)
+                    self._rename_catalog_entry_noreplace(
+                        dest_path,
+                        source_path,
+                        expected_source_identity=source_identity,
+                    )
                 with suppress(Exception):
                     self._move_db_record_in_place(actual_dest_rel_path, source_rel_path, self)
             raise
         return MoveResult(source_rel_path, actual_dest_rel_path, self.root)
 
-    def _move_directory_to_rel_path(self, source_dir_rel: str, dest_dir_rel: str) -> MoveResult:
+    def _move_directory_to_rel_path(
+        self,
+        source_dir_rel: str,
+        dest_dir_rel: str,
+        *,
+        expected_identity: DirectoryIdentity | None = None,
+    ) -> MoveResult:
         if not source_dir_rel or source_dir_rel == dest_dir_rel:
             raise ValueError("source and destination must be different directory paths")
         source_path = self._mutation_path(source_dir_rel)
         try:
-            source_stat = source_path.stat()
+            source_stat = source_path.lstat()
         except FileNotFoundError:
             self._delete_directory_records(source_dir_rel)
             raise FileNotFoundError(source_path)
         if not stat_module.S_ISDIR(source_stat.st_mode):
             raise ValueError(f"directory move source is not a directory: {source_dir_rel}")
+        current_identity = (
+            int(source_stat.st_dev),
+            int(source_stat.st_ino),
+            int(source_stat.st_mtime_ns),
+            self._path_change_time_ns(source_path, source_stat),
+        )
+        if expected_identity is not None and current_identity != expected_identity:
+            raise OSError(f"directory changed after move was confirmed: {source_dir_rel}")
         dest_path = self._mutation_path(dest_dir_rel, allow_missing_leaf=True)
-        dest_path.parent.mkdir(parents=True, exist_ok=True)
-        dest_path, copied_for_move = self._move_directory_no_clobber(source_path, dest_path)
+        self._mkdir_catalog_path(dest_path.parent)
+        dest_path, copy_proof = self._move_directory_no_clobber(
+            source_path,
+            dest_path,
+            expected_source_identity=current_identity,
+        )
         actual_dest_dir_rel = self.rel_path(dest_path)
         try:
             self._move_directory_records_in_place(source_dir_rel, actual_dest_dir_rel)
@@ -3876,25 +6366,42 @@ class Catalog:
                 self._forget_trash_items_under(source_dir_rel)
             elif is_inside_trash_rel_path(source_dir_rel) and is_inside_trash_rel_path(actual_dest_dir_rel):
                 self._move_trash_item_mappings_under(source_dir_rel, actual_dest_dir_rel)
-            if copied_for_move:
-                shutil.rmtree(source_path)
+            if copy_proof is not None:
+                self._cleanup_copied_directory_source(
+                    source_path,
+                    dest_path,
+                    copy_proof,
+                    wipe=False,
+                )
         except Exception:
-            if copied_for_move:
+            if copy_proof is not None:
                 if source_path.exists():
                     with suppress(Exception):
                         self.refresh_directory(source_dir_rel, force=True)
             else:
                 with suppress(Exception):
-                    _rename_noreplace(dest_path, source_path)
+                    self._rename_catalog_entry_noreplace(
+                        dest_path,
+                        source_path,
+                        expected_source_identity=current_identity,
+                    )
                 with suppress(Exception):
                     self._move_directory_records_in_place(actual_dest_dir_rel, source_dir_rel)
             raise
         return MoveResult(source_dir_rel, actual_dest_dir_rel, self.root)
 
     def remember_directory(self, dir_rel: str) -> None:
+        self._assert_writable()
         self._remember_directory(dir_rel)
 
-    def create_directory(self, parent_dir_rel: str, name: str) -> str:
+    def create_directory(
+        self,
+        parent_dir_rel: str,
+        name: str,
+        *,
+        expected_parent_identity: DirectoryIdentity | object | None = None,
+    ) -> str:
+        self._assert_writable()
         clean_name = name.strip()
         if not clean_name:
             raise ValueError("directory name cannot be empty")
@@ -3903,8 +6410,45 @@ class Catalog:
         parent = self._mutation_path(parent_dir_rel) if parent_dir_rel else self.root
         if not parent.is_dir():
             raise FileNotFoundError(parent)
+        if expected_parent_identity is None:
+            expected_parent_identity = self.directory_identity(parent_dir_rel)
+        if (
+            not isinstance(expected_parent_identity, tuple)
+            or len(expected_parent_identity) < 2
+            or not all(isinstance(value, int) for value in expected_parent_identity[:2])
+        ):
+            raise OSError("parent directory identity was not captured before creation")
+        expected_parent_object = expected_parent_identity[:2]
         target = parent / clean_name
-        target.mkdir()
+        with self._open_catalog_directory_fd(parent) as parent_fd:
+            if parent_fd is None:
+                if self.directory_identity(parent_dir_rel)[:2] != expected_parent_object:
+                    raise OSError(
+                        f"parent directory changed after creation was requested: "
+                        f"{parent_dir_rel or '.'}"
+                    )
+                target.mkdir()
+                if self.directory_identity(parent_dir_rel)[:2] != expected_parent_object:
+                    raise OSError(
+                        f"parent directory changed while creating: {parent_dir_rel or '.'}"
+                    )
+            else:
+                opened_parent = os.fstat(parent_fd)
+                if (int(opened_parent.st_dev), int(opened_parent.st_ino)) != expected_parent_object:
+                    raise OSError(
+                        f"parent directory changed after creation was requested: "
+                        f"{parent_dir_rel or '.'}"
+                    )
+                os.mkdir(clean_name, dir_fd=parent_fd)
+                try:
+                    if self.directory_identity(parent_dir_rel)[:2] != expected_parent_object:
+                        raise OSError(
+                            f"parent directory changed while creating: {parent_dir_rel or '.'}"
+                        )
+                except BaseException:
+                    with suppress(OSError):
+                        os.rmdir(clean_name, dir_fd=parent_fd)
+                    raise
         rel_path = self.rel_path(target)
         self._remember_directory(rel_path)
         self._save_directory_tree_cache_safely()
@@ -3922,6 +6466,40 @@ class Catalog:
             self._path_change_time_ns(directory, directory_stat),
         )
 
+    def file_identity(self, rel_path: str) -> CatalogFileIdentity:
+        """Capture the cheap identity a caller can retain across confirmation UI."""
+
+        return self._catalog_file_identity(self._mutation_path(rel_path))
+
+    def file_identities(
+        self,
+        rel_paths: Iterable[str],
+    ) -> dict[str, CatalogFileIdentity]:
+        return {rel_path: self.file_identity(rel_path) for rel_path in rel_paths}
+
+    def file_proof(self, rel_path: str) -> CatalogFileProof:
+        identity, content_hash = self._stable_regular_file_hash(
+            self._mutation_path(rel_path)
+        )
+        return (*identity[:5], content_hash)
+
+    def _catalog_file_identity(
+        self,
+        path: Path,
+        file_stat: os.stat_result | None = None,
+    ) -> CatalogFileIdentity:
+        current = path.lstat() if file_stat is None else file_stat
+        if not stat_module.S_ISREG(current.st_mode):
+            raise FileNotFoundError(path)
+        return (
+            int(current.st_dev),
+            int(current.st_ino),
+            int(current.st_nlink),
+            int(current.st_size),
+            int(current.st_mtime_ns),
+            self._path_change_time_ns(path, current),
+        )
+
     def delete_directory(
         self,
         dir_rel: str,
@@ -3929,6 +6507,7 @@ class Catalog:
         wipe: bool = False,
         expected_identity: DirectoryIdentity | None = None,
     ) -> None:
+        self._assert_writable()
         if not dir_rel:
             raise ValueError("catalog root cannot be deleted")
         directory = self._mutation_path(dir_rel)
@@ -3939,15 +6518,11 @@ class Catalog:
         if expected_identity is not None and current_identity != expected_identity:
             raise OSError(f"directory changed after deletion was confirmed: {dir_rel}")
 
-        fd, quarantine_name = tempfile.mkstemp(
-            prefix=f".{directory.name}.",
-            suffix=".marnwick-delete-dir",
-            dir=directory.parent,
+        quarantine = self._quarantine_catalog_entry(
+            directory,
+            ".marnwick-delete-dir",
+            expected_source_identity=current_identity,
         )
-        os.close(fd)
-        quarantine = Path(quarantine_name)
-        quarantine.unlink()
-        _rename_noreplace(directory, quarantine)
         try:
             quarantined_stat = quarantine.lstat()
             if (
@@ -3958,11 +6533,18 @@ class Catalog:
                 raise OSError(f"directory changed while deletion was starting: {dir_rel}")
             if wipe:
                 self._wipe_directory_files(quarantine)
-            shutil.rmtree(quarantine)
+            self._remove_catalog_directory_tree(
+                quarantine,
+                expected_identity=current_identity,
+            )
         except BaseException:
             if quarantine.exists() or quarantine.is_symlink():
                 try:
-                    _rename_noreplace(quarantine, directory)
+                    self._rename_catalog_entry_noreplace(
+                        quarantine,
+                        directory,
+                        expected_source_identity=current_identity,
+                    )
                 except OSError as restore_error:
                     raise OSError(
                         f"directory delete failed; remaining files were retained at {quarantine}"
@@ -3977,27 +6559,170 @@ class Catalog:
         self.update_hashes_after_targeted_move({parent_rel})
         self._save_directory_tree_cache_safely()
 
-    def _delete_file(self, path: Path, *, wipe: bool) -> None:
-        if wipe and not path.is_symlink():
-            try:
-                if path.stat().st_nlink > 1:
-                    self.append_log(
-                        f"Not wiping hard-linked file; unlinking name only: {self.rel_path(path)}",
-                        level="WARNING",
+    def _remove_catalog_directory_tree(
+        self,
+        directory: Path,
+        *,
+        expected_identity: Sequence[int],
+    ) -> None:
+        """Remove a quarantined tree relative to its pinned catalog parent."""
+
+        if os.name != "nt" and hasattr(os, "O_DIRECTORY"):
+            with self._open_catalog_directory_fd(directory.parent) as parent_fd:
+                if parent_fd is not None:
+                    current = os.stat(
+                        directory.name,
+                        dir_fd=parent_fd,
+                        follow_symlinks=False,
                     )
-                    path.unlink()
+                    if (
+                        int(current.st_dev),
+                        int(current.st_ino),
+                    ) != (
+                        int(expected_identity[0]),
+                        int(expected_identity[1]),
+                    ):
+                        raise OSError(
+                            f"directory changed before final deletion: {directory}"
+                        )
+                    if not SHUTIL_RMTREE_AVOIDS_SYMLINK_ATTACKS:
+                        raise OSError(
+                            errno.ENOTSUP,
+                            "descriptor-safe recursive deletion is unavailable",
+                            directory,
+                        )
+                    shutil.rmtree(directory.name, dir_fd=parent_fd)
                     return
-            except OSError:
-                raise
-            shred_bin = shutil.which("shred")
-            if shred_bin is not None:
-                try:
-                    subprocess.run([shred_bin, "-u", str(path)], check=True)
-                except subprocess.CalledProcessError as error:
-                    raise OSError(f"secure deletion failed for {path}") from error
-                return
-            self.append_log(f"shred is unavailable; deleting without wipe: {self.rel_path(path)}", level="WARNING")
+        current = directory.lstat()
+        if (int(current.st_dev), int(current.st_ino)) != (
+            int(expected_identity[0]),
+            int(expected_identity[1]),
+        ):
+            raise OSError(f"directory changed before final deletion: {directory}")
+        shutil.rmtree(directory)
+
+    def _unlink_catalog_file_entry(
+        self,
+        path: Path,
+        expected_identity: Sequence[int],
+    ) -> None:
+        if os.name != "nt" and hasattr(os, "O_DIRECTORY"):
+            with self._open_catalog_directory_fd(path.parent) as parent_fd:
+                if parent_fd is not None:
+                    current = os.stat(
+                        path.name,
+                        dir_fd=parent_fd,
+                        follow_symlinks=False,
+                    )
+                    if (int(current.st_dev), int(current.st_ino)) != (
+                        int(expected_identity[0]),
+                        int(expected_identity[1]),
+                    ):
+                        raise OSError(f"file changed before final deletion: {path}")
+                    os.unlink(path.name, dir_fd=parent_fd)
+                    return
+        current = path.lstat()
+        if (int(current.st_dev), int(current.st_ino)) != (
+            int(expected_identity[0]),
+            int(expected_identity[1]),
+        ):
+            raise OSError(f"file changed before final deletion: {path}")
         path.unlink()
+
+    def _delete_file(self, path: Path, *, wipe: bool) -> None:
+        identity = self._catalog_file_identity(path)
+        if not wipe:
+            self._unlink_catalog_file_entry(path, identity)
+            return
+        if identity[2] > 1:
+            self.append_log(
+                f"Not wiping hard-linked file; unlinking name only: {self.rel_path(path)}",
+                level="WARNING",
+            )
+            self._unlink_catalog_file_entry(path, identity)
+            return
+        shred_bin = shutil.which("shred")
+        if shred_bin is None:
+            self.append_log(
+                f"shred is unavailable; deleting without wipe: {self.rel_path(path)}",
+                level="WARNING",
+            )
+            self._unlink_catalog_file_entry(path, identity)
+            return
+
+        # GNU shred may block indefinitely on a damaged/FUSE filesystem and it
+        # overwrites before unlinking. Keep a verified, durable recovery copy
+        # until the bounded subprocess has both exited successfully and removed
+        # the selected name. A timeout/failure therefore restores the bytes and
+        # lets the caller put the quarantine back at its original pathname.
+        source_identity, source_hash = self._stable_regular_file_hash(path)
+        fd, recovery_name = tempfile.mkstemp(
+            prefix=f".{path.name}.",
+            suffix=".marnwick-shred-recovery",
+            dir=path.parent,
+        )
+        os.close(fd)
+        recovery = Path(recovery_name)
+        shred_started = False
+        try:
+            shutil.copy2(path, recovery, follow_symlinks=False)
+            final_identity, final_hash = self._stable_regular_file_hash(path)
+            _, recovery_hash = self._stable_regular_file_hash(recovery)
+            if (
+                final_identity != source_identity
+                or final_hash != source_hash
+                or recovery_hash != source_hash
+            ):
+                raise OSError(f"file changed while secure-delete recovery was created: {path}")
+            self._fsync_regular_file(recovery)
+            self._fsync_directory(path.parent)
+            try:
+                shred_started = True
+                _run_shred_bounded([shred_bin, "-u", str(path)])
+                if path.exists() or path.is_symlink():
+                    raise OSError(f"secure deletion did not remove {path}")
+            except BaseException as error:
+                current: os.stat_result | None
+                try:
+                    current = path.lstat()
+                except FileNotFoundError:
+                    current = None
+                if current is not None and (
+                    int(current.st_dev),
+                    int(current.st_ino),
+                ) != source_identity[:2]:
+                    raise OSError(
+                        f"secure deletion failed; original bytes were retained at {recovery}"
+                    ) from error
+                if current is not None:
+                    self._unlink_catalog_file_entry(path, source_identity)
+                try:
+                    self._rename_catalog_entry_noreplace(
+                        recovery,
+                        path,
+                    )
+                except OSError as restore_error:
+                    raise OSError(
+                        f"secure deletion failed; original bytes were retained at {recovery}"
+                    ) from restore_error
+                raise OSError(f"secure deletion failed for {path}") from error
+            try:
+                recovery.unlink()
+            except OSError as error:
+                # The selected source is gone and the recovery is an extra
+                # private copy. Do not misreport the committed deletion.
+                self.append_log(
+                    f"Secure-delete recovery cleanup failed: {recovery}: {error}",
+                    level="WARNING",
+                )
+            self._fsync_directory(path.parent)
+        except BaseException:
+            # If restoration consumed the recovery this is a no-op. Otherwise
+            # retain it on failure instead of risking loss for cosmetic cleanup.
+            if not shred_started:
+                with suppress(OSError):
+                    recovery.unlink()
+            raise
 
     def _wipe_directory_files(self, directory: Path) -> None:
         for root, _, filenames in os.walk(directory):
@@ -4065,6 +6790,7 @@ class Catalog:
         *,
         workers: int | None = None,
     ) -> ThumbnailPruneResult:
+        self._assert_writable()
         total_row = self._conn.execute("SELECT COUNT(*) AS count FROM images").fetchone()
         total = 0 if total_row is None else int(total_row["count"])
         workers = max(1, int(self.settings.prune_parallelism if workers is None else workers))
@@ -4074,24 +6800,37 @@ class Catalog:
         legacy_migrated = 0
         errors = 0
         last_id = 0
-        worker_state = threading.local()
-        worker_catalogs: list[Catalog] = []
-        worker_catalogs_lock = threading.Lock()
 
         if progress is not None:
             progress(0, total, "Pruning thumbnails")
 
-        def catalog_for_worker() -> Catalog:
-            catalog = getattr(worker_state, "catalog", None)
-            if catalog is None:
-                catalog = Catalog(self.root)
-                with worker_catalogs_lock:
-                    worker_catalogs.append(catalog)
-                worker_state.catalog = catalog
-            return catalog
+        def rows_to_prune() -> Iterator[dict[str, object]]:
+            nonlocal last_id
+            while True:
+                rows = self._conn.execute(
+                    """
+                    SELECT
+                        id, rel_path, file_size_bytes, modified_at_ns, ctime_ns, thumb_rel_path,
+                        thumb_cache_key, thumb_size_px, image_hash, thumb_blob
+                    FROM images
+                    WHERE id > ?
+                    ORDER BY id ASC
+                    LIMIT ?
+                    """,
+                    (last_id, PRUNE_BATCH_SIZE),
+                ).fetchall()
+                if not rows:
+                    return
+                last_id = int(rows[-1]["id"])
+                for row in rows:
+                    yield {key: row[key] for key in row.keys()}
 
-        def process_row(row_data: dict[str, object]) -> ThumbnailPruneRowResult:
-            return catalog_for_worker()._prune_thumbnail_row(row_data, cancel_check)
+        def process_row(
+            catalog: Catalog,
+            raw_row: dict[str, object] | Path,
+        ) -> ThumbnailPruneRowResult:
+            assert isinstance(raw_row, dict)
+            return catalog._prune_thumbnail_row(raw_row, cancel_check)
 
         def record_result(result: ThumbnailPruneRowResult) -> None:
             nonlocal checked, rebuilt, stale_removed, legacy_migrated, errors
@@ -4103,43 +6842,15 @@ class Catalog:
             if progress is not None:
                 progress(checked, total, result.rel_path)
 
-        pending = set()
-        try:
-            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="marnwick-prune") as executor:
-                while True:
-                    rows = self._conn.execute(
-                        """
-                        SELECT
-                            id, rel_path, file_size_bytes, modified_at_ns, ctime_ns, thumb_rel_path,
-                            thumb_cache_key, thumb_size_px, image_hash, thumb_blob
-                        FROM images
-                        WHERE id > ?
-                        ORDER BY id ASC
-                        LIMIT ?
-                        """,
-                        (last_id, PRUNE_BATCH_SIZE),
-                    ).fetchall()
-                    if not rows:
-                        break
-                    last_id = int(rows[-1]["id"])
-                    for row in rows:
-                        if cancel_check is not None:
-                            cancel_check()
-                        row_data = {key: row[key] for key in row.keys()}
-                        pending.add(executor.submit(process_row, row_data))
-                        while len(pending) >= max(1, workers * 4):
-                            future = next(as_completed(pending))
-                            pending.remove(future)
-                            record_result(future.result())
-
-                while pending:
-                    future = next(as_completed(pending))
-                    pending.remove(future)
-                    record_result(future.result())
-        finally:
-            for catalog in worker_catalogs:
-                with suppress(Exception):
-                    catalog.close()
+        for result in self._parallel_prune_results(
+            rows_to_prune(),
+            process_row,
+            workers=workers,
+            cancel_check=cancel_check,
+            thread_name_prefix="marnwick-prune",
+        ):
+            assert isinstance(result, ThumbnailPruneRowResult)
+            record_result(result)
 
         orphan_removed = self._prune_orphan_thumbnail_files(workers, cancel_check=cancel_check)
         result = ThumbnailPruneResult(
@@ -4195,6 +6906,7 @@ class Catalog:
             return ThumbnailPruneRowResult(rel_path, errors=1)
 
     def rebuild_thumbnail(self, rel_path: str) -> ImageRecord | None:
+        self._assert_writable()
         old_thumb_rel_paths = self._thumbnail_rel_paths_for_records([rel_path])
         self._conn.execute(
             """
@@ -4266,7 +6978,9 @@ class Catalog:
                 scanned_at_ns INTEGER NOT NULL,
                 find_hash TEXT,
                 hash_at_ns INTEGER NOT NULL DEFAULT 0,
-                find_hash_complete INTEGER NOT NULL DEFAULT 0
+                find_hash_complete INTEGER NOT NULL DEFAULT 0,
+                entry_find_hash TEXT,
+                entry_hash_at_ns INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS catalog_refresh_state (
@@ -4425,15 +7139,27 @@ class Catalog:
             self._conn.execute(
                 "ALTER TABLE directories ADD COLUMN parent_dir_rel TEXT NOT NULL DEFAULT ''"
             )
+        if "entry_find_hash" not in columns:
+            self._conn.execute("ALTER TABLE directories ADD COLUMN entry_find_hash TEXT")
+        if "entry_hash_at_ns" not in columns:
+            self._conn.execute(
+                "ALTER TABLE directories ADD COLUMN entry_hash_at_ns INTEGER NOT NULL DEFAULT 0"
+            )
         migration = self._conn.execute(
             "SELECT value FROM settings WHERE key = 'directory_parent_schema_version'"
         ).fetchone()
         if migration is None or str(migration["value"]) != "1":
-            normalized: set[str] = {""}
-            for row in self._conn.execute("SELECT dir_rel FROM directories"):
-                normalized.update(self._directory_and_parents(str(row["dir_rel"])))
-            for row in self._conn.execute("SELECT DISTINCT dir_rel FROM images"):
-                normalized.update(self._directory_and_parents(str(row["dir_rel"])))
+            candidates = {
+                str(row["dir_rel"])
+                for row in self._conn.execute(
+                    """
+                    SELECT dir_rel FROM directories
+                    UNION
+                    SELECT dir_rel FROM images
+                    """
+                )
+            }
+            normalized = self._expand_directory_paths_once(candidates)
             now_ns = time.time_ns()
             with self._database_savepoint("migrate_directory_parents"):
                 self._conn.executemany(
@@ -4461,6 +7187,22 @@ class Catalog:
             "CREATE INDEX IF NOT EXISTS idx_directories_name ON directories(dir_rel COLLATE NOCASE, dir_rel)"
         )
 
+    def _expand_directory_paths_once(self, dir_rels: Iterable[str]) -> set[str]:
+        """Expand a path set while visiting every missing ancestor only once."""
+
+        normalized: set[str] = {""}
+        for dir_rel in sorted(
+            {value for value in dir_rels if value and value != "."},
+            key=lambda value: (value.count("/"), len(value), value),
+        ):
+            current = dir_rel
+            missing: list[str] = []
+            while current and current not in normalized:
+                missing.append(current)
+                current = self._parent_dir_rel(current)
+            normalized.update(reversed(missing))
+        return normalized
+
     def _get_setting(self, key: str) -> str | None:
         row = self._conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
         return None if row is None else str(row["value"])
@@ -4487,14 +7229,20 @@ class Catalog:
             stderr=subprocess.DEVNULL,
         )
         try:
-            while process.poll() is None:
+            while True:
                 if cancel_check is not None:
                     cancel_check()
-                time.sleep(FIND_POLL_INTERVAL_SECONDS)
-            stdout, _ = process.communicate()
+                try:
+                    # communicate() drains the pipe while it waits. Waiting
+                    # for process exit before reading can deadlock once a
+                    # large find result fills the OS pipe buffer.
+                    stdout, _ = process.communicate(timeout=FIND_POLL_INTERVAL_SECONDS)
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
         except BaseException:
             process.kill()
-            process.wait()
+            process.communicate()
             raise
         if process.returncode not in (0, None):
             raise OSError(f"command failed: {' '.join(command)}")
@@ -4518,13 +7266,59 @@ class Catalog:
             raise OSError("find did not provide stdout")
         count = 0
         buffer = b""
+        pending_rows: list[str] = []
+        chunks: queue.Queue[bytes | BaseException | object] = queue.Queue(maxsize=4)
+        reader_stop = threading.Event()
+        reader_sentinel = object()
+
+        def publish(item: bytes | BaseException | object) -> bool:
+            while not reader_stop.is_set():
+                try:
+                    chunks.put(item, timeout=FIND_POLL_INTERVAL_SECONDS)
+                    return True
+                except queue.Full:
+                    continue
+            return False
+
+        def read_stdout() -> None:
+            try:
+                while not reader_stop.is_set():
+                    chunk = process.stdout.read1(64 * 1024)
+                    if not chunk:
+                        break
+                    if not publish(chunk):
+                        return
+            except BaseException as error:
+                publish(error)
+            finally:
+                publish(reader_sentinel)
+
+        reader = threading.Thread(
+            target=read_stdout,
+            name="marnwick-directory-discovery-reader",
+            daemon=True,
+        )
+        reader.start()
+
+        def remember_pending() -> None:
+            if pending_rows:
+                self._remember_discovered_directories(pending_rows)
+                pending_rows.clear()
+
         try:
             while True:
                 if cancel_check is not None:
                     cancel_check()
-                chunk = process.stdout.read1(64 * 1024)
-                if not chunk:
+                try:
+                    item = chunks.get(timeout=FIND_POLL_INTERVAL_SECONDS)
+                except queue.Empty:
+                    continue
+                if item is reader_sentinel:
                     break
+                if isinstance(item, BaseException):
+                    raise item
+                assert isinstance(item, bytes)
+                chunk = item
                 buffer += chunk
                 parts = buffer.split(b"\0")
                 buffer = parts.pop()
@@ -4532,20 +7326,30 @@ class Catalog:
                     dir_rel = self._find_display_path_to_dir_rel(raw_path)
                     if dir_rel is None or not self._sqlite_text_safe(dir_rel):
                         continue
-                    self._remember_directory(dir_rel)
+                    pending_rows.append(dir_rel)
                     count += 1
+                    if len(pending_rows) >= DISCOVERY_WRITE_BATCH_SIZE:
+                        remember_pending()
                     if progress is not None and count % SCAN_PROGRESS_INTERVAL == 0:
                         progress(count, None, dir_rel or ".")
             if buffer:
                 dir_rel = self._find_display_path_to_dir_rel(buffer)
                 if dir_rel is not None and self._sqlite_text_safe(dir_rel):
-                    self._remember_directory(dir_rel)
+                    pending_rows.append(dir_rel)
                     count += 1
+            remember_pending()
+            reader_stop.set()
+            reader.join()
             process.stdout.close()
             return_code = process.wait()
         except BaseException:
-            process.kill()
+            reader_stop.set()
+            if process.poll() is None:
+                process.kill()
             process.wait()
+            reader.join(timeout=1.0)
+            if not reader.is_alive():
+                process.stdout.close()
             raise
         if return_code not in (0, None):
             raise OSError("directory discovery command failed")
@@ -4557,6 +7361,7 @@ class Catalog:
         cancel_check: CancelCallback | None = None,
     ) -> int:
         count = 0
+        pending_rows: list[str] = []
         for dirpath, dirnames, _ in os.walk(self.root):
             if cancel_check is not None:
                 cancel_check()
@@ -4565,10 +7370,15 @@ class Catalog:
             dir_rel = "" if current == self.root else self.rel_path(current)
             if not self._sqlite_text_safe(dir_rel):
                 continue
-            self._remember_directory(dir_rel)
+            pending_rows.append(dir_rel)
             count += 1
+            if len(pending_rows) >= DISCOVERY_WRITE_BATCH_SIZE:
+                self._remember_discovered_directories(pending_rows)
+                pending_rows.clear()
             if progress is not None and count % SCAN_PROGRESS_INTERVAL == 0:
                 progress(count, None, dir_rel or ".")
+        if pending_rows:
+            self._remember_discovered_directories(pending_rows)
         return count
 
     def _find_display_path_to_dir_rel(self, display_path: bytes | str) -> str | None:
@@ -4589,7 +7399,9 @@ class Catalog:
         *,
         find_bin: str,
         md5_bin: str,
+        sort_bin: str,
     ) -> str:
+        process_environment = {**os.environ, "LC_ALL": "C"}
         find_process = subprocess.Popen(
             [
                 find_bin,
@@ -4601,37 +7413,58 @@ class Catalog:
                 "-prune",
                 "-o",
                 "-printf",
-                "%T@ %s %C@ %p\n",
+                "%T@ %s %C@ %p\\0",
             ],
             cwd=directory,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
+            env=process_environment,
         )
         if find_process.stdout is None:
             find_process.kill()
             raise OSError("find did not provide stdout")
-        md5_process = subprocess.Popen(
-            [md5_bin],
+        sort_process = subprocess.Popen(
+            [sort_bin, "-z"],
             stdin=find_process.stdout,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
+            env=process_environment,
         )
         find_process.stdout.close()
+        if sort_process.stdout is None:
+            find_process.kill()
+            sort_process.kill()
+            raise OSError("sort did not provide stdout")
+        md5_process = subprocess.Popen(
+            [md5_bin],
+            stdin=sort_process.stdout,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env=process_environment,
+        )
+        sort_process.stdout.close()
         try:
-            while find_process.poll() is None or md5_process.poll() is None:
+            while any(
+                process.poll() is None
+                for process in (find_process, sort_process, md5_process)
+            ):
                 if cancel_check is not None:
                     cancel_check()
                 time.sleep(FIND_POLL_INTERVAL_SECONDS)
             stdout, _ = md5_process.communicate()
             find_process.wait()
+            sort_process.wait()
         except BaseException:
-            for process in (find_process, md5_process):
+            for process in (find_process, sort_process, md5_process):
                 if process.poll() is None:
                     process.kill()
-            for process in (find_process, md5_process):
+            for process in (find_process, sort_process, md5_process):
                 process.wait()
             raise
-        if find_process.returncode not in (0, None) or md5_process.returncode not in (0, None):
+        if any(
+            process.returncode not in (0, None)
+            for process in (find_process, sort_process, md5_process)
+        ):
             raise OSError("directory find hash command failed")
         parts = stdout.decode("ascii", errors="replace").split()
         if not parts:
@@ -4647,7 +7480,11 @@ class Catalog:
         for dirpath, dirnames, filenames in os.walk(directory):
             if cancel_check is not None:
                 cancel_check()
-            dirnames[:] = [name for name in dirnames if name != ".marnwick"]
+            dirnames[:] = sorted(
+                (name for name in dirnames if name != ".marnwick"),
+                key=str.casefold,
+            )
+            filenames.sort(key=str.casefold)
             current = Path(dirpath)
             for dirname in dirnames:
                 yield current / dirname
@@ -4775,6 +7612,39 @@ class Catalog:
                 (directory, self._parent_dir_rel(directory), time.time_ns()),
             )
 
+    def _remember_directories(self, dir_rels: Iterable[str]) -> None:
+        """Record a batch and its missing ancestors with one write per path."""
+
+        directories = self._expand_directory_paths_once(dir_rels)
+        self._remember_discovered_directories(
+            sorted(directories, key=lambda value: (value.count("/"), value))
+        )
+
+    def _remember_discovered_directories(self, dir_rels: Sequence[str]) -> None:
+        """Record a traversal batch without re-walking every path's ancestors.
+
+        Both discovery implementations enumerate each real ancestor before its
+        descendants, so expanding all parents for every row turns a depth-N tree
+        into N(N+1)/2 writes without adding any information.
+        """
+        if not dir_rels:
+            return
+        scanned_at_ns = time.time_ns()
+        with self._database_savepoint("remember_discovered_directories"):
+            self._conn.executemany(
+                """
+                INSERT INTO directories(dir_rel, parent_dir_rel, scanned_at_ns)
+                VALUES (?, ?, ?)
+                ON CONFLICT(dir_rel) DO UPDATE SET
+                    parent_dir_rel = excluded.parent_dir_rel,
+                    scanned_at_ns = excluded.scanned_at_ns
+                """,
+                (
+                    (dir_rel, self._parent_dir_rel(dir_rel), scanned_at_ns)
+                    for dir_rel in dir_rels
+                ),
+            )
+
     def _directory_and_parents(self, dir_rel: str) -> list[str]:
         if not dir_rel or dir_rel == ".":
             return [""]
@@ -4791,41 +7661,197 @@ class Catalog:
         return "" if parent == "." else parent
 
     def update_hashes_after_targeted_move(self, dir_rels: Iterable[str]) -> None:
+        """Invalidate affected freshness proofs without rescanning whole trees.
+
+        A single leaf move used to recursively hash every ancestor immediately,
+        making a protected mutation take O(depth * catalog size) after the file
+        operation had already completed. The next selected/idle refresh will
+        rebuild the cheap direct-entry/full-catalog proofs respectively.
+        """
+        self._assert_writable()
         affected: set[str] = set()
         for dir_rel in dir_rels:
             affected.update(self._directory_and_parents(dir_rel))
-        for dir_rel in sorted(affected, key=lambda value: (value.count("/"), value)):
-            _, was_complete = self.stored_directory_find_hash(dir_rel)
-            complete = was_complete or dir_rel == ""
-            find_hash = self.save_directory_find_hash(dir_rel, complete=complete)
-            if dir_rel == "":
-                self._save_catalog_find_hash_value(find_hash)
+        for chunk in batched(sorted(affected), SQLITE_VARIABLE_BATCH_SIZE):
+            placeholders = ",".join("?" for _ in chunk)
+            self._conn.execute(
+                f"""
+                UPDATE directories
+                SET find_hash = NULL,
+                    find_hash_complete = 0,
+                    hash_at_ns = 0,
+                    entry_find_hash = NULL,
+                    entry_hash_at_ns = 0
+                WHERE dir_rel IN ({placeholders})
+                """,
+                chunk,
+            )
+        self._conn.execute("DELETE FROM catalog_refresh_state")
 
     def _read_image_metadata_and_thumbnail(self, path: Path) -> tuple[int, int, bytes, int, int, str, bytes]:
         with open_catalog_image(path) as image:
-            image = ImageOps.exif_transpose(image)
-            width, height = image.size
-            perceptual_hash, color_signature = self._image_similarity_features(image)
-            thumb_blob, thumb_width, thumb_height = self._thumbnail_jpeg_blob(image)
-            return width, height, thumb_blob, thumb_width, thumb_height, perceptual_hash, color_signature
+            return self._read_image_metadata_and_thumbnail_from_open_image(image)
 
     def _read_image_metadata_and_thumbnail_from_bytes(self, data: bytes) -> tuple[int, int, bytes, int, int, str, bytes]:
         with open_catalog_image(io.BytesIO(data)) as image:
-            image = ImageOps.exif_transpose(image)
-            width, height = image.size
-            perceptual_hash, color_signature = self._image_similarity_features(image)
-            thumb_blob, thumb_width, thumb_height = self._thumbnail_jpeg_blob(image)
-            return width, height, thumb_blob, thumb_width, thumb_height, perceptual_hash, color_signature
+            return self._read_image_metadata_and_thumbnail_from_open_image(image)
 
-    def _thumbnail_jpeg_blob(self, image: Image.Image) -> tuple[bytes, int, int]:
-        thumb = image.copy()
+    def _read_image_metadata_and_thumbnail_from_open_image(
+        self,
+        image: Image.Image,
+    ) -> tuple[int, int, bytes, int, int, str, bytes]:
+        try:
+            ImageOps.exif_transpose(image, in_place=True)
+        except TypeError:  # Pillow versions predating the in-place option.
+            image = ImageOps.exif_transpose(image)
+        width, height = image.size
+        # Composite alpha and convert color only after reducing to the largest
+        # representation any catalog artifact needs. A huge RGBA source should
+        # not allocate a second full-resolution RGBA plus RGB buffer merely to
+        # create a small thumbnail and 64-byte similarity signature.
+        working_limit = max(self.settings.thumbnail_native_size, 64, 9)
+        reduced = ImageOps.contain(
+            image,
+            (working_limit, working_limit),
+            method=Image.Resampling.LANCZOS,
+        )
+        working = self._similarity_rgb_image(reduced, copy_rgb=False)
+        perceptual_hash = self._image_dhash(working)
+        color_signature = self._image_color_signature(working)
+        thumb_blob, thumb_width, thumb_height = self._thumbnail_jpeg_blob(
+            working,
+            copy_image=False,
+        )
+        return width, height, thumb_blob, thumb_width, thumb_height, perceptual_hash, color_signature
+
+    def _read_image_metadata_thumbnail_and_hash(
+        self,
+        job: ImageReadJob,
+        cancel_check: CancelCallback | None = None,
+    ) -> tuple[int, int, bytes, int, int, str, bytes, str, str]:
+        """Decode and hash one stable open file description.
+
+        A pathname can be replaced between two ordinary reads. Keeping one
+        descriptor open and verifying both it and the final pathname prevents
+        a thumbnail from version A being published under version B's content
+        key without retaining an entire large source file in memory.
+        """
+
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0)
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        if nofollow:
+            flags |= nofollow
+        elif job.path.is_symlink():
+            raise ImageChangedDuringIndexError(
+                errno.ELOOP,
+                "refusing symbolic-link image",
+                job.path,
+            )
+        noatime = getattr(os, "O_NOATIME", 0)
+        try:
+            fd = os.open(job.path, flags | noatime)
+        except OSError as error:
+            if not noatime or error.errno not in {errno.EACCES, errno.EINVAL, errno.EPERM}:
+                if error.errno in {errno.ENOENT, errno.ENOTDIR, errno.ELOOP}:
+                    raise ImageChangedDuringIndexError(
+                        f"image changed before indexing: {job.rel_path}"
+                    ) from error
+                raise
+            try:
+                fd = os.open(job.path, flags)
+            except OSError as fallback_error:
+                if fallback_error.errno in {errno.ENOENT, errno.ENOTDIR, errno.ELOOP}:
+                    raise ImageChangedDuringIndexError(
+                        f"image changed before indexing: {job.rel_path}"
+                    ) from fallback_error
+                raise
+        before: os.stat_result | None = None
+        after: os.stat_result | None = None
+        metadata: tuple[int, int, bytes, int, int, str, bytes] | None = None
+        digest = hashlib.sha256()
+        operation_error: BaseException | None = None
+        try:
+            before = os.fstat(fd)
+            if not stat_module.S_ISREG(before.st_mode) or not self._index_stat_matches_job(before, job):
+                raise ImageChangedDuringIndexError(
+                    f"image changed before indexing: {job.rel_path}"
+                )
+            try:
+                with os.fdopen(fd, "rb", closefd=False) as handle:
+                    with open_catalog_image(handle) as image:
+                        metadata = self._read_image_metadata_and_thumbnail_from_open_image(image)
+                    handle.seek(0)
+                    while True:
+                        if cancel_check is not None:
+                            cancel_check()
+                        chunk = handle.read(HASH_CHUNK_SIZE)
+                        if not chunk:
+                            break
+                        digest.update(chunk)
+            except BaseException as error:
+                operation_error = error
+            finally:
+                after = os.fstat(fd)
+        finally:
+            os.close(fd)
+
+        try:
+            current = job.path.stat()
+            current_changed_ns = self._path_change_time_ns(job.path, current)
+        except OSError as error:
+            raise ImageChangedDuringIndexError(
+                f"image changed after indexing: {job.rel_path}"
+            ) from error
+        if before is None or after is None:
+            if operation_error is not None:
+                raise operation_error
+            raise ImageChangedDuringIndexError(f"image could not be verified: {job.rel_path}")
+        if (
+            self._index_stat_token(before) != self._index_stat_token(after)
+            or not self._index_stat_matches_job(current, job)
+            or current_changed_ns != job.changed_ns
+        ):
+            raise ImageChangedDuringIndexError(
+                f"image changed while it was being indexed: {job.rel_path}"
+            ) from operation_error
+        if operation_error is not None:
+            raise operation_error
+        if metadata is None:
+            raise OSError(f"image metadata was not produced: {job.rel_path}")
+        value = digest.hexdigest()
+        return (*metadata, value, value)
+
+    @staticmethod
+    def _index_stat_token(file_stat: os.stat_result) -> tuple[int, int, int, int, int, int]:
+        return (
+            int(file_stat.st_dev),
+            int(file_stat.st_ino),
+            int(file_stat.st_nlink),
+            int(file_stat.st_size),
+            int(file_stat.st_mtime_ns),
+            int(file_stat.st_ctime_ns),
+        )
+
+    def _index_stat_matches_job(self, file_stat: os.stat_result, job: ImageReadJob) -> bool:
+        return self._index_stat_token(file_stat) == self._index_stat_token(job.stat)
+
+    def _thumbnail_jpeg_blob(
+        self,
+        image: Image.Image,
+        *,
+        copy_image: bool = True,
+    ) -> tuple[bytes, int, int]:
+        thumb = image.copy() if copy_image else image
         thumb.thumbnail(
             (self.settings.thumbnail_native_size, self.settings.thumbnail_native_size),
             Image.Resampling.LANCZOS,
         )
         thumb = self._jpeg_compatible_image(thumb)
         out = io.BytesIO()
-        thumb.save(out, format="JPEG", quality=82, optimize=True)
+        # Huffman optimization adds substantial CPU per image for only a small
+        # cache-size reduction. Fast 4:2:0 encoding keeps catalog ingestion
+        # responsive while retaining ample thumbnail quality.
+        thumb.save(out, format="JPEG", quality=82, optimize=False, subsampling=2)
         return out.getvalue(), thumb.width, thumb.height
 
     def _jpeg_compatible_image(self, image: Image.Image) -> Image.Image:
@@ -4842,21 +7868,35 @@ class Catalog:
 
     def _image_similarity_features_for_path(self, path: Path) -> tuple[str, bytes]:
         with open_catalog_image(path) as image:
-            image = ImageOps.exif_transpose(image)
-            return self._image_similarity_features(image)
+            try:
+                ImageOps.exif_transpose(image, in_place=True)
+            except TypeError:
+                image = ImageOps.exif_transpose(image)
+            reduced = ImageOps.contain(
+                image,
+                (64, 64),
+                method=Image.Resampling.LANCZOS,
+            )
+            rgb = self._similarity_rgb_image(reduced, copy_rgb=False)
+            return self._image_dhash(rgb), self._image_color_signature(rgb)
 
     def _image_similarity_features(self, image: Image.Image) -> tuple[str, bytes]:
-        rgb = self._similarity_rgb_image(image)
+        reduced = ImageOps.contain(
+            image,
+            (64, 64),
+            method=Image.Resampling.LANCZOS,
+        )
+        rgb = self._similarity_rgb_image(reduced, copy_rgb=False)
         return self._image_dhash(rgb), self._image_color_signature(rgb)
 
-    def _similarity_rgb_image(self, image: Image.Image) -> Image.Image:
+    def _similarity_rgb_image(self, image: Image.Image, *, copy_rgb: bool = True) -> Image.Image:
         if "A" in image.getbands():
             rgba = image.convert("RGBA")
             background = Image.new("RGB", rgba.size, (255, 255, 255))
             background.paste(rgba, mask=rgba.getchannel("A"))
             return background
         if image.mode == "RGB":
-            return image.copy()
+            return image.copy() if copy_rgb else image
         return image.convert("RGB")
 
     def _image_dhash(self, image: Image.Image) -> str:
@@ -4870,8 +7910,9 @@ class Catalog:
         return f"{value:0{SIMILARITY_DHASH_HEX_LENGTH}x}"
 
     def _image_color_signature(self, image: Image.Image) -> bytes:
-        sample = image.copy()
-        sample.thumbnail((64, 64), Image.Resampling.LANCZOS)
+        # ImageOps.contain allocates only the small result instead of first
+        # copying a potentially multi-hundred-megapixel source image.
+        sample = ImageOps.contain(image, (64, 64), method=Image.Resampling.LANCZOS)
         bins = [0] * 64
         data = sample.tobytes("raw", "RGB")
         for index in range(0, len(data), 3):
@@ -4897,6 +7938,25 @@ class Catalog:
                 digest.update(chunk)
         value = digest.hexdigest()
         return value, value
+
+    def _image_file_hashes_stable(
+        self,
+        job: ImageReadJob,
+        cancel_check: CancelCallback | None = None,
+    ) -> tuple[str, str]:
+        hashes = self._image_file_hashes(job.path, cancel_check)
+        try:
+            current = job.path.stat()
+            changed_ns = self._path_change_time_ns(job.path, current)
+        except OSError as error:
+            raise ImageChangedDuringIndexError(
+                f"image changed while it was being hashed: {job.rel_path}"
+            ) from error
+        if not self._index_stat_matches_job(current, job) or changed_ns != job.changed_ns:
+            raise ImageChangedDuringIndexError(
+                f"image changed while it was being hashed: {job.rel_path}"
+            )
+        return hashes
 
     def _image_hashes_for_bytes(self, data: bytes) -> tuple[str, str]:
         value = hashlib.sha256(data).hexdigest()
@@ -4943,7 +8003,12 @@ class Catalog:
         )
 
     def _image_columns(self, include_blob: bool) -> str:
-        thumb_column = "thumb_blob" if include_blob else "NULL AS thumb_blob"
+        thumb_column = (
+            f"CASE WHEN length(thumb_blob) <= {MAX_THUMBNAIL_FILE_BYTES} "
+            "THEN thumb_blob ELSE NULL END AS thumb_blob"
+            if include_blob
+            else "NULL AS thumb_blob"
+        )
         return (
             "id, rel_path, dir_rel, filename, file_size_bytes AS size_bytes, "
             "modified_at_ns AS mtime_ns, width, height, aspect_ratio, thumb_width, "
@@ -4969,55 +8034,102 @@ class Catalog:
         )
 
     def _delete_db_records(self, rel_paths: Iterable[str]) -> None:
-        rel_paths = list(rel_paths)
-        old_thumb_rel_paths = self._thumbnail_rel_paths_for_records(rel_paths)
-        self._conn.executemany("DELETE FROM images WHERE rel_path = ?", [(rel_path,) for rel_path in rel_paths])
-        self._conn.executemany("DELETE FROM trash_items WHERE trash_rel_path = ?", [(rel_path,) for rel_path in rel_paths])
-        self._conn.executemany(
-            "DELETE FROM image_index_failures WHERE rel_path = ?",
-            [(rel_path,) for rel_path in rel_paths],
-        )
-        self._remove_unreferenced_thumbnail_files(old_thumb_rel_paths)
+        pending: list[str] = []
+
+        def delete_pending() -> None:
+            old_thumb_rel_paths = self._thumbnail_rel_paths_for_records(pending)
+            parameters = [(rel_path,) for rel_path in pending]
+            self._conn.executemany(
+                "DELETE FROM images WHERE rel_path = ?",
+                parameters,
+            )
+            self._conn.executemany(
+                "DELETE FROM trash_items WHERE trash_rel_path = ?",
+                parameters,
+            )
+            self._conn.executemany(
+                "DELETE FROM image_index_failures WHERE rel_path = ?",
+                parameters,
+            )
+            self._remove_unreferenced_thumbnail_files(old_thumb_rel_paths)
+
+        for rel_path in rel_paths:
+            pending.append(rel_path)
+            if len(pending) < SQLITE_VARIABLE_BATCH_SIZE:
+                continue
+            delete_pending()
+            pending.clear()
+        if pending:
+            delete_pending()
 
     def _delete_directory_records(self, dir_rel: str) -> None:
-        nested_like = descendant_like_pattern(dir_rel)
+        descendant_bounds = descendant_range_bounds(dir_rel) if dir_rel else None
+        variable_limit = PRUNE_BATCH_SIZE
+        if hasattr(self._conn, "getlimit"):
+            variable_limit = min(
+                variable_limit,
+                self._conn.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER),
+            )
+        batch_size = max(1, variable_limit)
         if dir_rel:
-            old_thumb_rel_paths = {
+            assert descendant_bounds is not None
+            descendant_start, descendant_end = descendant_bounds
+            selection_sql = """
+                SELECT id, thumb_rel_path
+                FROM images
+                WHERE dir_rel = ? OR (dir_rel >= ? AND dir_rel < ?)
+                ORDER BY id
+                LIMIT ?
+            """
+            selection_params: Sequence[object] = (
+                dir_rel,
+                descendant_start,
+                descendant_end,
+                batch_size,
+            )
+        else:
+            selection_sql = """
+                SELECT id, thumb_rel_path
+                FROM images
+                ORDER BY id
+                LIMIT ?
+            """
+            selection_params = (batch_size,)
+        while True:
+            rows = self._conn.execute(selection_sql, selection_params).fetchall()
+            if not rows:
+                break
+            image_ids = [int(row["id"]) for row in rows]
+            old_thumb_rel_paths = [
                 str(row["thumb_rel_path"])
-                for row in self._conn.execute(
-                    """
-                    SELECT thumb_rel_path
-                    FROM images
-                    WHERE (dir_rel = ? OR dir_rel LIKE ? ESCAPE '\\')
-                        AND thumb_rel_path IS NOT NULL
-                    """,
-                    (dir_rel, nested_like),
-                )
-            }
+                for row in rows
+                if row["thumb_rel_path"] is not None
+            ]
             self._conn.execute(
-                "DELETE FROM images WHERE dir_rel = ? OR dir_rel LIKE ? ESCAPE '\\'",
-                (dir_rel, nested_like),
+                f"DELETE FROM images WHERE id IN ({','.join('?' for _ in image_ids)})",
+                image_ids,
+            )
+            self._remove_unreferenced_thumbnail_files(old_thumb_rel_paths)
+        if dir_rel:
+            self._conn.execute(
+                """
+                DELETE FROM directories
+                WHERE dir_rel = ? OR (dir_rel >= ? AND dir_rel < ?)
+                """,
+                (dir_rel, descendant_start, descendant_end),
             )
             self._conn.execute(
-                "DELETE FROM directories WHERE dir_rel = ? OR dir_rel LIKE ? ESCAPE '\\'",
-                (dir_rel, nested_like),
-            )
-            self._conn.execute(
-                "DELETE FROM image_index_failures WHERE dir_rel = ? OR dir_rel LIKE ? ESCAPE '\\'",
-                (dir_rel, nested_like),
+                """
+                DELETE FROM image_index_failures
+                WHERE dir_rel = ? OR (dir_rel >= ? AND dir_rel < ?)
+                """,
+                (dir_rel, descendant_start, descendant_end),
             )
             self._forget_trash_items_under(dir_rel)
-            self._remove_unreferenced_thumbnail_files(old_thumb_rel_paths)
             return
-        old_thumb_rel_paths = {
-            str(row["thumb_rel_path"])
-            for row in self._conn.execute("SELECT thumb_rel_path FROM images WHERE thumb_rel_path IS NOT NULL")
-        }
-        self._conn.execute("DELETE FROM images")
         self._conn.execute("DELETE FROM image_index_failures")
         self._conn.execute("DELETE FROM directories WHERE dir_rel != ''")
         self._conn.execute("DELETE FROM trash_items")
-        self._remove_unreferenced_thumbnail_files(old_thumb_rel_paths)
 
     def _delete_missing_child_directories(self, parent_dir_rel: str, child_dirs: Sequence[str]) -> None:
         known_children = set(self._direct_child_directories(parent_dir_rel))
@@ -5064,38 +8176,132 @@ class Catalog:
                 return candidate
             counter += 1
 
-    def _move_file_no_clobber(self, source: Path, desired: Path) -> tuple[Path, bool]:
+    def _move_file_no_clobber(
+        self,
+        source: Path,
+        desired: Path,
+        *,
+        expected_source_identity: CatalogFileIdentity | None = None,
+        dest_catalog: "Catalog | None" = None,
+    ) -> tuple[Path, _FileCopyProof | None]:
+        destination_owner = self if dest_catalog is None else dest_catalog
         while True:
             destination = self._unique_destination(desired)
+            source_identity = self._catalog_file_identity(source)
+            if (
+                expected_source_identity is not None
+                and source_identity != expected_source_identity
+            ):
+                raise OSError(f"move source changed before rename: {source}")
             try:
-                _rename_noreplace(source, destination)
-                return destination, False
+                self._rename_catalog_entry_noreplace(
+                    source,
+                    destination,
+                    dest_catalog=destination_owner,
+                    expected_source_identity=source_identity,
+                )
+                moved_identity = self._catalog_file_identity(destination)
+                if moved_identity[:5] != source_identity[:5]:
+                    try:
+                        destination_owner._rename_catalog_entry_noreplace(
+                            destination,
+                            source,
+                            dest_catalog=self,
+                            expected_source_identity=source_identity,
+                        )
+                    except OSError as restore_error:
+                        raise OSError(
+                            f"move source changed; replacement retained at {destination}"
+                        ) from restore_error
+                    raise OSError(f"move source changed while rename was starting: {source}")
+                return destination, None
             except OSError as error:
                 if error.errno == errno.EEXIST:
                     continue
                 if error.errno != errno.EXDEV:
                     raise
             try:
-                self._copy_file_to_destination(source, destination)
-                return destination, True
+                proof = self._copy_file_to_destination(source, destination)
+                if (
+                    expected_source_identity is not None
+                    and proof.source_identity != expected_source_identity
+                ):
+                    raise OSError(
+                        f"move source changed before cross-filesystem copy: {source}"
+                    )
+                return destination, proof
             except OSError as error:
                 if error.errno != errno.EEXIST:
                     raise
 
-    def _move_directory_no_clobber(self, source: Path, desired: Path) -> tuple[Path, bool]:
+    def _move_directory_no_clobber(
+        self,
+        source: Path,
+        desired: Path,
+        *,
+        expected_source_identity: DirectoryIdentity | None = None,
+        dest_catalog: "Catalog | None" = None,
+    ) -> tuple[Path, _DirectoryCopyProof | None]:
+        destination_owner = self if dest_catalog is None else dest_catalog
         while True:
             destination = self._unique_destination(desired)
+            source_stat = source.lstat()
+            source_identity = (
+                int(source_stat.st_dev),
+                int(source_stat.st_ino),
+                int(source_stat.st_mtime_ns),
+            )
+            current_identity = (
+                *source_identity,
+                self._path_change_time_ns(source, source_stat),
+            )
+            if expected_source_identity is not None and current_identity != expected_source_identity:
+                raise OSError(f"directory move source changed before rename: {source}")
             try:
-                _rename_noreplace(source, destination)
-                return destination, False
+                self._rename_catalog_entry_noreplace(
+                    source,
+                    destination,
+                    dest_catalog=destination_owner,
+                    expected_source_identity=current_identity,
+                )
+                moved_stat = destination.lstat()
+                if (
+                    int(moved_stat.st_dev),
+                    int(moved_stat.st_ino),
+                    int(moved_stat.st_mtime_ns),
+                ) != source_identity:
+                    try:
+                        destination_owner._rename_catalog_entry_noreplace(
+                            destination,
+                            source,
+                            dest_catalog=self,
+                            expected_source_identity=current_identity,
+                        )
+                    except OSError as restore_error:
+                        raise OSError(
+                            f"directory move source changed; replacement retained at {destination}"
+                        ) from restore_error
+                    raise OSError(f"directory changed while rename was starting: {source}")
+                return destination, None
             except OSError as error:
                 if error.errno == errno.EEXIST:
                     continue
                 if error.errno != errno.EXDEV:
                     raise
             try:
-                self._copy_directory_to_destination(source, destination)
-                return destination, True
+                proof = self._copy_directory_to_destination(source, destination)
+                if (
+                    expected_source_identity is not None
+                    and (
+                        proof.source_root_identity[0],
+                        proof.source_root_identity[1],
+                        proof.source_root_identity[4],
+                    ) != expected_source_identity[:3]
+                ):
+                    raise OSError(
+                        f"directory move source changed before cross-filesystem copy: {source}"
+                    )
+                return destination, proof
             except OSError as error:
                 if error.errno != errno.EEXIST:
                     raise
@@ -5108,28 +8314,496 @@ class Catalog:
     def _temporary_directory_destination(self, destination: Path) -> Path:
         return Path(tempfile.mkdtemp(prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent))
 
-    def _copy_file_to_destination(self, source: Path, destination: Path) -> None:
+    def _copy_file_to_destination(self, source: Path, destination: Path) -> _FileCopyProof:
+        source_identity, source_hash = self._stable_regular_file_hash(source)
         temp = self._temporary_destination(destination)
         try:
             shutil.copy2(source, temp)
+            _, copied_hash = self._stable_regular_file_hash(temp)
+            final_source_identity, final_source_hash = self._stable_regular_file_hash(source)
+            if (
+                final_source_identity != source_identity
+                or final_source_hash != source_hash
+                or copied_hash != source_hash
+            ):
+                raise OSError(f"source changed while it was being copied: {source}")
+            self._fsync_regular_file(temp)
             _rename_noreplace(temp, destination)
+            self._fsync_directory(destination.parent)
+            _, destination_hash = self._stable_regular_file_hash(destination)
+            if destination_hash != source_hash:
+                raise OSError(f"destination verification failed after copy: {destination}")
+            self._fsync_regular_file(destination)
+            self._fsync_directory(destination.parent)
+            return _FileCopyProof(source_identity, source_hash)
         finally:
             temp.unlink(missing_ok=True)
 
-    def _copy_directory_to_destination(self, source: Path, destination: Path) -> None:
+    def _copy_directory_to_destination(
+        self,
+        source: Path,
+        destination: Path,
+    ) -> _DirectoryCopyProof:
+        source_proof = self._directory_copy_proof(source)
         temp = self._temporary_directory_destination(destination)
         try:
             shutil.copytree(source, temp, dirs_exist_ok=True, symlinks=True)
+            copied_proof = self._directory_copy_proof(temp)
+            final_source_proof = self._directory_copy_proof(source)
+            if final_source_proof != source_proof:
+                raise OSError(f"source directory changed while it was being copied: {source}")
+            if copied_proof.content_hash != source_proof.content_hash:
+                raise OSError(f"destination directory verification failed: {destination}")
+            self._fsync_directory_tree(temp)
             _rename_noreplace(temp, destination)
+            self._fsync_directory(destination.parent)
+            published_proof = self._directory_copy_proof(destination)
+            if published_proof.content_hash != source_proof.content_hash:
+                raise OSError(f"published directory verification failed: {destination}")
+            self._fsync_directory_tree(destination)
+            self._fsync_directory(destination.parent)
+            return source_proof
         finally:
             if temp.exists():
                 shutil.rmtree(temp, ignore_errors=True)
 
-    def _move_db_record_in_place(self, source_rel_path: str, dest_rel_path: str, dest_catalog: "Catalog") -> None:
+    def _stable_regular_file_hash(
+        self,
+        path: Path,
+        cancel_check: CancelCallback | None = None,
+    ) -> tuple[CatalogFileIdentity, str]:
+        path_stat = path.lstat()
+        identity = self._catalog_file_identity(path, path_stat)
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(path, flags)
+        try:
+            before = os.fstat(fd)
+            if self._index_stat_token(before) != self._index_stat_token(path_stat):
+                raise OSError(f"file changed before verification: {path}")
+            digest = hashlib.sha256()
+            while True:
+                if cancel_check is not None:
+                    cancel_check()
+                chunk = os.read(fd, HASH_CHUNK_SIZE)
+                if not chunk:
+                    break
+                digest.update(chunk)
+            after = os.fstat(fd)
+        finally:
+            os.close(fd)
+        current_stat = path.lstat()
+        current_identity = self._catalog_file_identity(path, current_stat)
+        if (
+            self._index_stat_token(before) != self._index_stat_token(after)
+            or self._index_stat_token(after) != self._index_stat_token(current_stat)
+            or current_identity != identity
+        ):
+            raise OSError(f"file changed during verification: {path}")
+        return identity, digest.hexdigest()
+
+    @staticmethod
+    def _manifest_record_value(*values: bytes) -> int:
+        digest = hashlib.sha256()
+        for value in values:
+            digest.update(len(value).to_bytes(8, "big"))
+            digest.update(value)
+        return int.from_bytes(digest.digest(), "big")
+
+    def _directory_copy_proof(self, root: Path) -> _DirectoryCopyProof:
+        root_stat = root.lstat()
+        if not stat_module.S_ISDIR(root_stat.st_mode):
+            raise OSError(f"directory copy source is not a directory: {root}")
+        root_identity = (
+            int(root_stat.st_dev),
+            int(root_stat.st_ino),
+            int(root_stat.st_nlink),
+            int(root_stat.st_size),
+            int(root_stat.st_mtime_ns),
+        )
+        modulus = 1 << 256
+        content_count = 1
+        content_sum = self._manifest_record_value(
+            b"root",
+            str(stat_module.S_IMODE(root_stat.st_mode)).encode("ascii"),
+            str(root_stat.st_mtime_ns).encode("ascii"),
+        )
+        content_xor = content_sum
+        identity_count = 1
+        identity_sum = self._manifest_record_value(
+            b"root",
+            repr(root_identity).encode("ascii"),
+        )
+        identity_xor = identity_sum
+        pending: list[tuple[Path, str]] = [(root, "")]
+        while pending:
+            directory, directory_rel = pending.pop()
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    entry_path = Path(entry.path)
+                    rel_path = f"{directory_rel}/{entry.name}" if directory_rel else entry.name
+                    rel_bytes = rel_path.encode("utf-8", errors="surrogateescape")
+                    entry_stat = entry_path.lstat()
+                    stat_identity = self._index_stat_token(entry_stat)
+                    metadata = (
+                        f"{stat_module.S_IMODE(entry_stat.st_mode)}:{entry_stat.st_size}:"
+                        f"{entry_stat.st_mtime_ns}"
+                    ).encode("ascii")
+                    if stat_module.S_ISDIR(entry_stat.st_mode):
+                        kind = b"d"
+                        payload = b""
+                        pending.append((entry_path, rel_path))
+                    elif stat_module.S_ISREG(entry_stat.st_mode):
+                        kind = b"f"
+                        stable_identity, file_hash = self._stable_regular_file_hash(entry_path)
+                        if stable_identity != self._catalog_file_identity(entry_path, entry_stat):
+                            raise OSError(f"directory entry changed during verification: {entry_path}")
+                        payload = file_hash.encode("ascii")
+                    elif stat_module.S_ISLNK(entry_stat.st_mode):
+                        kind = b"l"
+                        payload = os.fsencode(os.readlink(entry_path))
+                    else:
+                        raise OSError(f"unsupported directory entry during move: {entry_path}")
+                    content_value = self._manifest_record_value(
+                        rel_bytes,
+                        kind,
+                        metadata,
+                        payload,
+                    )
+                    identity_value = self._manifest_record_value(
+                        rel_bytes,
+                        kind,
+                        repr(stat_identity).encode("ascii"),
+                        payload,
+                    )
+                    content_count += 1
+                    content_sum = (content_sum + content_value) % modulus
+                    content_xor ^= content_value
+                    identity_count += 1
+                    identity_sum = (identity_sum + identity_value) % modulus
+                    identity_xor ^= identity_value
+        return _DirectoryCopyProof(
+            root_identity,
+            self._combined_directory_entry_hash(
+                identity_count,
+                identity_sum,
+                identity_xor,
+            ),
+            self._combined_directory_entry_hash(
+                content_count,
+                content_sum,
+                content_xor,
+            ),
+        )
+
+    def _fsync_regular_file(self, path: Path) -> None:
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(path, flags)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    def _fsync_directory(self, path: Path) -> None:
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_DIRECTORY", 0)
+        try:
+            fd = os.open(path, flags)
+        except OSError as error:
+            if error.errno in {errno.EACCES, errno.EINVAL, errno.ENOTSUP, errno.EPERM}:
+                return
+            raise
+        try:
+            try:
+                os.fsync(fd)
+            except OSError as error:
+                if error.errno not in {errno.EBADF, errno.EINVAL, errno.ENOTSUP}:
+                    raise
+        finally:
+            os.close(fd)
+
+    def _fsync_directory_tree(self, root: Path) -> None:
+        directories: list[Path] = []
+        for dirpath, dirnames, filenames in os.walk(root, topdown=True, followlinks=False):
+            directory = Path(dirpath)
+            directories.append(directory)
+            for filename in filenames:
+                path = directory / filename
+                if not path.is_symlink():
+                    self._fsync_regular_file(path)
+            dirnames[:] = [name for name in dirnames if not (directory / name).is_symlink()]
+        for directory in reversed(directories):
+            self._fsync_directory(directory)
+
+    def _quarantine_path(self, source: Path, suffix: str) -> Path:
+        return source.with_name(
+            f".{source.name}.{secrets.token_hex(12)}{suffix}"
+        )
+
+    def _quarantine_catalog_entry(
+        self,
+        source: Path,
+        suffix: str,
+        *,
+        expected_source_identity: Sequence[int],
+    ) -> Path:
+        for _ in range(128):
+            quarantine = self._quarantine_path(source, suffix)
+            try:
+                self._rename_catalog_entry_noreplace(
+                    source,
+                    quarantine,
+                    expected_source_identity=expected_source_identity,
+                )
+                return quarantine
+            except FileExistsError:
+                continue
+        raise FileExistsError(
+            errno.EEXIST,
+            "could not allocate a private quarantine name",
+            source,
+        )
+
+    def _pin_destination_file_recovery(
+        self,
+        destination: Path,
+        expected_hash: str,
+    ) -> Path:
+        """Retain a private destination-FS copy until source cleanup commits.
+
+        A cross-filesystem move cannot atomically rename source to destination.
+        Verifying the public destination and then unlinking the source leaves a
+        race in which another process can replace that destination in between.
+        Prefer a cheap hard link, falling back to a durable copy on filesystems
+        that do not support links, and verify the private name independently.
+        """
+
+        recovery = self._quarantine_path(destination, ".marnwick-move-recovery")
+        try:
+            try:
+                os.link(destination, recovery, follow_symlinks=False)
+            except (NotImplementedError, OSError):
+                shutil.copy2(destination, recovery, follow_symlinks=False)
+            _, recovery_hash = self._stable_regular_file_hash(recovery)
+            if recovery_hash != expected_hash:
+                raise OSError(
+                    f"destination changed while its recovery copy was created: {destination}"
+                )
+            self._fsync_regular_file(recovery)
+            self._fsync_directory(recovery.parent)
+            return recovery
+        except BaseException:
+            with suppress(OSError):
+                recovery.unlink()
+            raise
+
+    def _release_destination_file_recovery(
+        self,
+        destination: Path,
+        recovery: Path,
+        expected_hash: str,
+    ) -> None:
+        _, destination_hash = self._stable_regular_file_hash(destination)
+        _, recovery_hash = self._stable_regular_file_hash(recovery)
+        if destination_hash != expected_hash or recovery_hash != expected_hash:
+            raise OSError(
+                f"destination changed after source cleanup; recovery retained at {recovery}"
+            )
+        recovery.unlink()
+        self._fsync_directory(recovery.parent)
+
+    @staticmethod
+    def _link_or_copy_recovery_file(source: str, destination: str) -> str:
+        try:
+            os.link(source, destination, follow_symlinks=False)
+        except (NotImplementedError, OSError):
+            return shutil.copy2(source, destination, follow_symlinks=False)
+        return destination
+
+    def _pin_destination_directory_recovery(
+        self,
+        destination: Path,
+        expected_hash: str,
+    ) -> Path:
+        recovery = Path(
+            tempfile.mkdtemp(
+                prefix=f".{destination.name}.",
+                suffix=".marnwick-move-recovery-dir",
+                dir=destination.parent,
+            )
+        )
+        try:
+            shutil.copytree(
+                destination,
+                recovery,
+                dirs_exist_ok=True,
+                symlinks=True,
+                copy_function=self._link_or_copy_recovery_file,
+            )
+            recovery_proof = self._directory_copy_proof(recovery)
+            if recovery_proof.content_hash != expected_hash:
+                raise OSError(
+                    f"destination directory changed while its recovery copy was created: {destination}"
+                )
+            self._fsync_directory_tree(recovery)
+            self._fsync_directory(recovery.parent)
+            return recovery
+        except BaseException:
+            shutil.rmtree(recovery, ignore_errors=True)
+            raise
+
+    def _release_destination_directory_recovery(
+        self,
+        destination: Path,
+        recovery: Path,
+        expected_hash: str,
+    ) -> None:
+        destination_proof = self._directory_copy_proof(destination)
+        recovery_proof = self._directory_copy_proof(recovery)
+        if (
+            destination_proof.content_hash != expected_hash
+            or recovery_proof.content_hash != expected_hash
+        ):
+            raise OSError(
+                f"destination directory changed after source cleanup; "
+                f"recovery retained at {recovery}"
+            )
+        shutil.rmtree(recovery)
+        self._fsync_directory(recovery.parent)
+
+    def _cleanup_copied_file_source(
+        self,
+        source: Path,
+        destination: Path,
+        proof: _FileCopyProof,
+        *,
+        wipe: bool,
+    ) -> None:
+        current_identity, current_hash = self._stable_regular_file_hash(source)
+        if current_identity != proof.source_identity or current_hash != proof.content_hash:
+            raise OSError(f"source changed after it was copied; both copies were retained: {source}")
+        recovery = self._pin_destination_file_recovery(
+            destination,
+            proof.content_hash,
+        )
+        try:
+            quarantine = self._quarantine_catalog_entry(
+                source,
+                ".marnwick-move-source",
+                expected_source_identity=proof.source_identity,
+            )
+        except BaseException:
+            with suppress(OSError):
+                recovery.unlink()
+            raise
+        try:
+            quarantined_identity, quarantined_hash = self._stable_regular_file_hash(quarantine)
+            _, destination_hash = self._stable_regular_file_hash(destination)
+            if (
+                quarantined_identity[:5] != proof.source_identity[:5]
+                or quarantined_hash != proof.content_hash
+                or destination_hash != proof.content_hash
+            ):
+                raise OSError("move verification changed before source cleanup")
+            self._fsync_regular_file(destination)
+            self._fsync_directory(destination.parent)
+            self._delete_file(quarantine, wipe=wipe)
+            self._fsync_directory(source.parent)
+            self._release_destination_file_recovery(
+                destination,
+                recovery,
+                proof.content_hash,
+            )
+        except BaseException:
+            if quarantine.exists() or quarantine.is_symlink():
+                try:
+                    self._rename_catalog_entry_noreplace(
+                        quarantine,
+                        source,
+                        expected_source_identity=proof.source_identity,
+                    )
+                except OSError as restore_error:
+                    raise OSError(
+                        f"move cleanup failed; source was retained at {quarantine}"
+                    ) from restore_error
+            raise
+
+    def _cleanup_copied_directory_source(
+        self,
+        source: Path,
+        destination: Path,
+        proof: _DirectoryCopyProof,
+        *,
+        wipe: bool,
+    ) -> None:
+        if self._directory_copy_proof(source) != proof:
+            raise OSError(f"source directory changed after it was copied; both copies were retained: {source}")
+        recovery = self._pin_destination_directory_recovery(
+            destination,
+            proof.content_hash,
+        )
+        try:
+            quarantine = self._quarantine_catalog_entry(
+                source,
+                ".marnwick-move-source-dir",
+                expected_source_identity=proof.source_root_identity,
+            )
+        except BaseException:
+            shutil.rmtree(recovery, ignore_errors=True)
+            raise
+        try:
+            quarantined = self._directory_copy_proof(quarantine)
+            destination_proof = self._directory_copy_proof(destination)
+            if (
+                quarantined.source_root_identity != proof.source_root_identity
+                or quarantined.source_identity_hash != proof.source_identity_hash
+                or quarantined.content_hash != proof.content_hash
+                or destination_proof.content_hash != proof.content_hash
+            ):
+                raise OSError("directory move verification changed before source cleanup")
+            self._fsync_directory_tree(destination)
+            self._fsync_directory(destination.parent)
+            if wipe:
+                self._wipe_directory_files(quarantine)
+            self._remove_catalog_directory_tree(
+                quarantine,
+                expected_identity=proof.source_root_identity,
+            )
+            self._fsync_directory(source.parent)
+            self._release_destination_directory_recovery(
+                destination,
+                recovery,
+                proof.content_hash,
+            )
+        except BaseException:
+            if quarantine.exists() or quarantine.is_symlink():
+                try:
+                    self._rename_catalog_entry_noreplace(
+                        quarantine,
+                        source,
+                        expected_source_identity=proof.source_root_identity,
+                    )
+                except OSError as restore_error:
+                    raise OSError(
+                        f"directory move cleanup failed; source was retained at {quarantine}"
+                    ) from restore_error
+            raise
+
+    def _move_db_record_in_place(
+        self,
+        source_rel_path: str,
+        dest_rel_path: str,
+        dest_catalog: "Catalog",
+        *,
+        remember_directory: bool = True,
+    ) -> None:
         dir_rel = Path(dest_rel_path).parent.as_posix()
         if dir_rel == ".":
             dir_rel = ""
-        dest_catalog._remember_directory(dir_rel)
+        if remember_directory:
+            dest_catalog._remember_directory(dir_rel)
         dest_catalog._conn.execute(
             """
             UPDATE images
@@ -5139,96 +8813,243 @@ class Catalog:
             (dest_rel_path, dir_rel, Path(dest_rel_path).name, source_rel_path),
         )
 
-    def _move_directory_records_in_place(self, source_dir_rel: str, dest_dir_rel: str) -> None:
+    def _move_directory_records_in_place(
+        self,
+        source_dir_rel: str,
+        dest_dir_rel: str,
+        *,
+        cancel_check: CancelCallback | None = None,
+    ) -> None:
         with self._database_savepoint("move_directory_records"):
-            self._move_directory_records_in_place_unlocked(source_dir_rel, dest_dir_rel)
+            with self._sqlite_cancel_progress(cancel_check):
+                self._move_directory_records_in_place_unlocked(source_dir_rel, dest_dir_rel)
 
     def _move_directory_records_in_place_unlocked(self, source_dir_rel: str, dest_dir_rel: str) -> None:
         self._delete_directory_records(dest_dir_rel)
-        nested_like = descendant_like_pattern(source_dir_rel)
-        directory_rows = [
-            str(row["dir_rel"])
-            for row in self._conn.execute(
-                "SELECT dir_rel FROM directories WHERE dir_rel = ? OR dir_rel LIKE ? ESCAPE '\\'",
-                (source_dir_rel, nested_like),
-            )
-        ]
-        image_rows = [
-            str(row["rel_path"])
-            for row in self._conn.execute(
-                "SELECT rel_path FROM images WHERE rel_path = ? OR rel_path LIKE ? ESCAPE '\\'",
-                (source_dir_rel, nested_like),
-            )
-        ]
-        for old_dir_rel in sorted(directory_rows, key=len, reverse=True):
-            new_dir_rel = self._replace_prefix(old_dir_rel, source_dir_rel, dest_dir_rel)
-            self._conn.execute(
-                """
-                UPDATE directories
-                SET dir_rel = ?, parent_dir_rel = ?, scanned_at_ns = ?
-                WHERE dir_rel = ?
-                """,
-                (new_dir_rel, self._parent_dir_rel(new_dir_rel), time.time_ns(), old_dir_rel),
-            )
-        for old_rel_path in image_rows:
-            new_rel_path = self._replace_prefix(old_rel_path, source_dir_rel, dest_dir_rel)
-            new_dir_rel = self._parent_dir_rel(new_rel_path)
-            self._conn.execute(
-                """
-                UPDATE images
-                SET rel_path = ?, dir_rel = ?, filename = ?
-                WHERE rel_path = ?
-                """,
-                (new_rel_path, new_dir_rel, Path(new_rel_path).name, old_rel_path),
-            )
+        descendant_start, descendant_end = descendant_range_bounds(source_dir_rel)
+        suffix_start = len(source_dir_rel) + 1
+        now_ns = time.time_ns()
+        self._conn.execute(
+            """
+            UPDATE directories
+            SET parent_dir_rel = CASE
+                    WHEN dir_rel = ? THEN ?
+                    ELSE ? || substr(parent_dir_rel, ?)
+                END,
+                dir_rel = ? || substr(dir_rel, ?),
+                scanned_at_ns = ?
+            WHERE dir_rel = ? OR (dir_rel >= ? AND dir_rel < ?)
+            """,
+            (
+                source_dir_rel,
+                self._parent_dir_rel(dest_dir_rel),
+                dest_dir_rel,
+                suffix_start,
+                dest_dir_rel,
+                suffix_start,
+                now_ns,
+                source_dir_rel,
+                descendant_start,
+                descendant_end,
+            ),
+        )
+        self._conn.execute(
+            """
+            UPDATE images
+            SET rel_path = ? || substr(rel_path, ?),
+                dir_rel = ? || substr(dir_rel, ?)
+            WHERE dir_rel = ? OR (dir_rel >= ? AND dir_rel < ?)
+            """,
+            (
+                dest_dir_rel,
+                suffix_start,
+                dest_dir_rel,
+                suffix_start,
+                source_dir_rel,
+                descendant_start,
+                descendant_end,
+            ),
+        )
+        self._conn.execute(
+            """
+            UPDATE image_index_failures
+            SET rel_path = ? || substr(rel_path, ?),
+                dir_rel = ? || substr(dir_rel, ?)
+            WHERE dir_rel = ? OR (dir_rel >= ? AND dir_rel < ?)
+            """,
+            (
+                dest_dir_rel,
+                suffix_start,
+                dest_dir_rel,
+                suffix_start,
+                source_dir_rel,
+                descendant_start,
+                descendant_end,
+            ),
+        )
         self._remember_directory(dest_dir_rel)
 
-    def _transfer_directory_records(self, source_dir_rel: str, dest_dir_rel: str, dest_catalog: "Catalog") -> None:
-        self._copy_directory_records(source_dir_rel, dest_dir_rel, dest_catalog)
+    def _transfer_directory_records(
+        self,
+        source_dir_rel: str,
+        dest_dir_rel: str,
+        dest_catalog: "Catalog",
+        *,
+        cancel_check: CancelCallback | None = None,
+    ) -> None:
+        self._copy_directory_records(
+            source_dir_rel,
+            dest_dir_rel,
+            dest_catalog,
+            cancel_check=cancel_check,
+        )
         with self._database_savepoint("transfer_directory_source_delete"):
             self._delete_directory_records(source_dir_rel)
 
-    def _copy_directory_records(self, source_dir_rel: str, dest_dir_rel: str, dest_catalog: "Catalog") -> None:
+    def _copy_directory_records(
+        self,
+        source_dir_rel: str,
+        dest_dir_rel: str,
+        dest_catalog: "Catalog",
+        *,
+        cancel_check: CancelCallback | None = None,
+    ) -> None:
         dest_catalog._delete_directory_records(dest_dir_rel)
-        nested_like = descendant_like_pattern(source_dir_rel)
-        directory_rows = [
-            str(row["dir_rel"])
-            for row in self._conn.execute(
-                "SELECT dir_rel FROM directories WHERE dir_rel = ? OR dir_rel LIKE ? ESCAPE '\\'",
-                (source_dir_rel, nested_like),
-            )
-        ]
-        if source_dir_rel not in directory_rows:
-            directory_rows.append(source_dir_rel)
-        for old_dir_rel in sorted(directory_rows):
-            new_dir_rel = self._replace_prefix(old_dir_rel, source_dir_rel, dest_dir_rel)
-            dest_catalog._remember_directory(new_dir_rel)
-        rows = self._conn.execute(
-            "SELECT * FROM images WHERE rel_path = ? OR rel_path LIKE ? ESCAPE '\\'",
-            (source_dir_rel, nested_like),
-        ).fetchall()
-        for row in rows:
-            old_rel_path = str(row["rel_path"])
-            new_rel_path = self._replace_prefix(old_rel_path, source_dir_rel, dest_dir_rel)
-            dest_catalog._insert_transferred_image_row(
-                row,
-                new_rel_path,
-                self.get_image_tags(old_rel_path),
-                source_catalog=self,
-            )
+        descendant_start, descendant_end = descendant_range_bounds(source_dir_rel)
+        # The public move path normally prepared this parent already. Use the
+        # batch helper here as a defensive fallback without re-walking it once
+        # per transferred row (or duplicating the caller's hot-path call).
+        dest_catalog._remember_directories(
+            [dest_catalog._parent_dir_rel(dest_dir_rel)]
+        )
+        directory_cursor = self._conn.execute(
+            """
+            SELECT dir_rel
+            FROM directories
+            WHERE dir_rel = ? OR (dir_rel >= ? AND dir_rel < ?)
+            """,
+            (source_dir_rel, descendant_start, descendant_end),
+        )
+        copied_root = False
+        for rows in iter(
+            lambda: directory_cursor.fetchmany(DIRECTORY_RECORD_TRANSFER_BATCH_SIZE),
+            [],
+        ):
+            if cancel_check is not None:
+                cancel_check()
+            mapped: list[str] = []
+            for row in rows:
+                old_dir_rel = str(row["dir_rel"])
+                copied_root = copied_root or old_dir_rel == source_dir_rel
+                mapped.append(
+                    self._replace_prefix(old_dir_rel, source_dir_rel, dest_dir_rel)
+                )
+            dest_catalog._remember_discovered_directories(mapped)
+        if not copied_root:
+            dest_catalog._remember_discovered_directories([dest_dir_rel])
 
-    def _transfer_db_record(self, source_rel_path: str, dest_rel_path: str, dest_catalog: "Catalog") -> None:
-        self._copy_db_record_to_catalog(source_rel_path, dest_rel_path, dest_catalog)
+        image_cursor = self._conn.execute(
+            """
+            SELECT *
+            FROM images
+            WHERE dir_rel = ? OR (dir_rel >= ? AND dir_rel < ?)
+            """,
+            (source_dir_rel, descendant_start, descendant_end),
+        )
+        while True:
+            if cancel_check is not None:
+                cancel_check()
+            rows = image_cursor.fetchmany(DIRECTORY_RECORD_TRANSFER_BATCH_SIZE)
+            if not rows:
+                break
+            tags_by_image_id = self._tag_names_for_image_ids(
+                [int(row["id"]) for row in rows]
+            )
+            for row in rows:
+                if cancel_check is not None:
+                    cancel_check()
+                old_rel_path = str(row["rel_path"])
+                new_rel_path = self._replace_prefix(
+                    old_rel_path,
+                    source_dir_rel,
+                    dest_dir_rel,
+                )
+                dest_catalog._insert_transferred_image_row(
+                    row,
+                    new_rel_path,
+                    tags_by_image_id.get(int(row["id"]), ()),
+                    source_catalog=self,
+                    remember_directory=False,
+                    cancel_check=cancel_check,
+                )
+
+    def _tag_names_for_image_ids(
+        self,
+        image_ids: Sequence[int],
+    ) -> dict[int, list[str]]:
+        if not image_ids:
+            return {}
+        tags_by_image_id: dict[int, list[str]] = defaultdict(list)
+        variable_limit = SQLITE_VARIABLE_BATCH_SIZE
+        if hasattr(self._conn, "getlimit"):
+            variable_limit = min(
+                variable_limit,
+                self._conn.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER),
+            )
+        for image_id_chunk in batched(image_ids, max(1, variable_limit)):
+            rows = self._conn.execute(
+                f"""
+                SELECT image_tags.image_id, tags.name
+                FROM image_tags
+                JOIN tags ON tags.id = image_tags.tag_id
+                WHERE image_tags.image_id IN ({",".join("?" for _ in image_id_chunk)})
+                ORDER BY image_tags.image_id, tags.name COLLATE NOCASE, tags.name
+                """,
+                image_id_chunk,
+            )
+            for row in rows:
+                tags_by_image_id[int(row["image_id"])].append(str(row["name"]))
+        return dict(tags_by_image_id)
+
+    def _transfer_db_record(
+        self,
+        source_rel_path: str,
+        dest_rel_path: str,
+        dest_catalog: "Catalog",
+        *,
+        remember_directory: bool = True,
+    ) -> None:
+        self._copy_db_record_to_catalog(
+            source_rel_path,
+            dest_rel_path,
+            dest_catalog,
+            remember_directory=remember_directory,
+        )
         with self._database_savepoint("transfer_image_source_delete"):
             self._delete_db_records([source_rel_path])
 
-    def _copy_db_record_to_catalog(self, source_rel_path: str, dest_rel_path: str, dest_catalog: "Catalog") -> None:
+    def _copy_db_record_to_catalog(
+        self,
+        source_rel_path: str,
+        dest_rel_path: str,
+        dest_catalog: "Catalog",
+        *,
+        remember_directory: bool = True,
+    ) -> None:
         row = self._conn.execute("SELECT * FROM images WHERE rel_path = ?", (source_rel_path,)).fetchone()
         tag_names = self.get_image_tags(source_rel_path)
         if row is None:
+            if remember_directory:
+                dest_catalog._remember_directory(dest_catalog._parent_dir_rel(dest_rel_path))
             dest_catalog.index_image(dest_rel_path)
             return
-        dest_catalog._insert_transferred_image_row(row, dest_rel_path, tag_names, source_catalog=self)
+        dest_catalog._insert_transferred_image_row(
+            row,
+            dest_rel_path,
+            tag_names,
+            source_catalog=self,
+            remember_directory=remember_directory,
+        )
 
     def _insert_transferred_image_row(
         self,
@@ -5237,13 +9058,30 @@ class Catalog:
         tag_names: Sequence[str],
         *,
         source_catalog: "Catalog | None" = None,
+        remember_directory: bool = True,
+        cancel_check: CancelCallback | None = None,
     ) -> None:
         dest_path = self.abs_path(dest_rel_path)
         stat = dest_path.stat()
-        image_hash = row["image_hash"]
-        thumb_cache_key = row["thumb_cache_key"]
-        if not is_exact_image_hash(image_hash) or not thumb_cache_key:
-            image_hash, thumb_cache_key = self._image_file_hashes(dest_path)
+        changed_ns = self._path_change_time_ns(dest_path, stat)
+        image_hash, thumb_cache_key = self._image_file_hashes_stable(
+            ImageReadJob(dest_rel_path, dest_path, stat, changed_ns),
+            cancel_check,
+        )
+        source_image_hash = row["image_hash"]
+        if (
+            not is_exact_image_hash(source_image_hash)
+            or str(source_image_hash) != image_hash
+        ):
+            indexed = self.index_image(
+                dest_rel_path,
+                cancel_check=cancel_check,
+                force=True,
+            )
+            if indexed is None:
+                raise OSError(f"destination changed while transfer was being indexed: {dest_rel_path}")
+            self.set_image_tags(dest_rel_path, tag_names, replace=True)
+            return
         perceptual_hash = row["perceptual_hash"]
         color_signature = row["color_signature"]
         if not self._image_similarity_features_current(row):
@@ -5257,7 +9095,8 @@ class Catalog:
         dir_rel = Path(dest_rel_path).parent.as_posix()
         if dir_rel == ".":
             dir_rel = ""
-        self._remember_directory(dir_rel)
+        if remember_directory:
+            self._remember_directory(dir_rel)
         self._conn.execute(
             """
             INSERT INTO images (
@@ -5300,7 +9139,7 @@ class Catalog:
                 stat.st_size,
                 stat.st_mtime_ns,
                 stat.st_mtime_ns,
-                self._path_change_time_ns(dest_path, stat),
+                changed_ns,
                 image_hash,
                 int(row["width"]),
                 int(row["height"]),
@@ -5356,10 +9195,13 @@ class Catalog:
         return f"{dest_prefix}/{suffix}" if dest_prefix else suffix
 
     def _directory_and_descendants(self, dir_rel: str) -> list[str]:
-        nested_like = descendant_like_pattern(dir_rel)
+        descendant_start, descendant_end = descendant_range_bounds(dir_rel)
         rows = self._conn.execute(
-            "SELECT dir_rel FROM directories WHERE dir_rel = ? OR dir_rel LIKE ? ESCAPE '\\'",
-            (dir_rel, nested_like),
+            """
+            SELECT dir_rel FROM directories
+            WHERE dir_rel = ? OR (dir_rel >= ? AND dir_rel < ?)
+            """,
+            (dir_rel, descendant_start, descendant_end),
         )
         dirs = {dir_rel}
         dirs.update(str(row["dir_rel"]) for row in rows)
