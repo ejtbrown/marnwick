@@ -6024,6 +6024,77 @@ class MainWindow(QMainWindow):
         if self._tree_children_tasks or self._tree_tags_tasks:
             QTimer.singleShot(0, self._poll_indexer)
 
+    @staticmethod
+    def _tree_directory_order_key(dir_rel: str) -> tuple[str, str]:
+        return (dir_rel.casefold(), dir_rel)
+
+    @staticmethod
+    def _physical_tree_directory_rel(item: QTreeWidgetItem) -> str | None:
+        if (
+            item.data(0, VIRTUAL_KIND_ROLE)
+            or item.data(0, TREE_LOAD_MORE_ROLE) is not None
+            or item.data(0, TREE_LOAD_MORE_TAGS_ROLE) is not None
+        ):
+            return None
+        dir_rel = item.data(0, DIR_REL_ROLE)
+        return str(dir_rel) if dir_rel else None
+
+    def _insert_tree_directory_item(
+        self,
+        parent: QTreeWidgetItem,
+        item: QTreeWidgetItem,
+        dir_rel: str,
+    ) -> None:
+        """Place one physical directory among its lexical siblings.
+
+        On-demand navigation can materialize a path before background
+        discovery returns earlier siblings.  Every physical insertion and
+        reconciliation uses this helper so arrival order never becomes UI
+        order.  Virtual and load-more rows remain after physical folders.
+        """
+
+        order_key = self._tree_directory_order_key(dir_rel)
+        current_parent = item.parent()
+        if current_parent is not None:
+            current_index = current_parent.indexOfChild(item)
+            if current_index >= 0:
+                if current_parent is parent:
+                    previous_rel = (
+                        self._physical_tree_directory_rel(parent.child(current_index - 1))
+                        if current_index > 0
+                        else None
+                    )
+                    next_rel = (
+                        self._physical_tree_directory_rel(parent.child(current_index + 1))
+                        if current_index + 1 < parent.childCount()
+                        else None
+                    )
+                    previous_is_ordered = current_index == 0 or (
+                        previous_rel is not None
+                        and self._tree_directory_order_key(previous_rel) <= order_key
+                    )
+                    next_is_ordered = next_rel is None or (
+                        order_key <= self._tree_directory_order_key(next_rel)
+                    )
+                    if previous_is_ordered and next_is_ordered:
+                        return
+                current_parent.takeChild(current_index)
+        physical_count = parent.childCount()
+        while physical_count > 0:
+            if self._physical_tree_directory_rel(parent.child(physical_count - 1)) is not None:
+                break
+            physical_count -= 1
+        lower = 0
+        upper = physical_count
+        while lower < upper:
+            middle = (lower + upper) // 2
+            sibling_rel = self._physical_tree_directory_rel(parent.child(middle))
+            if sibling_rel is None or order_key < self._tree_directory_order_key(sibling_rel):
+                upper = middle
+            else:
+                lower = middle + 1
+        parent.insertChild(lower, item)
+
     def rebuild_tree(self) -> None:
         if self._closing:
             return
@@ -6081,7 +6152,7 @@ class MainWindow(QMainWindow):
                 item.setChildIndicatorPolicy(
                     QTreeWidgetItem.ChildIndicatorPolicy.ShowIndicator
                 )
-                parent_item.addChild(item)
+                self._insert_tree_directory_item(parent_item, item, dir_rel)
                 item_by_dir[dir_rel] = item
                 if self._is_current_tree_item(catalog.root, dir_rel):
                     selected_item = item
@@ -6410,11 +6481,13 @@ class MainWindow(QMainWindow):
                     item.setChildIndicatorPolicy(
                         QTreeWidgetItem.ChildIndicatorPolicy.ShowIndicator
                     )
-                    parent_item.addChild(item)
+                    self._insert_tree_directory_item(parent_item, item, dir_rel)
                     task.item_by_dir[dir_rel] = item
                     item_work_this_turn += 1
                     if self._tree_state_key_for_directory(task.catalog.root, dir_rel) in task.expanded_items:
                         item.setExpanded(True)
+                else:
+                    self._insert_tree_directory_item(parent_item, item, dir_rel)
                 task.seen_directories.add(dir_rel)
                 task.rebuilt_item_by_dir[dir_rel] = item
                 if self._is_current_tree_item(task.catalog.root, dir_rel):
@@ -6447,9 +6520,21 @@ class MainWindow(QMainWindow):
                         item.setChildIndicatorPolicy(
                             QTreeWidgetItem.ChildIndicatorPolicy.ShowIndicator
                         )
-                        fallback_parent.addChild(item)
+                        self._insert_tree_directory_item(
+                            fallback_parent,
+                            item,
+                            current_rel,
+                        )
                         task.item_by_dir[current_rel] = item
                         item_work_this_turn += 1
+                    else:
+                        fallback_parent = task.item_by_dir.get(current_parent)
+                        if fallback_parent is not None:
+                            self._insert_tree_directory_item(
+                                fallback_parent,
+                                item,
+                                current_rel,
+                            )
                     task.seen_directories.add(current_rel)
                     task.rebuilt_item_by_dir[current_rel] = item
                     current_parent = current_rel
@@ -6524,7 +6609,6 @@ class MainWindow(QMainWindow):
         if task.selected_item is not None:
             self.tree.setCurrentItem(task.selected_item)
             self._expand_tree_item_ancestors(task.selected_item)
-            self.tree.scrollToItem(task.selected_item)
         self._append_timing_event(
             task.catalog.root,
             "incremental_tree_rebuild_complete",
@@ -6666,8 +6750,10 @@ class MainWindow(QMainWindow):
                 child.setChildIndicatorPolicy(
                     QTreeWidgetItem.ChildIndicatorPolicy.ShowIndicator
                 )
-                task.current_item.addChild(child)
+                self._insert_tree_directory_item(task.current_item, child, next_rel)
                 current_map[next_rel] = child
+            else:
+                self._insert_tree_directory_item(task.current_item, child, next_rel)
             task.current_item.setExpanded(True)
             task.current_item = child
             task.current_rel = next_rel
@@ -7029,8 +7115,10 @@ class MainWindow(QMainWindow):
                     child.setChildIndicatorPolicy(
                         QTreeWidgetItem.ChildIndicatorPolicy.ShowIndicator
                     )
-                    item.addChild(child)
+                    self._insert_tree_directory_item(item, child, dir_rel)
                     item_by_dir[dir_rel] = child
+                else:
+                    self._insert_tree_directory_item(item, child, dir_rel)
                 active_build = self._tree_build_task
                 if active_build is not None and active_build.catalog is catalog:
                     active_build.seen_directories.add(dir_rel)
@@ -11424,12 +11512,30 @@ class MainWindow(QMainWindow):
                 order=order,
                 index=start_index,
             )
-        viewer = FullscreenViewer(catalog, navigator, self, wipe_on_delete=self.wipe_on_delete_enabled())
-        viewer.exec_fullscreen()
-        last_viewed = viewer.last_viewed_rel_path
-        viewer.deleteLater()
-        if self.current_catalog is catalog:
-            self.select_rel_path(last_viewed)
+        tree_scroll_position = self._tree_scroll_position()
+        viewer = FullscreenViewer(
+            catalog,
+            navigator,
+            self,
+            wipe_on_delete=self.wipe_on_delete_enabled(),
+        )
+        last_viewed: str | None = None
+        try:
+            viewer.exec_fullscreen()
+            last_viewed = viewer.last_viewed_rel_path
+        finally:
+            viewer.deleteLater()
+            if last_viewed is not None and self.current_catalog is catalog:
+                self.select_rel_path(last_viewed)
+            # Modal activation and any discovery publication that completed
+            # behind the viewer must not repurpose the user's tree viewport.
+            self._restore_tree_scroll_position(tree_scroll_position)
+            QTimer.singleShot(
+                0,
+                lambda position=tree_scroll_position: self._restore_tree_scroll_position(
+                    position
+                ),
+            )
 
     def navigate_to_directory(self, dir_rel: str, *, catalog: Catalog | None = None) -> None:
         catalog = catalog or self.current_catalog

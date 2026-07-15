@@ -4568,6 +4568,74 @@ def test_move_refresh_preserves_directory_tree_scrollbar(tmp_path: Path) -> None
         qt_app.processEvents()
 
 
+def test_fullscreen_exit_restores_directory_tree_scrollbar(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    for index in range(100):
+        (root / f"dir-{index:03d}").mkdir(parents=True)
+    Image.new("RGB", (8, 8), (10, 20, 30)).save(root / "image.jpg")
+
+    window = MainWindow()
+
+    class FakeViewer:
+        def __init__(self, _catalog, navigator, parent, **_kwargs):  # type: ignore[no-untyped-def]
+            self.last_viewed_rel_path = navigator.current
+            self.parent = parent
+
+        def exec_fullscreen(self) -> None:
+            scroll_bar = self.parent.tree.verticalScrollBar()
+            scroll_bar.setValue(scroll_bar.maximum())
+            qt_app.processEvents()
+
+        def deleteLater(self) -> None:  # noqa: N802 - Qt-compatible fake
+            return None
+
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        catalog.refresh()
+        window.current_catalog = catalog
+        window.current_dir_rel = ""
+        window.resize(520, 260)
+        window.show()
+        window.rebuild_tree()
+        settle_tree_build_tasks(window, qt_app)
+        window.load_current_directory()
+        settle_virtual_view_tasks(window, qt_app)
+
+        scroll_bar = window.tree.verticalScrollBar()
+        deadline = monotonic() + 1.0
+        while scroll_bar.maximum() == 0 and monotonic() < deadline:
+            qt_app.processEvents()
+            sleep(0.01)
+        assert scroll_bar.maximum() > 0
+        original_position = max(1, scroll_bar.maximum() // 3)
+        scroll_bar.setValue(original_position)
+        image_row = next(
+            row
+            for row, record in enumerate(window.model.images)
+            if isinstance(record, ImageRecord) and record.rel_path == "image.jpg"
+        )
+        monkeypatch.setattr(ui_module, "FullscreenViewer", FakeViewer)
+
+        window.open_viewer(window.model.index(image_row, 0), random_mode=False)
+        qt_app.processEvents()
+
+        assert scroll_bar.value() == original_position
+    finally:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        window.indexer.shutdown()
+        window.workspace.close()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
 def test_right_pane_shows_directory_tiles_before_images_and_navigates(tmp_path: Path) -> None:
     qt_app = app()
     root = tmp_path / "catalog"
@@ -5755,6 +5823,66 @@ def test_open_catalog_discovers_directory_tree_without_waiting_for_image_index(t
         nested = child.child(0)
         assert nested is not None
         assert nested.data(0, DIR_REL_ROLE) == "empty/nested"
+    finally:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        window.indexer.shutdown()
+        window.workspace.close()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_out_of_order_directory_navigation_stays_lexically_sorted_after_discovery(
+    tmp_path: Path,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    for name in ("alpha", "middle", "zeta"):
+        (root / name).mkdir(parents=True)
+
+    window = MainWindow()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        window.current_catalog = catalog
+        window.current_dir_rel = ""
+        window._shallow_tree_roots.add(catalog.root)
+        window.rebuild_tree()
+
+        # This is the user-visible race: the right pane knows the filesystem
+        # entry before recursive discovery has recorded its lexical siblings.
+        window.navigate_to_directory("zeta")
+        root_item = window._tree_item_maps[catalog.root][""]
+        assert any(
+            root_item.child(index).data(0, DIR_REL_ROLE) == "zeta"
+            for index in range(root_item.childCount())
+        )
+
+        catalog.discover_directories()
+        window._shallow_tree_roots.discard(catalog.root)
+        window._request_incremental_tree_rebuild(
+            catalog,
+            reason="test_directory_discovery",
+        )
+        settle_tree_build_tasks(window, qt_app)
+
+        deadline = monotonic() + 2.0
+        while window._tree_children_tasks and monotonic() < deadline:
+            qt_app.processEvents()
+            window._settle_tree_children_tasks()
+            sleep(0.01)
+        window._settle_tree_children_tasks()
+        physical_children = [
+            root_item.child(index).data(0, DIR_REL_ROLE)
+            for index in range(root_item.childCount())
+            if not root_item.child(index).data(0, VIRTUAL_KIND_ROLE)
+            and root_item.child(index).data(0, ui_module.TREE_LOAD_MORE_ROLE) is None
+        ]
+
+        assert physical_children == ["alpha", "middle", "zeta"]
+        assert root_item.child(root_item.childCount() - 1).data(0, VIRTUAL_KIND_ROLE)
     finally:
         window.progress_timer.stop()
         window.idle_timer.stop()
