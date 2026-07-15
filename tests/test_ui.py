@@ -902,7 +902,7 @@ def test_clone_brush_drag_moves_source_with_target(tmp_path: Path) -> None:
             viewer.base_pixmap.fill()
             viewer.start_region_edit("clone_heal")
             viewer.clone_source_center = (10, 10)
-            viewer.clone_drag_start_target = (50, 50)
+            viewer.clone_alignment_target = (50, 50)
             viewer.clone_brush_radius_label = 10
 
             viewer.paint_clone_to((50, 50))
@@ -918,6 +918,91 @@ def test_clone_brush_drag_moves_source_with_target(tmp_path: Path) -> None:
             assert viewer.display_preview_image is not None
             assert viewer.preview_image is None
             assert viewer.preview_path is None
+        finally:
+            viewer.operations.clear()
+            viewer.close()
+            viewer.deleteLater()
+            qt_app.processEvents()
+
+
+def test_clone_brush_keeps_source_aligned_across_separate_strokes(tmp_path: Path) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    Image.new("RGB", (100, 100), (10, 20, 30)).save(root / "image.jpg")
+
+    with Catalog(root) as catalog:
+        viewer = FullscreenViewer(catalog, ImageNavigator.sequential(["image.jpg"], "image.jpg"))
+        try:
+            viewer.label.resize(100, 100)
+            viewer.base_pixmap = QPixmap(100, 100)
+            viewer.base_pixmap.fill()
+            viewer._fit_pixmap()
+            viewer.start_region_edit("clone_heal")
+            viewer.clone_brush_radius_label = 10
+
+            def send_mouse_event(
+                event_type: QEvent.Type,
+                point: QPointF,
+                button: Qt.MouseButton,
+                buttons: Qt.MouseButton,
+            ) -> None:
+                qt_app.sendEvent(
+                    viewer.label,
+                    QMouseEvent(
+                        event_type,
+                        point,
+                        point,
+                        point,
+                        button,
+                        buttons,
+                        Qt.KeyboardModifier.NoModifier,
+                    ),
+                )
+
+            source = QPointF(10, 20)
+            first_target = QPointF(40, 50)
+            second_target = QPointF(60, 40)
+            send_mouse_event(
+                QEvent.Type.MouseButtonPress,
+                source,
+                Qt.MouseButton.RightButton,
+                Qt.MouseButton.RightButton,
+            )
+            send_mouse_event(
+                QEvent.Type.MouseButtonPress,
+                first_target,
+                Qt.MouseButton.LeftButton,
+                Qt.MouseButton.LeftButton,
+            )
+            send_mouse_event(
+                QEvent.Type.MouseButtonRelease,
+                first_target,
+                Qt.MouseButton.LeftButton,
+                Qt.MouseButton.NoButton,
+            )
+            send_mouse_event(
+                QEvent.Type.MouseMove,
+                second_target,
+                Qt.MouseButton.NoButton,
+                Qt.MouseButton.NoButton,
+            )
+            send_mouse_event(
+                QEvent.Type.MouseButtonPress,
+                second_target,
+                Qt.MouseButton.LeftButton,
+                Qt.MouseButton.LeftButton,
+            )
+
+            first = viewer.operations[0].params or {}
+            second = viewer.operations[-1].params or {}
+
+            assert len(viewer.operations) == 2
+            assert first["source_center"] == (10, 20)
+            assert first["target_center"] == (40, 50)
+            assert second["source_center"] == (30, 10)
+            assert second["target_center"] == (60, 40)
+            assert viewer.clone_alignment_target == (40, 50)
         finally:
             viewer.operations.clear()
             viewer.close()

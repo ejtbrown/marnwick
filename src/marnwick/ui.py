@@ -14196,7 +14196,7 @@ class FullscreenViewer(QDialog):
         self.clone_source_center: tuple[int, int] | None = None
         self.clone_brush_radius_label = 32
         self.clone_painting = False
-        self.clone_drag_start_target: tuple[int, int] | None = None
+        self.clone_alignment_target: tuple[int, int] | None = None
         self.clone_last_target: tuple[int, int] | None = None
         self.drag_origin: QPoint | None = None
         self.preview_path: Path | None = None
@@ -14457,7 +14457,7 @@ class FullscreenViewer(QDialog):
             if image_point is not None:
                 self.clone_source_center = image_point
                 self.clone_painting = False
-                self.clone_drag_start_target = None
+                self.clone_alignment_target = None
                 self.clone_last_target = None
                 self.update_clone_overlay(point)
             return True
@@ -14470,13 +14470,13 @@ class FullscreenViewer(QDialog):
             if self.clone_source_center is None:
                 return True
             self.clone_painting = True
-            self.clone_drag_start_target = image_point
+            if self.clone_alignment_target is None:
+                self.clone_alignment_target = image_point
             self.clone_last_target = None
             self.paint_clone_to(image_point)
             return True
         if event_type == QEvent.Type.MouseButtonRelease and event.button() == Qt.MouseButton.LeftButton:  # type: ignore[attr-defined]
             self.clone_painting = False
-            self.clone_drag_start_target = None
             self.clone_last_target = None
             self.update_clone_overlay(event.position().toPoint())  # type: ignore[attr-defined]
             return True
@@ -15824,7 +15824,7 @@ class FullscreenViewer(QDialog):
         self.rubber_band.hide()
         self.clone_source_center = None
         self.clone_painting = False
-        self.clone_drag_start_target = None
+        self.clone_alignment_target = None
         self.clone_last_target = None
         if mode == "clone_heal":
             self.clone_overlay.setGeometry(self.label.rect())
@@ -15842,7 +15842,7 @@ class FullscreenViewer(QDialog):
         self.edit_mode = None
         self.clone_source_center = None
         self.clone_painting = False
-        self.clone_drag_start_target = None
+        self.clone_alignment_target = None
         self.clone_last_target = None
         self.drag_origin = None
         if hasattr(self, "rubber_band"):
@@ -15982,13 +15982,13 @@ class FullscreenViewer(QDialog):
             return
         if self.clone_source_center is None:
             return
-        if self.clone_drag_start_target is None:
-            self.clone_drag_start_target = target
+        if self.clone_alignment_target is None:
+            self.clone_alignment_target = target
         image_radius = self.image_radius_from_label_radius()
         operations: list[EditOperation] = []
         for sample in self.clone_stroke_samples(self.clone_last_target, target, image_radius):
-            delta_x = sample[0] - self.clone_drag_start_target[0]
-            delta_y = sample[1] - self.clone_drag_start_target[1]
+            delta_x = sample[0] - self.clone_alignment_target[0]
+            delta_y = sample[1] - self.clone_alignment_target[1]
             source = (self.clone_source_center[0] + delta_x, self.clone_source_center[1] + delta_y)
             operations.append(
                 EditOperation(
