@@ -12188,6 +12188,75 @@ def test_automatic_tree_materialization_is_capped(tmp_path: Path, monkeypatch) -
         qt_app.processEvents()
 
 
+def test_capped_tree_reloads_root_page_read_before_discovery_finished(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    window = MainWindow()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        window.current_catalog = catalog
+        window.current_dir_rel = ""
+        for dir_rel in (
+            "alpha",
+            "alpha/child-0",
+            "alpha/child-1",
+            "alpha/child-2",
+            "alpha/child-3",
+            "omega",
+        ):
+            catalog.remember_directory(dir_rel)
+
+        # A flat automatic build can spend its whole item budget in the first
+        # lexical branch. The root child page is what makes a later sibling
+        # such as ``omega`` visible. Model the large-catalog race where that
+        # page began before discovery committed the later sibling and is
+        # still registered when the completed inventory asks for a refresh.
+        monkeypatch.setattr(ui_module, "MAX_AUTOMATIC_TREE_ITEMS", 5)
+        monkeypatch.setattr(ui_module, "TREE_BUILD_BATCH_SIZE", 2)
+        monkeypatch.setattr(ui_module, "TREE_BUILD_BUDGET_SECONDS", 999.0)
+        stale_future: Future[ui_module.TreeChildrenPageResult] = Future()
+        stale_future.set_result(
+            ui_module.TreeChildrenPageResult(
+                root=catalog.root,
+                parent_dir_rel="",
+                offset=0,
+                directories=["alpha"],
+                next_offset=1,
+                has_more=False,
+            )
+        )
+        window._tree_children_tasks[stale_future] = ui_module.TreeChildrenTask(
+            catalog=catalog,
+            parent_dir_rel="",
+            offset=0,
+            future=stale_future,
+            cancel_event=Event(),
+        )
+
+        window._start_incremental_tree_rebuild(catalog, reason="directory_discovery")
+        settle_tree_build_tasks(window, qt_app)
+        window._settle_tree_children_tasks()
+        deadline = monotonic() + 2.0
+        while window._tree_children_tasks and monotonic() < deadline:
+            qt_app.processEvents()
+            window._settle_tree_children_tasks()
+            sleep(0.001)
+
+        item_map = window._tree_item_maps[catalog.root]
+        assert "omega" in item_map
+        assert item_map["omega"].parent() is item_map[""]
+    finally:
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
 def test_expanded_tree_branch_loads_direct_children_in_explicit_pages(
     tmp_path: Path,
     monkeypatch,

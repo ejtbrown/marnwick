@@ -3072,6 +3072,10 @@ class MainWindow(QMainWindow):
         self._tree_path_selection_generation = 0
         self._tree_children_tasks: dict[Future[TreeChildrenPageResult], TreeChildrenTask] = {}
         self._tree_child_next_offsets: dict[tuple[Path, str], int | None] = {}
+        # A completed discovery/rebuild can require a fresh offset-zero page
+        # while an older page for the same parent is still registered. Keep
+        # that intent until the stale task settles instead of dropping it.
+        self._tree_child_refresh_pending: set[tuple[Path, str]] = set()
         self._tree_tags_tasks: dict[Future[TreeTagsPageResult], TreeTagsTask] = {}
         self._tree_tag_next_offsets: dict[Path, int | None] = {}
         self._tree_tag_cache: dict[Path, tuple[str, ...]] = {}
@@ -3280,6 +3284,7 @@ class MainWindow(QMainWindow):
             task.cancel_event.set()
             future.cancel()
         self._tree_children_tasks.clear()
+        self._tree_child_refresh_pending.clear()
         for future, task in list(self._tree_tags_tasks.items()):
             task.cancel_event.set()
             future.cancel()
@@ -5859,6 +5864,9 @@ class MainWindow(QMainWindow):
             for key, offset in self._tree_child_next_offsets.items()
             if key[0] != resolved
         }
+        self._tree_child_refresh_pending = {
+            key for key in self._tree_child_refresh_pending if key[0] != resolved
+        }
         for future, task in list(self._tree_tags_tasks.items()):
             if task.catalog.root != resolved:
                 continue
@@ -6112,6 +6120,7 @@ class MainWindow(QMainWindow):
             future.cancel()
         self._tree_tags_tasks.clear()
         self._tree_child_next_offsets.clear()
+        self._tree_child_refresh_pending.clear()
         self._pending_tree_rebuilds.clear()
         expanded_items = self._expanded_tree_items()
         known_items = self._known_tree_items()
@@ -6245,6 +6254,23 @@ class MainWindow(QMainWindow):
             # Keep the previous fixed virtual subtree visible while the page
             # read is in flight. It is replaced atomically after the physical
             # tree has caught up.
+        # Child pages may have been read while discovery was still committing
+        # its inventory. Their terminal offsets and childless indicators are
+        # no longer authoritative once this rebuild starts from the completed
+        # database view. Invalidate them now; the root and expanded branches
+        # are reconciled after the bounded flat build.
+        self._tree_child_next_offsets = {
+            key: offset
+            for key, offset in self._tree_child_next_offsets.items()
+            if key[0] != catalog.root
+        }
+        self._tree_child_refresh_pending = {
+            key for key in self._tree_child_refresh_pending if key[0] != catalog.root
+        }
+        for item in item_by_dir.values():
+            item.setChildIndicatorPolicy(
+                QTreeWidgetItem.ChildIndicatorPolicy.ShowIndicator
+            )
         root_item.setExpanded(True)
         self._tree_build_task = TreeBuildTask(
             catalog=catalog,
@@ -6619,19 +6645,18 @@ class MainWindow(QMainWindow):
         self._start_next_pending_tree_rebuild()
         if self.current_catalog is task.catalog:
             reconcile_rels = {""}
+            reconcile_rels.update(
+                key[2]
+                for key in task.expanded_items
+                if key[0] == task.catalog.root
+                and key[1] == "dir"
+                and key[2] in task.item_by_dir
+            )
             if self.current_virtual_kind is None and self.current_dir_rel:
                 reconcile_rels.add(self.current_dir_rel.rpartition("/")[0])
             for dir_rel in reconcile_rels:
-                QTimer.singleShot(
-                    0,
-                    lambda root=task.catalog.root, rel=dir_rel: (
-                        self._request_tree_children_for_directory(
-                            root,
-                            rel,
-                            offset=0,
-                        )
-                    ),
-                )
+                self._tree_child_refresh_pending.add((task.catalog.root, dir_rel))
+            QTimer.singleShot(0, self._submit_pending_tree_child_refresh)
 
     def _start_next_pending_tree_rebuild(self) -> None:
         if self._closing:
@@ -6999,6 +7024,8 @@ class MainWindow(QMainWindow):
             task.catalog is catalog and task.parent_dir_rel == parent_dir_rel
             for task in self._tree_children_tasks.values()
         ):
+            if offset == 0:
+                self._tree_child_refresh_pending.add(key)
             return
         self._remove_tree_load_more_items(item)
         cancel_event = Event()
@@ -7140,6 +7167,49 @@ class MainWindow(QMainWindow):
                     task.parent_dir_rel,
                     next_offset,
                 )
+        self._submit_pending_tree_child_refresh()
+
+    def _submit_pending_tree_child_refresh(self) -> None:
+        """Submit one deferred offset-zero child reconciliation.
+
+        The tree reader admits only one page at a time. Serializing pending
+        refreshes here retains that bound and, importantly, lets a discovery
+        refresh survive an older page for the same parent instead of treating
+        the stale page as the final inventory.
+        """
+
+        if (
+            self._closing
+            or self._tree_publication_blocked()
+            or self._tree_build_task is not None
+            or self._tree_children_tasks
+        ):
+            return
+        while self._tree_child_refresh_pending:
+            root, dir_rel = min(
+                self._tree_child_refresh_pending,
+                key=lambda value: (
+                    0
+                    if self.current_catalog is not None
+                    and value[0] == self.current_catalog.root
+                    else 1,
+                    value[1].count("/"),
+                    value[1].casefold(),
+                    value[1],
+                ),
+            )
+            catalog = self.workspace.catalog_for_exact_root(root)
+            item = self._tree_item_maps.get(root, {}).get(dir_rel)
+            if catalog is None or item is None:
+                self._tree_child_refresh_pending.discard((root, dir_rel))
+                continue
+            self._request_tree_children(item, offset=0)
+            if any(
+                task.catalog is catalog and task.parent_dir_rel == dir_rel
+                for task in self._tree_children_tasks.values()
+            ):
+                self._tree_child_refresh_pending.discard((root, dir_rel))
+            return
 
     @staticmethod
     def _read_tree_tags_page_worker(
