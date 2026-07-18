@@ -4613,7 +4613,9 @@ def test_move_payload_removal_keeps_thumbnail_scroll_anchored(tmp_path: Path, mo
         qt_app.processEvents()
 
 
-def test_move_refresh_preserves_directory_tree_scrollbar(tmp_path: Path) -> None:
+def test_move_refresh_preserves_directory_tree_scrollbar_through_async_rebuild(
+    tmp_path: Path,
+) -> None:
     qt_app = app()
     root = tmp_path / "catalog"
     for index in range(80):
@@ -4623,6 +4625,7 @@ def test_move_refresh_preserves_directory_tree_scrollbar(tmp_path: Path) -> None
     try:
         window.progress_timer.stop()
         window.idle_timer.stop()
+        assert not window.tree.hasAutoScroll()
         catalog = window.workspace.open_catalog(root)
         catalog.discover_directories()
         window.current_catalog = catalog
@@ -4636,13 +4639,15 @@ def test_move_refresh_preserves_directory_tree_scrollbar(tmp_path: Path) -> None
             sleep(0.01)
         scroll_bar = window.tree.verticalScrollBar()
         assert scroll_bar.maximum() > 0
-        scroll_bar.setValue(0)
+        expected_scroll = min(25, scroll_bar.maximum())
+        assert expected_scroll > 0
+        scroll_bar.setValue(expected_scroll)
         qt_app.processEvents()
 
         window._refresh_after_move_payload({catalog.root})
-        qt_app.processEvents()
+        settle_tree_build_tasks(window, qt_app)
 
-        assert scroll_bar.value() == 0
+        assert scroll_bar.value() == expected_scroll
     finally:
         window.progress_timer.stop()
         window.idle_timer.stop()

@@ -2774,9 +2774,20 @@ class DirectoryTree(QTreeWidget):
         self.setHeaderHidden(True)
         self.setAcceptDrops(True)
         self.setDragEnabled(True)
+        # Qt's item-view drag autoscroll changes the navigation viewport merely
+        # because a file is hovering near an edge. The folder tree is a stable
+        # drop-target surface; scrolling it remains an explicit user action.
+        self.setAutoScroll(False)
         self.setDropIndicatorShown(True)
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.customContextMenuRequested.connect(self._open_context_menu)
+        for scroll_bar in (self.verticalScrollBar(), self.horizontalScrollBar()):
+            scroll_bar.sliderPressed.connect(
+                self.window._cancel_tree_scroll_preservation
+            )
+            scroll_bar.actionTriggered.connect(
+                lambda _action: self.window._cancel_tree_scroll_preservation()
+            )
 
     def startDrag(self, supported_actions: Qt.DropAction) -> None:
         item = self.currentItem()
@@ -3102,6 +3113,8 @@ class MainWindow(QMainWindow):
         self._unavailable_catalog_paths: list[str] = []
         self._directory_drag_active = False
         self._tree_rebuild_deferred = False
+        self._tree_scroll_preservation_generation = 0
+        self._tree_scroll_preservation: tuple[int, tuple[int, int]] | None = None
         self._physical_pane_generation = 0
         self._last_physical_progress_reload_at = 0.0
         self._pending_physical_progress_reload: tuple[Path, str, SortOrder] | None = None
@@ -7531,15 +7544,16 @@ class MainWindow(QMainWindow):
         if self._closing:
             return
         tree_scroll_position = self._tree_scroll_position() if preserve_tree_scroll else None
+        tree_scroll_generation = (
+            self._begin_tree_scroll_preservation(tree_scroll_position)
+            if tree_scroll_position is not None
+            else None
+        )
         self._ensure_current_directory_exists()
         self.rebuild_tree()
         self.load_current_directory(preserve_selection=preserve_selection)
-        if tree_scroll_position is not None:
-            self._restore_tree_scroll_position(tree_scroll_position)
-            QTimer.singleShot(
-                0,
-                lambda position=tree_scroll_position: self._restore_tree_scroll_position(position),
-            )
+        if tree_scroll_generation is not None:
+            self._continue_tree_scroll_preservation(tree_scroll_generation)
 
     def _ensure_current_directory_exists(self) -> None:
         catalog = self.current_catalog
@@ -7562,6 +7576,52 @@ class MainWindow(QMainWindow):
             self.tree.verticalScrollBar().value(),
             self.tree.horizontalScrollBar().value(),
         )
+
+    def _begin_tree_scroll_preservation(self, position: tuple[int, int]) -> int:
+        self._tree_scroll_preservation_generation += 1
+        generation = self._tree_scroll_preservation_generation
+        self._tree_scroll_preservation = (generation, position)
+        return generation
+
+    def _cancel_tree_scroll_preservation(self) -> None:
+        self._tree_scroll_preservation_generation += 1
+        self._tree_scroll_preservation = None
+
+    def _continue_tree_scroll_preservation(self, generation: int) -> None:
+        preservation = self._tree_scroll_preservation
+        if (
+            self._closing
+            or preservation is None
+            or preservation[0] != generation
+        ):
+            return
+        position = preservation[1]
+        self._restore_tree_scroll_position(position)
+        vertical, horizontal = position
+        vertical_bar = self.tree.verticalScrollBar()
+        horizontal_bar = self.tree.horizontalScrollBar()
+        position_is_representable = (
+            vertical <= vertical_bar.maximum()
+            and horizontal <= horizontal_bar.maximum()
+        )
+        if (
+            not position_is_representable
+            and (
+                self._tree_rebuild_deferred
+                or self._tree_build_task is not None
+                or bool(self._pending_tree_rebuilds)
+                or self._tree_path_selection_task is not None
+                or bool(self._tree_children_tasks)
+                or bool(self._tree_child_refresh_pending)
+            )
+        ):
+            QTimer.singleShot(
+                TREE_PAGE_POLL_INTERVAL_MS,
+                partial(self._continue_tree_scroll_preservation, generation),
+            )
+            return
+        if self._tree_scroll_preservation == preservation:
+            self._tree_scroll_preservation = None
 
     def _restore_tree_scroll_position(self, position: tuple[int, int]) -> None:
         if self._closing:
