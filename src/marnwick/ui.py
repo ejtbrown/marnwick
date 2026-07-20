@@ -506,6 +506,7 @@ class MovePayloadTask:
     edit_operations: tuple[EditOperation, ...] = ()
     edit_owner: QWidget | None = None
     navigation_owner: FullscreenViewer | None = None
+    hide_sources: bool = True
 
 
 @dataclass(slots=True)
@@ -526,6 +527,7 @@ class MoveIdentityPreflightTask:
     affected_roots: set[Path]
     wipe_on_delete: bool
     future: Future[MutationIdentityResult]
+    copy_requested: bool = False
 
 
 @dataclass(slots=True)
@@ -2173,7 +2175,7 @@ class ThumbnailModel(QAbstractListModel):
         return flags
 
     def supportedDragActions(self) -> Qt.DropAction:
-        return Qt.DropAction.MoveAction
+        return Qt.DropAction.MoveAction | Qt.DropAction.CopyAction
 
     def mimeTypes(self) -> list[str]:
         return [self.MIME_TYPE]
@@ -2432,6 +2434,8 @@ class ThumbnailView(QListView):
     DRAG_ICON_SIZE = 72
     _single_drag_pixmap: QPixmap | None = None
     _multi_drag_pixmap: QPixmap | None = None
+    _single_copy_drag_pixmap: QPixmap | None = None
+    _multi_copy_drag_pixmap: QPixmap | None = None
 
     def __init__(self, window: "MainWindow | None" = None) -> None:
         super().__init__()
@@ -2443,6 +2447,7 @@ class ThumbnailView(QListView):
         self._drag_destination_root: Path | None = None
         self._drag_destination_dir_rel: str | None = None
         self._manual_drag_active = False
+        self._drag_copy_requested = False
         self._drag_cursor_active = False
         self._drag_cursor_restore_count = 0
         self._manual_drag_watchdog = QTimer(self)
@@ -2524,7 +2529,18 @@ class ThumbnailView(QListView):
             self.cleanup_manual_drag()
             event.accept()
             return
+        if self._manual_drag_active:
+            self._set_drag_copy_requested(
+                bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier)
+            )
         super().keyPressEvent(event)
+
+    def keyReleaseEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        if self._manual_drag_active:
+            self._set_drag_copy_requested(
+                bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier)
+            )
+        super().keyReleaseEvent(event)
 
     def wheelEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         if self.main_window is not None:
@@ -2557,7 +2573,15 @@ class ThumbnailView(QListView):
         drag.setPixmap(drag_pixmap)
         drag.setHotSpot(hotspot)
         drag.setDragCursor(drag_pixmap, Qt.DropAction.MoveAction)
-        drag.exec(supported_actions, Qt.DropAction.MoveAction)
+        copy_pixmap = self.static_drag_pixmap(
+            multiple=len(indexes) > 1,
+            copy=True,
+        )
+        drag.setDragCursor(copy_pixmap, Qt.DropAction.CopyAction)
+        drag.exec(
+            supported_actions | Qt.DropAction.CopyAction,
+            Qt.DropAction.MoveAction,
+        )
 
     def selected_drag_indexes(self) -> list[QModelIndex]:
         selection = self.selectionModel()
@@ -2588,7 +2612,14 @@ class ThumbnailView(QListView):
             return False
         self._drag_indexes = valid_indexes
         self._drag_payload = payload
-        drag_pixmap = self.drag_pixmap_for_indexes(valid_indexes)
+        self._drag_copy_requested = bool(
+            QApplication.keyboardModifiers()
+            & Qt.KeyboardModifier.ControlModifier
+        )
+        drag_pixmap = self.static_drag_pixmap(
+            multiple=len(valid_indexes) > 1,
+            copy=self._drag_copy_requested,
+        )
         hotspot = QPoint(int(drag_pixmap.width() / 2), int(drag_pixmap.height() / 2))
         self._manual_drag_active = True
         self._drag_cursor_active = True
@@ -2607,12 +2638,24 @@ class ThumbnailView(QListView):
             self._manual_drag_watchdog.stop()
             return
         global_pos = QCursor.pos()
+        self._set_drag_copy_requested(
+            bool(
+                QApplication.keyboardModifiers()
+                & Qt.KeyboardModifier.ControlModifier
+            )
+        )
         if QApplication.mouseButtons() & Qt.MouseButton.LeftButton:
             self.update_manual_drag(global_pos)
             return
         self.finish_manual_drag(global_pos)
 
     def update_manual_drag(self, global_pos: QPoint) -> None:
+        self._set_drag_copy_requested(
+            bool(
+                QApplication.keyboardModifiers()
+                & Qt.KeyboardModifier.ControlModifier
+            )
+        )
         item = self.tree_item_at_global(global_pos)
         self._drag_destination_item = item
         self._drag_destination_root = None
@@ -2631,7 +2674,7 @@ class ThumbnailView(QListView):
             self._drag_destination_dir_rel = record.dir_rel
 
     def finish_manual_drag(self, global_pos: QPoint) -> None:
-        move_request: tuple["MainWindow", list[dict[str, str]], Path, str] | None = None
+        move_request: tuple["MainWindow", list[dict[str, str]], Path, str, bool] | None = None
         try:
             self.update_manual_drag(global_pos)
             if (
@@ -2647,19 +2690,45 @@ class ThumbnailView(QListView):
                         payload,
                         self._drag_destination_root,
                         self._drag_destination_dir_rel,
+                        self._drag_copy_requested,
                     )
         finally:
             self.cleanup_manual_drag()
         if move_request is not None:
-            window, payload, root, dir_rel = move_request
+            window, payload, root, dir_rel, copy_requested = move_request
             QTimer.singleShot(
                 0,
                 lambda: (
                     None
                     if window._closing
-                    else window.move_payload_to_directory(payload, root, dir_rel)
+                    else (
+                        window.move_payload_to_directory(
+                            payload,
+                            root,
+                            dir_rel,
+                            copy=True,
+                        )
+                        if copy_requested
+                        else window.move_payload_to_directory(payload, root, dir_rel)
+                    )
                 ),
             )
+
+    def _set_drag_copy_requested(self, copy_requested: bool) -> None:
+        if (
+            not self._manual_drag_active
+            or self._drag_copy_requested == copy_requested
+        ):
+            return
+        self._drag_copy_requested = copy_requested
+        if not self._drag_cursor_active or QApplication.overrideCursor() is None:
+            return
+        pixmap = self.static_drag_pixmap(
+            multiple=len(self._drag_indexes) > 1,
+            copy=copy_requested,
+        )
+        hotspot = QPoint(int(pixmap.width() / 2), int(pixmap.height() / 2))
+        QApplication.changeOverrideCursor(QCursor(pixmap, hotspot.x(), hotspot.y()))
 
     def cleanup_manual_drag(self) -> None:
         was_active = self._manual_drag_active
@@ -2677,6 +2746,7 @@ class ThumbnailView(QListView):
         self._drag_destination_root = None
         self._drag_destination_dir_rel = None
         self._manual_drag_active = False
+        self._drag_copy_requested = False
         self._drag_cursor_active = False
         if was_active and self.main_window is not None:
             # A thumbnail drag deliberately freezes tree publication so its
@@ -2729,17 +2799,37 @@ class ThumbnailView(QListView):
         return payload if isinstance(payload, list) else []
 
     @classmethod
-    def static_drag_pixmap(cls, *, multiple: bool) -> QPixmap:
+    def static_drag_pixmap(cls, *, multiple: bool, copy: bool = False) -> QPixmap:
+        if copy:
+            if multiple:
+                if cls._multi_copy_drag_pixmap is None:
+                    cls._multi_copy_drag_pixmap = cls._build_static_drag_pixmap(
+                        multiple=True,
+                        copy=True,
+                    )
+                return cls._multi_copy_drag_pixmap
+            if cls._single_copy_drag_pixmap is None:
+                cls._single_copy_drag_pixmap = cls._build_static_drag_pixmap(
+                    multiple=False,
+                    copy=True,
+                )
+            return cls._single_copy_drag_pixmap
         if multiple:
             if cls._multi_drag_pixmap is None:
-                cls._multi_drag_pixmap = cls._build_static_drag_pixmap(multiple=True)
+                cls._multi_drag_pixmap = cls._build_static_drag_pixmap(
+                    multiple=True,
+                    copy=False,
+                )
             return cls._multi_drag_pixmap
         if cls._single_drag_pixmap is None:
-            cls._single_drag_pixmap = cls._build_static_drag_pixmap(multiple=False)
+            cls._single_drag_pixmap = cls._build_static_drag_pixmap(
+                multiple=False,
+                copy=False,
+            )
         return cls._single_drag_pixmap
 
     @classmethod
-    def _build_static_drag_pixmap(cls, *, multiple: bool) -> QPixmap:
+    def _build_static_drag_pixmap(cls, *, multiple: bool, copy: bool) -> QPixmap:
         size = cls.DRAG_ICON_SIZE
         pixmap = QPixmap(size, size)
         pixmap.fill(Qt.GlobalColor.transparent)
@@ -2751,6 +2841,13 @@ class ThumbnailView(QListView):
             cls._draw_photo_icon(painter, QRect(24, 24, 38, 30), "#ffffff", "#1d4ed8")
         else:
             cls._draw_photo_icon(painter, QRect(12, 14, 48, 38), "#ffffff", "#1d4ed8")
+        if copy:
+            painter.setPen(QPen(QColor("#ffffff"), 2))
+            painter.setBrush(QBrush(QColor("#16a34a")))
+            painter.drawEllipse(QRect(43, 43, 25, 25))
+            painter.setPen(QPen(QColor("#ffffff"), 4))
+            painter.drawLine(QPoint(49, 55), QPoint(62, 55))
+            painter.drawLine(QPoint(55, 49), QPoint(55, 62))
         painter.end()
         return pixmap
 
@@ -2894,8 +2991,21 @@ class DirectoryTree(QTreeWidget):
         except (UnicodeDecodeError, json.JSONDecodeError):
             event.ignore()
             return
-        self.window.move_payload_to_directory(payload, root, dir_rel)
-        event.acceptProposedAction()
+        copy_requested = bool(
+            event.keyboardModifiers() & Qt.KeyboardModifier.ControlModifier
+        )
+        if copy_requested:
+            event.setDropAction(Qt.DropAction.CopyAction)
+            self.window.move_payload_to_directory(
+                payload,
+                root,
+                dir_rel,
+                copy=True,
+            )
+            event.accept()
+        else:
+            self.window.move_payload_to_directory(payload, root, dir_rel)
+            event.acceptProposedAction()
 
     def set_drag_hover_item(self, item: QTreeWidgetItem | None) -> None:
         if self._drag_hover_item is item:
@@ -9367,7 +9477,7 @@ class MainWindow(QMainWindow):
             pending_images.update(request.rel_paths)
         pending_directories: set[str] = set()
         for move_task in move_tasks:
-            if move_task.future.done():
+            if move_task.future.done() or not move_task.hide_sources:
                 continue
             pending_images.update(
                 rel_path
@@ -11785,7 +11895,14 @@ class MainWindow(QMainWindow):
         self.load_current_directory()
         self.select_rel_path(rel_path)
 
-    def move_payload_to_directory(self, payload: object, dest_root: Path, dest_dir_rel: str) -> None:
+    def move_payload_to_directory(
+        self,
+        payload: object,
+        dest_root: Path,
+        dest_dir_rel: str,
+        *,
+        copy: bool = False,
+    ) -> None:
         self._settle_move_payload_task()
         dest_catalog = self.workspace.catalog_for_exact_root(dest_root.expanduser().absolute())
         if dest_catalog is None or not self._valid_payload_rel_path(dest_dir_rel, allow_root=True):
@@ -11843,9 +11960,15 @@ class MainWindow(QMainWindow):
                 pending_target == directory_rel or pending_target.startswith(f"{directory_rel}/")
                 for directory_rel in directory_payload.get(source_root, ())
             ):
-                self.progress_label.setText("Wait for the pending image save before moving it")
+                operation = "copying" if copy else "moving"
+                self.progress_label.setText(
+                    f"Wait for the pending image save before {operation} it"
+                )
                 return
         if is_trash_rel_path(dest_dir_rel):
+            if copy:
+                show_error(self, "Copy", "Cannot copy items into trash.")
+                return
             source_roots = {*directory_payload.keys(), *image_payload.keys()}
             if any(source_root != dest_catalog.root for source_root in source_roots):
                 show_error(self, "Move", "Cannot move items into another catalog's trash.")
@@ -11873,7 +11996,7 @@ class MainWindow(QMainWindow):
                 },
             )
         except RuntimeError:
-            self._show_identity_preflight_busy("move")
+            self._show_identity_preflight_busy("copy" if copy else "move")
             return
         preflight = MoveIdentityPreflightTask(
             generation=self._next_mutation_identity_generation(),
@@ -11885,10 +12008,13 @@ class MainWindow(QMainWindow):
             affected_roots=set(affected_roots),
             wipe_on_delete=self.wipe_on_delete_enabled(),
             future=future,
+            copy_requested=copy,
         )
         self._move_identity_preflights[future] = preflight
         self.progress_bar.setRange(0, 0)
-        self.progress_label.setText("Checking items before move")
+        self.progress_label.setText(
+            "Checking items before copy" if copy else "Checking items before move"
+        )
 
     @staticmethod
     def _valid_payload_rel_path(rel_path: str, *, allow_root: bool = False) -> bool:
@@ -11912,7 +12038,7 @@ class MainWindow(QMainWindow):
                 captured = future.result()
             except Exception as error:
                 self._mutation_identity_preflight_failed(
-                    "Move",
+                    "Copy" if preflight.copy_requested else "Move",
                     error,
                     preflight.affected_roots,
                 )
@@ -11940,6 +12066,7 @@ class MainWindow(QMainWindow):
         dest_catalog = preflight.dest_catalog
         dest_dir_rel = preflight.dest_dir_rel
         affected_roots = preflight.affected_roots
+        copy_requested = preflight.copy_requested
         for root in affected_roots:
             self.indexer.cancel_idle_tasks(root)
             self.indexer.cancel_directory_tasks(root)
@@ -11949,12 +12076,9 @@ class MainWindow(QMainWindow):
             if cross_catalog
             else ActionPriority.FILE_MOVE_WITHIN_CATALOG
         )
-        task, future = self.indexer.submit_action(
-            "Moving items",
-            dest_catalog.root,
-            dest_dir_rel,
-            priority=priority,
-            worker=lambda action_task: self._move_payload_worker(
+
+        def run_transfer(action_task: IndexTask) -> MovePayloadResult:
+            args = (
                 image_payload,
                 directory_payload,
                 dest_catalog.root,
@@ -11972,8 +12096,23 @@ class MainWindow(QMainWindow):
                     for root, context_catalog in preflight.catalog_context.items()
                 },
                 action_task,
+            )
+            if copy_requested:
+                return self._move_payload_worker(*args, copy=True)
+            # Preserve the established worker call shape for move-specific
+            # instrumentation and integrations that wrap this private seam.
+            return self._move_payload_worker(*args)
+
+        task, future = self.indexer.submit_action(
+            "Copying items" if copy_requested else "Moving items",
+            dest_catalog.root,
+            dest_dir_rel,
+            priority=priority,
+            worker=run_transfer,
+            key=(
+                f"{'copy' if copy_requested else 'move'}:"
+                f"{dest_catalog.root}:{dest_dir_rel}:{monotonic()}"
             ),
-            key=f"move:{dest_catalog.root}:{dest_dir_rel}:{monotonic()}",
             interactive=True,
             force_refresh=True,
             preemptible=False,
@@ -11999,11 +12138,14 @@ class MainWindow(QMainWindow):
             expected_image_identities=captured.image_identities,
             expected_directory_identities=captured.directory_identities,
             expected_destination_identity=captured.destination_identity,
+            completion_verb="Copied" if copy_requested else "Moved",
+            error_title="Copy" if copy_requested else "Move",
+            hide_sources=not copy_requested,
         )
         self._move_payload_tasks.append(move_task)
         self._refresh_active_move_payload_task()
         navigated_from_moved_directory = False
-        if self.current_catalog is not None:
+        if not copy_requested and self.current_catalog is not None:
             current_root = self.current_catalog.root
             for source_dir_rel in directory_payload.get(current_root, ()):
                 if self.current_dir_rel == source_dir_rel or self.current_dir_rel.startswith(f"{source_dir_rel}/"):
@@ -12015,7 +12157,11 @@ class MainWindow(QMainWindow):
                     break
         if navigated_from_moved_directory:
             self.load_current_directory(preserve_selection=True)
-        self._remove_queued_move_records_from_current_view(image_payload, directory_payload)
+        if not copy_requested:
+            self._remove_queued_move_records_from_current_view(
+                image_payload,
+                directory_payload,
+            )
         if self._move_payload_task is not None:
             self._show_move_payload_status(self._move_payload_task.task.snapshot())
         self._update_tools_menu_actions()
@@ -12095,6 +12241,8 @@ class MainWindow(QMainWindow):
         expected_root_identities: Mapping[Path, tuple[int, int]],
         expected_storage_identities: Mapping[Path, CatalogStorageIdentity],
         task: IndexTask,
+        *,
+        copy: bool = False,
     ) -> MovePayloadResult:
         affected_roots = {dest_root, *directory_groups.keys(), *image_groups.keys()}
         requested = sum(len(items) for items in directory_groups.values()) + sum(
@@ -12119,6 +12267,7 @@ class MainWindow(QMainWindow):
             return catalog
 
         task.update(0, requested, dest_dir_rel or ".")
+        operation = "copy" if copy else "move"
         try:
             dest_catalog = catalog_for(dest_root)
             if (
@@ -12126,8 +12275,10 @@ class MainWindow(QMainWindow):
                 or len(expected_destination_identity) < 2
                 or not all(isinstance(value, int) for value in expected_destination_identity[:2])
             ):
-                raise OSError("destination identity was not captured before move")
-            # Directory mtimes/ctimes change whenever one admitted move adds a
+                raise OSError(
+                    f"destination identity was not captured before {operation}"
+                )
+            # Directory mtimes/ctimes change whenever one admitted transfer adds a
             # child.  Pin the destination object itself, not its mutable
             # contents, so two independently confirmed moves to the same
             # directory can serialize successfully while replacement of that
@@ -12148,35 +12299,52 @@ class MainWindow(QMainWindow):
                 if missing_images or missing_directories:
                     missing = [*missing_images, *missing_directories]
                     raise OSError(
-                        "identity was not captured before move: "
+                        f"identity was not captured before {operation}: "
                         + ", ".join(missing[:3])
                     )
                 self._verify_expected_mutation_identities(
                     source_catalog,
                     expected_image_identities.get(source_root, {}),
                     expected_directory_identities.get(source_root, {}),
-                    verb="move",
+                    verb="copy" if copy else "move",
                 )
             for source_root, dir_rels in directory_groups.items():
                 source_catalog = catalog_for(source_root)
                 if dest_catalog.directory_identity(dest_dir_rel)[:2] != expected_destination_object:
                     raise OSError(
-                        f"destination changed after move was requested: {dest_dir_rel or '.'}"
+                        f"destination changed after {operation} was requested: "
+                        f"{dest_dir_rel or '.'}"
                     )
                 base_processed = processed
 
                 def directory_progress(local_processed: int, _total: int | None, current: str) -> None:
                     task.update(min(base_processed + local_processed, requested), requested, current)
 
-                results = source_catalog.move_directories(
-                    dir_rels,
-                    dest_catalog,
-                    dest_dir_rel,
-                    wipe_on_delete=wipe_on_delete,
-                    expected_identities=expected_directory_identities.get(source_root, {}),
-                    progress_callback=directory_progress,
-                    cancel_check=task.check_canceled,
-                )
+                if copy:
+                    results = source_catalog.copy_directories(
+                        dir_rels,
+                        dest_catalog,
+                        dest_dir_rel,
+                        expected_identities=expected_directory_identities.get(
+                            source_root,
+                            {},
+                        ),
+                        progress_callback=directory_progress,
+                        cancel_check=task.check_canceled,
+                    )
+                else:
+                    results = source_catalog.move_directories(
+                        dir_rels,
+                        dest_catalog,
+                        dest_dir_rel,
+                        wipe_on_delete=wipe_on_delete,
+                        expected_identities=expected_directory_identities.get(
+                            source_root,
+                            {},
+                        ),
+                        progress_callback=directory_progress,
+                        cancel_check=task.check_canceled,
+                    )
                 processed += len(dir_rels)
                 moved += len(results)
                 reconcile_subtrees.extend(
@@ -12188,22 +12356,39 @@ class MainWindow(QMainWindow):
                 source_catalog = catalog_for(source_root)
                 if dest_catalog.directory_identity(dest_dir_rel)[:2] != expected_destination_object:
                     raise OSError(
-                        f"destination changed after move was requested: {dest_dir_rel or '.'}"
+                        f"destination changed after {operation} was requested: "
+                        f"{dest_dir_rel or '.'}"
                     )
                 base_processed = processed
 
                 def image_progress(local_processed: int, _total: int | None, current: str) -> None:
                     task.update(min(base_processed + local_processed, requested), requested, current)
 
-                results = source_catalog.move_images(
-                    rel_paths,
-                    dest_catalog,
-                    dest_dir_rel,
-                    wipe_on_delete=wipe_on_delete,
-                    expected_identities=expected_image_identities.get(source_root, {}),
-                    progress_callback=image_progress,
-                    cancel_check=task.check_canceled,
-                )
+                if copy:
+                    results = source_catalog.copy_images(
+                        rel_paths,
+                        dest_catalog,
+                        dest_dir_rel,
+                        expected_identities=expected_image_identities.get(
+                            source_root,
+                            {},
+                        ),
+                        progress_callback=image_progress,
+                        cancel_check=task.check_canceled,
+                    )
+                else:
+                    results = source_catalog.move_images(
+                        rel_paths,
+                        dest_catalog,
+                        dest_dir_rel,
+                        wipe_on_delete=wipe_on_delete,
+                        expected_identities=expected_image_identities.get(
+                            source_root,
+                            {},
+                        ),
+                        progress_callback=image_progress,
+                        cancel_check=task.check_canceled,
+                    )
                 processed += len(rel_paths)
                 moved += len(results)
                 reconcile_images.extend(

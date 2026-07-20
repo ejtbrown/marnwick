@@ -2745,6 +2745,115 @@ def test_thumbnail_view_manual_drag_uses_static_cursor(tmp_path: Path) -> None:
         qt_app.processEvents()
 
 
+def test_thumbnail_drag_ctrl_switches_to_copy_cursor_and_copy_drop(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    (root / "dest").mkdir(parents=True)
+    Image.new("RGB", (8, 8), (10, 20, 30)).save(root / "image.jpg")
+    modifiers = [Qt.KeyboardModifier.NoModifier]
+    calls: list[tuple[list[dict[str, str]], Path, str, bool]] = []
+
+    window = MainWindow()
+    try:
+        catalog = window.workspace.open_catalog(root)
+        catalog.refresh()
+        window.current_catalog = catalog
+        window.current_dir_rel = ""
+        window.rebuild_tree()
+        window.load_current_directory()
+        window.resize(800, 480)
+        window.show()
+        settle_virtual_view_tasks(window, qt_app)
+        settle_tree_build_tasks(window, qt_app)
+
+        root_item = window.tree.topLevelItem(0)
+        assert root_item is not None
+        root_item.setExpanded(True)
+        dest_item = next(
+            root_item.child(index)
+            for index in range(root_item.childCount())
+            if root_item.child(index).text(0) == "dest"
+        )
+        dest_point = window.tree.viewport().mapToGlobal(
+            window.tree.visualItemRect(dest_item).center()
+        )
+        image_row = next(
+            row
+            for row, record in enumerate(window.model.images)
+            if isinstance(record, ImageRecord)
+        )
+        monkeypatch.setattr(
+            QApplication,
+            "keyboardModifiers",
+            staticmethod(lambda: modifiers[0]),
+        )
+
+        def record_transfer(
+            payload: list[dict[str, str]],
+            dest_root: Path,
+            dest_dir_rel: str,
+            *,
+            copy: bool = False,
+        ) -> None:
+            calls.append((payload, dest_root, dest_dir_rel, copy))
+
+        window.move_payload_to_directory = record_transfer  # type: ignore[method-assign]
+        assert window.thumbnail_view.begin_manual_drag(
+            [window.model.index(image_row, 0)],
+            dest_point,
+        )
+        move_cursor = QApplication.overrideCursor()
+        assert move_cursor is not None
+        move_image = move_cursor.pixmap().toImage()
+
+        modifiers[0] = Qt.KeyboardModifier.ControlModifier
+        window.thumbnail_view.update_manual_drag(dest_point)
+
+        copy_cursor = QApplication.overrideCursor()
+        assert copy_cursor is not None
+        assert window.thumbnail_view._drag_copy_requested
+        assert copy_cursor.pixmap().toImage() != move_image
+        copy_icon = ThumbnailView.static_drag_pixmap(multiple=False, copy=True).toImage()
+        assert copy_icon.pixelColor(55, 55) == QColor("#ffffff")
+
+        modifiers[0] = Qt.KeyboardModifier.NoModifier
+        window.thumbnail_view.update_manual_drag(dest_point)
+        restored_move_cursor = QApplication.overrideCursor()
+        assert restored_move_cursor is not None
+        assert not window.thumbnail_view._drag_copy_requested
+        assert restored_move_cursor.pixmap().toImage() == move_image
+
+        modifiers[0] = Qt.KeyboardModifier.ControlModifier
+        window.thumbnail_view.update_manual_drag(dest_point)
+
+        window.thumbnail_view.finish_manual_drag(dest_point)
+        qt_app.processEvents()
+
+        assert calls == [
+            (
+                [
+                    {
+                        "catalog_root": str(catalog.root),
+                        "rel_path": "image.jpg",
+                        "kind": "image",
+                    }
+                ],
+                catalog.root,
+                "dest",
+                True,
+            )
+        ]
+        assert QApplication.overrideCursor() is None
+    finally:
+        window.thumbnail_view.cleanup_manual_drag()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
 def test_thumbnail_view_manual_drag_cleans_cursor_when_button_state_is_lost(tmp_path: Path) -> None:
     qt_app = app()
     root = tmp_path / "catalog"
@@ -3805,6 +3914,71 @@ def test_move_payload_to_directory_moves_selected_images_across_catalogs(
         window.idle_timer.stop()
         window.indexer.shutdown()
         window.workspace.close()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_copy_payload_to_directory_keeps_source_visible_and_reconciles_copy(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    (root / "target").mkdir(parents=True)
+    Image.new("RGB", (8, 8), (10, 20, 30)).save(root / "image.png")
+    reconciled: list[tuple[Path, tuple[str, ...]]] = []
+    window = MainWindow()
+    try:
+        catalog = window.workspace.open_catalog(root)
+        catalog.refresh()
+        window.current_catalog = catalog
+        window.current_dir_rel = ""
+        window.load_current_directory()
+        settle_virtual_view_tasks(window, qt_app)
+        original_reconcile_images = window.indexer.reconcile_images
+
+        def track_reconcile_images(
+            task_root: Path,
+            rel_paths,  # type: ignore[no-untyped-def]
+            **kwargs,  # type: ignore[no-untyped-def]
+        ) -> IndexTask:
+            reconciled.append((task_root, tuple(rel_paths)))
+            return original_reconcile_images(task_root, rel_paths, **kwargs)
+
+        monkeypatch.setattr(window.indexer, "reconcile_images", track_reconcile_images)
+        window.move_payload_to_directory(
+            [
+                {
+                    "catalog_root": str(root),
+                    "rel_path": "image.png",
+                    "kind": "image",
+                }
+            ],
+            root,
+            "target",
+            copy=True,
+        )
+        settle_mutation_identity_preflights(window, qt_app)
+
+        assert "image.png" in [
+            record.rel_path
+            for record in window.model.images
+            if isinstance(record, ImageRecord)
+        ]
+        assert window._move_payload_tasks[0].completion_verb == "Copied"
+
+        settle_move_payload_task(window, qt_app)
+        settle_post_move_reconcile_tasks(window, qt_app)
+
+        assert (root / "image.png").is_file()
+        assert (root / "target" / "image.png").is_file()
+        assert catalog.get_image("image.png") is not None
+        copied = catalog.get_image("target/image.png")
+        assert copied is not None
+        assert copied.image_hash is not None
+        assert reconciled == [(catalog.root, ("target/image.png",))]
+    finally:
         window.close()
         window.deleteLater()
         qt_app.processEvents()
