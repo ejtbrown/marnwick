@@ -2450,8 +2450,20 @@ class ThumbnailView(QListView):
         self._manual_drag_watchdog.timeout.connect(self._poll_manual_drag)
         self.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         self.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self.setAutoScroll(False)
         self.verticalScrollBar().setSingleStep(self.SMOOTH_SCROLL_STEP)
         self.horizontalScrollBar().setSingleStep(self.SMOOTH_SCROLL_STEP)
+        if window is not None:
+            for scroll_bar in (self.verticalScrollBar(), self.horizontalScrollBar()):
+                scroll_bar.sliderPressed.connect(
+                    window._thumbnail_scroll_user_action
+                )
+                scroll_bar.sliderReleased.connect(
+                    window._remember_thumbnail_scroll_position
+                )
+                scroll_bar.actionTriggered.connect(
+                    lambda _action: window._thumbnail_scroll_user_action()
+                )
         self.setLayoutMode(QListView.LayoutMode.Batched)
         self.setBatchSize(256)
 
@@ -2469,6 +2481,8 @@ class ThumbnailView(QListView):
         return super().event(event)
 
     def mousePressEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        if self.main_window is not None:
+            self.main_window._thumbnail_scroll_user_action()
         if event.button() == Qt.MouseButton.LeftButton:
             self._drag_start_pos = event.position().toPoint()
         super().mousePressEvent(event)
@@ -2504,11 +2518,18 @@ class ThumbnailView(QListView):
         super().mouseReleaseEvent(event)
 
     def keyPressEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        if self.main_window is not None:
+            self.main_window._thumbnail_scroll_user_action()
         if self._manual_drag_active and event.key() == Qt.Key.Key_Escape:
             self.cleanup_manual_drag()
             event.accept()
             return
         super().keyPressEvent(event)
+
+    def wheelEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        if self.main_window is not None:
+            self.main_window._thumbnail_scroll_user_action()
+        super().wheelEvent(event)
 
     def manual_drag_active(self) -> bool:
         return self._manual_drag_active
@@ -2788,6 +2809,12 @@ class DirectoryTree(QTreeWidget):
             scroll_bar.actionTriggered.connect(
                 lambda _action: self.window._cancel_tree_scroll_preservation()
             )
+            scroll_bar.valueChanged.connect(
+                lambda _value: self.window._enforce_tree_scroll_preservation()
+            )
+            scroll_bar.rangeChanged.connect(
+                lambda _minimum, _maximum: self.window._enforce_tree_scroll_preservation()
+            )
 
     def startDrag(self, supported_actions: Qt.DropAction) -> None:
         item = self.currentItem()
@@ -2814,6 +2841,18 @@ class DirectoryTree(QTreeWidget):
             self.set_drag_hover_item(None)
             self.window._directory_drag_active = False
             self.window._resume_deferred_tree_publication()
+
+    def mousePressEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        self.window._cancel_tree_scroll_preservation()
+        super().mousePressEvent(event)
+
+    def keyPressEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        self.window._cancel_tree_scroll_preservation()
+        super().keyPressEvent(event)
+
+    def wheelEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        self.window._cancel_tree_scroll_preservation()
+        super().wheelEvent(event)
 
     def dragEnterEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         if event.mimeData().hasFormat(ThumbnailModel.MIME_TYPE):
@@ -6195,9 +6234,8 @@ class MainWindow(QMainWindow):
                 deferred_catalogs.append(catalog)
             self._tree_item_maps[catalog.root] = item_by_dir
         if selected_item is not None:
-            self.tree.setCurrentItem(selected_item)
+            self._set_current_tree_item_without_scrolling(selected_item)
             self._expand_tree_item_ancestors(selected_item)
-            self.tree.scrollToItem(selected_item)
         for catalog in deferred_catalogs:
             self._pending_tree_rebuilds[catalog.root] = (catalog, "large_tree")
         if deferred_catalogs:
@@ -6646,7 +6684,7 @@ class MainWindow(QMainWindow):
         else:
             task.selected_item = None
         if task.selected_item is not None:
-            self.tree.setCurrentItem(task.selected_item)
+            self._set_current_tree_item_without_scrolling(task.selected_item)
             self._expand_tree_item_ancestors(task.selected_item)
         self._append_timing_event(
             task.catalog.root,
@@ -6813,8 +6851,7 @@ class MainWindow(QMainWindow):
                 lambda generation=generation: self._continue_tree_path_selection(generation),
             )
             return
-        self.tree.setCurrentItem(task.current_item)
-        self.tree.scrollToItem(task.current_item)
+        self._set_current_tree_item_without_scrolling(task.current_item)
         self._tree_path_selection_task = None
 
     def _add_virtual_tree_items(
@@ -7436,8 +7473,7 @@ class MainWindow(QMainWindow):
                     next_offset,
                 )
             if selected_item is not None:
-                self.tree.setCurrentItem(selected_item)
-                self.tree.scrollToItem(selected_item)
+                self._set_current_tree_item_without_scrolling(selected_item)
 
     def _tree_item_expanded(self, item: QTreeWidgetItem) -> None:
         if (
@@ -7577,6 +7613,19 @@ class MainWindow(QMainWindow):
             self.tree.horizontalScrollBar().value(),
         )
 
+    def _set_current_tree_item_without_scrolling(
+        self,
+        item: QTreeWidgetItem,
+    ) -> None:
+        index = self.tree.indexFromItem(item)
+        if not index.isValid():
+            return
+        self.tree.selectionModel().setCurrentIndex(
+            index,
+            QItemSelectionModel.SelectionFlag.ClearAndSelect
+            | QItemSelectionModel.SelectionFlag.Rows,
+        )
+
     def _begin_tree_scroll_preservation(self, position: tuple[int, int]) -> int:
         self._tree_scroll_preservation_generation += 1
         generation = self._tree_scroll_preservation_generation
@@ -7595,26 +7644,8 @@ class MainWindow(QMainWindow):
             or preservation[0] != generation
         ):
             return
-        position = preservation[1]
-        self._restore_tree_scroll_position(position)
-        vertical, horizontal = position
-        vertical_bar = self.tree.verticalScrollBar()
-        horizontal_bar = self.tree.horizontalScrollBar()
-        position_is_representable = (
-            vertical <= vertical_bar.maximum()
-            and horizontal <= horizontal_bar.maximum()
-        )
-        if (
-            not position_is_representable
-            and (
-                self._tree_rebuild_deferred
-                or self._tree_build_task is not None
-                or bool(self._pending_tree_rebuilds)
-                or self._tree_path_selection_task is not None
-                or bool(self._tree_children_tasks)
-                or bool(self._tree_child_refresh_pending)
-            )
-        ):
+        self._enforce_tree_scroll_preservation()
+        if self._tree_scroll_publication_pending():
             QTimer.singleShot(
                 TREE_PAGE_POLL_INTERVAL_MS,
                 partial(self._continue_tree_scroll_preservation, generation),
@@ -7622,6 +7653,36 @@ class MainWindow(QMainWindow):
             return
         if self._tree_scroll_preservation == preservation:
             self._tree_scroll_preservation = None
+
+    def _tree_scroll_publication_pending(self) -> bool:
+        return bool(
+            self._tree_rebuild_deferred
+            or self._tree_build_task is not None
+            or self._pending_tree_rebuilds
+            or self._tree_path_selection_task is not None
+            or self._tree_children_tasks
+            or self._tree_child_refresh_pending
+        )
+
+    def _enforce_tree_scroll_preservation(self) -> None:
+        preservation = self._tree_scroll_preservation
+        if self._closing or preservation is None:
+            return
+        vertical, horizontal = preservation[1]
+        vertical_bar = self.tree.verticalScrollBar()
+        horizontal_bar = self.tree.horizontalScrollBar()
+        target_vertical = max(
+            vertical_bar.minimum(),
+            min(vertical, vertical_bar.maximum()),
+        )
+        target_horizontal = max(
+            horizontal_bar.minimum(),
+            min(horizontal, horizontal_bar.maximum()),
+        )
+        if vertical_bar.value() != target_vertical:
+            vertical_bar.setValue(target_vertical)
+        if horizontal_bar.value() != target_horizontal:
+            horizontal_bar.setValue(target_horizontal)
 
     def _restore_tree_scroll_position(self, position: tuple[int, int]) -> None:
         if self._closing:
@@ -8746,6 +8807,24 @@ class MainWindow(QMainWindow):
 
     def _cancel_thumbnail_scroll_restore(self) -> None:
         self._thumbnail_scroll_restore_generation += 1
+
+    def _thumbnail_scroll_user_action(self) -> None:
+        self._cancel_thumbnail_scroll_restore()
+        scroll_key = self._thumbnail_scroll_key
+        QTimer.singleShot(
+            0,
+            partial(
+                self._remember_thumbnail_scroll_position_if_current,
+                scroll_key,
+            ),
+        )
+
+    def _remember_thumbnail_scroll_position_if_current(
+        self,
+        scroll_key: TreeStateKey | None,
+    ) -> None:
+        if scroll_key == self._thumbnail_scroll_key:
+            self._remember_thumbnail_scroll_position()
 
     def _shallow_child_directories(
         self,
@@ -10993,13 +11072,19 @@ class MainWindow(QMainWindow):
             self._swept_catalog_roots.discard(root)
             self._pruned_catalog_roots.discard(root)
             self._drop_very_similar_cache(root)
+        tree_scroll_generation = self._begin_tree_scroll_preservation(
+            self._tree_scroll_position()
+        )
         if self.current_catalog is not None and self.current_catalog.root in affected_roots:
-            self.reload_tree_and_directory(preserve_tree_scroll=True)
-        else:
-            for root in affected_roots:
-                catalog = self.workspace.catalog_for_root(root)
-                if catalog is not None:
-                    self._request_incremental_tree_rebuild(catalog, reason="file_move")
+            # Image moves do not require clearing the entire folder tree. Keep
+            # its existing Qt items as the incremental database reconciliation
+            # updates any directory rows in place.
+            self.load_current_directory(preserve_selection=True)
+        for root in affected_roots:
+            catalog = self.workspace.catalog_for_root(root)
+            if catalog is not None:
+                self._request_incremental_tree_rebuild(catalog, reason="file_move")
+        self._continue_tree_scroll_preservation(tree_scroll_generation)
 
     def _active_move_payload_task(self) -> MovePayloadTask | None:
         self._refresh_active_move_payload_task()
@@ -12175,6 +12260,16 @@ class MainWindow(QMainWindow):
         directory_rels = directory_rels or set()
         if not image_rels and not directory_rels:
             return
+        scroll_key = self._current_thumbnail_scroll_key()
+        scroll_position = (
+            self.thumbnail_view.verticalScrollBar().value(),
+            self.thumbnail_view.horizontalScrollBar().value(),
+        )
+        if scroll_key is not None:
+            self._thumbnail_scroll_positions[scroll_key] = scroll_position
+            self._thumbnail_scroll_positions.move_to_end(scroll_key)
+            while len(self._thumbnail_scroll_positions) > MAX_THUMBNAIL_VIEW_STATES:
+                self._thumbnail_scroll_positions.popitem(last=False)
         if (
             self.current_virtual_kind is None
             and self.model.has_complete_row_map
@@ -12238,13 +12333,17 @@ class MainWindow(QMainWindow):
         if not removed_rows:
             return
         anchor_key = self._thumbnail_anchor_key_after_removal(records, remove_flags, removed_rows)
-        self.model.replace_loaded_records(filtered)
-        self.refresh_thumbnail_layout()
-        if anchor_key is not None:
-            self._select_thumbnail_record_key(anchor_key)
-        else:
+        self.thumbnail_view.setUpdatesEnabled(False)
+        try:
+            self.model.replace_loaded_records(filtered)
+            self.refresh_thumbnail_layout()
+            if anchor_key is not None:
+                self._restore_thumbnail_selection({anchor_key}, anchor_key)
             self.update_selection_status()
-            self._remember_thumbnail_scroll_position()
+            self._restore_thumbnail_scroll_position(scroll_key)
+        finally:
+            self.thumbnail_view.setUpdatesEnabled(True)
+            self.thumbnail_view.viewport().update()
 
     def _thumbnail_anchor_key_after_removal(
         self,

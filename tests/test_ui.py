@@ -4535,7 +4535,12 @@ def test_two_preflighted_moves_to_same_destination_both_commit(
         qt_app.processEvents()
 
 
-def test_move_payload_removal_keeps_thumbnail_scroll_anchored(tmp_path: Path, monkeypatch) -> None:
+@pytest.mark.parametrize("large_snapshot", [False, True])
+def test_move_payload_removal_preserves_thumbnail_scrollbar(
+    tmp_path: Path,
+    monkeypatch,
+    large_snapshot: bool,
+) -> None:
     qt_app = app()
     root = tmp_path / "catalog"
     (root / "target").mkdir(parents=True)
@@ -4546,8 +4551,11 @@ def test_move_payload_removal_keeps_thumbnail_scroll_anchored(tmp_path: Path, mo
 
     window = MainWindow()
     try:
+        if large_snapshot:
+            monkeypatch.setattr(ui_module, "THUMBNAIL_MODEL_BATCH_SIZE", 20)
         window.progress_timer.stop()
         window.idle_timer.stop()
+        assert not window.thumbnail_view.hasAutoScroll()
         catalog = window.workspace.open_catalog(root)
         catalog.refresh()
         window.current_catalog = catalog
@@ -4564,8 +4572,9 @@ def test_move_payload_removal_keeps_thumbnail_scroll_anchored(tmp_path: Path, mo
             qt_app.processEvents()
             sleep(0.01)
         assert scroll_bar.maximum() > 0
-        window.select_rel_path("image-70.jpg")
-        assert scroll_bar.value() > 0
+        expected_scroll = max(1, scroll_bar.maximum() * 2 // 3)
+        scroll_bar.setValue(expected_scroll)
+        qt_app.processEvents()
 
         def slow_move_worker(
             _image_groups,
@@ -4597,11 +4606,21 @@ def test_move_payload_removal_keeps_thumbnail_scroll_anchored(tmp_path: Path, mo
         settle_mutation_identity_preflights(window, qt_app)
 
         assert started.wait(timeout=1.0)
-        assert window.selected_rel_paths() == ["image-71.jpg"]
-        assert scroll_bar.value() > 0
+        settle_virtual_view_tasks(window, qt_app)
+        if not large_snapshot:
+            assert window.selected_rel_paths() == ["image-71.jpg"]
+        assert "image-70.jpg" not in {
+            record.rel_path
+            for record in window.model.images
+            if isinstance(record, ImageRecord)
+        }
+        assert scroll_bar.value() == expected_scroll
 
         release.set()
         settle_move_payload_task(window, qt_app)
+        settle_virtual_view_tasks(window, qt_app)
+
+        assert scroll_bar.value() == expected_scroll
     finally:
         release.set()
         window.progress_timer.stop()
@@ -4633,6 +4652,7 @@ def test_move_refresh_preserves_directory_tree_scrollbar_through_async_rebuild(
         window.resize(420, 220)
         window.show()
         window.rebuild_tree()
+        settle_tree_build_tasks(window, qt_app)
         deadline = monotonic() + 1.0
         while window.tree.verticalScrollBar().maximum() == 0 and monotonic() < deadline:
             qt_app.processEvents()
@@ -4643,11 +4663,14 @@ def test_move_refresh_preserves_directory_tree_scrollbar_through_async_rebuild(
         assert expected_scroll > 0
         scroll_bar.setValue(expected_scroll)
         qt_app.processEvents()
+        generated_positions: list[int] = []
+        scroll_bar.valueChanged.connect(generated_positions.append)
 
         window._refresh_after_move_payload({catalog.root})
         settle_tree_build_tasks(window, qt_app)
 
         assert scroll_bar.value() == expected_scroll
+        assert generated_positions == []
     finally:
         window.progress_timer.stop()
         window.idle_timer.stop()
