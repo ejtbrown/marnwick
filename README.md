@@ -22,7 +22,7 @@ Each catalog keeps its metadata beside the photos in a `.marnwick` directory. Mo
 - Find visually similar images using perceptual hashes, aspect ratio, and color distribution.
 - Inspect matches for an individual image or automatically move duplicate candidates into the catalog's `T-r-a-s-h` directory.
 - Restore images and directories from `T-r-a-s-h`, including collision-safe restore names.
-- Drag images and directories within one catalog or between open catalogs.
+- Drag images and directories within one catalog or between open catalogs; hold `Ctrl` while dragging to copy instead of move.
 - Create and delete directories, delete selected images, and optionally request wipe-on-delete through GNU `shred`.
 - View per-catalog logs, directory statistics, database size, and thumbnail repository size.
 - Rebuild stale thumbnails and prune unreferenced cache files.
@@ -107,6 +107,7 @@ You can open more catalogs with **File > Open** or manage remembered catalogs un
 | `Ctrl+C` | Copy selected image files to the desktop clipboard |
 | `Delete` or `Backspace` | Permanently delete selected image files after confirmation |
 | Drag | Move selected images or folders to a physical folder tile or folder-tree item |
+| `Ctrl` while dragging | Copy selected images or folders; the drag cursor shows a `+` badge |
 
 Use the slider to choose the number of thumbnail columns and the sort menu to change ordering. Scroll positions and selections are remembered separately for each physical or virtual directory during the session.
 
@@ -138,7 +139,7 @@ Saves preserve supported EXIF/GPS with orientation normalized, ICC profiles, PNG
 
 ## Catalog organization and deletion
 
-Drag-and-drop moves, directory creation, deletion, restoration, and duplicate cleanup are asynchronous and serialized through one prioritized, protected catalog-action pipeline. User mutations take precedence over selected-folder indexing, which in turn takes precedence over deep discovery and idle refresh or pruning. Pending sources remain hidden when you navigate away and back. Successful moves preserve tags, invalidate content-derived metadata and thumbnail references, and queue a targeted background reconciliation that restores those fields from the object at its new path. Name collisions receive a numbered suffix such as `photo (1).jpg`, while a drop onto the existing parent is treated as a no-op.
+Drag-and-drop moves and copies, directory creation, deletion, restoration, and duplicate cleanup are asynchronous and serialized through one prioritized, protected catalog-action pipeline. User mutations take precedence over selected-folder indexing, which in turn takes precedence over deep discovery and idle refresh or pruning. Pending move sources remain hidden when you navigate away and back; copy sources remain visible. Successful transfers preserve tags, invalidate content-derived metadata and thumbnail references at the destination, and queue a targeted background reconciliation that restores those fields from the copied or moved object. Name collisions receive a numbered suffix such as `photo (1).jpg`; a move onto the existing parent is a no-op, while a copy there creates a numbered sibling.
 
 Edit saves use a fixed four-worker encoding pool, with at most eight active or queued saves globally and at most one admitted save per catalog. A stalled codec or filesystem can therefore occupy one lane without blocking navigation or a save in another catalog. A second save in the same catalog is not admitted concurrently. Moves, directory deletion, and restoration are rejected while they overlap an image being saved, and duplicate cleanup waits for every save in that catalog; Marnwick asks you to retry those operations later. Catalog reconciliation returns to the protected action pipeline after atomic replacement. Deleting the same image is the exception: that intent is retained and deferred until a successful save and proof-aware reconciliation finish.
 

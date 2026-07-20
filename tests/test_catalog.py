@@ -1832,6 +1832,58 @@ def test_move_uses_unique_destination_when_name_exists(tmp_path: Path) -> None:
         assert (root / "dest" / "image (1).jpg").exists()
 
 
+def test_copy_image_keeps_source_and_uses_unique_destination(tmp_path: Path) -> None:
+    root = tmp_path / "catalog"
+    make_image(root / "album" / "image.jpg", (100, 80), (20, 30, 40))
+
+    with Catalog(root) as catalog:
+        catalog.refresh()
+        catalog.set_image_tags("album/image.jpg", ["Keep"], replace=True)
+        source = catalog.get_image("album/image.jpg")
+        assert source is not None
+
+        results = catalog.copy_images(["album/image.jpg"], catalog, "album")
+
+        assert results[0].dest_rel_path == "album/image (1).jpg"
+        assert (root / "album" / "image.jpg").is_file()
+        assert (root / "album" / "image (1).jpg").is_file()
+        assert catalog.get_image("album/image.jpg") == source
+        copied = catalog.get_image("album/image (1).jpg")
+        assert copied is not None
+        assert copied.image_hash is None
+        assert catalog.get_image_tags("album/image.jpg") == ["Keep"]
+        assert catalog.get_image_tags("album/image (1).jpg") == ["Keep"]
+        assert catalog.index_image("album/image (1).jpg", force=True) is not None
+
+
+def test_copy_directory_across_catalogs_keeps_source_and_nested_tags(tmp_path: Path) -> None:
+    source_root = tmp_path / "source"
+    dest_root = tmp_path / "dest"
+    make_image(source_root / "set" / "nested" / "image.jpg", (120, 90))
+    (source_root / "set" / "note.txt").write_text("keep me", encoding="utf-8")
+
+    with Catalog(source_root) as source, Catalog(dest_root) as dest:
+        source.refresh()
+        dest.refresh()
+        source.set_image_tags("set/nested/image.jpg", ["Keep"], replace=True)
+
+        results = source.copy_directories(["set"], dest, "target")
+
+        assert results[0].dest_rel_path == "target/set"
+        assert (source_root / "set" / "nested" / "image.jpg").is_file()
+        assert (source_root / "set" / "note.txt").read_text(encoding="utf-8") == "keep me"
+        assert (dest_root / "target" / "set" / "nested" / "image.jpg").is_file()
+        assert (dest_root / "target" / "set" / "note.txt").read_text(encoding="utf-8") == "keep me"
+        assert source.get_image("set/nested/image.jpg") is not None
+        copied = dest.get_image("target/set/nested/image.jpg")
+        assert copied is not None
+        assert copied.image_hash is None
+        assert source.get_image_tags("set/nested/image.jpg") == ["Keep"]
+        assert dest.get_image_tags("target/set/nested/image.jpg") == ["Keep"]
+        assert dest.refresh_subtree("target/set")
+        assert dest.get_image("target/set/nested/image.jpg") is not None
+
+
 def test_same_catalog_directory_move_treats_like_wildcards_as_literal_names(tmp_path: Path) -> None:
     root = tmp_path / "catalog"
     make_image(root / "a_b" / "nested" / "image.jpg", (100, 80), (20, 20, 20))

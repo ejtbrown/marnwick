@@ -7058,6 +7058,248 @@ class Catalog:
             )
         ]
 
+    def copy_images(
+        self,
+        rel_paths: Sequence[str],
+        dest_catalog: "Catalog",
+        dest_dir_rel: str = "",
+        *,
+        expected_identities: Mapping[str, CatalogFileIdentity] | None = None,
+        progress_callback: ProgressCallback | None = None,
+        cancel_check: CancelCallback | None = None,
+    ) -> list[MoveResult]:
+        """Copy images without replacing an existing destination or removing sources."""
+
+        self._assert_writable()
+        dest_catalog._assert_writable()
+        if is_trash_rel_path(dest_dir_rel):
+            raise ValueError("cannot copy items into trash")
+        total = len(rel_paths)
+        processed = 0
+        if progress_callback is not None:
+            progress_callback(0, total, dest_dir_rel or ".")
+        dest_dir = (
+            dest_catalog._mutation_path(dest_dir_rel, allow_missing_leaf=True)
+            if dest_dir_rel
+            else dest_catalog.root
+        )
+        dest_catalog._mkdir_catalog_path(dest_dir)
+        dest_catalog._remember_directory(dest_dir_rel)
+        results: list[MoveResult] = []
+        impacted_dirs: set[str] = set()
+        for rel_path in rel_paths:
+            if cancel_check is not None:
+                cancel_check()
+            if progress_callback is not None:
+                progress_callback(processed, total, rel_path)
+            source_path = self._mutation_path(rel_path, allow_missing_leaf=True)
+            try:
+                source_stat = source_path.lstat()
+            except FileNotFoundError:
+                processed += 1
+                if progress_callback is not None:
+                    progress_callback(processed, total, rel_path)
+                continue
+            if not stat_module.S_ISREG(source_stat.st_mode):
+                raise ValueError(f"image copy source is not a regular file: {rel_path}")
+            source_identity = self._catalog_file_identity(source_path, source_stat)
+            expected_identity = (
+                expected_identities.get(rel_path)
+                if expected_identities is not None
+                else None
+            )
+            if expected_identity is not None and source_identity != expected_identity:
+                raise OSError(f"image changed after copy was confirmed: {rel_path}")
+
+            def report_image_detail(detail: str) -> None:
+                if progress_callback is not None:
+                    progress_callback(
+                        processed,
+                        total,
+                        f"{rel_path}: {detail}",
+                    )
+
+            while True:
+                dest_path = dest_catalog._unique_destination(dest_dir / source_path.name)
+                try:
+                    proof = self._copy_file_to_destination(
+                        source_path,
+                        dest_path,
+                        expected_source_identity=source_identity,
+                        cancel_check=cancel_check,
+                        detail_callback=report_image_detail,
+                    )
+                except OSError as error:
+                    if error.errno == errno.EEXIST:
+                        continue
+                    raise
+                if proof.source_identity != source_identity:
+                    dest_catalog._discard_rejected_published_file(dest_path)
+                    raise OSError(f"image changed while it was being copied: {rel_path}")
+                break
+            dest_rel_path = dest_catalog.rel_path(dest_path)
+            source_tags = self.get_image_tags(rel_path)
+            try:
+                dest_catalog._delete_db_records([dest_rel_path])
+                self._copy_db_record_to_catalog(
+                    rel_path,
+                    dest_rel_path,
+                    dest_catalog,
+                    remember_directory=False,
+                    invalidate_content=True,
+                )
+            except Exception:
+                # The verified copy is already public. Keep and reconcile it so
+                # a database failure never turns a successful copy into data loss.
+                with suppress(Exception):
+                    recovered = dest_catalog.index_image(dest_rel_path, force=True)
+                    if recovered is not None:
+                        dest_catalog.set_image_tags(
+                            dest_rel_path,
+                            source_tags,
+                            replace=True,
+                        )
+                raise
+            impacted_dirs.add(dest_catalog._parent_dir_rel(dest_rel_path))
+            results.append(MoveResult(rel_path, dest_rel_path, dest_catalog.root))
+            processed += 1
+            if progress_callback is not None:
+                progress_callback(processed, total, dest_rel_path)
+        if impacted_dirs:
+            dest_catalog.update_hashes_after_targeted_move(impacted_dirs)
+            dest_catalog._save_directory_tree_cache_safely()
+        return results
+
+    def copy_directories(
+        self,
+        dir_rels: Sequence[str],
+        dest_catalog: "Catalog",
+        dest_dir_rel: str = "",
+        *,
+        expected_identities: Mapping[str, DirectoryIdentity] | None = None,
+        progress_callback: ProgressCallback | None = None,
+        cancel_check: CancelCallback | None = None,
+    ) -> list[MoveResult]:
+        """Copy directory trees without replacing destinations or removing sources."""
+
+        self._assert_writable()
+        dest_catalog._assert_writable()
+        if is_trash_rel_path(dest_dir_rel):
+            raise ValueError("cannot copy items into trash")
+        sorted_dir_rels = sorted(set(dir_rels), key=lambda value: value.count("/"))
+        total = len(sorted_dir_rels)
+        processed = 0
+        if progress_callback is not None:
+            progress_callback(0, total, dest_dir_rel or ".")
+        dest_parent = (
+            dest_catalog._mutation_path(dest_dir_rel, allow_missing_leaf=True)
+            if dest_dir_rel
+            else dest_catalog.root
+        )
+        dest_catalog._mkdir_catalog_path(dest_parent)
+        dest_catalog._remember_directory(dest_dir_rel)
+        results: list[MoveResult] = []
+        impacted_dirs: set[str] = set()
+        for dir_rel in sorted_dir_rels:
+            if cancel_check is not None:
+                cancel_check()
+            if progress_callback is not None:
+                progress_callback(processed, total, dir_rel or ".")
+            if not dir_rel:
+                processed += 1
+                if progress_callback is not None:
+                    progress_callback(processed, total, ".")
+                continue
+            if self.root == dest_catalog.root and (
+                dest_dir_rel == dir_rel or dest_dir_rel.startswith(f"{dir_rel}/")
+            ):
+                raise ValueError("cannot copy a directory into itself")
+            source_path = self._mutation_path(dir_rel, allow_missing_leaf=True)
+            try:
+                source_stat = source_path.lstat()
+            except FileNotFoundError:
+                processed += 1
+                if progress_callback is not None:
+                    progress_callback(processed, total, dir_rel)
+                continue
+            if not stat_module.S_ISDIR(source_stat.st_mode):
+                raise ValueError(f"directory copy source is not a directory: {dir_rel}")
+            source_identity = (
+                int(source_stat.st_dev),
+                int(source_stat.st_ino),
+                int(source_stat.st_mtime_ns),
+                self._path_change_time_ns(source_path, source_stat),
+            )
+            expected_identity = (
+                expected_identities.get(dir_rel)
+                if expected_identities is not None
+                else None
+            )
+            if expected_identity is not None and source_identity != expected_identity:
+                raise OSError(f"directory changed after copy was confirmed: {dir_rel}")
+
+            def report_directory_detail(detail: str) -> None:
+                if progress_callback is not None:
+                    progress_callback(
+                        processed,
+                        total,
+                        f"{dir_rel}: {detail}",
+                    )
+
+            while True:
+                dest_path = dest_catalog._unique_destination(dest_parent / source_path.name)
+                try:
+                    proof = self._copy_directory_to_destination(
+                        source_path,
+                        dest_path,
+                        expected_source_identity=source_identity,
+                        cancel_check=cancel_check,
+                        detail_callback=report_directory_detail,
+                    )
+                except OSError as error:
+                    if error.errno == errno.EEXIST:
+                        continue
+                    raise
+                proof_identity = (
+                    proof.source_root_identity[0],
+                    proof.source_root_identity[1],
+                    proof.source_root_identity[4],
+                    proof.source_root_identity[5],
+                )
+                if proof_identity != source_identity:
+                    dest_catalog._discard_rejected_published_directory(dest_path)
+                    raise OSError(f"directory changed while it was being copied: {dir_rel}")
+                break
+            dest_rel_path = dest_catalog.rel_path(dest_path)
+            try:
+                self._copy_directory_records(
+                    dir_rel,
+                    dest_rel_path,
+                    dest_catalog,
+                    cancel_check=cancel_check,
+                    invalidate_content=True,
+                )
+            except Exception:
+                # As with image copies, retain and reconcile an already-published
+                # verified tree if catalog bookkeeping fails afterward.
+                with suppress(Exception):
+                    dest_catalog.refresh_subtree(dest_rel_path)
+                raise
+            impacted_dirs.update(
+                {
+                    dest_rel_path,
+                    dest_catalog._parent_dir_rel(dest_rel_path),
+                }
+            )
+            results.append(MoveResult(dir_rel, dest_rel_path, dest_catalog.root))
+            processed += 1
+            if progress_callback is not None:
+                progress_callback(processed, total, dest_rel_path)
+        if impacted_dirs:
+            dest_catalog.update_hashes_after_targeted_move(impacted_dirs)
+            dest_catalog._save_directory_tree_cache_safely()
+        return results
+
     def move_images(
         self,
         rel_paths: Sequence[str],
