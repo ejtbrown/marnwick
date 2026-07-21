@@ -3739,6 +3739,39 @@ class Catalog:
             ).fetchone()
         return 0 if row is None else int(row["count"])
 
+    def known_directories_with_children(
+        self,
+        dir_rels: Sequence[str],
+        *,
+        cancel_check: CancelCallback | None = None,
+    ) -> set[str]:
+        """Return the requested indexed directories that have direct children."""
+
+        if cancel_check is not None:
+            cancel_check()
+        candidates = tuple(dict.fromkeys(dir_rels))
+        parents_with_children: set[str] = set()
+        for start in range(0, len(candidates), SQLITE_VARIABLE_BATCH_SIZE):
+            if cancel_check is not None:
+                cancel_check()
+            batch = candidates[start : start + SQLITE_VARIABLE_BATCH_SIZE]
+            placeholders = ", ".join("?" for _ in batch)
+            with self._sqlite_cancel_progress(cancel_check):
+                rows = self._conn.execute(
+                    f"""
+                    SELECT DISTINCT parent_dir_rel
+                    FROM directories
+                    WHERE parent_dir_rel IN ({placeholders})
+                        AND dir_rel != parent_dir_rel
+                    """,
+                    batch,
+                )
+                parents_with_children.update(
+                    str(row["parent_dir_rel"])
+                    for row in self._iter_cursor_rows(rows, cancel_check)
+                )
+        return parents_with_children
+
     def list_known_child_directories_page(
         self,
         parent_dir_rel: str = "",

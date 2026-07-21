@@ -12390,6 +12390,75 @@ def test_automatic_tree_materialization_is_capped(tmp_path: Path, monkeypatch) -
         qt_app.processEvents()
 
 
+def test_physical_tree_only_forces_expanders_for_directories_with_children(
+    tmp_path: Path,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    (root / "branch" / "child").mkdir(parents=True)
+    (root / "leaf").mkdir()
+    window = MainWindow()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        catalog.refresh()
+        window.current_catalog = catalog
+        window.current_dir_rel = ""
+        window.rebuild_tree()
+        settle_tree_build_tasks(window, qt_app)
+        deadline = monotonic() + 2
+        while window._tree_children_tasks and monotonic() < deadline:
+            qt_app.processEvents()
+            window._settle_tree_children_tasks()
+            sleep(0.001)
+
+        item_map = window._tree_item_maps[catalog.root]
+        hidden_when_empty = (
+            QTreeWidgetItem.ChildIndicatorPolicy.DontShowIndicatorWhenChildless
+        )
+        assert item_map["branch"].childIndicatorPolicy() == (
+            QTreeWidgetItem.ChildIndicatorPolicy.ShowIndicator
+        )
+        assert item_map["branch/child"].childIndicatorPolicy() == hidden_when_empty
+        assert item_map["leaf"].childIndicatorPolicy() == hidden_when_empty
+    finally:
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_capped_tree_keeps_expander_for_unmaterialized_known_child(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    window = MainWindow()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        catalog.remember_directory("branch/child")
+        monkeypatch.setattr(ui_module, "MAX_AUTOMATIC_TREE_ITEMS", 2)
+        monkeypatch.setattr(ui_module, "TREE_BUILD_BUDGET_SECONDS", 999.0)
+
+        window._start_incremental_tree_rebuild(catalog, reason="indicator-test")
+        settle_tree_build_tasks(window, qt_app)
+
+        item_map = window._tree_item_maps[catalog.root]
+        assert "branch" in item_map
+        assert "branch/child" not in item_map
+        assert item_map["branch"].childIndicatorPolicy() == (
+            QTreeWidgetItem.ChildIndicatorPolicy.ShowIndicator
+        )
+    finally:
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
 def test_capped_tree_reloads_root_page_read_before_discovery_finished(
     tmp_path: Path,
     monkeypatch,
