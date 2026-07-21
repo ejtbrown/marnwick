@@ -6502,6 +6502,9 @@ def test_query_backed_catalog_pages_stay_bounded_with_100k_rows(
         assert len(child_page) == 31
         assert child_page[0] == "wide/child-099900"
         assert child_page[-1] == "wide/child-099930"
+        assert catalog.known_directories_with_children(
+            ["", "wide", *child_page]
+        ) == {"", "wide"}
 
         aggregate_page_sizes: list[int] = []
         real_aggregates = catalog._child_directory_image_aggregates
@@ -6593,6 +6596,7 @@ def test_bounded_query_pages_validate_limits_offsets_and_honor_cancellation(
             lambda: catalog.tag_image_count("tag", cancel_check=cancel),
             lambda: catalog.exact_duplicate_image_count(cancel_check=cancel),
             lambda: catalog.known_child_directory_count(cancel_check=cancel),
+            lambda: catalog.known_directories_with_children([""], cancel_check=cancel),
             lambda: catalog.known_directory_prefix_count("", cancel_check=cancel),
             lambda: catalog.list_images_page(limit=10, cancel_check=cancel),
             lambda: catalog.list_images_for_tag_page("tag", limit=10, cancel_check=cancel),

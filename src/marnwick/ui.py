@@ -316,6 +316,7 @@ class CatalogOpenTask:
 class TreeBuildTask:
     catalog: Catalog
     directories: list[str]
+    directories_with_children: frozenset[str]
     total: int | None
     page_offset: int
     processed: int
@@ -343,6 +344,7 @@ class TreePageResult:
     directories: list[str]
     tags: tuple[str, ...] | None
     tags_have_more: bool = False
+    directories_with_children: frozenset[str] = field(default_factory=frozenset)
 
 
 @dataclass(slots=True)
@@ -353,6 +355,7 @@ class TreeChildrenPageResult:
     directories: list[str]
     next_offset: int
     has_more: bool
+    directories_with_children: frozenset[str] = field(default_factory=frozenset)
 
 
 @dataclass(slots=True)
@@ -6265,6 +6268,18 @@ class MainWindow(QMainWindow):
                 lower = middle + 1
         parent.insertChild(lower, item)
 
+    @staticmethod
+    def _set_tree_directory_child_indicator(
+        item: QTreeWidgetItem,
+        *,
+        has_subdirectories: bool,
+    ) -> None:
+        item.setChildIndicatorPolicy(
+            QTreeWidgetItem.ChildIndicatorPolicy.ShowIndicator
+            if has_subdirectories
+            else QTreeWidgetItem.ChildIndicatorPolicy.DontShowIndicatorWhenChildless
+        )
+
     def rebuild_tree(self) -> None:
         if self._closing:
             return
@@ -6296,8 +6311,9 @@ class MainWindow(QMainWindow):
             root_item.setToolTip(0, str(catalog.root))
             root_item.setData(0, CATALOG_ROOT_ROLE, str(catalog.root))
             root_item.setData(0, DIR_REL_ROLE, "")
-            root_item.setChildIndicatorPolicy(
-                QTreeWidgetItem.ChildIndicatorPolicy.ShowIndicator
+            self._set_tree_directory_child_indicator(
+                root_item,
+                has_subdirectories=False,
             )
             self.tree.addTopLevelItem(root_item)
             item_by_dir = {"": root_item}
@@ -6320,8 +6336,9 @@ class MainWindow(QMainWindow):
                 item.setToolTip(0, str(catalog.root / dir_rel))
                 item.setData(0, CATALOG_ROOT_ROLE, str(catalog.root))
                 item.setData(0, DIR_REL_ROLE, dir_rel)
-                item.setChildIndicatorPolicy(
-                    QTreeWidgetItem.ChildIndicatorPolicy.ShowIndicator
+                self._set_tree_directory_child_indicator(
+                    item,
+                    has_subdirectories=False,
                 )
                 self._insert_tree_directory_item(parent_item, item, dir_rel)
                 item_by_dir[dir_rel] = item
@@ -6405,8 +6422,9 @@ class MainWindow(QMainWindow):
             root_item.setToolTip(0, str(catalog.root))
             root_item.setData(0, CATALOG_ROOT_ROLE, str(catalog.root))
             root_item.setData(0, DIR_REL_ROLE, "")
-            root_item.setChildIndicatorPolicy(
-                QTreeWidgetItem.ChildIndicatorPolicy.ShowIndicator
+            self._set_tree_directory_child_indicator(
+                root_item,
+                has_subdirectories=False,
             )
             self.tree.addTopLevelItem(root_item)
             item_by_dir = {"": root_item}
@@ -6429,13 +6447,15 @@ class MainWindow(QMainWindow):
             key for key in self._tree_child_refresh_pending if key[0] != catalog.root
         }
         for item in item_by_dir.values():
-            item.setChildIndicatorPolicy(
-                QTreeWidgetItem.ChildIndicatorPolicy.ShowIndicator
+            self._set_tree_directory_child_indicator(
+                item,
+                has_subdirectories=False,
             )
         root_item.setExpanded(True)
         self._tree_build_task = TreeBuildTask(
             catalog=catalog,
             directories=[],
+            directories_with_children=frozenset(),
             total=None,
             page_offset=0,
             processed=0,
@@ -6503,28 +6523,37 @@ class MainWindow(QMainWindow):
             expected_root_identity=expected_root_identity,
             expected_storage_identity=expected_storage_identity,
         ) as catalog:
-            directories = catalog.list_known_directories_with_prefix_page(
-                "",
-                limit=TREE_BUILD_BATCH_SIZE,
-                offset=offset,
-                cancel_check=check_canceled,
-            )
-            if offset == 0:
-                tag_rows = catalog._conn.execute(  # noqa: SLF001 - bounded read-only worker query
-                    """
-                    SELECT name
-                    FROM tags
-                    ORDER BY name COLLATE NOCASE, name
-                    LIMIT ?
-                    """,
-                    (MAX_TREE_TAG_ITEMS + 1,),
+            catalog._conn.execute("BEGIN")  # noqa: SLF001 - page/indicator snapshot
+            try:
+                directories = catalog.list_known_directories_with_prefix_page(
+                    "",
+                    limit=TREE_BUILD_BATCH_SIZE,
+                    offset=offset,
+                    cancel_check=check_canceled,
                 )
-                tag_page = tuple(str(row["name"]) for row in tag_rows)
-                tags_have_more = len(tag_page) > MAX_TREE_TAG_ITEMS
-                tags = tag_page[:MAX_TREE_TAG_ITEMS]
-            else:
-                tags = None
-                tags_have_more = False
+                directories_with_children = catalog.known_directories_with_children(
+                    directories,
+                    cancel_check=check_canceled,
+                )
+                if offset == 0:
+                    tag_rows = catalog._conn.execute(  # noqa: SLF001 - bounded read-only worker query
+                        """
+                        SELECT name
+                        FROM tags
+                        ORDER BY name COLLATE NOCASE, name
+                        LIMIT ?
+                        """,
+                        (MAX_TREE_TAG_ITEMS + 1,),
+                    )
+                    tag_page = tuple(str(row["name"]) for row in tag_rows)
+                    tags_have_more = len(tag_page) > MAX_TREE_TAG_ITEMS
+                    tags = tag_page[:MAX_TREE_TAG_ITEMS]
+                else:
+                    tags = None
+                    tags_have_more = False
+            finally:
+                with suppress(sqlite3.Error):
+                    catalog._conn.execute("ROLLBACK")  # noqa: SLF001
             catalog._assert_catalog_storage_identity()  # noqa: SLF001 - stale-result guard
         check_canceled()
         return TreePageResult(
@@ -6534,6 +6563,7 @@ class MainWindow(QMainWindow):
             directories=directories,
             tags=tags,
             tags_have_more=tags_have_more,
+            directories_with_children=frozenset(directories_with_children),
         )
 
     def _submit_tree_page(self, task: TreeBuildTask) -> None:
@@ -6628,6 +6658,7 @@ class MainWindow(QMainWindow):
             page = page_result.directories
             task.page_offset += len(page)
             task.directories = [dir_rel for dir_rel in page if dir_rel]
+            task.directories_with_children = page_result.directories_with_children
             task.index = 0
             if page_result.tags is not None:
                 task.tags = page_result.tags
@@ -6665,8 +6696,11 @@ class MainWindow(QMainWindow):
                     item.setToolTip(0, str(task.catalog.root / dir_rel))
                     item.setData(0, CATALOG_ROOT_ROLE, str(task.catalog.root))
                     item.setData(0, DIR_REL_ROLE, dir_rel)
-                    item.setChildIndicatorPolicy(
-                        QTreeWidgetItem.ChildIndicatorPolicy.ShowIndicator
+                    self._set_tree_directory_child_indicator(
+                        item,
+                        has_subdirectories=(
+                            dir_rel in task.directories_with_children
+                        ),
                     )
                     self._insert_tree_directory_item(parent_item, item, dir_rel)
                     task.item_by_dir[dir_rel] = item
@@ -6675,6 +6709,12 @@ class MainWindow(QMainWindow):
                         item.setExpanded(True)
                 else:
                     self._insert_tree_directory_item(parent_item, item, dir_rel)
+                    self._set_tree_directory_child_indicator(
+                        item,
+                        has_subdirectories=(
+                            dir_rel in task.directories_with_children
+                        ),
+                    )
                 task.seen_directories.add(dir_rel)
                 task.rebuilt_item_by_dir[dir_rel] = item
                 if self._is_current_tree_item(task.catalog.root, dir_rel):
@@ -6704,8 +6744,11 @@ class MainWindow(QMainWindow):
                         item.setToolTip(0, str(task.catalog.root / current_rel))
                         item.setData(0, CATALOG_ROOT_ROLE, str(task.catalog.root))
                         item.setData(0, DIR_REL_ROLE, current_rel)
-                        item.setChildIndicatorPolicy(
-                            QTreeWidgetItem.ChildIndicatorPolicy.ShowIndicator
+                        self._set_tree_directory_child_indicator(
+                            item,
+                            has_subdirectories=(
+                                current_rel in task.directories_with_children
+                            ),
                         )
                         self._insert_tree_directory_item(
                             fallback_parent,
@@ -6722,6 +6765,12 @@ class MainWindow(QMainWindow):
                                 item,
                                 current_rel,
                             )
+                        self._set_tree_directory_child_indicator(
+                            item,
+                            has_subdirectories=(
+                                current_rel in task.directories_with_children
+                            ),
+                        )
                     task.seen_directories.add(current_rel)
                     task.rebuilt_item_by_dir[current_rel] = item
                     current_parent = current_rel
@@ -6861,8 +6910,9 @@ class MainWindow(QMainWindow):
             root_item.setToolTip(0, str(catalog.root))
             root_item.setData(0, CATALOG_ROOT_ROLE, str(catalog.root))
             root_item.setData(0, DIR_REL_ROLE, "")
-            root_item.setChildIndicatorPolicy(
-                QTreeWidgetItem.ChildIndicatorPolicy.ShowIndicator
+            self._set_tree_directory_child_indicator(
+                root_item,
+                has_subdirectories=False,
             )
             self.tree.addTopLevelItem(root_item)
             item_by_dir = {"": root_item}
@@ -6933,8 +6983,9 @@ class MainWindow(QMainWindow):
                 child.setToolTip(0, str(task.catalog.root / next_rel))
                 child.setData(0, CATALOG_ROOT_ROLE, str(task.catalog.root))
                 child.setData(0, DIR_REL_ROLE, next_rel)
-                child.setChildIndicatorPolicy(
-                    QTreeWidgetItem.ChildIndicatorPolicy.ShowIndicator
+                self._set_tree_directory_child_indicator(
+                    child,
+                    has_subdirectories=False,
                 )
                 self._insert_tree_directory_item(task.current_item, child, next_rel)
                 current_map[next_rel] = child
@@ -6963,6 +7014,9 @@ class MainWindow(QMainWindow):
             return
         self._set_current_tree_item_without_scrolling(task.current_item)
         self._tree_path_selection_task = None
+        if task.dir_rel:
+            self._tree_child_refresh_pending.add((task.catalog.root, task.dir_rel))
+            self._submit_pending_tree_child_refresh()
 
     def _add_virtual_tree_items(
         self,
@@ -7086,6 +7140,10 @@ class MainWindow(QMainWindow):
                     offset=offset,
                     cancel_check=check_canceled,
                 )
+                directories_with_children = catalog.known_directories_with_children(
+                    directories,
+                    cancel_check=check_canceled,
+                )
             finally:
                 with suppress(sqlite3.Error):
                     catalog._conn.execute("ROLLBACK")  # noqa: SLF001
@@ -7099,6 +7157,7 @@ class MainWindow(QMainWindow):
             directories=directories,
             next_offset=next_offset,
             has_more=next_offset < total,
+            directories_with_children=frozenset(directories_with_children),
         )
 
     @staticmethod
@@ -7299,13 +7358,22 @@ class MainWindow(QMainWindow):
                     child.setToolTip(0, str(catalog.root / dir_rel))
                     child.setData(0, CATALOG_ROOT_ROLE, str(catalog.root))
                     child.setData(0, DIR_REL_ROLE, dir_rel)
-                    child.setChildIndicatorPolicy(
-                        QTreeWidgetItem.ChildIndicatorPolicy.ShowIndicator
+                    self._set_tree_directory_child_indicator(
+                        child,
+                        has_subdirectories=(
+                            dir_rel in result.directories_with_children
+                        ),
                     )
                     self._insert_tree_directory_item(item, child, dir_rel)
                     item_by_dir[dir_rel] = child
                 else:
                     self._insert_tree_directory_item(item, child, dir_rel)
+                    self._set_tree_directory_child_indicator(
+                        child,
+                        has_subdirectories=(
+                            dir_rel in result.directories_with_children
+                        ),
+                    )
                 active_build = self._tree_build_task
                 if active_build is not None and active_build.catalog is catalog:
                     active_build.seen_directories.add(dir_rel)
@@ -7317,8 +7385,9 @@ class MainWindow(QMainWindow):
                     child.setExpanded(True)
             next_offset = result.next_offset if result.has_more else None
             self._tree_child_next_offsets[(catalog.root, task.parent_dir_rel)] = next_offset
-            item.setChildIndicatorPolicy(
-                QTreeWidgetItem.ChildIndicatorPolicy.DontShowIndicatorWhenChildless
+            self._set_tree_directory_child_indicator(
+                item,
+                has_subdirectories=bool(result.directories),
             )
             if next_offset is not None:
                 self._add_tree_load_more_item(
