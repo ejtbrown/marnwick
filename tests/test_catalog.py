@@ -1832,6 +1832,84 @@ def test_move_uses_unique_destination_when_name_exists(tmp_path: Path) -> None:
         assert (root / "dest" / "image (1).jpg").exists()
 
 
+def test_rename_image_updates_catalog_record_and_preserves_tags(tmp_path: Path) -> None:
+    root = tmp_path / "catalog"
+    make_image(root / "album" / "original.jpg")
+
+    with Catalog(root) as catalog:
+        catalog.refresh()
+        catalog.set_image_tags("album/original.jpg", ["Keep"], replace=True)
+        original = catalog.get_image("album/original.jpg", include_blob=False)
+        assert original is not None
+
+        result = catalog.rename_image(
+            "album/original.jpg",
+            "renamed.jpg",
+            expected_identity=catalog.file_identity("album/original.jpg"),
+        )
+
+        assert result.dest_rel_path == "album/renamed.jpg"
+        assert not (root / "album" / "original.jpg").exists()
+        assert (root / "album" / "renamed.jpg").is_file()
+        assert catalog.get_image("album/original.jpg", include_blob=False) is None
+        renamed = catalog.get_image("album/renamed.jpg", include_blob=False)
+        assert renamed is not None
+        assert renamed.id == original.id
+        assert renamed.filename == "renamed.jpg"
+        assert catalog.get_image_tags("album/renamed.jpg") == ["Keep"]
+
+
+def test_rename_image_rejects_source_replaced_after_confirmation(tmp_path: Path) -> None:
+    root = tmp_path / "catalog"
+    make_image(root / "source.jpg", color=(10, 20, 30))
+
+    with Catalog(root) as catalog:
+        catalog.refresh()
+        expected_identity = catalog.file_identity("source.jpg")
+        (root / "source.jpg").unlink()
+        make_image(root / "source.jpg", size=(91, 73), color=(90, 80, 70))
+
+        with pytest.raises(OSError, match="changed after rename was requested"):
+            catalog.rename_image(
+                "source.jpg",
+                "renamed.jpg",
+                expected_identity=expected_identity,
+            )
+
+        assert (root / "source.jpg").is_file()
+        assert not (root / "renamed.jpg").exists()
+
+
+@pytest.mark.parametrize(
+    ("requested_name", "occupied_names", "expected_name"),
+    [
+        ("taken.jpg", ("taken.jpg", "taken-001.jpg"), "taken-002.jpg"),
+        ("photo009.jpg", ("photo009.jpg", "photo010.jpg"), "photo011.jpg"),
+        ("photo99.jpg", ("photo99.jpg",), "photo100.jpg"),
+    ],
+)
+def test_rename_image_uses_requested_collision_sequence(
+    tmp_path: Path,
+    requested_name: str,
+    occupied_names: tuple[str, ...],
+    expected_name: str,
+) -> None:
+    root = tmp_path / "catalog"
+    make_image(root / "source.jpg", color=(10, 20, 30))
+    for index, occupied_name in enumerate(occupied_names):
+        make_image(root / occupied_name, color=(index + 40, 50, 60))
+
+    with Catalog(root) as catalog:
+        catalog.refresh()
+
+        result = catalog.rename_image("source.jpg", requested_name)
+
+        assert result.dest_rel_path == expected_name
+        assert not (root / "source.jpg").exists()
+        assert (root / expected_name).is_file()
+        assert all((root / occupied_name).is_file() for occupied_name in occupied_names)
+
+
 def test_copy_image_keeps_source_and_uses_unique_destination(tmp_path: Path) -> None:
     root = tmp_path / "catalog"
     make_image(root / "album" / "image.jpg", (100, 80), (20, 30, 40))
@@ -6906,6 +6984,7 @@ def test_open_reader_rejects_every_public_catalog_mutator_before_side_effects(
             lambda: reader.set_image_tags("image.png", ["tag"]),
             lambda: reader.apply_tag_entry("image.png", "tag"),
             lambda: reader.move_images([], reader),
+            lambda: reader.rename_image("image.png", "renamed.png"),
             lambda: reader.restore_image_from_trash(f"{TRASH_DIR_NAME}/image.png"),
             lambda: reader.restore_directory_from_trash(f"{TRASH_DIR_NAME}/album"),
             lambda: reader.move_directories([], reader),

@@ -54,6 +54,7 @@ from marnwick.ui import (  # noqa: E402
     DuplicateDeleteTask,
     DuplicateListDialog,
     FullscreenViewer,
+    ImageRenameDialog,
     LogsDialog,
     MAX_PENDING_THUMBNAIL_RETRIES,
     MAX_THUMBNAIL_PIXMAP_CACHE_ITEMS,
@@ -2705,6 +2706,108 @@ def test_thumbnail_context_menu_uses_directory_actions(tmp_path: Path) -> None:
         window.idle_timer.stop()
         window.indexer.shutdown()
         window.workspace.close()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_thumbnail_context_menu_includes_image_rename_action(tmp_path: Path) -> None:
+    qt_app = app()
+    window = MainWindow()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        record = ImageRecord(
+            id=1,
+            catalog_root=tmp_path,
+            rel_path="image.jpg",
+            dir_rel="",
+            filename="image.jpg",
+            size_bytes=1,
+            mtime_ns=1,
+            width=1,
+            height=1,
+            aspect_ratio=1.0,
+            thumb_width=1,
+            thumb_height=1,
+        )
+        menu = QMenu()
+        try:
+            actions = window._thumbnail_context_menu_actions(menu, record)
+            labels = [action.text() for action in menu.actions() if action.text()]
+
+            assert labels == ["Rename", "List Duplicates", "Delete", "Metadata"]
+            assert set(actions) == {"rename", "list_duplicates", "delete", "metadata"}
+        finally:
+            menu.close()
+            menu.deleteLater()
+    finally:
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_image_rename_dialog_selects_stem_and_keeps_extension() -> None:
+    qt_app = app()
+    dialog = ImageRenameDialog("holiday.photo.jpeg")
+    try:
+        assert dialog.entry.text() == "holiday.photo.jpeg"
+        assert dialog.entry.selectedText() == "holiday.photo"
+
+        dialog.entry.insert("renamed")
+
+        assert dialog.file_name() == "renamed.jpeg"
+    finally:
+        dialog.close()
+        dialog.deleteLater()
+        qt_app.processEvents()
+
+
+def test_rename_image_dialog_queues_safe_collision_rename(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    Image.new("RGB", (8, 8), (10, 20, 30)).save(root / "source.jpg")
+    Image.new("RGB", (8, 8), (40, 50, 60)).save(root / "vacation.jpg")
+
+    class FakeImageRenameDialog:
+        def __init__(self, filename: str, _parent=None) -> None:  # type: ignore[no-untyped-def]
+            assert filename == "source.jpg"
+
+        def exec(self) -> QDialog.DialogCode:
+            return QDialog.DialogCode.Accepted
+
+        def file_name(self) -> str:
+            return "vacation.jpg"
+
+    window = MainWindow()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        catalog.refresh()
+        record = catalog.get_image("source.jpg", include_blob=False)
+        assert record is not None
+        window.current_catalog = catalog
+        window.current_dir_rel = ""
+        window.load_current_directory()
+        settle_virtual_view_tasks(window, qt_app)
+        monkeypatch.setattr(ui_module, "ImageRenameDialog", FakeImageRenameDialog)
+
+        window.rename_image(catalog, record)
+        settle_move_payload_task(window, qt_app)
+        settle_virtual_view_tasks(window, qt_app)
+        settle_post_move_reconcile_tasks(window, qt_app)
+
+        assert not (root / "source.jpg").exists()
+        assert (root / "vacation.jpg").is_file()
+        assert (root / "vacation-001.jpg").is_file()
+        assert catalog.get_image("source.jpg", include_blob=False) is None
+        assert catalog.get_image("vacation-001.jpg", include_blob=False) is not None
+    finally:
         window.close()
         window.deleteLater()
         qt_app.processEvents()

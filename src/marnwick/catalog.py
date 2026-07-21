@@ -7547,6 +7547,43 @@ class Catalog:
         self.append_log(f"Restored image {rel_path} to {result.dest_rel_path}")
         return result
 
+    def rename_image(
+        self,
+        rel_path: str,
+        new_name: str,
+        *,
+        expected_identity: CatalogFileIdentity | None = None,
+    ) -> MoveResult:
+        """Rename one image in place without replacing an existing entry."""
+
+        self._assert_writable()
+        if (
+            not new_name
+            or new_name in {".", ".."}
+            or Path(new_name).name != new_name
+            or is_marnwick_internal_artifact_name(new_name)
+        ):
+            raise ValueError("image name must be a single non-empty file name")
+        source_path = self._mutation_path(rel_path)
+        source_identity = self._catalog_file_identity(source_path)
+        if expected_identity is not None and source_identity != expected_identity:
+            raise OSError(f"image changed after rename was requested: {rel_path}")
+        if source_path.name == new_name:
+            return MoveResult(rel_path, rel_path, self.root)
+
+        parent_rel = self._parent_dir_rel(rel_path)
+        dest_rel_path = f"{parent_rel}/{new_name}" if parent_rel else new_name
+        result = self._move_image_to_rel_path(
+            rel_path,
+            dest_rel_path,
+            expected_identity=source_identity,
+            destination_resolver=self._unique_rename_destination,
+        )
+        self.update_hashes_after_targeted_move({parent_rel})
+        self._save_directory_tree_cache_safely()
+        self.append_log(f"Renamed image {rel_path} to {result.dest_rel_path}")
+        return result
+
     def restore_directory_from_trash(
         self,
         dir_rel: str,
@@ -8020,6 +8057,7 @@ class Catalog:
         dest_rel_path: str,
         *,
         expected_identity: CatalogFileIdentity | None = None,
+        destination_resolver: Callable[[Path], Path] | None = None,
     ) -> MoveResult:
         if not source_rel_path or source_rel_path == dest_rel_path:
             raise ValueError("source and destination must be different image paths")
@@ -8035,12 +8073,19 @@ class Catalog:
         if expected_identity is not None and source_identity != expected_identity:
             raise OSError(f"image changed after move was confirmed: {source_rel_path}")
         source_tags = self.get_image_tags(source_rel_path)
-        dest_path = self._mutation_path(dest_rel_path, allow_missing_leaf=True)
-        self._mkdir_catalog_path(dest_path.parent)
+        dest_parent_rel = self._parent_dir_rel(dest_rel_path)
+        dest_parent = (
+            self._mutation_path(dest_parent_rel, allow_missing_leaf=True)
+            if dest_parent_rel
+            else self.root
+        )
+        self._mkdir_catalog_path(dest_parent)
+        dest_path = dest_parent / Path(dest_rel_path).name
         dest_path, copy_proof = self._move_file_no_clobber(
             source_path,
             dest_path,
             expected_source_identity=source_identity,
+            destination_resolver=destination_resolver,
         )
         actual_dest_rel_path = self.rel_path(dest_path)
         try:
@@ -10020,6 +10065,32 @@ class Catalog:
                 return candidate
             counter += 1
 
+    def _unique_rename_destination(self, desired: Path) -> Path:
+        """Resolve rename collisions with a zero-padded numeric sequence."""
+
+        if not os.path.lexists(desired):
+            return desired
+        stem = desired.stem
+        suffix = desired.suffix
+        digit_start = len(stem)
+        while digit_start and "0" <= stem[digit_start - 1] <= "9":
+            digit_start -= 1
+        trailing_digits = stem[digit_start:]
+        if trailing_digits:
+            prefix = stem[:digit_start]
+            width = len(trailing_digits)
+            counter = int(trailing_digits) + 1
+        else:
+            prefix = f"{stem}-"
+            width = 3
+            counter = 1
+        while True:
+            number = str(counter).zfill(width)
+            candidate = desired.with_name(f"{prefix}{number}{suffix}")
+            if not os.path.lexists(candidate):
+                return candidate
+            counter += 1
+
     def _discard_rejected_published_file(self, destination: Path) -> None:
         """Remove exactly a copy published before its source proof was rejected."""
 
@@ -10062,10 +10133,12 @@ class Catalog:
         dest_catalog: "Catalog | None" = None,
         cancel_check: CancelCallback | None = None,
         detail_callback: MutationDetailCallback | None = None,
+        destination_resolver: Callable[[Path], Path] | None = None,
     ) -> tuple[Path, _FileCopyProof | None]:
         destination_owner = self if dest_catalog is None else dest_catalog
+        resolve_destination = destination_resolver or self._unique_destination
         while True:
-            destination = self._unique_destination(desired)
+            destination = resolve_destination(desired)
             source_identity = self._catalog_file_identity(source)
             if (
                 expected_source_identity is not None
