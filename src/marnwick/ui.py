@@ -14771,10 +14771,18 @@ class CircularSelectionOverlay(QWidget):
 
 
 class ImageDisplayLabel(QLabel):
+    ORDINAL_MARGIN = 16
+    ORDINAL_PADDING = 2
+    ORDINAL_FONT_POINT_SIZE = 12
+    LIGHT_BACKGROUND_LUMINANCE = 140.0
+    ORDINAL_SAMPLE_WIDTH = 16
+    ORDINAL_SAMPLE_HEIGHT = 64
+
     def __init__(self) -> None:
         super().__init__()
         self._display_pixmap = QPixmap()
         self._target_rect: QRect | None = None
+        self._ordinal_text = ""
 
     def set_display_pixmap(self, pixmap: QPixmap, target_rect: QRect | None = None) -> None:
         self._display_pixmap = QPixmap(pixmap)
@@ -14790,9 +14798,118 @@ class ImageDisplayLabel(QLabel):
     def display_pixmap(self) -> QPixmap:
         return QPixmap(self._display_pixmap)
 
+    def set_ordinal_text(self, text: str) -> None:
+        if text == self._ordinal_text:
+            return
+        self._ordinal_text = text
+        self.update()
+
+    def ordinal_text(self) -> str:
+        return self._ordinal_text
+
+    def ordinal_overlay_rect(self) -> QRect:
+        if not self._ordinal_text:
+            return QRect()
+        font = QFont(self.font())
+        font.setPointSize(max(font.pointSize(), self.ORDINAL_FONT_POINT_SIZE))
+        metrics = QFontMetrics(font)
+        unrotated_width = metrics.horizontalAdvance(self._ordinal_text) + 2 * self.ORDINAL_PADDING
+        unrotated_height = metrics.height() + 2 * self.ORDINAL_PADDING
+        available_height = max(0, self.height() - 2 * self.ORDINAL_MARGIN)
+        rotated_height = min(unrotated_width, available_height)
+        if rotated_height <= 0:
+            return QRect()
+        return QRect(
+            self.ORDINAL_MARGIN,
+            self.height() - self.ORDINAL_MARGIN - rotated_height,
+            unrotated_height,
+            rotated_height,
+        )
+
+    def ordinal_text_color(self) -> QColor:
+        luminance = self._average_display_luminance(self.ordinal_overlay_rect())
+        return QColor("black" if luminance >= self.LIGHT_BACKGROUND_LUMINANCE else "white")
+
+    def _display_target_rect(self) -> QRect:
+        if self._target_rect is not None:
+            return QRect(self._target_rect)
+        logical_size = logical_size_for_physical(
+            self._display_pixmap.size(),
+            self._display_pixmap.devicePixelRatio(),
+        )
+        return QRect(
+            int((self.width() - logical_size.width()) / 2),
+            int((self.height() - logical_size.height()) / 2),
+            logical_size.width(),
+            logical_size.height(),
+        )
+
+    def _average_display_luminance(self, sample_rect: QRect) -> float:
+        """Return the average displayed brightness beneath the ordinal text."""
+
+        sample_rect = sample_rect.intersected(self.rect())
+        if sample_rect.isEmpty() or self._display_pixmap.isNull():
+            return 0.0
+        sample_width = min(self.ORDINAL_SAMPLE_WIDTH, sample_rect.width())
+        sample_height = min(self.ORDINAL_SAMPLE_HEIGHT, sample_rect.height())
+        sample = QImage(
+            max(1, sample_width),
+            max(1, sample_height),
+            QImage.Format.Format_RGB32,
+        )
+        sample.fill(QColor("black"))
+        target = self._display_target_rect()
+        scaled_target = QRect(
+            round((target.x() - sample_rect.x()) * sample.width() / sample_rect.width()),
+            round((target.y() - sample_rect.y()) * sample.height() / sample_rect.height()),
+            max(1, round(target.width() * sample.width() / sample_rect.width())),
+            max(1, round(target.height() * sample.height() / sample_rect.height())),
+        )
+        sample_painter = QPainter(sample)
+        sample_painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        sample_painter.drawPixmap(
+            scaled_target,
+            self._display_pixmap,
+            self._display_pixmap.rect(),
+        )
+        sample_painter.end()
+        luminance_total = 0.0
+        for y in range(sample.height()):
+            for x in range(sample.width()):
+                color = sample.pixelColor(x, y)
+                luminance_total += (
+                    0.2126 * color.red()
+                    + 0.7152 * color.green()
+                    + 0.0722 * color.blue()
+                )
+        return luminance_total / (sample.width() * sample.height())
+
+    def _paint_ordinal_overlay(self, painter: QPainter) -> None:
+        overlay_rect = self.ordinal_overlay_rect()
+        if overlay_rect.isEmpty():
+            return
+        font = QFont(self.font())
+        font.setPointSize(max(font.pointSize(), self.ORDINAL_FONT_POINT_SIZE))
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+        painter.setFont(font)
+        painter.setPen(self.ordinal_text_color())
+        # Rotating the normal left-to-right text counterclockwise maps its
+        # first character to the bottom of the screen.
+        painter.translate(overlay_rect.left(), overlay_rect.bottom() + 1)
+        painter.rotate(-90.0)
+        painter.drawText(
+            QRect(0, 0, overlay_rect.height(), overlay_rect.width()),
+            Qt.AlignmentFlag.AlignCenter,
+            self._ordinal_text,
+        )
+        painter.restore()
+
     def paintEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         if self._display_pixmap.isNull():
             super().paintEvent(event)
+            painter = QPainter(self)
+            self._paint_ordinal_overlay(painter)
             return
         painter = QPainter(self)
         painter.fillRect(self.rect(), QColor("black"))
@@ -14801,17 +14918,9 @@ class ImageDisplayLabel(QLabel):
         # never manufacture a target-sized raster on the GUI thread.
         painter.setClipRegion(event.region())
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-        logical_size = logical_size_for_physical(
-            self._display_pixmap.size(),
-            self._display_pixmap.devicePixelRatio(),
-        )
-        target = self._target_rect or QRect(
-            int((self.width() - logical_size.width()) / 2),
-            int((self.height() - logical_size.height()) / 2),
-            logical_size.width(),
-            logical_size.height(),
-        )
+        target = self._display_target_rect()
         painter.drawPixmap(target, self._display_pixmap, self._display_pixmap.rect())
+        self._paint_ordinal_overlay(painter)
 
 
 class FullscreenViewer(QDialog):
@@ -15399,6 +15508,7 @@ class FullscreenViewer(QDialog):
                 self.accept()
             return
         added = navigator.append_page(page)
+        self.update_ordinal_overlay()
         self._navigation_page_select_first = False
         self._navigation_page_replace_all = False
         if page.has_more and page.next_offset <= old_offset:
@@ -15538,6 +15648,7 @@ class FullscreenViewer(QDialog):
         self._cancel_navigation_page_for_delete(preserve_rebuild=True)
         self._pending_image_delete = ViewerDeletePending(rel_path, removed_index)
         self.navigator.order.pop(removed_index)
+        self.update_ordinal_overlay()
         if not self.navigator.order:
             self.navigator.index = 0
             self.setWindowTitle("Marnwick — deleting image…")
@@ -15634,6 +15745,7 @@ class FullscreenViewer(QDialog):
         self.image_delete_started(rel_path)
 
     def load_current(self) -> None:
+        self.update_ordinal_overlay()
         self.stop_movie()
         self.cleanup_preview()
         self.operations.clear()
@@ -16151,7 +16263,21 @@ class FullscreenViewer(QDialog):
         self.info_overlay_enabled = not self.info_overlay_enabled
         self.update_info_overlay()
 
+    def image_position(self) -> tuple[int, int]:
+        total = (
+            self.navigator.total_count
+            if isinstance(self.navigator, PagedImageNavigator)
+            else len(self.navigator.order)
+        )
+        ordinal = self.navigator.index + 1 if self.navigator.order and total else 0
+        return ordinal, total
+
+    def update_ordinal_overlay(self) -> None:
+        ordinal, total = self.image_position()
+        self.label.set_ordinal_text(f"{ordinal} / {total}" if ordinal and total else "")
+
     def update_info_overlay(self) -> None:
+        self.update_ordinal_overlay()
         if not self.info_overlay_enabled:
             self.info_overlay.hide()
             return
@@ -16171,12 +16297,7 @@ class FullscreenViewer(QDialog):
             if identity is not None
             else "Unavailable"
         )
-        total = (
-            self.navigator.total_count
-            if isinstance(self.navigator, PagedImageNavigator)
-            else len(self.navigator.order)
-        )
-        ordinal = self.navigator.index + 1 if total else 0
+        ordinal, total = self.image_position()
         return "\n".join(
             [
                 f"Full path: {self.current_path}",
@@ -16187,14 +16308,20 @@ class FullscreenViewer(QDialog):
 
     def position_info_overlay(self) -> None:
         margin = 16
-        max_width = max(1, self.label.width() - 2 * margin)
+        ordinal_rect = self.label.ordinal_overlay_rect()
+        left = (
+            ordinal_rect.right() + 1 + margin
+            if not ordinal_rect.isEmpty()
+            else margin
+        )
+        max_width = max(1, self.label.width() - left - margin)
         max_height = max(1, self.label.height() - 2 * margin)
         self.info_overlay.setMaximumWidth(max_width)
         self.info_overlay.adjustSize()
         width = min(max_width, max(1, self.info_overlay.width()))
         height = min(max_height, max(1, self.info_overlay.height()))
         self.info_overlay.setGeometry(
-            margin,
+            left,
             max(margin, self.label.height() - height - margin),
             width,
             height,

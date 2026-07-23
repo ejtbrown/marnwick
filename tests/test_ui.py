@@ -870,7 +870,10 @@ def test_fullscreen_z_toggles_file_info_overlay(tmp_path: Path) -> None:
             assert f"Full path: {catalog.abs_path('first.jpg')}" in viewer.info_overlay.text()
             assert "File date:" in viewer.info_overlay.text()
             assert "1 of 2 images" in viewer.info_overlay.text()
-            assert viewer.info_overlay.pos().x() == 16
+            assert (
+                viewer.info_overlay.pos().x()
+                > viewer.label.ordinal_overlay_rect().right()
+            )
             assert viewer.info_overlay.geometry().bottom() <= viewer.label.height() - 16
 
             viewer.navigate(1)
@@ -882,6 +885,93 @@ def test_fullscreen_z_toggles_file_info_overlay(tmp_path: Path) -> None:
 
             assert not viewer.info_overlay_enabled
             assert viewer.info_overlay.isHidden()
+        finally:
+            viewer.close()
+            viewer.deleteLater()
+            qt_app.processEvents()
+
+
+def test_fullscreen_image_ordinal_is_rotated_and_uses_adaptive_contrast(
+    tmp_path: Path,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    for index in range(1, 26):
+        Image.new("RGB", (8, 8), (10, 20, 30)).save(root / f"image-{index:02}.png")
+    order = [f"image-{index:02}.png" for index in range(1, 26)]
+
+    with Catalog(root) as catalog:
+        viewer = FullscreenViewer(
+            catalog,
+            ImageNavigator.sequential(order, "image-01.png"),
+        )
+        try:
+            viewer.resize(320, 240)
+            viewer.show()
+            qt_app.processEvents()
+            dark = QPixmap(viewer.label.size())
+            dark.fill(QColor(8, 8, 8))
+            viewer.label.set_display_pixmap(dark, viewer.label.rect())
+            viewer.label.repaint()
+            qt_app.processEvents()
+
+            assert viewer.label.ordinal_text() == "1 / 25"
+            overlay_rect = viewer.label.ordinal_overlay_rect()
+            assert overlay_rect.left() == viewer.label.ORDINAL_MARGIN
+            assert overlay_rect.bottom() == viewer.label.height() - viewer.label.ORDINAL_MARGIN - 1
+            assert overlay_rect.height() > overlay_rect.width()
+            assert viewer.label.ordinal_text_color() == QColor("white")
+
+            rendered = viewer.label.grab().toImage()
+            bright_points = [
+                (x, y)
+                for y in range(overlay_rect.top(), overlay_rect.bottom() + 1)
+                for x in range(overlay_rect.left(), overlay_rect.right() + 1)
+                if rendered.pixelColor(x, y).lightness() >= 150
+            ]
+            assert bright_points
+            bright_width = max(x for x, _y in bright_points) - min(x for x, _y in bright_points)
+            bright_height = max(y for _x, y in bright_points) - min(y for _x, y in bright_points)
+            assert bright_height > bright_width
+
+            light = QPixmap(viewer.label.size())
+            light.fill(QColor(245, 245, 245))
+            viewer.label.set_display_pixmap(light, viewer.label.rect())
+
+            assert viewer.label.ordinal_text_color() == QColor("black")
+
+            viewer.navigate(1)
+
+            assert viewer.label.ordinal_text() == "2 / 25"
+        finally:
+            viewer.close()
+            viewer.deleteLater()
+            qt_app.processEvents()
+
+
+def test_fullscreen_virtual_directory_ordinal_uses_complete_image_count(
+    tmp_path: Path,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    for name in ("first.png", "second.png"):
+        Image.new("RGB", (8, 8), (10, 20, 30)).save(root / name)
+
+    with Catalog(root) as catalog:
+        navigator = ui_module.PagedImageNavigator(
+            order=["first.png", "second.png"],
+            index=1,
+            next_offset=2,
+            has_more=True,
+            total_count=37,
+            page_loader=lambda *_args: pytest.fail("position display must not fetch a page"),
+            view_kind=VIRTUAL_KIND_TAG,
+        )
+        viewer = FullscreenViewer(catalog, navigator)
+        try:
+            assert viewer.label.ordinal_text() == "2 / 37"
         finally:
             viewer.close()
             viewer.deleteLater()
