@@ -4,7 +4,7 @@ import hashlib
 import io
 from pathlib import Path
 
-from PIL import Image
+from PIL import Image, ImageDraw
 import pytest
 
 from marnwick import lama
@@ -91,6 +91,17 @@ def test_lama_mask_and_context_are_bounded() -> None:
     assert top == 0
 
 
+def test_prepare_lama_model_mask_is_strictly_binary() -> None:
+    soft_mask = Image.new("L", (80, 60), 0)
+    ImageDraw.Draw(soft_mask).ellipse((20, 10, 60, 50), fill=96)
+
+    prepared = lama.prepare_lama_model_mask(soft_mask)
+
+    assert prepared.size == (lama.LAMA_INPUT_SIZE, lama.LAMA_INPUT_SIZE)
+    assert prepared.getextrema() == (0, 255)
+    assert sum(prepared.histogram()[1:255]) == 0
+
+
 def test_create_lama_edit_operation_retains_generated_patch(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -105,10 +116,14 @@ def test_create_lama_edit_operation_retains_generated_patch(
     def fake_worker(
         _model_path: Path,
         _input_path: Path,
-        _mask_path: Path,
+        mask_path: Path,
         output_path: Path,
         **_kwargs: object,
     ) -> None:
+        with Image.open(mask_path) as worker_mask:
+            worker_mask.load()
+            assert worker_mask.getextrema() == (0, 255)
+            assert sum(worker_mask.histogram()[1:255]) == 0
         Image.new(
             "RGB",
             (lama.LAMA_INPUT_SIZE, lama.LAMA_INPUT_SIZE),
