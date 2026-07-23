@@ -97,6 +97,7 @@ from .catalog import (
     QUERY_PAGE_MAX_SIZE,
     TRASH_DIR_NAME,
     Catalog,
+    CatalogFileIdentity,
     CatalogStorageIdentity,
     DuplicateMatchGroups,
     DuplicateDeletionResult,
@@ -4284,6 +4285,79 @@ class MainWindow(QMainWindow):
             mutation.navigation_owner = owner
         return mutation
 
+    def rename_image(self, catalog: Catalog, record: ImageRecord) -> None:
+        if (
+            self.workspace.catalog_for_exact_root(catalog.root) is not catalog
+            or record.catalog_root != catalog.root
+        ):
+            return
+        if record.rel_path in self._pending_image_save_targets(catalog.root):
+            self.progress_label.setText("Wait for the pending image save before renaming it")
+            return
+        try:
+            identity_future = self.identity_executor.submit(
+                self._capture_image_identity_worker,
+                catalog.root,
+                catalog.root_identity,
+                catalog.storage_identity,
+                record.rel_path,
+            )
+        except RuntimeError:
+            self._show_identity_preflight_busy("rename the image")
+            return
+
+        dialog = ImageRenameDialog(record.filename, self)
+        accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        new_name = dialog.file_name() if accepted else ""
+        with suppress(AttributeError, RuntimeError):
+            dialog.deleteLater()
+        if not accepted or new_name == record.filename:
+            identity_future.cancel()
+            return
+        if not self._wait_for_image_identity(identity_future):
+            return
+        try:
+            expected_identity = identity_future.result()
+        except (OSError, ValueError) as error:
+            show_error(self, "Rename Image", str(error))
+            return
+        if self.workspace.catalog_for_exact_root(catalog.root) is not catalog:
+            return
+        self._queue_catalog_mutation(
+            catalog,
+            label="Renaming image",
+            dest_dir_rel=record.dir_rel,
+            priority=ActionPriority.FILE_MOVE_WITHIN_CATALOG,
+            worker=lambda task: self._rename_image_worker(
+                catalog.root,
+                catalog.root_identity,
+                record.rel_path,
+                new_name,
+                expected_identity,
+                task,
+            ),
+            source_images=((catalog.root, record.rel_path),),
+            expected_image_identities={
+                catalog.root: {record.rel_path: expected_identity}
+            },
+            completion_verb="Renamed",
+            error_title="Rename Image",
+        )
+
+    @staticmethod
+    def _capture_image_identity_worker(
+        root: Path,
+        expected_root_identity: tuple[int, int],
+        expected_storage_identity: CatalogStorageIdentity,
+        rel_path: str,
+    ) -> CatalogFileIdentity:
+        with Catalog.open_reader(
+            root,
+            expected_root_identity=expected_root_identity,
+            expected_storage_identity=expected_storage_identity,
+        ) as catalog:
+            return catalog.file_identity(rel_path)
+
     def open_directory_properties(self, root: Path, dir_rel: str) -> None:
         catalog = self.workspace.catalog_for_root(root)
         if catalog is None:
@@ -4347,14 +4421,34 @@ class MainWindow(QMainWindow):
         )
 
     def _wait_for_directory_identity(self, future: Future[object]) -> bool:
+        return self._wait_for_identity(
+            future,
+            title="Checking Directory",
+            message="Verifying the destination directory…",
+        )
+
+    def _wait_for_image_identity(self, future: Future[object]) -> bool:
+        return self._wait_for_identity(
+            future,
+            title="Checking Image",
+            message="Verifying the image…",
+        )
+
+    def _wait_for_identity(
+        self,
+        future: Future[object],
+        *,
+        title: str,
+        message: str,
+    ) -> bool:
         if future.done():
             return not future.cancelled()
         dialog = QDialog(self)
-        dialog.setWindowTitle("Checking Directory")
+        dialog.setWindowTitle(title)
         dialog.setWindowIcon(load_app_icon())
         dialog.setStyleSheet(DIALOG_STYLESHEET)
         layout = QVBoxLayout(dialog)
-        layout.addWidget(QLabel("Verifying the destination directory…"))
+        layout.addWidget(QLabel(message))
         progress = QProgressBar()
         progress.setRange(0, 0)
         layout.addWidget(progress)
@@ -5069,6 +5163,36 @@ class MainWindow(QMainWindow):
         task.update(1, 1, created_dir_rel)
         task.mark_done()
         return MovePayloadResult(1, 1, {root}, created_dir_rel=created_dir_rel)
+
+    @staticmethod
+    def _rename_image_worker(
+        root: Path,
+        expected_root_identity: tuple[int, int],
+        rel_path: str,
+        new_name: str,
+        expected_identity: CatalogFileIdentity,
+        task: IndexTask,
+    ) -> MovePayloadResult:
+        task.update(0, 1, rel_path)
+        task.check_canceled()
+        with Catalog.open_writer(
+            root,
+            expected_root_identity=expected_root_identity,
+            expected_storage_identity=task.expected_storage_identity,
+        ) as catalog:
+            result = catalog.rename_image(
+                rel_path,
+                new_name,
+                expected_identity=expected_identity,
+            )
+        task.update(1, 1, result.dest_rel_path)
+        task.mark_done()
+        return MovePayloadResult(
+            1,
+            1,
+            {root},
+            reconcile_images=((root, result.dest_rel_path),),
+        )
 
     def queue_image_edit(
         self,
@@ -11769,6 +11893,8 @@ class MainWindow(QMainWindow):
             self.delete_directory(catalog.root, record.dir_rel)
         elif selected == actions.get("list_duplicates") and isinstance(record, ImageRecord):
             self.open_duplicate_list_dialog(record, catalog=catalog)
+        elif selected == actions.get("rename") and isinstance(record, ImageRecord):
+            self.rename_image(catalog, record)
         elif selected == actions.get("delete"):
             self.delete_selected(
                 catalog=catalog,
@@ -11795,6 +11921,7 @@ class MainWindow(QMainWindow):
             if record.dir_rel:
                 actions["delete_directory"] = menu.addAction("Delete Directory")
             return actions
+        actions["rename"] = menu.addAction("Rename")
         actions["list_duplicates"] = menu.addAction("List Duplicates")
         actions["delete"] = menu.addAction("Delete")
         actions["metadata"] = menu.addAction("Metadata")
@@ -13986,6 +14113,37 @@ class DirectoryNameDialog(QDialog):
 
     def directory_name(self) -> str:
         return self.entry.text().strip()
+
+
+class ImageRenameDialog(QDialog):
+    def __init__(self, filename: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Rename Image")
+        self.setWindowIcon(load_app_icon())
+        self.setStyleSheet(DIALOG_STYLESHEET)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("File name:"))
+        self.entry = QLineEdit(filename)
+        self.entry.returnPressed.connect(self.accept)
+        layout.addWidget(self.entry)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        extension = Path(filename).suffix
+        selection_length = len(filename) - len(extension) if extension else len(filename)
+        self.entry.setFocus()
+        self.entry.setSelection(0, selection_length)
+        self.resize(460, 130)
+
+    def file_name(self) -> str:
+        return self.entry.text()
 
 
 class DirectoryPropertiesDialog(QDialog):
