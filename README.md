@@ -16,6 +16,7 @@ Each catalog keeps its metadata beside the photos in a `.marnwick` directory. Mo
 - View images fullscreen in display order or a randomized order.
 - Zoom, pan, show file information, copy files to the desktop clipboard, and inspect image metadata.
 - Rotate, flip, crop, reduce red eye, and clone/heal from the fullscreen viewer.
+- Remove masked objects locally with the CPU-oriented LaMa inpainting model.
 - Save edits normally or restore the original filesystem access, modification, and creation dates where the platform supports them.
 - Define catalog tags, assign them to images, and browse tag-based virtual directories.
 - Find exact duplicates using SHA-256 content hashes.
@@ -38,7 +39,7 @@ Marnwick recognizes AVIF, BMP, GIF, HEIC, HEIF, JPEG, PNG, TIFF, and WebP filena
 - Optional GNU `find` and `md5sum` for faster catalog discovery and freshness checks
 - Optional GNU `shred` for wipe-on-delete
 
-The runtime dependencies are Pillow and PySide6. Development dependencies are hash-locked in `requirements-dev.lock`.
+The runtime dependencies are NumPy, ONNX Runtime, Pillow, and PySide6. Development dependencies are hash-locked in `requirements-dev.lock`. LaMa's 198 MiB model data is optional and downloaded only after confirmation.
 
 ## Quick start
 
@@ -133,7 +134,11 @@ Directory tiles remain grouped before image tiles. Directory “size” is the t
 | `Ctrl+C` | Copy the current file to the desktop clipboard |
 | `Delete` or `Backspace` | Delete the current image and advance |
 
-The edit menu provides rotate-left, rotate-right, vertical flip, horizontal flip, red-eye selection, crop selection, and clone/heal tools. Drag over the image to select a crop or red-eye region. In clone/heal mode, right-click to set the initial source and left-drag to paint. The first left click aligns that source with the paint cursor; afterward, moving the cursor moves the source by the same amount across separate strokes until another right-click selects a new source. Use the mouse wheel to resize the brush. Navigation, tagging, or closing resolves pending edits by asking you to save, save while preserving filesystem dates, discard, or cancel; a tag dialog never races an asynchronous save. Save, warning, and error prompts remain owned by the fullscreen modal viewer, and focus returns to that viewer when a nested prompt closes. Returning from fullscreen keeps the directory tree at its prior scroll position while the thumbnail pane follows the last viewed image. In the main application, choosing save queues image decoding, editing, encoding, validation, and atomic replacement on a dedicated background worker; you can continue navigating while the status bar reports the save. A static PNG uses the same non-modal worker path, shares metadata inspection and editing in one traversal, and uses fast lossless compression. It no longer opens an indeterminate “preserving frames and metadata” progress dialog. After a successful replacement, Marnwick submits a targeted reindex through the catalog action queue. That reindex decodes and hashes one stable open file descriptor, compares the resulting filesystem identity and SHA-256 hash with the proof of the exact committed object, and publishes the new record and thumbnail only if they match. It does not perform a separate preliminary full-file proof hash. If a save or tag edit can change the membership or ordering of a database-paged fullscreen view, that navigator reloads from page zero asynchronously instead of continuing from a stale SQL offset. The currently displayed image stays published while bounded background pages locate its fresh position; editing pauses during that reconciliation, visible progress is reported, and an overlapping delete restarts the fresh query after its outcome is known. The main thumbnail pane also refreshes a visible physical or virtual query after save reconciliation.
+The edit menu provides rotate-left, rotate-right, vertical flip, horizontal flip, red-eye selection, crop selection, clone/heal, and LaMa. LaMa is shown with the `M` hotkey. Drag over the image to select a crop or red-eye region. In clone/heal mode, right-click to set the initial source and left-drag to paint. The first left click aligns that source with the paint cursor; afterward, moving the cursor moves the source by the same amount across separate strokes until another right-click selects a new source. Use the mouse wheel to resize the brush.
+
+In LaMa mode, paint the complete area to remove, use the mouse wheel to resize the mask brush, press `Backspace` to clear the mask, and press `Enter` to apply it. `Escape` cancels the mask or a running inference. LaMa runs through ONNX Runtime in a separate CPU-only process; images are never uploaded. Marnwick crops bounded context around the mask, retains the generated pixel patch in the edit history, and does not rerun the model when saving. LaMa currently supports static images only. Choosing LaMa when its model is absent offers to download it, and **Tools > Download LaMa Model** provides the same operation on demand. Downloads are pinned and SHA-256 verified before publication.
+
+Navigation, tagging, or closing resolves pending edits by asking you to save, save while preserving filesystem dates, discard, or cancel; a tag dialog never races an asynchronous save. Save, warning, and error prompts remain owned by the fullscreen modal viewer, and focus returns to that viewer when a nested prompt closes. Returning from fullscreen keeps the directory tree at its prior scroll position while the thumbnail pane follows the last viewed image. In the main application, choosing save queues image decoding, editing, encoding, validation, and atomic replacement on a dedicated background worker; you can continue navigating while the status bar reports the save. A static PNG uses the same non-modal worker path, shares metadata inspection and editing in one traversal, and uses fast lossless compression. It no longer opens an indeterminate “preserving frames and metadata” progress dialog. After a successful replacement, Marnwick submits a targeted reindex through the catalog action queue. That reindex decodes and hashes one stable open file descriptor, compares the resulting filesystem identity and SHA-256 hash with the proof of the exact committed object, and publishes the new record and thumbnail only if they match. It does not perform a separate preliminary full-file proof hash. If a save or tag edit can change the membership or ordering of a database-paged fullscreen view, that navigator reloads from page zero asynchronously instead of continuing from a stale SQL offset. The currently displayed image stays published while bounded background pages locate its fresh position; editing pauses during that reconciliation, visible progress is reported, and an overlapping delete restarts the fresh query after its outcome is known. The main thumbnail pane also refreshes a visible physical or virtual query after save reconciliation.
 
 A persistent `current / total` image counter appears vertically in the bottom-left corner. Its text is rotated counterclockwise so the current ordinal is nearest the corner, and it switches between black and white according to the average brightness beneath it.
 
@@ -194,12 +199,17 @@ Global window and catalog-list preferences default to `~/.config/marnwick/config
 | --- | --- | --- |
 | `MARNWICK_CONFIG_PATH` | Override the global JSON configuration path | XDG path described above |
 | `MARNWICK_DISABLE_CONFIG=1` | Disable global configuration loading and saving | Configuration enabled |
+| `MARNWICK_LAMA_MODEL_PATH` | Override the downloaded LaMa ONNX model path | Platform data directory |
+| `MARNWICK_LAMA_THREADS` | Limit LaMa worker CPU threads from 1 to 64 | Up to 8, leaving one logical CPU free |
+| `MARNWICK_LAMA_TIMEOUT_SECONDS` | Bound one local LaMa inference | `900` |
 | `MARNWICK_MAX_IMAGE_PIXELS` | Maximum decoded Pillow image area | `50000000` |
 | `MARNWICK_VENV` | Override the virtual environment used by setup and launch scripts | `<repo>/.venv` |
 | `PYTHON` | Override the interpreter used by setup | `python3` on Linux; discovered Python on Windows |
 | `MARNWICK_DEBUG_TOKEN` | Authenticate the optional localhost debug protocol | Random token printed to stderr |
 
 Application preferences include window geometry, remembered catalogs, thumbnail columns, sort order, and normal versus wipe deletion. Per-catalog preferences include saved thumbnail size and thumbnail-prune parallelism.
+
+On Linux, LaMa model data is stored under `$XDG_DATA_HOME/marnwick/models/lama_fp32.onnx` when that variable is set, or `~/.local/share/marnwick/models/lama_fp32.onnx` otherwise. On Windows it defaults below `%LOCALAPPDATA%\Marnwick\models`. The pinned ONNX export is downloaded from [`sapienkit/LaMa-ONNX`](https://huggingface.co/sapienkit/LaMa-ONNX), which identifies the model and export as Apache-2.0 and credits the original [LaMa project](https://github.com/advimman/lama) and Places2 training data. Model data is not included in the Marnwick repository or normal package.
 
 ## Responsiveness and resource bounds
 
@@ -213,6 +223,7 @@ Work that feeds the interface has explicit bounds:
 - The thumbnail model exposes records in 400-row batches, limits pending reads, and applies only a small number of completed thumbnails per UI tick. A newer thumbnail generation can start while old reads unwind.
 - Decoded thumbnail inputs are limited to 32 MiB and 4096 pixels per dimension. The primary thumbnail pixmap cache is limited to 512 entries or 256 MiB, the delegate's scaled-pixmap cache to 512 entries or 128 MiB, and remembered pane state and Very Similar result caches have fixed entry limits.
 - Fullscreen decode, edit-preview rendering, and paged navigation use three process-wide pools rather than creating threads per viewer. Decode and preview each allow eight workers and 16 admitted tasks; paging allows four workers and eight admitted tasks. Closing a viewer cancels its queued work without shutting down the shared pools.
+- LaMa inference admits one request per viewer and runs in a separate process with a bounded timeout. Its input and generated patch are fixed at 512 pixels per side; the full-resolution source stays in Marnwick's background preparation lane.
 - Pillow source decoding is limited by `MARNWICK_MAX_IMAGE_PIXELS`; the complete set of detached frames in one edit has the same aggregate pixel budget. Interactive edit-preview rasters are capped at 4096 pixels per dimension, and GIF movie input is capped at 128 MiB.
 - Catalog logs retain and read at most a 1 MiB tail, timing history retains 1,000 events, and the optional debug server caps connections, request work per event-loop turn, page and tail sizes, pending reads, file-read size, and queued response bytes.
 
@@ -220,6 +231,7 @@ Work that feeds the interface has explicit bounds:
 
 - Image and directory deletion is destructive; only items explicitly moved into `T-r-a-s-h` are restorable through Marnwick.
 - Edits atomically replace the original file after an explicit save. Marnwick refuses to replace a hard-linked image because doing so cannot preserve hard-link identity; copy or unlink it explicitly before editing. If an extremely rare rollback itself fails, the error identifies the retained recovery file rather than silently deleting displaced bytes.
+- LaMa generates a plausible replacement from surrounding pixels; it does not recover the actual hidden scene and can produce incorrect structure or artifacts. It supports static images only and is limited by its fixed 512-pixel inference crop.
 - Filesystem operations and one or two independent SQLite databases cannot form a single crash-atomic transaction. Runtime failures are compensated, but abrupt process or power loss can require **Tools > Refresh Catalog** to reconcile filesystem and catalog state. Keep independent backups of irreplaceable images.
 - Cross-filesystem directory moves revalidate the published destination immediately before recursively removing the isolated source, but no portable filesystem operation makes those steps atomic across mounts. An external program that replaces or removes the destination during that cleanup window can defeat compensation; do not externally mutate paths participating in a move. Marnwick's catalog lock does not control unrelated filesystem tools.
 - Moving a directory across filesystems recreates regular files, directories, and symlinks. It does not preserve hard-link relationships or guarantee filesystem-specific metadata beyond supported creation dates and modification dates; unsupported special-file entries cause the move to fail with the source retained.
