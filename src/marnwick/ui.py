@@ -137,6 +137,16 @@ from .image_ops import (
     snapshot_image_file_identity_with_dates,
 )
 from .indexer import ActionPriority, BackgroundIndexer, IndexTask, IndexTaskCancelled
+from .lama import (
+    LAMA_MODEL_SIZE_BYTES,
+    LamaInferenceCancelled,
+    LamaModelError,
+    LamaStrokeSample,
+    create_lama_edit_operation,
+    default_lama_model_path,
+    download_lama_model as download_lama_model_data,
+    lama_model_appears_installed,
+)
 from .models import CatalogSettings, DirectoryRecord, FolderPreviewRecord, ImageRecord, PaneRecord, SortOrder
 from .navigation import ImageNavigator
 from .safe_image import MAX_IMAGE_PIXELS, open_catalog_image
@@ -3142,6 +3152,19 @@ class MainWindow(QMainWindow):
             max_workers=1,
             thread_name_prefix="marnwick-config-save",
         )
+        self.lama_download_executor = AbandonableThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="marnwick-lama-download",
+            max_pending=1,
+        )
+        self._lama_download_future: Future[Path] | None = None
+        self._lama_download_cancel_event: Event | None = None
+        self._lama_download_progress_lock = Lock()
+        self._lama_download_progress = (0, LAMA_MODEL_SIZE_BYTES)
+        self._lama_download_waiters: list[
+            Callable[[Path | None, str | None], None]
+        ] = []
+        self._lama_download_report_completion = False
         self._config_save_futures: set[Future[None]] = set()
         self._config_save_contexts: dict[Future[None], tuple[int, tuple[str, ...]]] = {}
         self._config_save_sequence = 0
@@ -3437,6 +3460,12 @@ class MainWindow(QMainWindow):
         self._shutdown_initial_config_load()
         self._shutdown_catalog_open_tasks()
         self.timing_executor.shutdown(wait=False, cancel_futures=True)
+        if self._lama_download_cancel_event is not None:
+            self._lama_download_cancel_event.set()
+        if self._lama_download_future is not None:
+            self._lama_download_future.cancel()
+        self._lama_download_waiters.clear()
+        self.lama_download_executor.shutdown(wait=False, cancel_futures=True)
         # The executor has only a single pending slot containing the complete
         # newest snapshot.  Preserve it for a final daemon-thread durability
         # attempt instead of canceling it just because the UI is now closed.
@@ -4025,6 +4054,9 @@ class MainWindow(QMainWindow):
         self.prune_thumbnails_action = QAction("Prune Thumbnails", self)
         self.prune_thumbnails_action.triggered.connect(self.prune_current_catalog_thumbnails)
         self.tools_menu.addAction(self.prune_thumbnails_action)
+        self.download_lama_action = QAction("Download LaMa Model…", self)
+        self.download_lama_action.triggered.connect(self.download_lama_model_dialog)
+        self.tools_menu.addAction(self.download_lama_action)
         self.preferences_action = QAction("Preferences", self)
         self.preferences_action.triggered.connect(self.open_app_preferences)
         self.tools_menu.addAction(self.preferences_action)
@@ -4046,6 +4078,13 @@ class MainWindow(QMainWindow):
             and not self._has_pending_move_payload_tasks()
             and self._active_virtual_view_task() is None
         )
+        model_installed = lama_model_appears_installed()
+        self.download_lama_action.setText(
+            "Re-download LaMa Model…"
+            if model_installed
+            else "Download LaMa Model…"
+        )
+        self.download_lama_action.setEnabled(self._lama_download_future is None)
 
     def open_catalog_dialog(self) -> None:
         dialog_started_at = monotonic()
@@ -4089,6 +4128,123 @@ class MainWindow(QMainWindow):
         dialog = LogsDialog(self.workspace.catalogs, self)
         dialog.exec()
         dialog.deleteLater()
+
+    def download_lama_model_dialog(self) -> None:
+        self._request_lama_model_download(
+            owner=self,
+            force=lama_model_appears_installed(),
+            report_completion=True,
+        )
+
+    def ensure_lama_model(
+        self,
+        owner: QWidget,
+        callback: Callable[[Path | None, str | None], None],
+    ) -> None:
+        model_path = default_lama_model_path()
+        if lama_model_appears_installed(model_path):
+            QTimer.singleShot(0, partial(callback, model_path, None))
+            return
+        self._request_lama_model_download(
+            owner=owner,
+            force=False,
+            report_completion=False,
+            callback=callback,
+        )
+
+    def _request_lama_model_download(
+        self,
+        *,
+        owner: QWidget,
+        force: bool,
+        report_completion: bool,
+        callback: Callable[[Path | None, str | None], None] | None = None,
+    ) -> None:
+        if self._lama_download_future is not None:
+            if callback is not None:
+                self._lama_download_waiters.append(callback)
+            self._lama_download_report_completion |= report_completion
+            return
+        if not ask_download_lama_model(owner, replace=force):
+            if callback is not None:
+                QTimer.singleShot(0, partial(callback, None, None))
+            return
+        cancel_event = Event()
+        with self._lama_download_progress_lock:
+            self._lama_download_progress = (0, LAMA_MODEL_SIZE_BYTES)
+
+        def record_progress(downloaded: int, total: int) -> None:
+            with self._lama_download_progress_lock:
+                self._lama_download_progress = (downloaded, total)
+
+        try:
+            future = self.lama_download_executor.submit(
+                download_lama_model_data,
+                default_lama_model_path(),
+                progress=record_progress,
+                cancel_event=cancel_event,
+            )
+        except ExecutorSaturatedError:
+            message = "The LaMa model downloader is already busy."
+            if callback is not None:
+                QTimer.singleShot(0, partial(callback, None, message))
+            else:
+                show_error(owner, "Download LaMa Model", message)
+            return
+        self._lama_download_future = future
+        self._lama_download_cancel_event = cancel_event
+        self._lama_download_report_completion = report_completion
+        self._lama_download_waiters = [callback] if callback is not None else []
+        self.progress_bar.setRange(0, LAMA_MODEL_SIZE_BYTES)
+        self.progress_bar.setValue(0)
+        self.progress_label.setText("Downloading LaMa model: 0%")
+        self._update_tools_menu_actions()
+
+    def _settle_lama_model_download(self) -> None:
+        future = self._lama_download_future
+        if future is None or not future.done():
+            return
+        self._lama_download_future = None
+        self._lama_download_cancel_event = None
+        waiters = self._lama_download_waiters
+        self._lama_download_waiters = []
+        report_completion = self._lama_download_report_completion
+        self._lama_download_report_completion = False
+        model_path: Path | None = None
+        error_message: str | None = None
+        if future.cancelled():
+            error_message = "LaMa model download was canceled."
+        else:
+            try:
+                model_path = future.result()
+            except LamaInferenceCancelled:
+                error_message = "LaMa model download was canceled."
+            except Exception as error:
+                error_message = str(error)
+        for callback in waiters:
+            callback(model_path, error_message)
+        if report_completion and not self._closing:
+            if error_message is not None:
+                show_error(self, "Download LaMa Model", error_message)
+            elif model_path is not None:
+                QMessageBox.information(
+                    self,
+                    "Download LaMa Model",
+                    f"LaMa model data is ready at:\n{model_path}",
+                )
+        self._update_tools_menu_actions()
+
+    def _show_lama_download_status(self) -> None:
+        with self._lama_download_progress_lock:
+            downloaded, total = self._lama_download_progress
+        total = max(1, total)
+        self.progress_bar.setRange(0, total)
+        self.progress_bar.setValue(min(downloaded, total))
+        percent = int(downloaded * 100 / total)
+        self.progress_label.setText(
+            f"Downloading LaMa model: {percent}% "
+            f"({format_bytes(downloaded)} / {format_bytes(total)})"
+        )
 
     def prune_current_catalog_thumbnails(self) -> None:
         if self.current_catalog is None:
@@ -12899,6 +13055,7 @@ class MainWindow(QMainWindow):
             return
         self._settle_initial_config_load(self._initial_config_load_generation)
         self._settle_config_saves()
+        self._settle_lama_model_download()
         if not self._tree_publication_blocked():
             self._settle_tree_children_tasks()
             self._settle_tree_tags_tasks()
@@ -12930,6 +13087,9 @@ class MainWindow(QMainWindow):
         self._settle_idle_tasks()
         self._settle_thumbnail_prune_tasks()
         self._settle_thumbnail_repair_tasks()
+        if self._lama_download_future is not None:
+            self._show_lama_download_status()
+            return
         active_open_task = self._active_catalog_open_task()
         if active_open_task is not None:
             self._show_catalog_open_status(active_open_task.root)
@@ -14661,6 +14821,7 @@ class EditCommandDialog(QDialog):
         ("I", "Remove red eye", "red_eye"),
         ("C", "Crop", "crop"),
         ("X", "Clone and heal", "clone_heal"),
+        ("M", "LaMa", "lama"),
     ]
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -14745,6 +14906,70 @@ class CloneBrushOverlay(QWidget):
         painter.setPen(pen)
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawEllipse(self.center, self.radius, self.radius)
+
+
+class LamaMaskOverlay(QWidget):
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent)
+        self.samples: tuple[LamaStrokeSample, ...] = ()
+        self.image_size = (1, 1)
+        self.display_rect = QRect()
+        self.brush_center: QPoint | None = None
+        self.brush_radius = 32
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.hide()
+
+    def update_mask(
+        self,
+        samples: Sequence[LamaStrokeSample],
+        image_size: tuple[int, int],
+        display_rect: QRect,
+        *,
+        brush_center: QPoint | None = None,
+        brush_radius: int = 32,
+    ) -> None:
+        self.samples = tuple(samples)
+        self.image_size = image_size
+        self.display_rect = QRect(display_rect)
+        self.brush_center = QPoint(brush_center) if brush_center is not None else None
+        self.brush_radius = max(1, int(brush_radius))
+        self.setVisible(bool(self.samples) or self.brush_center is not None)
+        self.update()
+
+    def clear_mask(self) -> None:
+        self.samples = ()
+        self.brush_center = None
+        self.hide()
+        self.update()
+
+    def paintEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        if self.display_rect.isEmpty():
+            return
+        image_width, image_height = self.image_size
+        if image_width <= 0 or image_height <= 0:
+            return
+        scale_x = self.display_rect.width() / image_width
+        scale_y = self.display_rect.height() / image_height
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(239, 68, 68, 105))
+        for x, y, radius in self.samples:
+            center = QPoint(
+                self.display_rect.left() + round(x * scale_x),
+                self.display_rect.top() + round(y * scale_y),
+            )
+            display_radius = max(1, round(radius * max(scale_x, scale_y)))
+            painter.drawEllipse(center, display_radius, display_radius)
+        if self.brush_center is not None:
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QPen(QColor("#f8fafc"), 2))
+            painter.drawEllipse(
+                self.brush_center,
+                self.brush_radius,
+                self.brush_radius,
+            )
 
 
 class CircularSelectionOverlay(QWidget):
@@ -14948,6 +15173,10 @@ class FullscreenViewer(QDialog):
         self.clone_painting = False
         self.clone_alignment_target: tuple[int, int] | None = None
         self.clone_last_target: tuple[int, int] | None = None
+        self.lama_samples: list[LamaStrokeSample] = []
+        self.lama_brush_radius_label = 32
+        self.lama_painting = False
+        self.lama_last_target: tuple[int, int] | None = None
         self.drag_origin: QPoint | None = None
         self.preview_path: Path | None = None
         self.preview_image: Image.Image | None = None
@@ -15009,6 +15238,15 @@ class FullscreenViewer(QDialog):
         # safety copy so a later failure cannot be consumed accidentally.
         self._retained_preview_rel: str | None = None
         self._retained_preview_operations: tuple[EditOperation, ...] = ()
+        self._lama_executor = AbandonableThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="marnwick-lama-inference",
+            max_pending=1,
+        )
+        self._lama_future: Future[EditOperation] | None = None
+        self._lama_cancel_event: Event | None = None
+        self._lama_rel_path: str | None = None
+        self._lama_preceding_operations: tuple[EditOperation, ...] = ()
         self._load_timer = QTimer(self)
         self._load_timer.setInterval(20)
         self._load_timer.timeout.connect(self._settle_async_load)
@@ -15018,6 +15256,9 @@ class FullscreenViewer(QDialog):
         self._preview_timer = QTimer(self)
         self._preview_timer.setInterval(20)
         self._preview_timer.timeout.connect(self._settle_preview_render)
+        self._lama_timer = QTimer(self)
+        self._lama_timer.setInterval(50)
+        self._lama_timer.timeout.connect(self._settle_lama_inference)
         self._navigation_page_timer = QTimer(self)
         self._navigation_page_timer.setInterval(20)
         self._navigation_page_timer.timeout.connect(self._settle_navigation_page)
@@ -15039,6 +15280,7 @@ class FullscreenViewer(QDialog):
         self.info_overlay.hide()
         self.rubber_band = QRubberBand(QRubberBand.Shape.Rectangle, self.label)
         self.clone_overlay = CloneBrushOverlay(self.label)
+        self.lama_overlay = LamaMaskOverlay(self.label)
         self.red_eye_overlay = CircularSelectionOverlay(self.label)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -15072,6 +15314,18 @@ class FullscreenViewer(QDialog):
             # while its rebased first page is loading. Current-image actions
             # must remain inert during that bounded gap.
             return
+        if self._lama_future is not None:
+            if key == Qt.Key.Key_Escape:
+                self._cancel_lama_inference()
+                self.exit_region_edit()
+            return
+        if self.edit_mode == "lama":
+            if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                self.apply_lama_mask()
+                return
+            if key in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+                self.clear_lama_mask()
+                return
         if key in (Qt.Key.Key_Plus, Qt.Key.Key_Equal):
             self.zoom_in()
             return
@@ -15128,6 +15382,8 @@ class FullscreenViewer(QDialog):
     def eventFilter(self, watched: object, event: QEvent) -> bool:
         if watched == self.label and self.edit_mode == "clone_heal":
             return self.handle_clone_event(event)
+        if watched == self.label and self.edit_mode == "lama":
+            return self.handle_lama_event(event)
         if watched == self.label and self.edit_mode is not None:
             if event.type() == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:  # type: ignore[attr-defined]
                 self.drag_origin = event.position().toPoint()  # type: ignore[attr-defined]
@@ -15235,10 +15491,186 @@ class FullscreenViewer(QDialog):
             return True
         return False
 
+    def handle_lama_event(self, event: QEvent) -> bool:
+        event_type = event.type()
+        if self._lama_future is not None:
+            return True
+        if event_type == QEvent.Type.Wheel:
+            point = event.position().toPoint()  # type: ignore[attr-defined]
+            delta = event.angleDelta().y()  # type: ignore[attr-defined]
+            if delta:
+                direction = 1 if delta > 0 else -1
+                steps = max(1, abs(delta) // 120)
+                self.set_lama_brush_radius(
+                    self.lama_brush_radius_label + direction * steps * 4
+                )
+            self.update_lama_overlay(point)
+            return True
+        if event_type == QEvent.Type.MouseMove:
+            point = event.position().toPoint()  # type: ignore[attr-defined]
+            self.update_lama_overlay(point)
+            if self.lama_painting and event.buttons() & Qt.MouseButton.LeftButton:  # type: ignore[attr-defined]
+                target = self.image_point_from_label_point(point)
+                if target is not None:
+                    self.paint_lama_to(target)
+            return True
+        if (
+            event_type == QEvent.Type.MouseButtonPress
+            and event.button() == Qt.MouseButton.LeftButton  # type: ignore[attr-defined]
+        ):
+            point = event.position().toPoint()  # type: ignore[attr-defined]
+            target = self.image_point_from_label_point(point)
+            if target is None:
+                return True
+            self.lama_painting = True
+            self.lama_last_target = None
+            self.paint_lama_to(target)
+            self.update_lama_overlay(point)
+            return True
+        if (
+            event_type == QEvent.Type.MouseButtonRelease
+            and event.button() == Qt.MouseButton.LeftButton  # type: ignore[attr-defined]
+        ):
+            self.lama_painting = False
+            self.lama_last_target = None
+            self.update_lama_overlay(event.position().toPoint())  # type: ignore[attr-defined]
+            return True
+        if event_type == QEvent.Type.Leave:
+            self.update_lama_overlay(None)
+            return True
+        return False
+
+    def set_lama_brush_radius(self, radius: int) -> None:
+        max_radius = max(
+            8,
+            min(256, max(1, min(self.label.width(), self.label.height()) // 2)),
+        )
+        self.lama_brush_radius_label = max(4, min(max_radius, radius))
+
+    def update_lama_overlay(self, point: QPoint | None) -> None:
+        if self.edit_mode != "lama":
+            self.lama_overlay.clear_mask()
+            return
+        if point is not None and not self.displayed_image_rect().contains(point):
+            point = None
+        self.lama_overlay.update_mask(
+            self.lama_samples,
+            self.image_coordinate_size,
+            self.displayed_image_rect(),
+            brush_center=point,
+            brush_radius=self.lama_brush_radius_label,
+        )
+
+    def paint_lama_to(self, target: tuple[int, int]) -> None:
+        image_radius = self.image_radius_from_label_radius(
+            self.lama_brush_radius_label
+        )
+        for sample_x, sample_y in self.clone_stroke_samples(
+            self.lama_last_target,
+            target,
+            image_radius,
+        ):
+            self.lama_samples.append((sample_x, sample_y, image_radius))
+        self.lama_last_target = target
+        self.update_lama_overlay(None)
+
+    def clear_lama_mask(self) -> None:
+        if self._lama_future is not None:
+            return
+        self.lama_samples.clear()
+        self.lama_last_target = None
+        self.update_lama_overlay(None)
+
+    def apply_lama_mask(self) -> None:
+        if (
+            self.edit_mode != "lama"
+            or self._lama_future is not None
+            or not self.lama_samples
+            or not self.navigator.order
+        ):
+            return
+        identity = self.loaded_file_identity
+        if identity is None:
+            show_error(self, "LaMa", "The displayed image identity is unavailable.")
+            return
+        rel_path = self.navigator.current
+        preceding_operations = tuple(self.operations)
+        cancel_event = Event()
+        try:
+            future = self._lama_executor.submit(
+                create_lama_edit_operation,
+                self.current_path,
+                preceding_operations,
+                tuple(self.lama_samples),
+                expected_identity=identity,
+                expected_size=self.image_coordinate_size,
+                cancel_event=cancel_event,
+            )
+        except ExecutorSaturatedError:
+            show_error(self, "LaMa", "The local LaMa worker is already busy.")
+            return
+        self.lama_painting = False
+        self.lama_last_target = None
+        self._lama_future = future
+        self._lama_cancel_event = cancel_event
+        self._lama_rel_path = rel_path
+        self._lama_preceding_operations = preceding_operations
+        self.setWindowTitle("Marnwick — LaMa is filling the masked area locally…")
+        self._lama_timer.start()
+
+    def _settle_lama_inference(self) -> None:
+        future = self._lama_future
+        if future is None or not future.done():
+            return
+        rel_path = self._lama_rel_path
+        preceding_operations = self._lama_preceding_operations
+        self._lama_future = None
+        self._lama_cancel_event = None
+        self._lama_rel_path = None
+        self._lama_preceding_operations = ()
+        self._lama_timer.stop()
+        if future.cancelled() or self._load_closed:
+            return
+        try:
+            operation = future.result()
+        except LamaInferenceCancelled:
+            return
+        except Exception as error:
+            self.setWindowTitle(
+                "Marnwick — LaMa: paint; Enter applies; Backspace clears; "
+                "wheel changes brush; Esc cancels"
+            )
+            show_error(self, "LaMa", str(error))
+            return
+        if (
+            rel_path is None
+            or not self.navigator.order
+            or self.navigator.current != rel_path
+            or tuple(self.operations) != preceding_operations
+        ):
+            return
+        self.exit_region_edit()
+        self.operations.append(operation)
+        self.render_preview()
+
+    def _cancel_lama_inference(self) -> None:
+        self._lama_timer.stop()
+        if self._lama_cancel_event is not None:
+            self._lama_cancel_event.set()
+        if self._lama_future is not None:
+            self._lama_future.cancel()
+        self._lama_future = None
+        self._lama_cancel_event = None
+        self._lama_rel_path = None
+        self._lama_preceding_operations = ()
+
     def resizeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         super().resizeEvent(event)
         if hasattr(self, "clone_overlay"):
             self.clone_overlay.setGeometry(self.label.rect())
+        if hasattr(self, "lama_overlay"):
+            self.lama_overlay.setGeometry(self.label.rect())
+            self.update_lama_overlay(None)
         if hasattr(self, "red_eye_overlay"):
             self.red_eye_overlay.setGeometry(self.label.rect())
         if hasattr(self, "pan_offset"):
@@ -16155,6 +16587,8 @@ class FullscreenViewer(QDialog):
         if self._load_closed:
             return
         self._load_closed = True
+        self._cancel_lama_inference()
+        self._lama_executor.shutdown(wait=False, cancel_futures=True)
         self._load_generation += 1
         self._pending_load_request = None
         self._load_timer.stop()
@@ -16257,7 +16691,7 @@ class FullscreenViewer(QDialog):
             return False
         if self._load_future is not None and not self._load_future.done():
             return False
-        return self._preview_future is None
+        return self._preview_future is None and self._lama_future is None
 
     def toggle_info_overlay(self) -> None:
         self.info_overlay_enabled = not self.info_overlay_enabled
@@ -16406,9 +16840,11 @@ class FullscreenViewer(QDialog):
             if self.movie.scaledSize() != bounded_size:
                 self.movie.setScaledSize(bounded_size)
             self._display_movie_frame()
+            self.update_lama_overlay(None)
             return
         if self.base_pixmap.isNull():
             self.label.clear_display_pixmap()
+            self.update_lama_overlay(None)
             return
         self.pan_offset = self.clamped_pan_offset(self.pan_offset)
         display_rect = self.displayed_image_rect()
@@ -16424,12 +16860,14 @@ class FullscreenViewer(QDialog):
                     ),
                     display_rect,
                 )
+                self.update_lama_overlay(None)
                 return
         # QPainter scales this bounded source directly into the clipped target
         # rect. In particular, MAX_ZOOM cannot allocate a 16x pixmap here.
         display = QPixmap(self.base_pixmap)
         display.setDevicePixelRatio(self.image_device_pixel_ratio())
         self.label.set_display_pixmap(display, display_rect)
+        self.update_lama_overlay(None)
 
     def is_zoomed(self) -> bool:
         return self.zoom_level > 1.001
@@ -16573,6 +17011,45 @@ class FullscreenViewer(QDialog):
             self.start_region_edit("red_eye")
         elif command == "clone_heal":
             self.start_region_edit("clone_heal")
+        elif command == "lama":
+            self.open_lama_tool()
+
+    def open_lama_tool(self) -> None:
+        if not self.can_edit_current() or not self.navigator.order:
+            return
+        target_rel_path = self.navigator.current
+        parent = self.parent()
+        if isinstance(parent, MainWindow):
+            viewer_ref = weakref.ref(self)
+
+            def model_ready(path: Path | None, error: str | None) -> None:
+                viewer = viewer_ref()
+                if viewer is None or viewer._load_closed:
+                    return
+                viewer.setWindowTitle("Marnwick")
+                if error is not None:
+                    show_error(viewer, "LaMa", error)
+                    return
+                if (
+                    path is not None
+                    and viewer.navigator.order
+                    and viewer.navigator.current == target_rel_path
+                    and viewer.can_edit_current()
+                ):
+                    viewer.start_region_edit("lama")
+
+            parent.ensure_lama_model(self, model_ready)
+            if not lama_model_appears_installed():
+                self.setWindowTitle("Marnwick — downloading LaMa model…")
+            return
+        if not lama_model_appears_installed():
+            show_error(
+                self,
+                "LaMa",
+                "LaMa model data is unavailable. Use Tools > Download LaMa Model.",
+            )
+            return
+        self.start_region_edit("lama")
 
     def apply_instant_operation(self, name: str) -> None:
         if not self.can_edit_current():
@@ -16594,12 +17071,26 @@ class FullscreenViewer(QDialog):
         self.clone_painting = False
         self.clone_alignment_target = None
         self.clone_last_target = None
+        self.lama_samples.clear()
+        self.lama_painting = False
+        self.lama_last_target = None
         if mode == "clone_heal":
             self.clone_overlay.setGeometry(self.label.rect())
             self.clone_overlay.update_brush(None, self.clone_brush_radius_label, False)
             self.red_eye_overlay.update_selection(None)
+            self.lama_overlay.clear_mask()
+        elif mode == "lama":
+            self.clone_overlay.update_brush(None, self.clone_brush_radius_label, False)
+            self.red_eye_overlay.update_selection(None)
+            self.lama_overlay.setGeometry(self.label.rect())
+            self.update_lama_overlay(None)
+            self.setWindowTitle(
+                "Marnwick — LaMa: paint; Enter applies; Backspace clears; "
+                "wheel changes brush; Esc cancels"
+            )
         else:
             self.clone_overlay.update_brush(None, self.clone_brush_radius_label, False)
+            self.lama_overlay.clear_mask()
             if mode == "red_eye":
                 self.red_eye_overlay.setGeometry(self.label.rect())
             else:
@@ -16612,15 +17103,22 @@ class FullscreenViewer(QDialog):
         self.clone_painting = False
         self.clone_alignment_target = None
         self.clone_last_target = None
+        self.lama_samples.clear()
+        self.lama_painting = False
+        self.lama_last_target = None
         self.drag_origin = None
         if hasattr(self, "rubber_band"):
             self.rubber_band.hide()
         if hasattr(self, "clone_overlay"):
             self.clone_overlay.update_brush(None, self.clone_brush_radius_label, False)
+        if hasattr(self, "lama_overlay"):
+            self.lama_overlay.clear_mask()
         if hasattr(self, "red_eye_overlay"):
             self.red_eye_overlay.update_selection(None)
         if hasattr(self, "label"):
             self.update_cursor_visibility()
+        if not self._load_closed and self._lama_future is None:
+            self.setWindowTitle("Marnwick")
 
     def update_cursor_visibility(self) -> None:
         if not hasattr(self, "label"):
@@ -16722,15 +17220,20 @@ class FullscreenViewer(QDialog):
         y = max(0, min(y, image_height - 1))
         return x, y
 
-    def image_radius_from_label_radius(self) -> int:
+    def image_radius_from_label_radius(self, label_radius: int | None = None) -> int:
+        display_radius = (
+            self.clone_brush_radius_label
+            if label_radius is None
+            else max(1, int(label_radius))
+        )
         if self.base_pixmap.isNull():
             return 1
         display_rect = self.displayed_image_rect()
         if display_rect.width() <= 0:
-            return max(1, self.clone_brush_radius_label)
+            return max(1, display_radius)
         image_width = self.image_coordinate_size[0] or self.base_pixmap.width()
         scale = image_width / display_rect.width()
-        return max(1, int(round(self.clone_brush_radius_label * scale)))
+        return max(1, int(round(display_radius * scale)))
 
     def set_clone_brush_radius(self, radius: int) -> None:
         max_radius = max(8, min(256, max(1, min(self.label.width(), self.label.height()) // 2)))
@@ -17317,6 +17820,37 @@ def ask_discard_failed_edits_on_exit(parent: QWidget, count: int) -> bool:
     style_message_box_buttons(box)
     box.exec()
     confirmed = box.clickedButton() == discard_button
+    box.deleteLater()
+    return confirmed
+
+
+def ask_download_lama_model(parent: QWidget, *, replace: bool) -> bool:
+    size_text = format_bytes(LAMA_MODEL_SIZE_BYTES)
+    box = QMessageBox(parent)
+    box.setWindowTitle("Download LaMa Model")
+    box.setWindowIcon(load_app_icon())
+    box.setIcon(QMessageBox.Icon.Question)
+    box.setText(
+        f"Re-download and replace the installed {size_text} LaMa model data?"
+        if replace
+        else f"Download {size_text} of LaMa model data for local CPU inpainting?"
+    )
+    box.setInformativeText(
+        "The model runs locally through ONNX Runtime. Images are not uploaded. "
+        "Model data is downloaded from the pinned sapienkit/LaMa-ONNX release "
+        "on Hugging Face and verified with SHA-256."
+    )
+    download_button = box.addButton(
+        "Replace" if replace else "Download",
+        QMessageBox.ButtonRole.AcceptRole,
+    )
+    cancel_button = box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+    box.setDefaultButton(download_button)
+    box.setEscapeButton(cancel_button)
+    box.setStyleSheet(DIALOG_STYLESHEET)
+    style_message_box_buttons(box)
+    box.exec()
+    confirmed = box.clickedButton() is download_button
     box.deleteLater()
     return confirmed
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import errno
 import ctypes
 import hashlib
+import io
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
@@ -194,6 +195,8 @@ JPEG_XMP_MAX_BYTES = 65_504
 # frame that would cross it.  Tests may lower this constant to exercise the
 # boundary without allocating large images.
 MAX_EDIT_SEQUENCE_PIXELS = MAX_IMAGE_PIXELS
+MAX_GENERATED_PATCH_BYTES = 8 * 1024 * 1024
+MAX_GENERATED_PATCH_DIMENSION = 1024
 
 
 def apply_operation_to_image(image: Image.Image, operation: EditOperation) -> Image.Image:
@@ -256,7 +259,57 @@ def _apply_operation_to_normalized_image(
         source_box = tuple(params["source_box"])
         target_xy = tuple(params["target_xy"])
         return clone_heal(image, source_box, target_xy)
+    if operation.name == "lama":
+        return _apply_lama_patch(image, params)
     raise ValueError(f"unknown edit operation: {operation.name}")
+
+
+def _apply_lama_patch(image: Image.Image, params: dict[str, Any]) -> Image.Image:
+    source_size = params.get("source_size")
+    if (
+        not isinstance(source_size, (tuple, list))
+        or len(source_size) != 2
+        or tuple(int(value) for value in source_size) != image.size
+    ):
+        raise ValueError("LaMa patch does not match the edited image dimensions")
+    raw_box = params.get("box")
+    if not isinstance(raw_box, (tuple, list)) or len(raw_box) != 4:
+        raise ValueError("LaMa patch is missing its target box")
+    box = tuple(int(value) for value in raw_box)
+    if (
+        box[0] < 0
+        or box[1] < 0
+        or box[2] > image.width
+        or box[3] > image.height
+        or box[2] <= box[0]
+        or box[3] <= box[1]
+    ):
+        raise ValueError("LaMa patch target is outside the edited image")
+    patch_data = params.get("patch_png")
+    if (
+        not isinstance(patch_data, bytes)
+        or not patch_data
+        or len(patch_data) > MAX_GENERATED_PATCH_BYTES
+    ):
+        raise ValueError("LaMa patch data is missing or exceeds the safe edit size")
+    with Image.open(io.BytesIO(patch_data)) as patch_source:
+        if (
+            patch_source.width <= 0
+            or patch_source.height <= 0
+            or patch_source.width > MAX_GENERATED_PATCH_DIMENSION
+            or patch_source.height > MAX_GENERATED_PATCH_DIMENSION
+        ):
+            raise ValueError("LaMa patch dimensions exceed the safe edit size")
+        patch_source.load()
+        patch = patch_source.convert("RGBA")
+    target_size = (box[2] - box[0], box[3] - box[1])
+    if patch.size != target_size:
+        patch = patch.resize(target_size, Image.Resampling.LANCZOS)
+    alpha = patch.getchannel("A")
+    output_mode = "RGBA" if "A" in image.getbands() else "RGB"
+    result = image.convert(output_mode)
+    result.paste(patch.convert(output_mode), box[:2], alpha)
+    return result
 
 
 def apply_operation_to_file(
@@ -591,6 +644,12 @@ def _inspect_open_image(
     """
 
     frame_count = max(1, int(getattr(image, "n_frames", 1)))
+    if (
+        frame_count > 1
+        and operations is not None
+        and any(operation.name == "lama" for operation in operations)
+    ):
+        raise MultiFrameSaveError("LaMa currently supports static images only")
     original_frame = int(getattr(image, "tell", lambda: 0)())
     durations: list[int | None] = []
     disposals: list[int | None] = []
