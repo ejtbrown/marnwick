@@ -35,7 +35,11 @@ def run_inference(model_path: Path, input_path: Path, mask_path: Path) -> Image.
     if image.size != expected_size or mask.size != expected_size:
         raise ValueError(f"LaMa worker inputs must be {LAMA_INPUT_SIZE}x{LAMA_INPUT_SIZE}")
     image_array = np.asarray(image, dtype=np.float32).transpose(2, 0, 1)[None, ...] / 255.0
-    mask_array = np.asarray(mask, dtype=np.float32)[None, None, ...] / 255.0
+    # The export was trained with a binary erase mask. Fractional mask edges
+    # are interpreted as image content and can turn the whole fill gray.
+    mask_array = (
+        np.asarray(mask, dtype=np.uint8) > 0
+    ).astype(np.float32)[None, None, ...]
     input_names = {item.name for item in session.get_inputs()}
     if {"image", "mask"} <= input_names:
         feeds = {"image": image_array, "mask": mask_array}

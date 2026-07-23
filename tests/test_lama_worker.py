@@ -17,7 +17,7 @@ def test_run_inference_uses_pinned_tensor_contract_and_cpu_provider(
     image_path = tmp_path / "input.png"
     mask_path = tmp_path / "mask.png"
     Image.new("RGB", (512, 512), (64, 128, 255)).save(image_path)
-    Image.new("L", (512, 512), 255).save(mask_path)
+    Image.new("L", (512, 512), 96).save(mask_path)
     observed: dict[str, object] = {}
 
     class FakeSession:

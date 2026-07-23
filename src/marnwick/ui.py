@@ -14972,6 +14972,94 @@ class LamaMaskOverlay(QWidget):
             )
 
 
+class LamaBusyOverlay(QWidget):
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+
+        outer_layout = QVBoxLayout(self)
+        outer_layout.setContentsMargins(24, 24, 24, 24)
+        outer_layout.addStretch(1)
+
+        self.panel = QFrame()
+        self.panel.setObjectName("lamaBusyPanel")
+        self.panel.setMinimumWidth(340)
+        self.panel.setMaximumWidth(440)
+        panel_layout = QVBoxLayout(self.panel)
+        panel_layout.setContentsMargins(24, 20, 24, 20)
+        panel_layout.setSpacing(10)
+
+        self.title_label = QLabel("LaMa is filling the masked area…")
+        self.title_label.setObjectName("lamaBusyTitle")
+        self.title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        panel_layout.addWidget(self.title_label)
+
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 0)
+        self.progress.setTextVisible(False)
+        self.progress.setFixedHeight(12)
+        panel_layout.addWidget(self.progress)
+
+        self.detail_label = QLabel(
+            "Running locally on the CPU. This can take a few moments. "
+            "Press Esc to cancel."
+        )
+        self.detail_label.setObjectName("lamaBusyDetail")
+        self.detail_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.detail_label.setWordWrap(True)
+        self.detail_label.setMinimumHeight(32)
+        panel_layout.addWidget(self.detail_label)
+
+        self.panel.setStyleSheet(
+            """
+            QFrame#lamaBusyPanel {
+                background-color: rgba(15, 23, 42, 230);
+                border: 1px solid rgba(226, 232, 240, 90);
+                border-radius: 12px;
+            }
+            QLabel#lamaBusyTitle {
+                background-color: transparent;
+                color: #f8fafc;
+                font-size: 16px;
+                font-weight: 600;
+            }
+            QLabel#lamaBusyDetail {
+                background-color: transparent;
+                color: #cbd5e1;
+                font-size: 12px;
+            }
+            QProgressBar {
+                background-color: #334155;
+                border: 0;
+                border-radius: 6px;
+            }
+            QProgressBar::chunk {
+                background-color: #38bdf8;
+                border-radius: 6px;
+            }
+            """
+        )
+        outer_layout.addWidget(
+            self.panel,
+            0,
+            Qt.AlignmentFlag.AlignHCenter,
+        )
+        outer_layout.addStretch(1)
+        self.hide()
+
+    def start(self) -> None:
+        self.show()
+        self.raise_()
+
+    def stop(self) -> None:
+        self.hide()
+
+    def paintEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor(0, 0, 0, 88))
+
+
 class CircularSelectionOverlay(QWidget):
     def __init__(self, parent: QWidget) -> None:
         super().__init__(parent)
@@ -15282,6 +15370,7 @@ class FullscreenViewer(QDialog):
         self.clone_overlay = CloneBrushOverlay(self.label)
         self.lama_overlay = LamaMaskOverlay(self.label)
         self.red_eye_overlay = CircularSelectionOverlay(self.label)
+        self.lama_busy_overlay = LamaBusyOverlay(self.label)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self.label, 1)
@@ -15616,6 +15705,8 @@ class FullscreenViewer(QDialog):
         self._lama_rel_path = rel_path
         self._lama_preceding_operations = preceding_operations
         self.setWindowTitle("Marnwick — LaMa is filling the masked area locally…")
+        self.lama_busy_overlay.setGeometry(self.label.rect())
+        self.lama_busy_overlay.start()
         self._lama_timer.start()
 
     def _settle_lama_inference(self) -> None:
@@ -15629,6 +15720,7 @@ class FullscreenViewer(QDialog):
         self._lama_rel_path = None
         self._lama_preceding_operations = ()
         self._lama_timer.stop()
+        self.lama_busy_overlay.stop()
         if future.cancelled() or self._load_closed:
             return
         try:
@@ -15663,6 +15755,7 @@ class FullscreenViewer(QDialog):
         self._lama_cancel_event = None
         self._lama_rel_path = None
         self._lama_preceding_operations = ()
+        self.lama_busy_overlay.stop()
 
     def resizeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         super().resizeEvent(event)
@@ -15673,6 +15766,8 @@ class FullscreenViewer(QDialog):
             self.update_lama_overlay(None)
         if hasattr(self, "red_eye_overlay"):
             self.red_eye_overlay.setGeometry(self.label.rect())
+        if hasattr(self, "lama_busy_overlay"):
+            self.lama_busy_overlay.setGeometry(self.label.rect())
         if hasattr(self, "pan_offset"):
             self.pan_offset = self.clamped_pan_offset(self.pan_offset)
         self._fit_pixmap()

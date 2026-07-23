@@ -245,11 +245,8 @@ def create_lama_edit_operation(
         (LAMA_INPUT_SIZE, LAMA_INPUT_SIZE),
         Image.Resampling.LANCZOS,
     )
-    mask_crop = mask.crop(target_box).resize(
-        (LAMA_INPUT_SIZE, LAMA_INPUT_SIZE),
-        Image.Resampling.BILINEAR,
-    )
-    model_mask = mask_crop.filter(ImageFilter.MaxFilter(5))
+    mask_crop = mask.crop(target_box)
+    model_mask = prepare_lama_model_mask(mask_crop)
     if model_mask.getbbox() is None:
         raise ValueError("paint over an area before applying LaMa")
     _check_canceled(cancel_event)
@@ -310,6 +307,17 @@ def lama_mask_from_samples(
             fill=255,
         )
     return mask
+
+
+def prepare_lama_model_mask(mask: Image.Image) -> Image.Image:
+    """Return the strictly binary mask expected by the exported LaMa model."""
+
+    resized = mask.convert("L").resize(
+        (LAMA_INPUT_SIZE, LAMA_INPUT_SIZE),
+        Image.Resampling.NEAREST,
+    )
+    dilated = resized.filter(ImageFilter.MaxFilter(5))
+    return dilated.point(lambda value: 255 if value else 0)
 
 
 def lama_context_box(mask: Image.Image) -> tuple[int, int, int, int]:
