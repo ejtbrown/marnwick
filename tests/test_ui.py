@@ -7646,11 +7646,68 @@ def test_catalog_settings_update_waits_in_protected_worker_lane(tmp_path: Path) 
         qt_app.processEvents()
 
 
-def test_gpu_test_dialog_runs_all_methods_and_copies_explanations(monkeypatch) -> None:
+def test_tools_gpu_test_uses_confirmed_lama_model(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    window = MainWindow()
+    model_path = tmp_path / "lama.onnx"
+    observed: dict[str, object] = {}
+
+    class FakeGpuTestDialog:
+        def __init__(self, model: Path, parent: MainWindow) -> None:
+            observed["model"] = model
+            observed["parent"] = parent
+
+        def exec(self) -> None:
+            observed["executed"] = True
+
+        def deleteLater(self) -> None:
+            observed["deleted"] = True
+
+    def fake_ensure_lama_model(owner, callback):  # type: ignore[no-untyped-def]
+        observed["owner"] = owner
+        callback(model_path, None)
+
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        monkeypatch.setattr(window, "ensure_lama_model", fake_ensure_lama_model)
+        monkeypatch.setattr(ui_module, "GpuTestDialog", FakeGpuTestDialog)
+
+        window.open_gpu_test()
+
+        assert observed == {
+            "owner": window,
+            "model": model_path,
+            "parent": window,
+            "executed": True,
+            "deleted": True,
+        }
+    finally:
+        window.indexer.shutdown()
+        window.workspace.close()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_gpu_test_dialog_runs_all_methods_and_copies_explanations(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
     qt_app = app()
 
-    def fake_run_gpu_tests(*, cancel_event, result_callback, timeout_seconds=30.0):  # type: ignore[no-untyped-def]
+    def fake_run_gpu_tests(  # type: ignore[no-untyped-def]
+        model_path,
+        *,
+        cancel_event,
+        result_callback,
+        timeout_seconds=300.0,
+    ):
         del timeout_seconds
+        assert model_path == tmp_path / "model.onnx"
         assert not cancel_event.is_set()
         results = []
         for index, method in enumerate(ui_module.GPU_TEST_METHODS):
@@ -7668,6 +7725,8 @@ def test_gpu_test_dialog_runs_all_methods_and_copies_explanations(monkeypatch) -
                 method.label,
                 status,
                 explanation,
+                1.25 if status == ui_module.GPU_TEST_STATUS_WORKS else None,
+                0.375 if status == ui_module.GPU_TEST_STATUS_WORKS else None,
             )
             results.append(result)
             result_callback(result)
@@ -7676,7 +7735,7 @@ def test_gpu_test_dialog_runs_all_methods_and_copies_explanations(monkeypatch) -
     monkeypatch.setattr(ui_module, "run_gpu_tests", fake_run_gpu_tests)
 
     started_at = monotonic()
-    dialog = GpuTestDialog()
+    dialog = GpuTestDialog(tmp_path / "model.onnx")
     try:
         assert monotonic() - started_at < 0.1
         deadline = monotonic() + 2
@@ -7687,10 +7746,12 @@ def test_gpu_test_dialog_runs_all_methods_and_copies_explanations(monkeypatch) -
         assert dialog._future is None
         assert dialog.progress.value() == len(ui_module.GPU_TEST_METHODS)
         assert dialog.results_tree.topLevelItem(0).text(1) == "Works"
+        assert dialog.results_tree.topLevelItem(0).text(2) == "1.25 s"
+        assert dialog.results_tree.topLevelItem(0).text(3) == "375 ms"
         assert dialog.results_tree.topLevelItem(1).text(1) == "Failed"
         assert dialog.results_tree.topLevelItem(2).text(1) == "Not available"
         assert dialog.status_label.text() == (
-            "Testing complete: 1 working, 4 not available, and 1 failed."
+            "Testing complete: 1 working, 5 not available, and 1 failed."
         )
 
         dialog.results_tree.setCurrentItem(dialog.results_tree.topLevelItem(1))
@@ -7698,7 +7759,10 @@ def test_gpu_test_dialog_runs_all_methods_and_copies_explanations(monkeypatch) -
         dialog.copy_button.click()
         copied = qt_app.clipboard().text()
         assert "Marnwick GPU Test" in copied
-        assert "NVIDIA (CUDA): Works" in copied
+        assert (
+            "NVIDIA (CUDA): Works; initialize 1.25 s; inpaint 375 ms"
+            in copied
+        )
         assert "WebGPU: Failed" in copied
         assert "native driver rejected device initialization" in copied
     finally:
