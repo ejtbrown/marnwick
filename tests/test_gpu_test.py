@@ -90,7 +90,7 @@ def test_run_gpu_tests_reports_invalid_model_for_every_method(
     assert all("integrity check failed" in result.explanation for result in results)
 
 
-def test_worker_verifies_that_operation_was_assigned_to_requested_provider(
+def test_worker_runs_cold_and_warm_repairs_without_profiling(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -98,7 +98,7 @@ def test_worker_verifies_that_operation_was_assigned_to_requested_provider(
 
     class FakeSessionOptions:
         def __init__(self) -> None:
-            self.profile_file_prefix = ""
+            observed["session_options"] = self
 
     class FakeSession:
         def __init__(
@@ -108,8 +108,16 @@ def test_worker_verifies_that_operation_was_assigned_to_requested_provider(
             sess_options: FakeSessionOptions,
             providers: list[str],
         ) -> None:
-            observed["providers"] = providers
-            self.profile_path = Path(f"{sess_options.profile_file_prefix}.json")
+            provider_observations = observed.setdefault("providers", [])
+            profiling_observations = observed.setdefault("profiling", [])
+            assert isinstance(provider_observations, list)
+            assert isinstance(profiling_observations, list)
+            provider_observations.append(providers)
+            profiling_observations.append(
+                bool(getattr(sess_options, "enable_profiling", False))
+            )
+            assert sess_options is observed["session_options"]
+            self.profile_path = tmp_path / "provider-profile.json"
 
         def disable_fallback(self) -> None:
             observed["fallback_disabled"] = True
@@ -119,6 +127,13 @@ def test_worker_verifies_that_operation_was_assigned_to_requested_provider(
             _outputs: object,
             feeds: dict[str, np.ndarray],
         ) -> list[np.ndarray]:
+            observed["runs"] = int(observed.get("runs", 0)) + 1
+            if "input" in feeds:
+                input_array = feeds["input"]
+                weight = (
+                    np.arange(16 * 16, dtype=np.float32).reshape(16, 16) % 17 - 8
+                ) / 16.0
+                return [input_array @ weight]
             assert feeds["image"].shape == (1, 3, 512, 512)
             assert feeds["mask"].shape == (1, 1, 512, 512)
             repaired = feeds["image"] * 255.0
@@ -172,11 +187,15 @@ def test_worker_verifies_that_operation_was_assigned_to_requested_provider(
     assert result["status"] == gpu_test.GPU_TEST_STATUS_WORKS
     assert "LaMa masked-image repair" in result["explanation"]
     assert result["setup_seconds"] >= 0
-    assert result["inference_seconds"] >= 0
-    assert observed == {
-        "providers": ["CUDAExecutionProvider", "CPUExecutionProvider"],
-        "fallback_disabled": True,
-    }
+    assert result["cold_inference_seconds"] >= 0
+    assert result["warm_inference_seconds"] >= 0
+    assert observed["providers"] == [
+        ["CUDAExecutionProvider", "CPUExecutionProvider"],
+        ["CUDAExecutionProvider", "CPUExecutionProvider"],
+    ]
+    assert observed["fallback_disabled"] is True
+    assert observed["runs"] == 3
+    assert observed["profiling"] == [False, True]
 
 
 def test_webgpu_worker_distinguishes_missing_plugin_from_runtime_failure(
@@ -241,16 +260,19 @@ def test_worker_payload_preserves_performance_measurements() -> None:
             "status": gpu_test.GPU_TEST_STATUS_WORKS,
             "explanation": "LaMa repair verified.",
             "setup_seconds": 1.25,
-            "inference_seconds": 0.375,
+            "cold_inference_seconds": 0.375,
+            "warm_inference_seconds": 0.125,
         },
         "",
     )
 
     assert result.status == gpu_test.GPU_TEST_STATUS_WORKS
     assert result.setup_seconds == 1.25
-    assert result.inference_seconds == 0.375
+    assert result.cold_inference_seconds == 0.375
+    assert result.warm_inference_seconds == 0.125
     assert result.setup_display == "1.25 s"
-    assert result.inference_display == "375 ms"
+    assert result.cold_inference_display == "375 ms"
+    assert result.warm_inference_display == "125 ms"
 
 
 class _TempDir:
