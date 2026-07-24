@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import argparse
-import base64
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
 import json
+from math import isfinite
 import os
 from pathlib import Path
 import platform
@@ -15,8 +16,14 @@ from threading import Event
 from time import monotonic, sleep
 from typing import Any
 
+from .lama import (
+    LAMA_CPU_EXECUTION_PROVIDER,
+    LAMA_INPUT_SIZE,
+    validate_lama_model,
+)
 
-GPU_TEST_TIMEOUT_SECONDS = 30.0
+
+GPU_TEST_TIMEOUT_SECONDS = 5 * 60.0
 MAX_GPU_TEST_OUTPUT_BYTES = 64 * 1024
 MAX_GPU_TEST_EXPLANATION_CHARS = 4096
 GPU_TEST_STATUS_WORKS = "works"
@@ -37,6 +44,8 @@ class GpuTestResult:
     label: str
     status: str
     explanation: str
+    setup_seconds: float | None = None
+    inference_seconds: float | None = None
 
     @property
     def display_status(self) -> str:
@@ -47,6 +56,14 @@ class GpuTestResult:
             GPU_TEST_STATUS_CANCELED: "Canceled",
         }.get(self.status, self.status)
 
+    @property
+    def setup_display(self) -> str:
+        return format_gpu_test_duration(self.setup_seconds)
+
+    @property
+    def inference_display(self) -> str:
+        return format_gpu_test_duration(self.inference_seconds)
+
 
 GPU_TEST_METHODS = (
     GpuTestMethod("CUDAExecutionProvider", "NVIDIA (CUDA)"),
@@ -55,48 +72,37 @@ GPU_TEST_METHODS = (
     GpuTestMethod("CoreMLExecutionProvider", "CoreML"),
     GpuTestMethod("ROCMExecutionProvider", "ROCm"),
     GpuTestMethod("MIGraphXExecutionProvider", "MIGraphX"),
+    GpuTestMethod(LAMA_CPU_EXECUTION_PROVIDER, "CPU (baseline)"),
 )
 _GPU_TEST_METHOD_BY_PROVIDER = {
     method.provider: method for method in GPU_TEST_METHODS
 }
 _WEBGPU_REGISTRATION_NAME = "marnwick_gpu_test_webgpu"
 
-# A 16x16 MatMul model generated with ONNX opset 13. Keeping the 1.2 KiB
-# diagnostic model in the module avoids making the optional 198 MiB LaMa
-# model—or the ONNX model-authoring package—a prerequisite for GPU testing.
-_GPU_TEST_MODEL_BASE64 = (
-    "CAgSCG1hcm53aWNrOooJCjAKBWlucHV0CgZ3ZWlnaHQSBm91dHB1dBoPZ3B1X3Rlc3Rf"
-    "bWF0bXVsIgZNYXRNdWwSD01hcm53aWNrR3B1VGVzdCqRCAgQCBAQAUIGd2VpZ2h0SoAI"
-    "AAAAvwAA4L4AAMC+AACgvgAAgL4AAEC+AAAAvgAAgL0AAAAAAACAPQAAAD4AAEA+AACAPg"
-    "AAoD4AAMA+AADgPgAAAD8AAAC/AADgvgAAwL4AAKC+AACAvgAAQL4AAAC+AACAvQAAAAAA"
-    "AIA9AAAAPgAAQD4AAIA+AACgPgAAwD4AAOA+AAAAPwAAAL8AAOC+AADAvgAAoL4AAIC+AA"
-    "BAvgAAAL4AAIC9AAAAAAAAgD0AAAA+AABAPgAAgD4AAKA+AADAPgAA4D4AAAA/AAAAvwAA"
-    "4L4AAMC+AACgvgAAgL4AAEC+AAAAvgAAgL0AAAAAAACAPQAAAD4AAEA+AACAPgAAoD4AAM"
-    "A+AADgPgAAAD8AAAC/AADgvgAAwL4AAKC+AACAvgAAQL4AAAC+AACAvQAAAAAAAIA9AAAA"
-    "PgAAQD4AAIA+AACgPgAAwD4AAOA+AAAAPwAAAL8AAOC+AADAvgAAoL4AAIC+AABAvgAAAL"
-    "4AAIC9AAAAAAAAgD0AAAA+AABAPgAAgD4AAKA+AADAPgAA4D4AAAA/AAAAvwAA4L4AAMC+"
-    "AACgvgAAgL4AAEC+AAAAvgAAgL0AAAAAAACAPQAAAD4AAEA+AACAPgAAoD4AAMA+AADgPg"
-    "AAAD8AAAC/AADgvgAAwL4AAKC+AACAvgAAQL4AAAC+AACAvQAAAAAAAIA9AAAAPgAAQD4A"
-    "AIA+AACgPgAAwD4AAOA+AAAAPwAAAL8AAOC+AADAvgAAoL4AAIC+AABAvgAAAL4AAIC9AA"
-    "AAAAAAgD0AAAA+AABAPgAAgD4AAKA+AADAPgAA4D4AAAA/AAAAvwAA4L4AAMC+AACgvgAA"
-    "gL4AAEC+AAAAvgAAgL0AAAAAAACAPQAAAD4AAEA+AACAPgAAoD4AAMA+AADgPgAAAD8AAA"
-    "C/AADgvgAAwL4AAKC+AACAvgAAQL4AAAC+AACAvQAAAAAAAIA9AAAAPgAAQD4AAIA+AACg"
-    "PgAAwD4AAOA+AAAAPwAAAL8AAOC+AADAvgAAoL4AAIC+AABAvgAAAL4AAIC9AAAAAAAAgD"
-    "0AAAA+AABAPgAAgD4AAKA+AADAPgAA4D4AAAA/AAAAvwAA4L4AAMC+AACgvgAAgL4AAEC+"
-    "AAAAvgAAgL0AAAAAAACAPQAAAD4AAEA+AACAPgAAoD4AAMA+AADgPgAAAD8AAAC/AADgvg"
-    "AAwL4AAKC+AACAvgAAQL4AAAC+AACAvQAAAAAAAIA9AAAAPgAAQD4AAIA+AACgPgAAwD4A"
-    "AOA+AAAAPwAAAL8AAOC+AADAvgAAoL4AAIC+AABAvgAAAL4AAIC9AAAAAAAAgD0AAAA+AA"
-    "BAPgAAgD4AAKA+AADAPgAA4D4AAAA/AAAAv1oXCgVpbnB1dBIOCgwIARIICgIIEAoCCBBi"
-    "GAoGb3V0cHV0Eg4KDAgBEggKAggQCgIIEEIECgAQDQ=="
-)
-
-
 def run_gpu_tests(
+    model_path: Path,
     *,
     cancel_event: Event | None = None,
     result_callback: Callable[[GpuTestResult], None] | None = None,
     timeout_seconds: float = GPU_TEST_TIMEOUT_SECONDS,
 ) -> tuple[GpuTestResult, ...]:
+    try:
+        validated_model_path = validate_lama_model(model_path)
+    except Exception as error:
+        explanation = f"The LaMa benchmark model is unavailable or invalid: {error}"
+        results = tuple(
+            GpuTestResult(
+                method.provider,
+                method.label,
+                GPU_TEST_STATUS_UNAVAILABLE,
+                explanation,
+            )
+            for method in GPU_TEST_METHODS
+        )
+        if result_callback is not None:
+            for result in results:
+                result_callback(result)
+        return results
     results: list[GpuTestResult] = []
     for method in GPU_TEST_METHODS:
         if cancel_event is not None and cancel_event.is_set():
@@ -105,6 +111,7 @@ def run_gpu_tests(
         if platform_reason is None:
             result = _run_gpu_test_worker(
                 method,
+                validated_model_path,
                 cancel_event=cancel_event,
                 timeout_seconds=timeout_seconds,
             )
@@ -121,6 +128,14 @@ def run_gpu_tests(
         if result.status == GPU_TEST_STATUS_CANCELED:
             break
     return tuple(results)
+
+
+def format_gpu_test_duration(seconds: float | None) -> str:
+    if seconds is None or not isfinite(seconds) or seconds < 0:
+        return "—"
+    if seconds < 1:
+        return f"{seconds * 1000:.0f} ms"
+    return f"{seconds:.2f} s"
 
 
 def gpu_test_host_description() -> str:
@@ -168,6 +183,7 @@ def gpu_test_platform_unavailability(
 
 def _run_gpu_test_worker(
     method: GpuTestMethod,
+    model_path: Path,
     *,
     cancel_event: Event | None,
     timeout_seconds: float,
@@ -178,6 +194,8 @@ def _run_gpu_test_worker(
         "marnwick.gpu_test",
         "--worker",
         method.provider,
+        "--model",
+        str(model_path),
     ]
     environment = dict(os.environ)
     environment["PYTHONNOUSERSITE"] = "1"
@@ -285,6 +303,17 @@ def _result_from_worker_payload(
             GPU_TEST_STATUS_FAILED,
             "The test returned an incomplete response.",
         )
+    setup_seconds = _payload_duration(payload.get("setup_seconds"))
+    inference_seconds = _payload_duration(payload.get("inference_seconds"))
+    if status == GPU_TEST_STATUS_WORKS and (
+        setup_seconds is None or inference_seconds is None
+    ):
+        return GpuTestResult(
+            method.provider,
+            method.label,
+            GPU_TEST_STATUS_FAILED,
+            "The benchmark completed without valid performance measurements.",
+        )
     if stderr.strip() and status != GPU_TEST_STATUS_WORKS:
         explanation = f"{explanation} Native runtime output: {_bounded_detail(stderr)}"
     return GpuTestResult(
@@ -292,10 +321,19 @@ def _result_from_worker_payload(
         method.label,
         status,
         _bounded_detail(explanation),
+        setup_seconds,
+        inference_seconds,
     )
 
 
-def _worker_test_provider(provider: str) -> dict[str, str]:
+def _payload_duration(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    duration = float(value)
+    return duration if isfinite(duration) and duration >= 0 else None
+
+
+def _worker_test_provider(provider: str, model_path: Path) -> dict[str, object]:
     method = _GPU_TEST_METHOD_BY_PROVIDER[provider]
     try:
         import numpy as np
@@ -322,9 +360,8 @@ def _worker_test_provider(provider: str) -> dict[str, str]:
     runtime_version = str(getattr(ort, "__version__", "unknown"))
     with tempfile.TemporaryDirectory(prefix="marnwick-gpu-test-") as temp_name:
         temp_dir = Path(temp_name)
-        model_path = temp_dir / "gpu-test.onnx"
-        model_path.write_bytes(base64.b64decode(_GPU_TEST_MODEL_BASE64))
         try:
+            setup_started = monotonic()
             if provider == "WebGpuExecutionProvider":
                 session, device_description = _create_webgpu_session(
                     ort,
@@ -348,39 +385,45 @@ def _worker_test_provider(provider: str) -> dict[str, str]:
                     provider,
                 )
                 device_description = _provider_device_description(ort, provider)
-            input_array = (
-                np.arange(16 * 16, dtype=np.float32).reshape(16, 16) / 32.0
-            )
-            weight = (
-                np.arange(16 * 16, dtype=np.float32).reshape(16, 16) % 17 - 8
-            ) / 16.0
-            try:
-                output = session.run(None, {"input": input_array})
-            finally:
-                profile_path = Path(session.end_profiling())
-            if len(output) != 1 or not np.allclose(
-                np.asarray(output[0]),
-                input_array @ weight,
-                rtol=1e-4,
-                atol=1e-4,
-            ):
-                return {
-                    "status": GPU_TEST_STATUS_FAILED,
-                    "explanation": (
-                        f"{method.label} ran the diagnostic model but returned an "
-                        "incorrect numerical result."
-                    ),
+            setup_seconds = monotonic() - setup_started
+            image_array, mask_array = _lama_benchmark_inputs(np)
+            inputs = session.get_inputs()
+            input_names = {str(item.name) for item in inputs}
+            if {"image", "mask"} <= input_names:
+                feeds = {"image": image_array, "mask": mask_array}
+            elif len(inputs) == 2:
+                feeds = {
+                    str(inputs[0].name): image_array,
+                    str(inputs[1].name): mask_array,
                 }
-            assigned_providers = _profile_node_providers(profile_path)
-            if provider not in assigned_providers:
-                assigned = ", ".join(sorted(assigned_providers)) or "no provider"
+            else:
+                raise ValueError("LaMa model has an unexpected input contract")
+            inference_started = monotonic()
+            try:
+                output = session.run(None, feeds)
+            finally:
+                inference_seconds = monotonic() - inference_started
+                profile_path = Path(session.end_profiling())
+            masked_mean_change = _validate_lama_benchmark_output(
+                np,
+                output,
+                image_array,
+                mask_array,
+            )
+            provider_counts = _profile_node_provider_counts(profile_path)
+            provider_node_count = provider_counts[provider]
+            profiled_node_count = sum(provider_counts.values())
+            if provider_node_count == 0:
+                assigned = ", ".join(sorted(provider_counts)) or "no provider"
                 return {
                     "status": GPU_TEST_STATUS_FAILED,
                     "explanation": (
                         f"The {method.label} session initialized, but ONNX Runtime "
-                        f"assigned the test operation to {assigned} instead of "
+                        f"assigned the LaMa operations to {assigned} instead of "
                         f"{provider}. This would not provide the requested GPU acceleration."
                     ),
+                    "setup_seconds": setup_seconds,
+                    "inference_seconds": inference_seconds,
                 }
         except _WebGpuUnavailable as error:
             return {
@@ -399,14 +442,84 @@ def _worker_test_provider(provider: str) -> dict[str, str]:
             }
 
     device_suffix = f" {device_description}" if device_description else ""
+    profile_detail = (
+        f"ONNX Runtime assigned {provider_node_count} of {profiled_node_count} "
+        f"profiled node executions to {provider}."
+    )
     return {
         "status": GPU_TEST_STATUS_WORKS,
         "explanation": (
-            f"ONNX Runtime {runtime_version} created a {method.label} session, "
-            f"ran matrix multiplication on {provider}, and verified the result."
+            f"ONNX Runtime {runtime_version} completed and verified a "
+            f"{LAMA_INPUT_SIZE}×{LAMA_INPUT_SIZE} LaMa masked-image repair. "
+            f"Initialization took {format_gpu_test_duration(setup_seconds)} and "
+            f"inpainting took {format_gpu_test_duration(inference_seconds)}. "
+            f"The repaired mask changed by an average of "
+            f"{masked_mean_change:.1f} pixel levels. {profile_detail}"
             f"{device_suffix}"
         ),
+        "setup_seconds": setup_seconds,
+        "inference_seconds": inference_seconds,
     }
+
+
+def _lama_benchmark_inputs(np: Any) -> tuple[Any, Any]:
+    # A lightly patterned background and high-contrast central object make a
+    # deterministic, provider-independent erase task without bundling a photo.
+    axis = np.arange(LAMA_INPUT_SIZE, dtype=np.float32)
+    x, y = np.meshgrid(axis, axis)
+    background_wave = 0.035 * np.sin(x / 12.0) * np.cos(y / 17.0)
+    background = np.stack(
+        (
+            0.80 + background_wave + 0.025 * np.sin(y / 31.0),
+            0.84 + background_wave + 0.020 * np.cos(x / 27.0),
+            0.88 + background_wave,
+        ),
+        axis=2,
+    )
+    image = np.clip(background, 0.0, 1.0).astype(np.float32)
+    center = LAMA_INPUT_SIZE / 2
+    unwanted_object = (
+        ((x - center) / 58.0) ** 2 + ((y - center) / 82.0) ** 2
+    ) <= 1.0
+    object_pattern = ((x.astype(np.int32) // 12 + y.astype(np.int32) // 12) % 2) == 0
+    image[unwanted_object & object_pattern] = (0.72, 0.08, 0.06)
+    image[unwanted_object & ~object_pattern] = (0.12, 0.16, 0.62)
+    erase_mask = (
+        ((x - center) / 68.0) ** 2 + ((y - center) / 92.0) ** 2
+    ) <= 1.0
+    image_array = image.transpose(2, 0, 1)[None, ...]
+    mask_array = erase_mask.astype(np.float32)[None, None, ...]
+    return image_array, mask_array
+
+
+def _validate_lama_benchmark_output(
+    np: Any,
+    output: object,
+    image_array: Any,
+    mask_array: Any,
+) -> float:
+    if not isinstance(output, (list, tuple)) or len(output) != 1:
+        raise ValueError("LaMa model returned an unexpected output count")
+    result = np.asarray(output[0])
+    if result.shape == (1, 3, LAMA_INPUT_SIZE, LAMA_INPUT_SIZE):
+        result_image = result[0].transpose(1, 2, 0)
+    elif result.shape == (1, LAMA_INPUT_SIZE, LAMA_INPUT_SIZE, 3):
+        result_image = result[0]
+    else:
+        raise ValueError(f"LaMa model returned an unexpected shape: {result.shape}")
+    if not bool(np.isfinite(result_image).all()):
+        raise ValueError("LaMa model returned non-finite pixels")
+    mask = mask_array[0, 0] > 0
+    source_image = image_array[0].transpose(1, 2, 0) * 255.0
+    masked_result = result_image[mask]
+    if float(np.std(masked_result)) < 0.5:
+        raise ValueError("LaMa returned a collapsed fill for the masked image area")
+    masked_mean_change = float(
+        np.mean(np.abs(masked_result - source_image[mask]))
+    )
+    if not isfinite(masked_mean_change) or masked_mean_change < 0.5:
+        raise ValueError("LaMa did not materially change the masked image area")
+    return masked_mean_change
 
 
 def _create_standard_session(
@@ -421,7 +534,11 @@ def _create_standard_session(
     session = ort.InferenceSession(
         str(model_path),
         sess_options=options,
-        providers=[provider, "CPUExecutionProvider"],
+        providers=(
+            [provider]
+            if provider == LAMA_CPU_EXECUTION_PROVIDER
+            else [provider, LAMA_CPU_EXECUTION_PROVIDER]
+        ),
     )
     disable_fallback = getattr(session, "disable_fallback", None)
     if callable(disable_fallback):
@@ -484,29 +601,43 @@ def _create_webgpu_session(
 
 def _session_options(ort: Any, temp_dir: Path) -> Any:
     options = ort.SessionOptions()
-    options.intra_op_num_threads = max(1, min(4, os.cpu_count() or 1))
+    options.intra_op_num_threads = _benchmark_thread_count()
     options.inter_op_num_threads = 1
     options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
     options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    options.log_severity_level = 3
     options.enable_profiling = True
     options.profile_file_prefix = str(temp_dir / "profile")
     return options
 
 
-def _profile_node_providers(profile_path: Path) -> set[str]:
-    if profile_path.stat().st_size > 2 * 1024 * 1024:
+def _benchmark_thread_count() -> int:
+    raw = os.environ.get("MARNWICK_LAMA_THREADS")
+    if raw:
+        try:
+            value = int(raw)
+        except ValueError as error:
+            raise ValueError("MARNWICK_LAMA_THREADS must be an integer") from error
+        if value < 1 or value > 64:
+            raise ValueError("MARNWICK_LAMA_THREADS must be between 1 and 64")
+        return value
+    return max(1, min(8, (os.cpu_count() or 2) - 1))
+
+
+def _profile_node_provider_counts(profile_path: Path) -> Counter[str]:
+    if profile_path.stat().st_size > 64 * 1024 * 1024:
         raise RuntimeError("ONNX Runtime produced an unexpectedly large test profile")
     payload = json.loads(profile_path.read_text(encoding="utf-8"))
     if not isinstance(payload, list):
         raise RuntimeError("ONNX Runtime produced an invalid test profile")
-    return {
+    return Counter(
         str(args["provider"])
         for event in payload
         if isinstance(event, dict)
         and event.get("cat") == "Node"
         and isinstance((args := event.get("args")), dict)
         and isinstance(args.get("provider"), str)
-    }
+    )
 
 
 def _provider_device_description(ort: Any, provider: str) -> str:
@@ -566,6 +697,9 @@ def _provider_unavailable_explanation(
         "MIGraphXExecutionProvider": (
             "A MIGraphX-enabled ONNX Runtime build and compatible AMD ROCm stack are required."
         ),
+        LAMA_CPU_EXECUTION_PROVIDER: (
+            "The standard onnxruntime package includes the required CPU provider."
+        ),
     }.get(method.provider, "A provider-specific ONNX Runtime package is required.")
     return (
         f"ONNX Runtime {runtime_version} does not expose {method.provider}. "
@@ -580,6 +714,13 @@ def _provider_failure_explanation(
     runtime_version: str,
 ) -> str:
     providers = ", ".join(available) if available else "none"
+    if method.provider == LAMA_CPU_EXECUTION_PROVIDER:
+        return (
+            f"ONNX Runtime {runtime_version} exposes the CPU provider, but the "
+            "LaMa benchmark session could not initialize or run. The installed "
+            f"runtime or model may be incompatible. Runtime detail: "
+            f"{_bounded_detail(error)} Available providers: {providers}."
+        )
     return (
         f"ONNX Runtime {runtime_version} exposes {method.provider}, but the "
         f"{method.label} session could not initialize or run. This usually means "
@@ -612,7 +753,7 @@ def _terminate_worker(process: subprocess.Popen[bytes]) -> None:
             pass
 
 
-def _worker_main(provider: str) -> int:
+def _worker_main(provider: str, model_path: Path) -> int:
     if provider not in _GPU_TEST_METHOD_BY_PROVIDER:
         print(
             json.dumps(
@@ -623,17 +764,18 @@ def _worker_main(provider: str) -> int:
             )
         )
         return 2
-    print(json.dumps(_worker_test_provider(provider), sort_keys=True))
+    print(json.dumps(_worker_test_provider(provider, model_path), sort_keys=True))
     return 0
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Marnwick isolated GPU diagnostic worker")
     parser.add_argument("--worker", choices=tuple(_GPU_TEST_METHOD_BY_PROVIDER))
+    parser.add_argument("--model", required=True, type=Path)
     args = parser.parse_args(argv)
     if args.worker is None:
         parser.error("--worker is required")
-    return _worker_main(str(args.worker))
+    return _worker_main(str(args.worker), args.model)
 
 
 if __name__ == "__main__":

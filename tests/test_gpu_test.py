@@ -54,12 +54,40 @@ def test_worker_reports_provider_missing_from_onnx_runtime(
     )
     monkeypatch.setitem(sys.modules, "onnxruntime", fake_ort)
 
-    result = gpu_test._worker_test_provider("CUDAExecutionProvider")
+    result = gpu_test._worker_test_provider(
+        "CUDAExecutionProvider",
+        Path("/unused/model.onnx"),
+    )
 
     assert result["status"] == gpu_test.GPU_TEST_STATUS_UNAVAILABLE
     assert "does not expose CUDAExecutionProvider" in result["explanation"]
     assert "AzureExecutionProvider, CPUExecutionProvider" in result["explanation"]
     assert "nvidia-smi" in result["explanation"]
+
+
+def test_run_gpu_tests_reports_invalid_model_for_every_method(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    callbacks = []
+
+    def reject_model(_path: Path) -> Path:
+        raise RuntimeError("integrity check failed")
+
+    monkeypatch.setattr(gpu_test, "validate_lama_model", reject_model)
+
+    results = gpu_test.run_gpu_tests(
+        tmp_path / "model.onnx",
+        result_callback=callbacks.append,
+    )
+
+    assert len(results) == len(gpu_test.GPU_TEST_METHODS)
+    assert callbacks == list(results)
+    assert all(
+        result.status == gpu_test.GPU_TEST_STATUS_UNAVAILABLE
+        for result in results
+    )
+    assert all("integrity check failed" in result.explanation for result in results)
 
 
 def test_worker_verifies_that_operation_was_assigned_to_requested_provider(
@@ -91,11 +119,17 @@ def test_worker_verifies_that_operation_was_assigned_to_requested_provider(
             _outputs: object,
             feeds: dict[str, np.ndarray],
         ) -> list[np.ndarray]:
-            input_array = feeds["input"]
-            weight = (
-                np.arange(16 * 16, dtype=np.float32).reshape(16, 16) % 17 - 8
-            ) / 16.0
-            return [input_array @ weight]
+            assert feeds["image"].shape == (1, 3, 512, 512)
+            assert feeds["mask"].shape == (1, 1, 512, 512)
+            repaired = feeds["image"] * 255.0
+            repaired = np.where(feeds["mask"] > 0, 255.0 - repaired, repaired)
+            return [repaired]
+
+        def get_inputs(self) -> list[SimpleNamespace]:
+            return [
+                SimpleNamespace(name="image"),
+                SimpleNamespace(name="mask"),
+            ]
 
         def end_profiling(self) -> str:
             self.profile_path.write_text(
@@ -130,10 +164,15 @@ def test_worker_verifies_that_operation_was_assigned_to_requested_provider(
         lambda **_kwargs: _TempDir(tmp_path),
     )
 
-    result = gpu_test._worker_test_provider("CUDAExecutionProvider")
+    result = gpu_test._worker_test_provider(
+        "CUDAExecutionProvider",
+        tmp_path / "model.onnx",
+    )
 
     assert result["status"] == gpu_test.GPU_TEST_STATUS_WORKS
-    assert "verified the result" in result["explanation"]
+    assert "LaMa masked-image repair" in result["explanation"]
+    assert result["setup_seconds"] >= 0
+    assert result["inference_seconds"] >= 0
     assert observed == {
         "providers": ["CUDAExecutionProvider", "CPUExecutionProvider"],
         "fallback_disabled": True,
@@ -156,10 +195,62 @@ def test_webgpu_worker_distinguishes_missing_plugin_from_runtime_failure(
         lambda **_kwargs: _TempDir(tmp_path),
     )
 
-    result = gpu_test._worker_test_provider("WebGpuExecutionProvider")
+    result = gpu_test._worker_test_provider(
+        "WebGpuExecutionProvider",
+        tmp_path / "model.onnx",
+    )
 
     assert result["status"] == gpu_test.GPU_TEST_STATUS_UNAVAILABLE
     assert "WebGPU execution-provider plugin is not installed" in result["explanation"]
+
+
+def test_benchmark_uses_patterned_image_and_mask_and_rejects_unchanged_output() -> None:
+    image, mask = gpu_test._lama_benchmark_inputs(np)
+
+    assert image.shape == (1, 3, 512, 512)
+    assert image.dtype == np.float32
+    assert mask.shape == (1, 1, 512, 512)
+    assert mask.dtype == np.float32
+    assert 0.05 < float(mask.mean()) < 0.15
+    assert set(np.unique(mask)) == {0.0, 1.0}
+    with pytest.raises(
+        ValueError,
+        match="did not materially change",
+    ):
+        gpu_test._validate_lama_benchmark_output(
+            np,
+            [image * 255.0],
+            image,
+            mask,
+        )
+    with pytest.raises(ValueError, match="collapsed fill"):
+        gpu_test._validate_lama_benchmark_output(
+            np,
+            [np.zeros_like(image)],
+            image,
+            mask,
+        )
+
+
+def test_worker_payload_preserves_performance_measurements() -> None:
+    method = gpu_test.GPU_TEST_METHODS[0]
+
+    result = gpu_test._result_from_worker_payload(
+        method,
+        {
+            "status": gpu_test.GPU_TEST_STATUS_WORKS,
+            "explanation": "LaMa repair verified.",
+            "setup_seconds": 1.25,
+            "inference_seconds": 0.375,
+        },
+        "",
+    )
+
+    assert result.status == gpu_test.GPU_TEST_STATUS_WORKS
+    assert result.setup_seconds == 1.25
+    assert result.inference_seconds == 0.375
+    assert result.setup_display == "1.25 s"
+    assert result.inference_display == "375 ms"
 
 
 class _TempDir:

@@ -4153,7 +4153,19 @@ class MainWindow(QMainWindow):
         dialog.deleteLater()
 
     def open_gpu_test(self) -> None:
-        dialog = GpuTestDialog(self)
+        self.ensure_lama_model(self, self._open_gpu_test_with_model)
+
+    def _open_gpu_test_with_model(
+        self,
+        model_path: Path | None,
+        error_message: str | None,
+    ) -> None:
+        if error_message is not None:
+            show_error(self, "GPU Test", error_message)
+            return
+        if model_path is None:
+            return
+        dialog = GpuTestDialog(model_path, self)
         dialog.exec()
         dialog.deleteLater()
 
@@ -14147,8 +14159,13 @@ class CatalogTagsDialog(QDialog):
 
 
 class GpuTestDialog(QDialog):
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        model_path: Path,
+        parent: QWidget | None = None,
+    ) -> None:
         super().__init__(parent)
+        self._model_path = model_path
         self._closed = False
         self._executor = shared_dialog_executor()
         self._future: Future[tuple[GpuTestResult, ...]] | None = None
@@ -14164,9 +14181,11 @@ class GpuTestDialog(QDialog):
 
         layout = QVBoxLayout(self)
         introduction = QLabel(
-            "Marnwick will run a small local inference through every GPU backend "
-            "it knows about. Each backend runs in an isolated process so a native "
-            "runtime failure cannot prevent the remaining tests."
+            "Marnwick will repair the same generated 512×512 test image and erase "
+            "mask with LaMa through every available backend, plus a CPU baseline. "
+            "Initialization and first-inpaint times are measured separately. Each "
+            "backend runs in an isolated process so a native runtime failure cannot "
+            "prevent the remaining tests."
         )
         introduction.setWordWrap(True)
         layout.addWidget(introduction)
@@ -14176,7 +14195,9 @@ class GpuTestDialog(QDialog):
         layout.addWidget(host_label)
 
         self.results_tree = QTreeWidget()
-        self.results_tree.setHeaderLabels(("Method", "Result", "Explanation"))
+        self.results_tree.setHeaderLabels(
+            ("Method", "Result", "Initialize", "Inpaint", "Explanation")
+        )
         self.results_tree.setRootIsDecorated(False)
         self.results_tree.setAlternatingRowColors(True)
         self.results_tree.setUniformRowHeights(True)
@@ -14184,15 +14205,19 @@ class GpuTestDialog(QDialog):
             QAbstractItemView.SelectionBehavior.SelectRows
         )
         self.results_tree.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.results_tree.setColumnWidth(0, 170)
-        self.results_tree.setColumnWidth(1, 120)
+        self.results_tree.setColumnWidth(0, 155)
+        self.results_tree.setColumnWidth(1, 105)
+        self.results_tree.setColumnWidth(2, 90)
+        self.results_tree.setColumnWidth(3, 90)
         self.results_tree.header().setStretchLastSection(True)
         self.results_tree.currentItemChanged.connect(self._show_selected_explanation)
         layout.addWidget(self.results_tree, 1)
 
         for method in GPU_TEST_METHODS:
-            item = QTreeWidgetItem((method.label, "Waiting", "Waiting to run…"))
-            item.setToolTip(2, "Waiting to run…")
+            item = QTreeWidgetItem(
+                (method.label, "Waiting", "—", "—", "Waiting to run…")
+            )
+            item.setToolTip(4, "Waiting to run…")
             self.results_tree.addTopLevelItem(item)
             self._items[method.provider] = item
 
@@ -14247,8 +14272,10 @@ class GpuTestDialog(QDialog):
         for method in GPU_TEST_METHODS:
             item = self._items[method.provider]
             item.setText(1, "Waiting")
-            item.setText(2, "Waiting to run…")
-            item.setToolTip(2, "Waiting to run…")
+            item.setText(2, "—")
+            item.setText(3, "—")
+            item.setText(4, "Waiting to run…")
+            item.setToolTip(4, "Waiting to run…")
             item.setForeground(1, QBrush(QColor("#202124")))
         self.progress.setValue(0)
         self.copy_button.setEnabled(False)
@@ -14257,6 +14284,7 @@ class GpuTestDialog(QDialog):
         result_queue = self._result_queue
         self._future = self._executor.submit(
             run_gpu_tests,
+            self._model_path,
             cancel_event=self._cancel_event,
             result_callback=result_queue.put,
         )
@@ -14309,8 +14337,10 @@ class GpuTestDialog(QDialog):
         self._results[result.provider] = result
         item = self._items[result.provider]
         item.setText(1, result.display_status)
-        item.setText(2, result.explanation)
-        item.setToolTip(2, result.explanation)
+        item.setText(2, result.setup_display)
+        item.setText(3, result.inference_display)
+        item.setText(4, result.explanation)
+        item.setToolTip(4, result.explanation)
         item.setForeground(
             1,
             QBrush(
@@ -14336,10 +14366,10 @@ class GpuTestDialog(QDialog):
         item = self._items[method.provider]
         if item.text(1) == "Waiting":
             item.setText(1, "Testing…")
-            item.setText(2, "Starting isolated provider test…")
-            item.setToolTip(2, item.text(2))
+            item.setText(4, "Starting isolated LaMa image repair benchmark…")
+            item.setToolTip(4, item.text(4))
             if self.results_tree.currentItem() is item:
-                self.details.setPlainText(item.text(2))
+                self.details.setPlainText(item.text(4))
         self.status_label.setText(
             f"Testing {method.label} ({self._completed_count + 1} of "
             f"{len(GPU_TEST_METHODS)})…"
@@ -14350,7 +14380,7 @@ class GpuTestDialog(QDialog):
         current: QTreeWidgetItem | None,
         _previous: QTreeWidgetItem | None,
     ) -> None:
-        self.details.setPlainText("" if current is None else current.text(2))
+        self.details.setPlainText("" if current is None else current.text(4))
 
     def _mark_unfinished(self, status: str, explanation: str) -> None:
         for method in GPU_TEST_METHODS:
@@ -14358,8 +14388,10 @@ class GpuTestDialog(QDialog):
                 continue
             item = self._items[method.provider]
             item.setText(1, status)
-            item.setText(2, explanation)
-            item.setToolTip(2, explanation)
+            item.setText(2, "—")
+            item.setText(3, "—")
+            item.setText(4, explanation)
+            item.setToolTip(4, explanation)
 
     def copy_results(self) -> None:
         lines = [
@@ -14371,8 +14403,9 @@ class GpuTestDialog(QDialog):
             item = self._items[method.provider]
             lines.extend(
                 (
-                    f"{method.label}: {item.text(1)}",
-                    item.text(2),
+                    f"{method.label}: {item.text(1)}; "
+                    f"initialize {item.text(2)}; inpaint {item.text(3)}",
+                    item.text(4),
                     "",
                 )
             )
