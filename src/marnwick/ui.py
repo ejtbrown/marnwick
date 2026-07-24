@@ -19,6 +19,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime
 from functools import partial
 from pathlib import Path
+from queue import Empty, SimpleQueue
 from threading import Event, Lock
 from time import monotonic
 
@@ -150,6 +151,7 @@ from .lama import (
     create_lama_edit_operation,
     default_lama_model_path,
     download_lama_model as download_lama_model_data,
+    lama_execution_provider_label,
     lama_model_appears_installed,
 )
 from .models import CatalogSettings, DirectoryRecord, FolderPreviewRecord, ImageRecord, PaneRecord, SortOrder
@@ -15031,7 +15033,7 @@ class LamaBusyOverlay(QWidget):
         panel_layout.addWidget(self.progress)
 
         self.detail_label = QLabel(
-            "Checking for a supported GPU, with local CPU fallback. "
+            "Selecting the local processing runtime. "
             "This can take a few moments. Press Esc to cancel."
         )
         self.detail_label.setObjectName("lamaBusyDetail")
@@ -15078,8 +15080,18 @@ class LamaBusyOverlay(QWidget):
         self.hide()
 
     def start(self) -> None:
+        self.detail_label.setText(
+            "Selecting the local processing runtime. "
+            "This can take a few moments. Press Esc to cancel."
+        )
         self.show()
         self.raise_()
+
+    def set_execution_provider(self, provider_label: str) -> None:
+        self.detail_label.setText(
+            f"Using {provider_label} for local inference. "
+            "This can take a few moments. Press Esc to cancel."
+        )
 
     def stop(self) -> None:
         self.hide()
@@ -15364,6 +15376,8 @@ class FullscreenViewer(QDialog):
         self._lama_cancel_event: Event | None = None
         self._lama_rel_path: str | None = None
         self._lama_preceding_operations: tuple[EditOperation, ...] = ()
+        self._lama_generation = 0
+        self._lama_provider_updates: SimpleQueue[tuple[int, str]] = SimpleQueue()
         self._load_timer = QTimer(self)
         self._load_timer.setInterval(20)
         self._load_timer.timeout.connect(self._settle_async_load)
@@ -15720,6 +15734,8 @@ class FullscreenViewer(QDialog):
             if isinstance(parent, MainWindow)
             else LAMA_RUNTIME_AUTO
         )
+        self._lama_generation += 1
+        lama_generation = self._lama_generation
         try:
             future = self._lama_executor.submit(
                 create_lama_edit_operation,
@@ -15730,6 +15746,9 @@ class FullscreenViewer(QDialog):
                 expected_size=self.image_coordinate_size,
                 runtime=runtime,
                 cancel_event=cancel_event,
+                provider_callback=lambda provider: self._lama_provider_updates.put(
+                    (lama_generation, provider)
+                ),
             )
         except ExecutorSaturatedError:
             show_error(self, "LaMa", "The local LaMa worker is already busy.")
@@ -15746,6 +15765,7 @@ class FullscreenViewer(QDialog):
         self._lama_timer.start()
 
     def _settle_lama_inference(self) -> None:
+        self._settle_lama_provider_updates()
         future = self._lama_future
         if future is None or not future.done():
             return
@@ -15778,21 +15798,28 @@ class FullscreenViewer(QDialog):
         ):
             return
         provider = str((operation.params or {}).get("execution_provider", "local runtime"))
-        provider_label = {
-            "CPUExecutionProvider": "CPU",
-            "CUDAExecutionProvider": "NVIDIA",
-            "WebGpuExecutionProvider": "WebGPU",
-            "DmlExecutionProvider": "DirectML",
-            "ROCMExecutionProvider": "ROCm",
-            "MIGraphXExecutionProvider": "MIGraphX",
-            "CoreMLExecutionProvider": "CoreML",
-        }.get(provider, provider)
+        provider_label = lama_execution_provider_label(provider)
         self.setWindowTitle(f"Marnwick — LaMa completed using {provider_label}")
         self.exit_region_edit()
         self.operations.append(operation)
         self.render_preview()
 
+    def _settle_lama_provider_updates(self) -> None:
+        while True:
+            try:
+                generation, provider = self._lama_provider_updates.get_nowait()
+            except Empty:
+                return
+            if generation != self._lama_generation or self._lama_future is None:
+                continue
+            provider_label = lama_execution_provider_label(provider)
+            self.lama_busy_overlay.set_execution_provider(provider_label)
+            self.setWindowTitle(
+                f"Marnwick — LaMa is filling the masked area using {provider_label}…"
+            )
+
     def _cancel_lama_inference(self) -> None:
+        self._lama_generation += 1
         self._lama_timer.stop()
         if self._lama_cancel_event is not None:
             self._lama_cancel_event.set()

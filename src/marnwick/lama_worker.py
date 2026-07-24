@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Callable
 import json
 import os
 from pathlib import Path
@@ -48,12 +49,14 @@ def run_inference(
     mask_path: Path,
     *,
     runtime: str = LAMA_RUNTIME_AUTO,
+    provider_callback: Callable[[str], None] | None = None,
 ) -> Image.Image:
     result, _provider = run_inference_with_provider(
         model_path,
         input_path,
         mask_path,
         runtime=runtime,
+        provider_callback=provider_callback,
     )
     return result
 
@@ -64,6 +67,7 @@ def run_inference_with_provider(
     mask_path: Path,
     *,
     runtime: str = LAMA_RUNTIME_AUTO,
+    provider_callback: Callable[[str], None] | None = None,
 ) -> tuple[Image.Image, str]:
     if runtime not in LAMA_RUNTIMES:
         raise ValueError(f"unsupported LaMa runtime preference: {runtime}")
@@ -83,6 +87,8 @@ def run_inference_with_provider(
         np.asarray(mask, dtype=np.uint8) > 0
     ).astype(np.float32)[None, None, ...]
     session, provider = _preferred_inference_session(model_path, runtime)
+    if provider_callback is not None:
+        provider_callback(provider)
     input_names = {item.name for item in session.get_inputs()}
     if {"image", "mask"} <= input_names:
         feeds = {"image": image_array, "mask": mask_array}
@@ -101,6 +107,8 @@ def run_inference_with_provider(
             LAMA_CPU_EXECUTION_PROVIDER,
         )
         provider = LAMA_CPU_EXECUTION_PROVIDER
+        if provider_callback is not None:
+            provider_callback(provider)
         output = session.run(None, feeds)
     if len(output) != 1:
         raise ValueError("LaMa model has an unexpected output contract")
@@ -271,6 +279,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input", required=True, type=Path)
     parser.add_argument("--mask", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--status", type=Path)
     parser.add_argument(
         "--runtime",
         choices=sorted(LAMA_RUNTIMES),
@@ -281,11 +290,20 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+
+    def report_provider(provider: str) -> None:
+        if args.status is not None:
+            args.status.write_text(
+                json.dumps({"provider": provider}, sort_keys=True),
+                encoding="utf-8",
+            )
+
     result, provider = run_inference_with_provider(
         args.model,
         args.input,
         args.mask,
         runtime=args.runtime,
+        provider_callback=report_provider,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     fd, temp_name = tempfile.mkstemp(

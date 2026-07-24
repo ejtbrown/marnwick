@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 from pathlib import Path
 
 from PIL import Image, ImageDraw
@@ -113,15 +114,20 @@ def test_create_lama_edit_operation_retains_generated_patch(
     model_path.write_bytes(model_data)
     image_path = tmp_path / "image.png"
     Image.new("RGB", (160, 120), (200, 20, 20)).save(image_path)
+    provider_updates: list[str] = []
 
     def fake_worker(
         _model_path: Path,
         _input_path: Path,
         mask_path: Path,
         output_path: Path,
+        _status_path: Path,
         **kwargs: object,
     ) -> str:
         assert kwargs["runtime"] == LAMA_RUNTIME_WEBGPU
+        provider_callback = kwargs["provider_callback"]
+        assert callable(provider_callback)
+        provider_callback(lama.LAMA_CPU_EXECUTION_PROVIDER)
         with Image.open(mask_path) as worker_mask:
             worker_mask.load()
             assert worker_mask.getextrema() == (0, 255)
@@ -142,6 +148,7 @@ def test_create_lama_edit_operation_retains_generated_patch(
         expected_size=(160, 120),
         model_path=model_path,
         runtime=LAMA_RUNTIME_WEBGPU,
+        provider_callback=provider_updates.append,
     )
 
     source = Image.new("RGB", (160, 120), (200, 20, 20))
@@ -151,6 +158,7 @@ def test_create_lama_edit_operation_retains_generated_patch(
     assert (operation.params or {}).get("execution_provider") == (
         lama.LAMA_CPU_EXECUTION_PROVIDER
     )
+    assert provider_updates == [lama.LAMA_CPU_EXECUTION_PROVIDER]
     assert edited.getpixel((80, 60))[1] > edited.getpixel((80, 60))[0]
     assert edited.getpixel((0, 119)) == (200, 20, 20)
 
@@ -180,3 +188,39 @@ def test_create_lama_edit_operation_rejects_animation(
             expected_size=(32, 24),
             model_path=model_path,
         )
+
+
+def test_worker_provider_status_publishes_changes_once(tmp_path: Path) -> None:
+    status_path = tmp_path / "status.json"
+    updates: list[str] = []
+    status_path.write_text(
+        json.dumps({"provider": lama.LAMA_WEBGPU_EXECUTION_PROVIDER}),
+        encoding="utf-8",
+    )
+
+    provider = lama._publish_lama_worker_provider(
+        status_path,
+        None,
+        updates.append,
+    )
+    provider = lama._publish_lama_worker_provider(
+        status_path,
+        provider,
+        updates.append,
+    )
+    status_path.write_text(
+        json.dumps({"provider": lama.LAMA_CPU_EXECUTION_PROVIDER}),
+        encoding="utf-8",
+    )
+    provider = lama._publish_lama_worker_provider(
+        status_path,
+        provider,
+        updates.append,
+    )
+
+    assert provider == lama.LAMA_CPU_EXECUTION_PROVIDER
+    assert updates == [
+        lama.LAMA_WEBGPU_EXECUTION_PROVIDER,
+        lama.LAMA_CPU_EXECUTION_PROVIDER,
+    ]
+    assert lama.lama_execution_provider_label(provider) == "CPU"

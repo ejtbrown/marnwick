@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -130,15 +131,18 @@ def test_run_inference_prefers_available_gpu_provider(
         "get_available_providers",
         lambda: ["CPUExecutionProvider", "CUDAExecutionProvider"],
     )
+    provider_updates: list[str] = []
 
     result, provider = lama_worker.run_inference_with_provider(
         tmp_path / "model.onnx",
         image_path,
         mask_path,
+        provider_callback=provider_updates.append,
     )
 
     assert sessions == [["CUDAExecutionProvider", "CPUExecutionProvider"]]
     assert provider == "CUDAExecutionProvider"
+    assert provider_updates == ["CUDAExecutionProvider"]
     assert result.getpixel((0, 0)) == (220, 220, 220)
 
 
@@ -188,11 +192,13 @@ def test_run_inference_falls_back_when_gpu_run_fails(
         "get_available_providers",
         lambda: ["CUDAExecutionProvider", "CPUExecutionProvider"],
     )
+    provider_updates: list[str] = []
 
     result, provider = lama_worker.run_inference_with_provider(
         tmp_path / "model.onnx",
         image_path,
         mask_path,
+        provider_callback=provider_updates.append,
     )
 
     assert sessions == [
@@ -200,6 +206,10 @@ def test_run_inference_falls_back_when_gpu_run_fails(
         ["CPUExecutionProvider"],
     ]
     assert provider == "CPUExecutionProvider"
+    assert provider_updates == [
+        "CUDAExecutionProvider",
+        "CPUExecutionProvider",
+    ]
     assert result.getpixel((0, 0)) == (180, 180, 180)
 
 
@@ -362,6 +372,55 @@ def test_auto_webgpu_hardware_filter_rejects_virtual_adapter() -> None:
     assert lama_worker._is_hardware_webgpu_device(physical)
     assert lama_worker._is_hardware_webgpu_device(apple)
     assert not lama_worker._is_hardware_webgpu_device(virtual)
+
+
+def test_main_publishes_selected_provider_status(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    output_path = tmp_path / "output.png"
+    status_path = tmp_path / "status.json"
+    monkeypatch.setattr(
+        lama_worker,
+        "parse_args",
+        lambda: SimpleNamespace(
+            model=tmp_path / "model.onnx",
+            input=tmp_path / "input.png",
+            mask=tmp_path / "mask.png",
+            output=output_path,
+            status=status_path,
+            runtime=LAMA_RUNTIME_WEBGPU,
+        ),
+    )
+
+    def fake_inference(
+        _model_path: Path,
+        _input_path: Path,
+        _mask_path: Path,
+        *,
+        runtime: str,
+        provider_callback,
+    ) -> tuple[Image.Image, str]:
+        assert runtime == LAMA_RUNTIME_WEBGPU
+        provider_callback("WebGpuExecutionProvider")
+        return Image.new("RGB", (512, 512), "white"), "WebGpuExecutionProvider"
+
+    monkeypatch.setattr(
+        lama_worker,
+        "run_inference_with_provider",
+        fake_inference,
+    )
+
+    assert lama_worker.main() == 0
+    assert json.loads(status_path.read_text(encoding="utf-8")) == {
+        "provider": "WebGpuExecutionProvider"
+    }
+    assert json.loads(capsys.readouterr().out) == {
+        "ok": True,
+        "provider": "WebGpuExecutionProvider",
+    }
+    assert output_path.is_file()
 
 
 @pytest.mark.parametrize("value", ["0", "65", "not-a-number"])

@@ -37,6 +37,7 @@ LAMA_MODEL_SHA256 = "1faef5301d78db7dda502fe59966957ec4b79dd64e16f03ed96913c7a4e
 LAMA_MODEL_SIZE_BYTES = 208_044_816
 LAMA_INPUT_SIZE = 512
 MAX_LAMA_WORKER_OUTPUT_BYTES = 64 * 1024
+MAX_LAMA_WORKER_STATUS_BYTES = 4 * 1024
 DEFAULT_LAMA_TIMEOUT_SECONDS = 15 * 60.0
 LAMA_CPU_EXECUTION_PROVIDER = "CPUExecutionProvider"
 LAMA_WEBGPU_EXECUTION_PROVIDER = "WebGpuExecutionProvider"
@@ -47,7 +48,15 @@ LAMA_GPU_EXECUTION_PROVIDERS = (
     "DmlExecutionProvider",
     "CoreMLExecutionProvider",
 )
+LAMA_EXECUTION_PROVIDERS = frozenset(
+    (
+        LAMA_CPU_EXECUTION_PROVIDER,
+        LAMA_WEBGPU_EXECUTION_PROVIDER,
+        *LAMA_GPU_EXECUTION_PROVIDERS,
+    )
+)
 LamaProgressCallback = Callable[[int, int], None]
+LamaProviderCallback = Callable[[str], None]
 LamaStrokeSample = tuple[int, int, int]
 
 
@@ -228,6 +237,7 @@ def create_lama_edit_operation(
     runtime: str = LAMA_RUNTIME_AUTO,
     cancel_event: Event | None = None,
     worker_timeout: float | None = None,
+    provider_callback: LamaProviderCallback | None = None,
 ) -> EditOperation:
     if not stroke_samples:
         raise ValueError("paint over an area before applying LaMa")
@@ -268,6 +278,7 @@ def create_lama_edit_operation(
         input_path = temp_dir / "input.png"
         mask_path = temp_dir / "mask.png"
         output_path = temp_dir / "output.png"
+        status_path = temp_dir / "status.json"
         image_crop.save(input_path, format="PNG", compress_level=1)
         model_mask.save(mask_path, format="PNG", compress_level=1)
         execution_provider = _run_lama_worker(
@@ -275,9 +286,11 @@ def create_lama_edit_operation(
             input_path,
             mask_path,
             output_path,
+            status_path,
             runtime=runtime,
             cancel_event=cancel_event,
             timeout=worker_timeout,
+            provider_callback=provider_callback,
         )
         _check_canceled(cancel_event)
         with Image.open(output_path) as output:
@@ -374,10 +387,12 @@ def _run_lama_worker(
     input_path: Path,
     mask_path: Path,
     output_path: Path,
+    status_path: Path,
     *,
     runtime: str,
     cancel_event: Event | None,
     timeout: float | None,
+    provider_callback: LamaProviderCallback | None,
 ) -> str:
     timeout_seconds = _lama_timeout_seconds(timeout)
     command = [
@@ -392,6 +407,8 @@ def _run_lama_worker(
         str(mask_path),
         "--output",
         str(output_path),
+        "--status",
+        str(status_path),
         "--runtime",
         runtime,
     ]
@@ -413,7 +430,13 @@ def _run_lama_worker(
             creationflags=creation_flags,
         )
         try:
+            reported_provider: str | None = None
             while process.poll() is None:
+                reported_provider = _publish_lama_worker_provider(
+                    status_path,
+                    reported_provider,
+                    provider_callback,
+                )
                 if cancel_event is not None and cancel_event.wait(0.05):
                     _terminate_worker(process)
                     raise LamaInferenceCancelled("LaMa inference was canceled")
@@ -426,6 +449,11 @@ def _run_lama_worker(
                     # Event.wait above provides the bounded poll when one is
                     # available; avoid a busy loop for direct library callers.
                     sleep(0.05)
+            reported_provider = _publish_lama_worker_provider(
+                status_path,
+                reported_provider,
+                provider_callback,
+            )
             stdout_file.seek(0)
             stderr_file.seek(0)
             stdout = stdout_file.read(MAX_LAMA_WORKER_OUTPUT_BYTES).decode(
@@ -444,20 +472,56 @@ def _run_lama_worker(
             if not isinstance(status, dict) or status.get("ok") is not True:
                 raise LamaModelError("LaMa worker did not confirm completion")
             provider = status.get("provider")
-            if provider not in {
-                LAMA_CPU_EXECUTION_PROVIDER,
-                LAMA_WEBGPU_EXECUTION_PROVIDER,
-                *LAMA_GPU_EXECUTION_PROVIDERS,
-            }:
+            if provider not in LAMA_EXECUTION_PROVIDERS:
                 raise LamaModelError(
                     "LaMa worker did not report a recognized execution provider"
                 )
+            if provider != reported_provider and provider_callback is not None:
+                provider_callback(str(provider))
             if not output_path.is_file():
                 raise LamaModelError("LaMa worker did not produce an output image")
             return str(provider)
         finally:
             if process.poll() is None:
                 _terminate_worker(process)
+
+
+def _publish_lama_worker_provider(
+    status_path: Path,
+    previous: str | None,
+    callback: LamaProviderCallback | None,
+) -> str | None:
+    try:
+        encoded = status_path.read_bytes()
+    except OSError:
+        return previous
+    if len(encoded) > MAX_LAMA_WORKER_STATUS_BYTES:
+        return previous
+    try:
+        status = json.loads(encoded)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return previous
+    if not isinstance(status, dict):
+        return previous
+    provider = status.get("provider")
+    if provider not in LAMA_EXECUTION_PROVIDERS or provider == previous:
+        return previous
+    provider_name = str(provider)
+    if callback is not None:
+        callback(provider_name)
+    return provider_name
+
+
+def lama_execution_provider_label(provider: str) -> str:
+    return {
+        LAMA_CPU_EXECUTION_PROVIDER: "CPU",
+        "CUDAExecutionProvider": "NVIDIA",
+        LAMA_WEBGPU_EXECUTION_PROVIDER: "WebGPU",
+        "DmlExecutionProvider": "DirectML",
+        "ROCMExecutionProvider": "ROCm",
+        "MIGraphXExecutionProvider": "MIGraphX",
+        "CoreMLExecutionProvider": "CoreML",
+    }.get(provider, provider)
 
 
 def _terminate_worker(process: subprocess.Popen[bytes]) -> None:
