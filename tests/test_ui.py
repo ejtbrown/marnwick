@@ -67,6 +67,7 @@ from marnwick.ui import (  # noqa: E402
     ImageRenameDialog,
     LogsDialog,
     MAX_PENDING_THUMBNAIL_RETRIES,
+    MAX_THUMBNAIL_PIXMAP_CACHE_BYTES,
     MAX_THUMBNAIL_PIXMAP_CACHE_ITEMS,
     MAX_WAITING_THUMBNAIL_LOADS,
     MetadataDialog,
@@ -12496,6 +12497,8 @@ def test_thumbnail_retry_and_pixmap_caches_are_bounded(tmp_path: Path) -> None:
     qt_app = app()
     model = ThumbnailModel()
     try:
+        assert MAX_THUMBNAIL_PIXMAP_CACHE_ITEMS == 4096
+        assert MAX_THUMBNAIL_PIXMAP_CACHE_BYTES == 2 * 1024 * 1024 * 1024
         for index in range(MAX_THUMBNAIL_PIXMAP_CACHE_ITEMS + 100):
             model._cache_pixmap(f"image-{index}.jpg", QPixmap(2, 2))
         for index in range(MAX_PENDING_THUMBNAIL_RETRIES + 100):
