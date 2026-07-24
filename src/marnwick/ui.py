@@ -14865,11 +14865,19 @@ class EditCommandDialog(QDialog):
         self.list_widget.itemDoubleClicked.connect(self._item_chosen)
         self.list_widget.installEventFilter(self)
         layout.addWidget(self.list_widget)
+        command_rows_height = (
+            self.list_widget.frameWidth() * 2
+            + sum(
+                self.list_widget.sizeHintForRow(row)
+                for row in range(self.list_widget.count())
+            )
+        )
+        self.list_widget.setMinimumHeight(command_rows_height)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
-        self.resize(360, 320)
+        self.resize(360, max(320, self.sizeHint().height()))
 
     def keyPressEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         key_text = event.text().upper()
