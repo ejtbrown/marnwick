@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import suppress
 import hashlib
 import io
 import json
@@ -9,9 +10,9 @@ import stat
 import subprocess  # nosec B404
 import sys
 import tempfile
-from threading import Event
+from threading import Event, Lock, Thread
 from time import monotonic, sleep
-from typing import Callable, Sequence
+from typing import BinaryIO, Callable, Sequence
 import urllib.request
 
 from PIL import Image, ImageDraw, ImageFilter, ImageOps
@@ -66,6 +67,338 @@ class LamaModelError(RuntimeError):
 
 class LamaInferenceCancelled(RuntimeError):
     pass
+
+
+class LamaWorkerService:
+    """Own one isolated, warmed LaMa process for an application instance."""
+
+    def __init__(self) -> None:
+        self._operation_lock = Lock()
+        self._prewarm_lock = Lock()
+        self._closed = Event()
+        self._process: subprocess.Popen[bytes] | None = None
+        self._process_key: tuple[Path, str, int, int, int, int] | None = None
+        self._provider: str | None = None
+        self._stderr_file: BinaryIO | None = None
+        self._worker_temp_dir: tempfile.TemporaryDirectory[str] | None = None
+        self._prewarm_thread: Thread | None = None
+
+    def prewarm(
+        self,
+        model_path: Path,
+        *,
+        runtime: str = LAMA_RUNTIME_AUTO,
+    ) -> None:
+        """Start initialization in the background if no warm-up is pending."""
+
+        if runtime not in LAMA_RUNTIMES:
+            raise ValueError(f"unsupported LaMa runtime preference: {runtime}")
+        if self._closed.is_set():
+            return
+        with self._prewarm_lock:
+            existing = self._prewarm_thread
+            if existing is not None and existing.is_alive():
+                return
+            thread = Thread(
+                target=self._prewarm_safely,
+                args=(Path(model_path), runtime),
+                name="marnwick-lama-prewarm",
+                daemon=True,
+            )
+            self._prewarm_thread = thread
+            thread.start()
+
+    def run(
+        self,
+        model_path: Path,
+        input_path: Path,
+        mask_path: Path,
+        output_path: Path,
+        response_path: Path,
+        *,
+        runtime: str,
+        cancel_event: Event | None,
+        timeout: float | None,
+        provider_callback: LamaProviderCallback | None,
+    ) -> str:
+        if runtime not in LAMA_RUNTIMES:
+            raise ValueError(f"unsupported LaMa runtime preference: {runtime}")
+        timeout_seconds = _lama_timeout_seconds(timeout)
+        deadline = monotonic() + timeout_seconds
+        self._acquire_operation(cancel_event, deadline)
+        try:
+            if self._closed.is_set():
+                raise LamaModelError("LaMa worker service is closed")
+            provider = self._ensure_worker_locked(
+                Path(model_path),
+                runtime,
+                cancel_event=cancel_event,
+                deadline=deadline,
+            )
+            reported_provider = provider
+            if provider_callback is not None:
+                provider_callback(provider)
+            process = self._process
+            if process is None or process.stdin is None:
+                raise LamaModelError("LaMa worker is unavailable")
+            response_path.unlink(missing_ok=True)
+            command = {
+                "command": "inpaint",
+                "input": str(input_path),
+                "mask": str(mask_path),
+                "output": str(output_path),
+                "response": str(response_path),
+            }
+            try:
+                process.stdin.write(
+                    (json.dumps(command, sort_keys=True) + "\n").encode("utf-8")
+                )
+                process.stdin.flush()
+            except (BrokenPipeError, OSError) as error:
+                detail = self._worker_failure_detail_locked()
+                self._stop_worker_locked()
+                raise LamaModelError(
+                    f"LaMa worker stopped before accepting the image: {detail}"
+                ) from error
+            while True:
+                response = _read_lama_worker_status(response_path)
+                if response is not None and "ok" in response:
+                    break
+                if cancel_event is not None and cancel_event.wait(0.05):
+                    # ONNX Runtime inference is not safely interruptible. Kill
+                    # this worker so a canceled result cannot leak into a later
+                    # request; the next edit will create and warm a fresh one.
+                    self._stop_worker_locked()
+                    raise LamaInferenceCancelled("LaMa inference was canceled")
+                if self._closed.is_set():
+                    self._stop_worker_locked()
+                    raise LamaInferenceCancelled("LaMa inference was canceled")
+                if monotonic() > deadline:
+                    self._stop_worker_locked()
+                    raise LamaModelError(
+                        f"LaMa inference exceeded its {timeout_seconds:g}-second limit"
+                    )
+                if process.poll() is not None:
+                    detail = self._worker_failure_detail_locked()
+                    self._stop_worker_locked()
+                    raise LamaModelError(f"LaMa worker failed: {detail}")
+                if cancel_event is None:
+                    sleep(0.05)
+            if response.get("ok") is not True:
+                detail = response.get("error")
+                raise LamaModelError(
+                    f"LaMa worker failed: {detail}"
+                    if isinstance(detail, str) and detail
+                    else "LaMa worker did not confirm completion"
+                )
+            provider_value = response.get("provider")
+            if provider_value not in LAMA_EXECUTION_PROVIDERS:
+                raise LamaModelError(
+                    "LaMa worker did not report a recognized execution provider"
+                )
+            provider = str(provider_value)
+            self._provider = provider
+            if provider != reported_provider and provider_callback is not None:
+                provider_callback(provider)
+            if not output_path.is_file():
+                raise LamaModelError("LaMa worker did not produce an output image")
+            return provider
+        finally:
+            self._operation_lock.release()
+
+    def close(self) -> None:
+        if self._closed.is_set():
+            return
+        self._closed.set()
+        # A prewarm or inference poll observes this event promptly. Terminating
+        # first also releases a thread currently inside native inference.
+        process = self._process
+        if process is not None and process.poll() is None:
+            _terminate_worker(process)
+        self._operation_lock.acquire()
+        try:
+            self._stop_worker_locked(graceful=False)
+        finally:
+            self._operation_lock.release()
+
+    def _prewarm_safely(self, model_path: Path, runtime: str) -> None:
+        try:
+            deadline = monotonic() + _lama_timeout_seconds(None)
+            self._acquire_operation(self._closed, deadline)
+            try:
+                if not self._closed.is_set():
+                    self._ensure_worker_locked(
+                        model_path,
+                        runtime,
+                        cancel_event=self._closed,
+                        deadline=deadline,
+                    )
+            finally:
+                self._operation_lock.release()
+        except (LamaInferenceCancelled, LamaModelError, OSError, ValueError):
+            # Warm-up is opportunistic. The foreground edit retries and reports
+            # a useful error if initialization still cannot succeed.
+            return
+
+    def _acquire_operation(
+        self,
+        cancel_event: Event | None,
+        deadline: float,
+    ) -> None:
+        while not self._operation_lock.acquire(timeout=0.05):
+            if cancel_event is not None and cancel_event.is_set():
+                raise LamaInferenceCancelled("LaMa inference was canceled")
+            if self._closed.is_set():
+                raise LamaInferenceCancelled("LaMa inference was canceled")
+            if monotonic() > deadline:
+                raise LamaModelError("LaMa worker was busy past its time limit")
+
+    def _ensure_worker_locked(
+        self,
+        model_path: Path,
+        runtime: str,
+        *,
+        cancel_event: Event | None,
+        deadline: float,
+    ) -> str:
+        model_stat = model_path.stat(follow_symlinks=False)
+        key = (
+            model_path.resolve(),
+            runtime,
+            int(model_stat.st_dev),
+            int(model_stat.st_ino),
+            int(model_stat.st_size),
+            int(model_stat.st_mtime_ns),
+        )
+        process = self._process
+        if (
+            self._process_key == key
+            and process is not None
+            and process.poll() is None
+            and self._provider in LAMA_EXECUTION_PROVIDERS
+        ):
+            return str(self._provider)
+        self._stop_worker_locked()
+        worker_temp_dir = tempfile.TemporaryDirectory(
+            prefix="marnwick-lama-service-"
+        )
+        ready_path = Path(worker_temp_dir.name) / "ready.json"
+        stderr_file = tempfile.TemporaryFile()
+        command = [
+            sys.executable,
+            "-m",
+            "marnwick.lama_worker",
+            "--serve",
+            "--model",
+            str(model_path),
+            "--ready-status",
+            str(ready_path),
+            "--runtime",
+            runtime,
+        ]
+        environment = dict(os.environ)
+        environment["PYTHONNOUSERSITE"] = "1"
+        creation_flags = (
+            int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            if os.name == "nt"
+            else 0
+        )
+        try:
+            process = subprocess.Popen(  # nosec B603
+                command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=stderr_file,
+                env=environment,
+                creationflags=creation_flags,
+            )
+        except BaseException:
+            stderr_file.close()
+            worker_temp_dir.cleanup()
+            raise
+        self._process = process
+        self._process_key = key
+        self._stderr_file = stderr_file
+        self._worker_temp_dir = worker_temp_dir
+        while True:
+            ready = _read_lama_worker_status(ready_path)
+            if ready is not None and ready.get("ready") is True:
+                provider = ready.get("provider")
+                if provider not in LAMA_EXECUTION_PROVIDERS:
+                    self._stop_worker_locked()
+                    raise LamaModelError(
+                        "LaMa worker did not report a recognized execution provider"
+                    )
+                self._provider = str(provider)
+                return str(provider)
+            if cancel_event is not None and cancel_event.wait(0.05):
+                self._stop_worker_locked()
+                raise LamaInferenceCancelled("LaMa inference was canceled")
+            if self._closed.is_set():
+                self._stop_worker_locked()
+                raise LamaInferenceCancelled("LaMa inference was canceled")
+            if monotonic() > deadline:
+                self._stop_worker_locked()
+                raise LamaModelError("LaMa worker initialization exceeded its time limit")
+            if process.poll() is not None:
+                detail = self._worker_failure_detail_locked()
+                self._stop_worker_locked()
+                raise LamaModelError(f"LaMa worker failed to initialize: {detail}")
+            if cancel_event is None:
+                sleep(0.05)
+
+    def _worker_failure_detail_locked(self) -> str:
+        process = self._process
+        stderr_file = self._stderr_file
+        if process is not None and process.poll() is None:
+            return "the process stopped responding"
+        if stderr_file is None:
+            return (
+                f"exit status {process.returncode}"
+                if process is not None
+                else "the process was unavailable"
+            )
+        try:
+            stderr_file.seek(0)
+            detail = stderr_file.read(MAX_LAMA_WORKER_OUTPUT_BYTES).decode(
+                "utf-8", errors="replace"
+            ).strip()
+        except OSError:
+            detail = ""
+        if detail:
+            return detail
+        return (
+            f"exit status {process.returncode}"
+            if process is not None
+            else "the process was unavailable"
+        )
+
+    def _stop_worker_locked(self, *, graceful: bool = True) -> None:
+        process = self._process
+        if process is not None:
+            if graceful and process.poll() is None and process.stdin is not None:
+                try:
+                    process.stdin.write(b'{"command":"shutdown"}\n')
+                    process.stdin.flush()
+                    process.wait(timeout=2.0)
+                except (BrokenPipeError, OSError, subprocess.TimeoutExpired):
+                    pass
+            if process.poll() is None:
+                _terminate_worker(process)
+            if process.stdin is not None:
+                with suppress(OSError):
+                    process.stdin.close()
+        stderr_file = self._stderr_file
+        worker_temp_dir = self._worker_temp_dir
+        self._process = None
+        self._process_key = None
+        self._provider = None
+        self._stderr_file = None
+        self._worker_temp_dir = None
+        if stderr_file is not None:
+            stderr_file.close()
+        if worker_temp_dir is not None:
+            worker_temp_dir.cleanup()
 
 
 def default_lama_model_path() -> Path:
@@ -238,6 +571,7 @@ def create_lama_edit_operation(
     cancel_event: Event | None = None,
     worker_timeout: float | None = None,
     provider_callback: LamaProviderCallback | None = None,
+    worker_service: LamaWorkerService | None = None,
 ) -> EditOperation:
     if not stroke_samples:
         raise ValueError("paint over an area before applying LaMa")
@@ -281,7 +615,12 @@ def create_lama_edit_operation(
         status_path = temp_dir / "status.json"
         image_crop.save(input_path, format="PNG", compress_level=1)
         model_mask.save(mask_path, format="PNG", compress_level=1)
-        execution_provider = _run_lama_worker(
+        run_worker = (
+            worker_service.run
+            if worker_service is not None
+            else _run_lama_worker
+        )
+        execution_provider = run_worker(
             checked_model_path,
             input_path,
             mask_path,
@@ -510,6 +849,20 @@ def _publish_lama_worker_provider(
     if callback is not None:
         callback(provider_name)
     return provider_name
+
+
+def _read_lama_worker_status(path: Path) -> dict[str, object] | None:
+    try:
+        encoded = path.read_bytes()
+    except OSError:
+        return None
+    if len(encoded) > MAX_LAMA_WORKER_STATUS_BYTES:
+        return None
+    try:
+        status = json.loads(encoded)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return status if isinstance(status, dict) else None
 
 
 def lama_execution_provider_label(provider: str) -> str:

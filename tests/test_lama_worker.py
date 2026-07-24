@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 from pathlib import Path
 import sys
@@ -421,6 +422,95 @@ def test_main_publishes_selected_provider_status(
         "provider": "WebGpuExecutionProvider",
     }
     assert output_path.is_file()
+
+
+def test_service_warms_one_session_and_uses_it_for_multiple_requests(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = {"sessions": 0, "warms": 0, "runs": 0}
+    session = object()
+    commands = []
+    for index in range(2):
+        commands.append(
+            json.dumps(
+                {
+                    "command": "inpaint",
+                    "input": str(tmp_path / f"input-{index}.png"),
+                    "mask": str(tmp_path / f"mask-{index}.png"),
+                    "output": str(tmp_path / f"output-{index}.png"),
+                    "response": str(tmp_path / f"response-{index}.json"),
+                }
+            )
+        )
+    commands.append(json.dumps({"command": "shutdown"}))
+    monkeypatch.setattr(
+        lama_worker.sys,
+        "stdin",
+        SimpleNamespace(buffer=io.BytesIO(("\n".join(commands) + "\n").encode())),
+    )
+
+    def fake_session(_model_path: Path, _runtime: str) -> tuple[object, str]:
+        calls["sessions"] += 1
+        return session, "CPUExecutionProvider"
+
+    def fake_warm(
+        _model_path: Path,
+        active_session: object,
+        provider: str,
+    ) -> tuple[object, str]:
+        calls["warms"] += 1
+        assert active_session is session
+        return active_session, provider
+
+    def fake_run(
+        _model_path: Path,
+        active_session: object,
+        provider: str,
+        _image_array: np.ndarray,
+        _mask_array: np.ndarray,
+        *,
+        provider_callback,
+    ) -> tuple[Image.Image, object, str]:
+        calls["runs"] += 1
+        assert active_session is session
+        assert provider_callback is None
+        return Image.new("RGB", (512, 512), "green"), active_session, provider
+
+    monkeypatch.setattr(lama_worker, "_preferred_inference_session", fake_session)
+    monkeypatch.setattr(lama_worker, "_warm_session", fake_warm)
+    monkeypatch.setattr(
+        lama_worker,
+        "_load_inference_inputs",
+        lambda *_args: (
+            np.zeros((1, 3, 512, 512), dtype=np.float32),
+            np.zeros((1, 1, 512, 512), dtype=np.float32),
+        ),
+    )
+    monkeypatch.setattr(lama_worker, "_run_with_fallback", fake_run)
+
+    assert (
+        lama_worker._serve(
+            tmp_path / "model.onnx",
+            LAMA_RUNTIME_CPU,
+            tmp_path / "ready.json",
+        )
+        == 0
+    )
+
+    assert calls == {"sessions": 1, "warms": 1, "runs": 2}
+    assert json.loads((tmp_path / "ready.json").read_text(encoding="utf-8")) == {
+        "provider": "CPUExecutionProvider",
+        "ready": True,
+    }
+    for index in range(2):
+        assert (tmp_path / f"output-{index}.png").is_file()
+        assert json.loads(
+            (tmp_path / f"response-{index}.json").read_text(encoding="utf-8")
+        ) == {
+            "ok": True,
+            "provider": "CPUExecutionProvider",
+        }
 
 
 @pytest.mark.parametrize("value", ["0", "65", "not-a-number"])

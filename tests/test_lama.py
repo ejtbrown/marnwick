@@ -224,3 +224,125 @@ def test_worker_provider_status_publishes_changes_once(tmp_path: Path) -> None:
         lama.LAMA_CPU_EXECUTION_PROVIDER,
     ]
     assert lama.lama_execution_provider_label(provider) == "CPU"
+
+
+def test_worker_service_prewarms_once_and_reuses_initialized_process(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    processes: list[FakeProcess] = []
+
+    class FakeStdin:
+        def __init__(self, process: "FakeProcess") -> None:
+            self.process = process
+
+        def write(self, encoded: bytes) -> int:
+            command = json.loads(encoded)
+            if command["command"] == "shutdown":
+                self.process.returncode = 0
+                return len(encoded)
+            output_path = Path(command["output"])
+            Image.new("RGB", (512, 512), "green").save(output_path)
+            Path(command["response"]).write_text(
+                json.dumps(
+                    {
+                        "ok": True,
+                        "provider": self.process.provider,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            return len(encoded)
+
+        def flush(self) -> None:
+            return
+
+        def close(self) -> None:
+            return
+
+    class FakeProcess:
+        def __init__(self, command: list[str]) -> None:
+            self.returncode: int | None = None
+            runtime = command[command.index("--runtime") + 1]
+            self.provider = (
+                lama.LAMA_WEBGPU_EXECUTION_PROVIDER
+                if runtime == LAMA_RUNTIME_WEBGPU
+                else lama.LAMA_CPU_EXECUTION_PROVIDER
+            )
+            self.stdin = FakeStdin(self)
+            ready_path = Path(command[command.index("--ready-status") + 1])
+            ready_path.write_text(
+                json.dumps({"ready": True, "provider": self.provider}),
+                encoding="utf-8",
+            )
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+        def wait(self, timeout: float | None = None) -> int:
+            del timeout
+            if self.returncode is None:
+                self.returncode = 0
+            return self.returncode
+
+        def terminate(self) -> None:
+            self.returncode = -15
+
+        def kill(self) -> None:
+            self.returncode = -9
+
+    def fake_popen(command: list[str], **_kwargs: object) -> FakeProcess:
+        process = FakeProcess(command)
+        processes.append(process)
+        return process
+
+    monkeypatch.setattr(lama.subprocess, "Popen", fake_popen)
+    model_path = tmp_path / "model.onnx"
+    model_path.write_bytes(b"model")
+    input_path = tmp_path / "input.png"
+    mask_path = tmp_path / "mask.png"
+    Image.new("RGB", (512, 512), "white").save(input_path)
+    Image.new("L", (512, 512), 255).save(mask_path)
+    service = lama.LamaWorkerService()
+    try:
+        service.prewarm(model_path)
+        assert service._prewarm_thread is not None
+        service._prewarm_thread.join(timeout=2)
+        assert not service._prewarm_thread.is_alive()
+
+        providers = []
+        for index in range(2):
+            provider = service.run(
+                model_path,
+                input_path,
+                mask_path,
+                tmp_path / f"output-{index}.png",
+                tmp_path / f"response-{index}.json",
+                runtime=lama.LAMA_RUNTIME_AUTO,
+                cancel_event=None,
+                timeout=2,
+                provider_callback=providers.append,
+            )
+            assert provider == lama.LAMA_CPU_EXECUTION_PROVIDER
+        assert len(processes) == 1
+
+        service.run(
+            model_path,
+            input_path,
+            mask_path,
+            tmp_path / "webgpu-output.png",
+            tmp_path / "webgpu-response.json",
+            runtime=LAMA_RUNTIME_WEBGPU,
+            cancel_event=None,
+            timeout=2,
+            provider_callback=providers.append,
+        )
+        assert len(processes) == 2
+        assert providers[-1] == lama.LAMA_WEBGPU_EXECUTION_PROVIDER
+        assert providers == [
+            lama.LAMA_CPU_EXECUTION_PROVIDER,
+            lama.LAMA_CPU_EXECUTION_PROVIDER,
+            lama.LAMA_WEBGPU_EXECUTION_PROVIDER,
+        ]
+    finally:
+        service.close()
