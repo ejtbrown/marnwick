@@ -129,6 +129,15 @@ from .config import (
     save_config,
 )
 from .folder_icon import render_folder_icon
+from .gpu_test import (
+    GPU_TEST_METHODS,
+    GPU_TEST_STATUS_FAILED,
+    GPU_TEST_STATUS_UNAVAILABLE,
+    GPU_TEST_STATUS_WORKS,
+    GpuTestResult,
+    gpu_test_host_description,
+    run_gpu_tests,
+)
 from .image_ops import (
     EditOperation,
     FileDateSnapshot,
@@ -690,16 +699,19 @@ QPushButton:default {
 QPushButton:hover {
     background: #eef2ff;
 }
-QListWidget {
+QListWidget,
+QTreeWidget {
     background: #ffffff;
     color: #202124;
     border: 1px solid #9aa0a6;
 }
-QListWidget::item {
+QListWidget::item,
+QTreeWidget::item {
     color: #202124;
     padding: 8px;
 }
-QListWidget::item:selected {
+QListWidget::item:selected,
+QTreeWidget::item:selected {
     background: #2563eb;
     color: #ffffff;
 }
@@ -4065,6 +4077,9 @@ class MainWindow(QMainWindow):
         self.download_lama_action = QAction("Download LaMa Model…", self)
         self.download_lama_action.triggered.connect(self.download_lama_model_dialog)
         self.tools_menu.addAction(self.download_lama_action)
+        self.gpu_test_action = QAction("GPU Test", self)
+        self.gpu_test_action.triggered.connect(self.open_gpu_test)
+        self.tools_menu.addAction(self.gpu_test_action)
         self.preferences_action = QAction("Preferences", self)
         self.preferences_action.triggered.connect(self.open_app_preferences)
         self.tools_menu.addAction(self.preferences_action)
@@ -4134,6 +4149,11 @@ class MainWindow(QMainWindow):
 
     def open_logs(self) -> None:
         dialog = LogsDialog(self.workspace.catalogs, self)
+        dialog.exec()
+        dialog.deleteLater()
+
+    def open_gpu_test(self) -> None:
+        dialog = GpuTestDialog(self)
         dialog.exec()
         dialog.deleteLater()
 
@@ -14123,6 +14143,258 @@ class CatalogTagsDialog(QDialog):
 
     def closeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         self._shutdown_tag_reads()
+        super().closeEvent(event)
+
+
+class GpuTestDialog(QDialog):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._closed = False
+        self._executor = shared_dialog_executor()
+        self._future: Future[tuple[GpuTestResult, ...]] | None = None
+        self._cancel_event: Event | None = None
+        self._result_queue: SimpleQueue[GpuTestResult] = SimpleQueue()
+        self._completed_count = 0
+        self._results: dict[str, GpuTestResult] = {}
+        self._items: dict[str, QTreeWidgetItem] = {}
+
+        self.setWindowTitle("GPU Test")
+        self.setWindowIcon(load_app_icon())
+        self.setStyleSheet(DIALOG_STYLESHEET)
+
+        layout = QVBoxLayout(self)
+        introduction = QLabel(
+            "Marnwick will run a small local inference through every GPU backend "
+            "it knows about. Each backend runs in an isolated process so a native "
+            "runtime failure cannot prevent the remaining tests."
+        )
+        introduction.setWordWrap(True)
+        layout.addWidget(introduction)
+
+        host_label = QLabel(f"Host: {gpu_test_host_description()}")
+        host_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(host_label)
+
+        self.results_tree = QTreeWidget()
+        self.results_tree.setHeaderLabels(("Method", "Result", "Explanation"))
+        self.results_tree.setRootIsDecorated(False)
+        self.results_tree.setAlternatingRowColors(True)
+        self.results_tree.setUniformRowHeights(True)
+        self.results_tree.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        self.results_tree.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.results_tree.setColumnWidth(0, 170)
+        self.results_tree.setColumnWidth(1, 120)
+        self.results_tree.header().setStretchLastSection(True)
+        self.results_tree.currentItemChanged.connect(self._show_selected_explanation)
+        layout.addWidget(self.results_tree, 1)
+
+        for method in GPU_TEST_METHODS:
+            item = QTreeWidgetItem((method.label, "Waiting", "Waiting to run…"))
+            item.setToolTip(2, "Waiting to run…")
+            self.results_tree.addTopLevelItem(item)
+            self._items[method.provider] = item
+
+        detail_label = QLabel("Selected result details:")
+        layout.addWidget(detail_label)
+        self.details = QPlainTextEdit()
+        self.details.setReadOnly(True)
+        self.details.setMaximumHeight(130)
+        layout.addWidget(self.details)
+
+        self.progress = QProgressBar()
+        self.progress.setRange(0, len(GPU_TEST_METHODS))
+        self.progress.setValue(0)
+        layout.addWidget(self.progress)
+
+        self.status_label = QLabel()
+        self.status_label.setWordWrap(True)
+        layout.addWidget(self.status_label)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        self.copy_button = buttons.addButton(
+            "Copy Results",
+            QDialogButtonBox.ButtonRole.ActionRole,
+        )
+        self.copy_button.setEnabled(False)
+        self.copy_button.clicked.connect(self.copy_results)
+        self.run_again_button = buttons.addButton(
+            "Run Again",
+            QDialogButtonBox.ButtonRole.ActionRole,
+        )
+        self.run_again_button.clicked.connect(self.start_tests)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self._timer = QTimer(self)
+        self._timer.setInterval(25)
+        self._timer.timeout.connect(self._settle_tests)
+        self._timer.start()
+        self.resize(1000, 620)
+
+        first_item = self.results_tree.topLevelItem(0)
+        if first_item is not None:
+            self.results_tree.setCurrentItem(first_item)
+        self.start_tests()
+
+    def start_tests(self) -> None:
+        if self._closed or self._future is not None:
+            return
+        self._completed_count = 0
+        self._results.clear()
+        self._result_queue = SimpleQueue()
+        for method in GPU_TEST_METHODS:
+            item = self._items[method.provider]
+            item.setText(1, "Waiting")
+            item.setText(2, "Waiting to run…")
+            item.setToolTip(2, "Waiting to run…")
+            item.setForeground(1, QBrush(QColor("#202124")))
+        self.progress.setValue(0)
+        self.copy_button.setEnabled(False)
+        self.run_again_button.setEnabled(False)
+        self._cancel_event = Event()
+        result_queue = self._result_queue
+        self._future = self._executor.submit(
+            run_gpu_tests,
+            cancel_event=self._cancel_event,
+            result_callback=result_queue.put,
+        )
+        self._show_next_active_method()
+
+    def _settle_tests(self) -> None:
+        if self._closed:
+            return
+        while True:
+            try:
+                result = self._result_queue.get_nowait()
+            except Empty:
+                break
+            self._display_result(result)
+        future = self._future
+        if future is None or not future.done():
+            return
+        self._future = None
+        self._cancel_event = None
+        try:
+            future.result()
+        except Exception as error:
+            detail = f"GPU testing stopped unexpectedly: {error}"
+            self._mark_unfinished("Not tested", detail)
+            self.status_label.setText(detail)
+        else:
+            works = sum(
+                result.status == GPU_TEST_STATUS_WORKS
+                for result in self._results.values()
+            )
+            unavailable = sum(
+                result.status == GPU_TEST_STATUS_UNAVAILABLE
+                for result in self._results.values()
+            )
+            failed = sum(
+                result.status == GPU_TEST_STATUS_FAILED
+                for result in self._results.values()
+            )
+            self.status_label.setText(
+                f"Testing complete: {works} working, {unavailable} not available, "
+                f"and {failed} failed."
+            )
+        self.progress.setValue(len(GPU_TEST_METHODS))
+        self.copy_button.setEnabled(True)
+        self.run_again_button.setEnabled(True)
+
+    def _display_result(self, result: GpuTestResult) -> None:
+        if result.provider in self._results:
+            return
+        self._results[result.provider] = result
+        item = self._items[result.provider]
+        item.setText(1, result.display_status)
+        item.setText(2, result.explanation)
+        item.setToolTip(2, result.explanation)
+        item.setForeground(
+            1,
+            QBrush(
+                QColor(
+                    {
+                        GPU_TEST_STATUS_WORKS: "#137333",
+                        GPU_TEST_STATUS_UNAVAILABLE: "#5f6368",
+                        GPU_TEST_STATUS_FAILED: "#b3261e",
+                    }.get(result.status, "#202124")
+                )
+            ),
+        )
+        if self.results_tree.currentItem() is item:
+            self.details.setPlainText(result.explanation)
+        self._completed_count += 1
+        self.progress.setValue(self._completed_count)
+        self._show_next_active_method()
+
+    def _show_next_active_method(self) -> None:
+        if self._completed_count >= len(GPU_TEST_METHODS):
+            return
+        method = GPU_TEST_METHODS[self._completed_count]
+        item = self._items[method.provider]
+        if item.text(1) == "Waiting":
+            item.setText(1, "Testing…")
+            item.setText(2, "Starting isolated provider test…")
+            item.setToolTip(2, item.text(2))
+            if self.results_tree.currentItem() is item:
+                self.details.setPlainText(item.text(2))
+        self.status_label.setText(
+            f"Testing {method.label} ({self._completed_count + 1} of "
+            f"{len(GPU_TEST_METHODS)})…"
+        )
+
+    def _show_selected_explanation(
+        self,
+        current: QTreeWidgetItem | None,
+        _previous: QTreeWidgetItem | None,
+    ) -> None:
+        self.details.setPlainText("" if current is None else current.text(2))
+
+    def _mark_unfinished(self, status: str, explanation: str) -> None:
+        for method in GPU_TEST_METHODS:
+            if method.provider in self._results:
+                continue
+            item = self._items[method.provider]
+            item.setText(1, status)
+            item.setText(2, explanation)
+            item.setToolTip(2, explanation)
+
+    def copy_results(self) -> None:
+        lines = [
+            "Marnwick GPU Test",
+            f"Host: {gpu_test_host_description()}",
+            "",
+        ]
+        for method in GPU_TEST_METHODS:
+            item = self._items[method.provider]
+            lines.extend(
+                (
+                    f"{method.label}: {item.text(1)}",
+                    item.text(2),
+                    "",
+                )
+            )
+        QApplication.clipboard().setText("\n".join(lines).rstrip())
+
+    def _shutdown_tests(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._timer.stop()
+        if self._cancel_event is not None:
+            self._cancel_event.set()
+        if self._future is not None:
+            self._future.cancel()
+        self._executor.shutdown(wait=False, cancel_futures=True)
+
+    def done(self, result: int) -> None:
+        self._shutdown_tests()
+        super().done(result)
+
+    def closeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        self._shutdown_tests()
         super().closeEvent(event)
 
 

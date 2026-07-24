@@ -63,6 +63,7 @@ from marnwick.ui import (  # noqa: E402
     DuplicateDeleteTask,
     DuplicateListDialog,
     FullscreenViewer,
+    GpuTestDialog,
     ImageRenameDialog,
     LogsDialog,
     MAX_PENDING_THUMBNAIL_RETRIES,
@@ -5805,6 +5806,7 @@ def test_tools_menu_refresh_catalog_forces_current_catalog_refresh(tmp_path: Pat
         assert any(action.text().replace("&", "") == "Refresh Catalog" for action in tools_menu.actions())
         assert any(action.text().replace("&", "") == "Logs" for action in tools_menu.actions())
         assert any(action.text().replace("&", "") == "Prune Thumbnails" for action in tools_menu.actions())
+        assert any(action.text().replace("&", "") == "GPU Test" for action in tools_menu.actions())
         assert any(action.text().replace("&", "") == "Preferences" for action in tools_menu.actions())
     finally:
         window.workspace.close()
@@ -7641,6 +7643,68 @@ def test_catalog_settings_update_waits_in_protected_worker_lane(tmp_path: Path) 
         window.workspace.close()
         window.close()
         window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_gpu_test_dialog_runs_all_methods_and_copies_explanations(monkeypatch) -> None:
+    qt_app = app()
+
+    def fake_run_gpu_tests(*, cancel_event, result_callback, timeout_seconds=30.0):  # type: ignore[no-untyped-def]
+        del timeout_seconds
+        assert not cancel_event.is_set()
+        results = []
+        for index, method in enumerate(ui_module.GPU_TEST_METHODS):
+            if index == 0:
+                status = ui_module.GPU_TEST_STATUS_WORKS
+                explanation = "The provider ran the test operation."
+            elif index == 1:
+                status = ui_module.GPU_TEST_STATUS_FAILED
+                explanation = "The native driver rejected device initialization."
+            else:
+                status = ui_module.GPU_TEST_STATUS_UNAVAILABLE
+                explanation = "This provider is not supported on the test host."
+            result = ui_module.GpuTestResult(
+                method.provider,
+                method.label,
+                status,
+                explanation,
+            )
+            results.append(result)
+            result_callback(result)
+        return tuple(results)
+
+    monkeypatch.setattr(ui_module, "run_gpu_tests", fake_run_gpu_tests)
+
+    started_at = monotonic()
+    dialog = GpuTestDialog()
+    try:
+        assert monotonic() - started_at < 0.1
+        deadline = monotonic() + 2
+        while dialog._future is not None and monotonic() < deadline:
+            qt_app.processEvents()
+            sleep(0.01)
+
+        assert dialog._future is None
+        assert dialog.progress.value() == len(ui_module.GPU_TEST_METHODS)
+        assert dialog.results_tree.topLevelItem(0).text(1) == "Works"
+        assert dialog.results_tree.topLevelItem(1).text(1) == "Failed"
+        assert dialog.results_tree.topLevelItem(2).text(1) == "Not available"
+        assert dialog.status_label.text() == (
+            "Testing complete: 1 working, 4 not available, and 1 failed."
+        )
+
+        dialog.results_tree.setCurrentItem(dialog.results_tree.topLevelItem(1))
+        assert "native driver rejected" in dialog.details.toPlainText()
+        dialog.copy_button.click()
+        copied = qt_app.clipboard().text()
+        assert "Marnwick GPU Test" in copied
+        assert "NVIDIA (CUDA): Works" in copied
+        assert "WebGPU: Failed" in copied
+        assert "native driver rejected device initialization" in copied
+    finally:
+        qt_app.clipboard().clear()
+        dialog.close()
+        dialog.deleteLater()
         qt_app.processEvents()
 
 

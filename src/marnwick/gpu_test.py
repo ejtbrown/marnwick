@@ -1,0 +1,640 @@
+from __future__ import annotations
+
+import argparse
+import base64
+from collections.abc import Callable
+from dataclasses import dataclass
+import json
+import os
+from pathlib import Path
+import platform
+import subprocess  # nosec B404
+import sys
+import tempfile
+from threading import Event
+from time import monotonic, sleep
+from typing import Any
+
+
+GPU_TEST_TIMEOUT_SECONDS = 30.0
+MAX_GPU_TEST_OUTPUT_BYTES = 64 * 1024
+MAX_GPU_TEST_EXPLANATION_CHARS = 4096
+GPU_TEST_STATUS_WORKS = "works"
+GPU_TEST_STATUS_UNAVAILABLE = "unavailable"
+GPU_TEST_STATUS_FAILED = "failed"
+GPU_TEST_STATUS_CANCELED = "canceled"
+
+
+@dataclass(frozen=True, slots=True)
+class GpuTestMethod:
+    provider: str
+    label: str
+
+
+@dataclass(frozen=True, slots=True)
+class GpuTestResult:
+    provider: str
+    label: str
+    status: str
+    explanation: str
+
+    @property
+    def display_status(self) -> str:
+        return {
+            GPU_TEST_STATUS_WORKS: "Works",
+            GPU_TEST_STATUS_UNAVAILABLE: "Not available",
+            GPU_TEST_STATUS_FAILED: "Failed",
+            GPU_TEST_STATUS_CANCELED: "Canceled",
+        }.get(self.status, self.status)
+
+
+GPU_TEST_METHODS = (
+    GpuTestMethod("CUDAExecutionProvider", "NVIDIA (CUDA)"),
+    GpuTestMethod("WebGpuExecutionProvider", "WebGPU"),
+    GpuTestMethod("DmlExecutionProvider", "DirectML"),
+    GpuTestMethod("CoreMLExecutionProvider", "CoreML"),
+    GpuTestMethod("ROCMExecutionProvider", "ROCm"),
+    GpuTestMethod("MIGraphXExecutionProvider", "MIGraphX"),
+)
+_GPU_TEST_METHOD_BY_PROVIDER = {
+    method.provider: method for method in GPU_TEST_METHODS
+}
+_WEBGPU_REGISTRATION_NAME = "marnwick_gpu_test_webgpu"
+
+# A 16x16 MatMul model generated with ONNX opset 13. Keeping the 1.2 KiB
+# diagnostic model in the module avoids making the optional 198 MiB LaMa
+# model—or the ONNX model-authoring package—a prerequisite for GPU testing.
+_GPU_TEST_MODEL_BASE64 = (
+    "CAgSCG1hcm53aWNrOooJCjAKBWlucHV0CgZ3ZWlnaHQSBm91dHB1dBoPZ3B1X3Rlc3Rf"
+    "bWF0bXVsIgZNYXRNdWwSD01hcm53aWNrR3B1VGVzdCqRCAgQCBAQAUIGd2VpZ2h0SoAI"
+    "AAAAvwAA4L4AAMC+AACgvgAAgL4AAEC+AAAAvgAAgL0AAAAAAACAPQAAAD4AAEA+AACAPg"
+    "AAoD4AAMA+AADgPgAAAD8AAAC/AADgvgAAwL4AAKC+AACAvgAAQL4AAAC+AACAvQAAAAAA"
+    "AIA9AAAAPgAAQD4AAIA+AACgPgAAwD4AAOA+AAAAPwAAAL8AAOC+AADAvgAAoL4AAIC+AA"
+    "BAvgAAAL4AAIC9AAAAAAAAgD0AAAA+AABAPgAAgD4AAKA+AADAPgAA4D4AAAA/AAAAvwAA"
+    "4L4AAMC+AACgvgAAgL4AAEC+AAAAvgAAgL0AAAAAAACAPQAAAD4AAEA+AACAPgAAoD4AAM"
+    "A+AADgPgAAAD8AAAC/AADgvgAAwL4AAKC+AACAvgAAQL4AAAC+AACAvQAAAAAAAIA9AAAA"
+    "PgAAQD4AAIA+AACgPgAAwD4AAOA+AAAAPwAAAL8AAOC+AADAvgAAoL4AAIC+AABAvgAAAL"
+    "4AAIC9AAAAAAAAgD0AAAA+AABAPgAAgD4AAKA+AADAPgAA4D4AAAA/AAAAvwAA4L4AAMC+"
+    "AACgvgAAgL4AAEC+AAAAvgAAgL0AAAAAAACAPQAAAD4AAEA+AACAPgAAoD4AAMA+AADgPg"
+    "AAAD8AAAC/AADgvgAAwL4AAKC+AACAvgAAQL4AAAC+AACAvQAAAAAAAIA9AAAAPgAAQD4A"
+    "AIA+AACgPgAAwD4AAOA+AAAAPwAAAL8AAOC+AADAvgAAoL4AAIC+AABAvgAAAL4AAIC9AA"
+    "AAAAAAgD0AAAA+AABAPgAAgD4AAKA+AADAPgAA4D4AAAA/AAAAvwAA4L4AAMC+AACgvgAA"
+    "gL4AAEC+AAAAvgAAgL0AAAAAAACAPQAAAD4AAEA+AACAPgAAoD4AAMA+AADgPgAAAD8AAA"
+    "C/AADgvgAAwL4AAKC+AACAvgAAQL4AAAC+AACAvQAAAAAAAIA9AAAAPgAAQD4AAIA+AACg"
+    "PgAAwD4AAOA+AAAAPwAAAL8AAOC+AADAvgAAoL4AAIC+AABAvgAAAL4AAIC9AAAAAAAAgD"
+    "0AAAA+AABAPgAAgD4AAKA+AADAPgAA4D4AAAA/AAAAvwAA4L4AAMC+AACgvgAAgL4AAEC+"
+    "AAAAvgAAgL0AAAAAAACAPQAAAD4AAEA+AACAPgAAoD4AAMA+AADgPgAAAD8AAAC/AADgvg"
+    "AAwL4AAKC+AACAvgAAQL4AAAC+AACAvQAAAAAAAIA9AAAAPgAAQD4AAIA+AACgPgAAwD4A"
+    "AOA+AAAAPwAAAL8AAOC+AADAvgAAoL4AAIC+AABAvgAAAL4AAIC9AAAAAAAAgD0AAAA+AA"
+    "BAPgAAgD4AAKA+AADAPgAA4D4AAAA/AAAAv1oXCgVpbnB1dBIOCgwIARIICgIIEAoCCBBi"
+    "GAoGb3V0cHV0Eg4KDAgBEggKAggQCgIIEEIECgAQDQ=="
+)
+
+
+def run_gpu_tests(
+    *,
+    cancel_event: Event | None = None,
+    result_callback: Callable[[GpuTestResult], None] | None = None,
+    timeout_seconds: float = GPU_TEST_TIMEOUT_SECONDS,
+) -> tuple[GpuTestResult, ...]:
+    results: list[GpuTestResult] = []
+    for method in GPU_TEST_METHODS:
+        if cancel_event is not None and cancel_event.is_set():
+            break
+        platform_reason = gpu_test_platform_unavailability(method.provider)
+        if platform_reason is None:
+            result = _run_gpu_test_worker(
+                method,
+                cancel_event=cancel_event,
+                timeout_seconds=timeout_seconds,
+            )
+        else:
+            result = GpuTestResult(
+                method.provider,
+                method.label,
+                GPU_TEST_STATUS_UNAVAILABLE,
+                platform_reason,
+            )
+        results.append(result)
+        if result_callback is not None:
+            result_callback(result)
+        if result.status == GPU_TEST_STATUS_CANCELED:
+            break
+    return tuple(results)
+
+
+def gpu_test_host_description() -> str:
+    system = platform.system() or sys.platform
+    release = platform.release()
+    machine = platform.machine() or "unknown architecture"
+    system_description = f"{system} {release}".strip()
+    return f"{system_description} ({machine}); Python {platform.python_version()}"
+
+
+def gpu_test_platform_unavailability(
+    provider: str,
+    *,
+    platform_name: str | None = None,
+) -> str | None:
+    current = platform_name or sys.platform
+    if provider == "DmlExecutionProvider" and current != "win32":
+        return (
+            "DirectML is an ONNX Runtime GPU backend for Windows; this host is "
+            "not running Windows."
+        )
+    if provider == "CoreMLExecutionProvider" and current != "darwin":
+        return (
+            "CoreML is an Apple GPU/Neural Engine backend for macOS; this host is "
+            "not running macOS."
+        )
+    if provider in {
+        "ROCMExecutionProvider",
+        "MIGraphXExecutionProvider",
+    } and not current.startswith("linux"):
+        return (
+            f"{_GPU_TEST_METHOD_BY_PROVIDER[provider].label} is supported by "
+            "Marnwick only on Linux."
+        )
+    if provider == "CUDAExecutionProvider" and not (
+        current.startswith("linux") or current == "win32"
+    ):
+        return "The ONNX Runtime CUDA provider is supported on Linux and Windows, not on this host."
+    if provider == "WebGpuExecutionProvider" and not (
+        current.startswith("linux") or current in {"darwin", "win32"}
+    ):
+        return "Marnwick's WebGPU plugin supports Linux, macOS, and Windows, not this host."
+    return None
+
+
+def _run_gpu_test_worker(
+    method: GpuTestMethod,
+    *,
+    cancel_event: Event | None,
+    timeout_seconds: float,
+) -> GpuTestResult:
+    command = [
+        sys.executable,
+        "-m",
+        "marnwick.gpu_test",
+        "--worker",
+        method.provider,
+    ]
+    environment = dict(os.environ)
+    environment["PYTHONNOUSERSITE"] = "1"
+    started = monotonic()
+    with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
+        creation_flags = (
+            int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            if os.name == "nt"
+            else 0
+        )
+        try:
+            process = subprocess.Popen(  # nosec B603
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=stdout_file,
+                stderr=stderr_file,
+                env=environment,
+                creationflags=creation_flags,
+            )
+        except OSError as error:
+            return GpuTestResult(
+                method.provider,
+                method.label,
+                GPU_TEST_STATUS_FAILED,
+                f"The isolated diagnostic process could not start: {_bounded_detail(error)}",
+            )
+        try:
+            while process.poll() is None:
+                if cancel_event is not None and cancel_event.wait(0.05):
+                    _terminate_worker(process)
+                    return GpuTestResult(
+                        method.provider,
+                        method.label,
+                        GPU_TEST_STATUS_CANCELED,
+                        "The test was canceled.",
+                    )
+                if monotonic() - started > timeout_seconds:
+                    _terminate_worker(process)
+                    return GpuTestResult(
+                        method.provider,
+                        method.label,
+                        GPU_TEST_STATUS_FAILED,
+                        (
+                            f"Provider initialization or inference exceeded the "
+                            f"{timeout_seconds:g}-second limit. This usually means a "
+                            "native driver or runtime call stopped responding."
+                        ),
+                    )
+                if cancel_event is None:
+                    sleep(0.05)
+            stdout_file.seek(0)
+            stderr_file.seek(0)
+            stdout = stdout_file.read(MAX_GPU_TEST_OUTPUT_BYTES).decode(
+                "utf-8", errors="replace"
+            )
+            stderr = stderr_file.read(MAX_GPU_TEST_OUTPUT_BYTES).decode(
+                "utf-8", errors="replace"
+            )
+            if process.returncode != 0:
+                detail = stderr.strip() or stdout.strip() or f"exit status {process.returncode}"
+                return GpuTestResult(
+                    method.provider,
+                    method.label,
+                    GPU_TEST_STATUS_FAILED,
+                    f"The isolated test process failed: {_bounded_detail(detail)}",
+                )
+            try:
+                payload = json.loads(stdout)
+            except json.JSONDecodeError:
+                detail = stderr.strip() or stdout.strip() or "no diagnostic output"
+                return GpuTestResult(
+                    method.provider,
+                    method.label,
+                    GPU_TEST_STATUS_FAILED,
+                    f"The test returned an unreadable response: {_bounded_detail(detail)}",
+                )
+            return _result_from_worker_payload(method, payload, stderr)
+        finally:
+            if process.poll() is None:
+                _terminate_worker(process)
+
+
+def _result_from_worker_payload(
+    method: GpuTestMethod,
+    payload: object,
+    stderr: str,
+) -> GpuTestResult:
+    if not isinstance(payload, dict):
+        return GpuTestResult(
+            method.provider,
+            method.label,
+            GPU_TEST_STATUS_FAILED,
+            "The test returned a response with an unexpected format.",
+        )
+    status = payload.get("status")
+    explanation = payload.get("explanation")
+    if status not in {
+        GPU_TEST_STATUS_WORKS,
+        GPU_TEST_STATUS_UNAVAILABLE,
+        GPU_TEST_STATUS_FAILED,
+    } or not isinstance(explanation, str):
+        return GpuTestResult(
+            method.provider,
+            method.label,
+            GPU_TEST_STATUS_FAILED,
+            "The test returned an incomplete response.",
+        )
+    if stderr.strip() and status != GPU_TEST_STATUS_WORKS:
+        explanation = f"{explanation} Native runtime output: {_bounded_detail(stderr)}"
+    return GpuTestResult(
+        method.provider,
+        method.label,
+        status,
+        _bounded_detail(explanation),
+    )
+
+
+def _worker_test_provider(provider: str) -> dict[str, str]:
+    method = _GPU_TEST_METHOD_BY_PROVIDER[provider]
+    try:
+        import numpy as np
+    except ImportError as error:
+        return {
+            "status": GPU_TEST_STATUS_UNAVAILABLE,
+            "explanation": (
+                "NumPy is not installed in Marnwick's Python environment, so a "
+                f"test tensor cannot be created: {_bounded_detail(error)}"
+            ),
+        }
+    try:
+        import onnxruntime as ort
+    except ImportError as error:
+        return {
+            "status": GPU_TEST_STATUS_UNAVAILABLE,
+            "explanation": (
+                "ONNX Runtime is not installed in Marnwick's Python environment: "
+                f"{_bounded_detail(error)}"
+            ),
+        }
+
+    available = tuple(str(item) for item in ort.get_available_providers())
+    runtime_version = str(getattr(ort, "__version__", "unknown"))
+    with tempfile.TemporaryDirectory(prefix="marnwick-gpu-test-") as temp_name:
+        temp_dir = Path(temp_name)
+        model_path = temp_dir / "gpu-test.onnx"
+        model_path.write_bytes(base64.b64decode(_GPU_TEST_MODEL_BASE64))
+        try:
+            if provider == "WebGpuExecutionProvider":
+                session, device_description = _create_webgpu_session(
+                    ort,
+                    model_path,
+                    temp_dir,
+                )
+            else:
+                if provider not in available:
+                    return {
+                        "status": GPU_TEST_STATUS_UNAVAILABLE,
+                        "explanation": _provider_unavailable_explanation(
+                            method,
+                            available,
+                            runtime_version,
+                        ),
+                    }
+                session = _create_standard_session(
+                    ort,
+                    model_path,
+                    temp_dir,
+                    provider,
+                )
+                device_description = _provider_device_description(ort, provider)
+            input_array = (
+                np.arange(16 * 16, dtype=np.float32).reshape(16, 16) / 32.0
+            )
+            weight = (
+                np.arange(16 * 16, dtype=np.float32).reshape(16, 16) % 17 - 8
+            ) / 16.0
+            try:
+                output = session.run(None, {"input": input_array})
+            finally:
+                profile_path = Path(session.end_profiling())
+            if len(output) != 1 or not np.allclose(
+                np.asarray(output[0]),
+                input_array @ weight,
+                rtol=1e-4,
+                atol=1e-4,
+            ):
+                return {
+                    "status": GPU_TEST_STATUS_FAILED,
+                    "explanation": (
+                        f"{method.label} ran the diagnostic model but returned an "
+                        "incorrect numerical result."
+                    ),
+                }
+            assigned_providers = _profile_node_providers(profile_path)
+            if provider not in assigned_providers:
+                assigned = ", ".join(sorted(assigned_providers)) or "no provider"
+                return {
+                    "status": GPU_TEST_STATUS_FAILED,
+                    "explanation": (
+                        f"The {method.label} session initialized, but ONNX Runtime "
+                        f"assigned the test operation to {assigned} instead of "
+                        f"{provider}. This would not provide the requested GPU acceleration."
+                    ),
+                }
+        except _WebGpuUnavailable as error:
+            return {
+                "status": GPU_TEST_STATUS_UNAVAILABLE,
+                "explanation": str(error),
+            }
+        except Exception as error:
+            return {
+                "status": GPU_TEST_STATUS_FAILED,
+                "explanation": _provider_failure_explanation(
+                    method,
+                    error,
+                    available,
+                    runtime_version,
+                ),
+            }
+
+    device_suffix = f" {device_description}" if device_description else ""
+    return {
+        "status": GPU_TEST_STATUS_WORKS,
+        "explanation": (
+            f"ONNX Runtime {runtime_version} created a {method.label} session, "
+            f"ran matrix multiplication on {provider}, and verified the result."
+            f"{device_suffix}"
+        ),
+    }
+
+
+def _create_standard_session(
+    ort: Any,
+    model_path: Path,
+    temp_dir: Path,
+    provider: str,
+) -> Any:
+    options = _session_options(ort, temp_dir)
+    if provider == "DmlExecutionProvider":
+        options.enable_mem_pattern = False
+    session = ort.InferenceSession(
+        str(model_path),
+        sess_options=options,
+        providers=[provider, "CPUExecutionProvider"],
+    )
+    disable_fallback = getattr(session, "disable_fallback", None)
+    if callable(disable_fallback):
+        disable_fallback()
+    return session
+
+
+def _create_webgpu_session(
+    ort: Any,
+    model_path: Path,
+    temp_dir: Path,
+) -> tuple[Any, str]:
+    try:
+        import onnxruntime_ep_webgpu as webgpu_ep
+    except ImportError as error:
+        raise _WebGpuUnavailable(
+            "The WebGPU execution-provider plugin is not installed in Marnwick's "
+            f"Python environment: {_bounded_detail(error)}"
+        ) from error
+    library_path = str(webgpu_ep.get_library_path())
+    try:
+        ort.register_execution_provider_library(
+            _WEBGPU_REGISTRATION_NAME,
+            library_path,
+        )
+    except Exception as error:
+        raise _WebGpuUnavailable(
+            f"The WebGPU plugin was found but could not be registered: {_bounded_detail(error)}"
+        ) from error
+    provider_name = str(webgpu_ep.get_ep_name())
+    if provider_name != "WebGpuExecutionProvider":
+        raise _WebGpuUnavailable(
+            f"The WebGPU plugin reported the unexpected provider name {provider_name}."
+        )
+    devices = [
+        device
+        for device in ort.get_ep_devices()
+        if str(getattr(device, "ep_name", "")) == "WebGpuExecutionProvider"
+    ]
+    if not devices:
+        raise _WebGpuUnavailable(
+            "The WebGPU plugin loaded, but ONNX Runtime did not find a compatible "
+            "WebGPU adapter. This usually points to a missing or incompatible native "
+            "Vulkan, Metal, or Direct3D 12 driver."
+        )
+    options = _session_options(ort, temp_dir)
+    options.add_provider_for_devices(
+        devices[:1],
+        {
+            "powerPreference": "high-performance",
+            "preferredLayout": "NHWC",
+        },
+    )
+    session = ort.InferenceSession(str(model_path), sess_options=options)
+    disable_fallback = getattr(session, "disable_fallback", None)
+    if callable(disable_fallback):
+        disable_fallback()
+    return session, _describe_ep_device(devices[0])
+
+
+def _session_options(ort: Any, temp_dir: Path) -> Any:
+    options = ort.SessionOptions()
+    options.intra_op_num_threads = max(1, min(4, os.cpu_count() or 1))
+    options.inter_op_num_threads = 1
+    options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    options.enable_profiling = True
+    options.profile_file_prefix = str(temp_dir / "profile")
+    return options
+
+
+def _profile_node_providers(profile_path: Path) -> set[str]:
+    if profile_path.stat().st_size > 2 * 1024 * 1024:
+        raise RuntimeError("ONNX Runtime produced an unexpectedly large test profile")
+    payload = json.loads(profile_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, list):
+        raise RuntimeError("ONNX Runtime produced an invalid test profile")
+    return {
+        str(args["provider"])
+        for event in payload
+        if isinstance(event, dict)
+        and event.get("cat") == "Node"
+        and isinstance((args := event.get("args")), dict)
+        and isinstance(args.get("provider"), str)
+    }
+
+
+def _provider_device_description(ort: Any, provider: str) -> str:
+    try:
+        device = next(
+            item
+            for item in ort.get_ep_devices()
+            if str(getattr(item, "ep_name", "")) == provider
+        )
+    except (AttributeError, StopIteration):
+        return ""
+    return _describe_ep_device(device)
+
+
+def _describe_ep_device(device: object) -> str:
+    hardware = getattr(device, "device", None)
+    if hardware is None:
+        return ""
+    parts: list[str] = []
+    vendor = getattr(hardware, "vendor", None)
+    if isinstance(vendor, str) and vendor.strip():
+        parts.append(vendor.strip())
+    vendor_id = getattr(hardware, "vendor_id", None)
+    if isinstance(vendor_id, int) and not isinstance(vendor_id, bool):
+        parts.append(f"vendor 0x{vendor_id:04x}")
+    device_id = getattr(hardware, "device_id", None)
+    if isinstance(device_id, int) and not isinstance(device_id, bool):
+        parts.append(f"device 0x{device_id:04x}")
+    device_type = str(getattr(hardware, "type", "")).rsplit(".", 1)[-1]
+    if device_type:
+        parts.append(f"reported as {device_type}")
+    if not parts:
+        return ""
+    return f"Adapter: {', '.join(parts)}."
+
+
+def _provider_unavailable_explanation(
+    method: GpuTestMethod,
+    available: tuple[str, ...],
+    runtime_version: str,
+) -> str:
+    providers = ", ".join(available) if available else "none"
+    hint = {
+        "CUDAExecutionProvider": (
+            "Marnwick's Linux setup installs onnxruntime-gpu when nvidia-smi "
+            "detects an NVIDIA GPU."
+        ),
+        "DmlExecutionProvider": (
+            "The Windows setup normally installs onnxruntime-directml on x86-64 systems."
+        ),
+        "CoreMLExecutionProvider": (
+            "A macOS ONNX Runtime build must include the CoreML provider."
+        ),
+        "ROCMExecutionProvider": (
+            "A ROCm-enabled ONNX Runtime build and compatible AMD ROCm stack are required."
+        ),
+        "MIGraphXExecutionProvider": (
+            "A MIGraphX-enabled ONNX Runtime build and compatible AMD ROCm stack are required."
+        ),
+    }.get(method.provider, "A provider-specific ONNX Runtime package is required.")
+    return (
+        f"ONNX Runtime {runtime_version} does not expose {method.provider}. "
+        f"This environment exposes: {providers}. {hint}"
+    )
+
+
+def _provider_failure_explanation(
+    method: GpuTestMethod,
+    error: Exception,
+    available: tuple[str, ...],
+    runtime_version: str,
+) -> str:
+    providers = ", ".join(available) if available else "none"
+    return (
+        f"ONNX Runtime {runtime_version} exposes {method.provider}, but the "
+        f"{method.label} session could not initialize or run. This usually means "
+        "the provider package is present while a required device, native driver, "
+        f"or vendor runtime is missing or incompatible. Runtime detail: "
+        f"{_bounded_detail(error)} Available providers: {providers}."
+    )
+
+
+class _WebGpuUnavailable(RuntimeError):
+    pass
+
+
+def _bounded_detail(value: object) -> str:
+    detail = " ".join(str(value).split())
+    if len(detail) <= MAX_GPU_TEST_EXPLANATION_CHARS:
+        return detail
+    return detail[: MAX_GPU_TEST_EXPLANATION_CHARS - 16] + "… [truncated]"
+
+
+def _terminate_worker(process: subprocess.Popen[bytes]) -> None:
+    try:
+        process.terminate()
+        process.wait(timeout=2.0)
+    except (OSError, subprocess.TimeoutExpired):
+        try:
+            process.kill()
+            process.wait(timeout=2.0)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+
+def _worker_main(provider: str) -> int:
+    if provider not in _GPU_TEST_METHOD_BY_PROVIDER:
+        print(
+            json.dumps(
+                {
+                    "status": GPU_TEST_STATUS_FAILED,
+                    "explanation": "The requested GPU provider is not recognized.",
+                }
+            )
+        )
+        return 2
+    print(json.dumps(_worker_test_provider(provider), sort_keys=True))
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Marnwick isolated GPU diagnostic worker")
+    parser.add_argument("--worker", choices=tuple(_GPU_TEST_METHOD_BY_PROVIDER))
+    args = parser.parse_args(argv)
+    if args.worker is None:
+        parser.error("--worker is required")
+    return _worker_main(str(args.worker))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
