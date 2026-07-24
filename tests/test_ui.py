@@ -716,6 +716,25 @@ def test_edit_command_dialog_hotkeys_work_when_list_has_focus() -> None:
         qt_app.processEvents()
 
 
+def test_edit_command_dialog_shows_every_command_without_scrolling() -> None:
+    qt_app = app()
+    dialog = EditCommandDialog()
+    try:
+        dialog.show()
+        qt_app.processEvents()
+
+        command_rows_height = sum(
+            dialog.list_widget.sizeHintForRow(row)
+            for row in range(dialog.list_widget.count())
+        )
+        assert dialog.list_widget.viewport().height() >= command_rows_height
+        assert dialog.list_widget.verticalScrollBar().maximum() == 0
+    finally:
+        dialog.close()
+        dialog.deleteLater()
+        qt_app.processEvents()
+
+
 def test_oriented_pixmap_respects_exif_orientation(tmp_path: Path) -> None:
     app()
     path = tmp_path / "sideways.jpg"
