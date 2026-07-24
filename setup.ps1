@@ -12,7 +12,7 @@ $LamaRuntimeRequest = if ($env:MARNWICK_LAMA_RUNTIME) {
 }
 
 if ($env:OS -ne "Windows_NT") {
-    throw "setup.ps1 is intended for Windows. Use ./setup.sh on Linux."
+    throw "setup.ps1 is intended for Windows. Use ./setup.sh on Linux or macOS."
 }
 
 if (-not (Test-Path -LiteralPath $IconPng)) {
@@ -41,9 +41,11 @@ if (-not $PythonExe) {
 }
 
 $IsX64 = $env:PROCESSOR_ARCHITECTURE -eq "AMD64"
+$InstallWebGpu = $false
 switch ($LamaRuntimeRequest) {
     "auto" {
         $LamaRuntime = if ($IsX64) { "directml" } else { "cpu" }
+        $InstallWebGpu = $IsX64
     }
     "cpu" {
         $LamaRuntime = "cpu"
@@ -53,6 +55,7 @@ switch ($LamaRuntimeRequest) {
             throw "DirectML LaMa runtime requires 64-bit Windows on x86-64."
         }
         $LamaRuntime = "directml"
+        $InstallWebGpu = $true
     }
     "directml" {
         if (-not $IsX64) {
@@ -60,9 +63,31 @@ switch ($LamaRuntimeRequest) {
         }
         $LamaRuntime = "directml"
     }
-    default {
-        throw "MARNWICK_LAMA_RUNTIME must be auto, cpu, gpu, or directml."
+    "webgpu" {
+        if (-not $IsX64) {
+            throw "WebGPU LaMa runtime requires 64-bit Windows on x86-64."
+        }
+        $LamaRuntime = "cpu"
+        $InstallWebGpu = $true
     }
+    "d3d12" {
+        if (-not $IsX64) {
+            throw "WebGPU over Direct3D 12 requires 64-bit Windows on x86-64."
+        }
+        $LamaRuntime = "cpu"
+        $InstallWebGpu = $true
+    }
+    default {
+        throw "MARNWICK_LAMA_RUNTIME must be auto, cpu, gpu, directml, webgpu, or d3d12."
+    }
+}
+
+$LamaRuntimeDisplay = if ($LamaRuntime -eq "directml" -and $InstallWebGpu) {
+    "directml + webgpu"
+} elseif ($InstallWebGpu) {
+    "webgpu"
+} else {
+    $LamaRuntime
 }
 
 & $PythonExe @PythonArgs -m venv $VenvDir
@@ -88,6 +113,13 @@ function Invoke-Pip {
 Invoke-Pip -Arguments @("install", "--upgrade", "pip", "setuptools", "wheel")
 $LockFile = Join-Path $RootDir "requirements-dev.lock"
 if (Test-Path -LiteralPath $LockFile) {
+    if (-not $InstallWebGpu) {
+        Invoke-Pip -Arguments @(
+            "uninstall",
+            "-y",
+            "onnxruntime-ep-webgpu"
+        )
+    }
     if ($LamaRuntime -eq "cpu") {
         Invoke-Pip -Arguments @(
             "uninstall",
@@ -115,10 +147,26 @@ if (Test-Path -LiteralPath $LockFile) {
             $DirectMlLockFile
         )
     }
+    if ($InstallWebGpu) {
+        $WebGpuLockFile = Join-Path $RootDir "requirements-lama-webgpu.lock"
+        Invoke-Pip -Arguments @(
+            "install",
+            "--no-deps",
+            "--require-hashes",
+            "-r",
+            $WebGpuLockFile
+        )
+    }
     Invoke-Pip -Arguments @("install", "--no-deps", "-e", $RootDir)
 } else {
     if ($LamaRuntime -eq "directml") {
-        Invoke-Pip -Arguments @("install", "-e", "${RootDir}[dev,directml]")
+        if ($InstallWebGpu) {
+            Invoke-Pip -Arguments @("install", "-e", "${RootDir}[dev,directml,webgpu]")
+        } else {
+            Invoke-Pip -Arguments @("install", "-e", "${RootDir}[dev,directml]")
+        }
+    } elseif ($InstallWebGpu) {
+        Invoke-Pip -Arguments @("install", "-e", "${RootDir}[cpu,dev,webgpu]")
     } else {
         Invoke-Pip -Arguments @("install", "-e", "${RootDir}[cpu,dev]")
     }
@@ -192,6 +240,6 @@ $Shortcut.Description = "Marnwick photo viewer and organizer"
 $Shortcut.Save()
 
 Write-Host "Marnwick is ready."
-Write-Host "LaMa runtime: $LamaRuntime"
+Write-Host "Installed LaMa runtimes: $LamaRuntimeDisplay + cpu fallback"
 Write-Host "Start it with: .\start.ps1"
 Write-Host "Start Menu shortcut installed at: $ShortcutPath"

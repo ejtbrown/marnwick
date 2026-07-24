@@ -13813,7 +13813,7 @@ class AppPreferencesDialog(QDialog):
         self.lama_runtime.addItem("Auto", LAMA_RUNTIME_AUTO)
         self.lama_runtime.addItem("CPU", LAMA_RUNTIME_CPU)
         self.lama_runtime.addItem("NVIDIA", LAMA_RUNTIME_NVIDIA)
-        self.lama_runtime.addItem("WebGPU/Vulkan", LAMA_RUNTIME_WEBGPU)
+        self.lama_runtime.addItem("WebGPU", LAMA_RUNTIME_WEBGPU)
         lama_runtime_index = self.lama_runtime.findData(config.lama_runtime)
         if lama_runtime_index >= 0:
             self.lama_runtime.setCurrentIndex(lama_runtime_index)
@@ -13833,7 +13833,7 @@ class AppPreferencesDialog(QDialog):
         lama_layout.addRow("Processing runtime", self.lama_runtime)
         lama_note = QLabel(
             "Auto prefers available GPU runtimes and falls back to CPU. "
-            "WebGPU/Vulkan uses a compatible Linux Vulkan driver, including Mesa."
+            "WebGPU uses the native GPU backend on Linux, macOS, and Windows."
         )
         lama_note.setWordWrap(True)
         lama_layout.addRow(lama_note)
@@ -15773,7 +15773,7 @@ class FullscreenViewer(QDialog):
         provider_label = {
             "CPUExecutionProvider": "CPU",
             "CUDAExecutionProvider": "NVIDIA",
-            "WebGpuExecutionProvider": "WebGPU/Vulkan",
+            "WebGpuExecutionProvider": "WebGPU",
             "DmlExecutionProvider": "DirectML",
             "ROCMExecutionProvider": "ROCm",
             "MIGraphXExecutionProvider": "MIGraphX",

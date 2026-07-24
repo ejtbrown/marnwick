@@ -6,6 +6,8 @@ VENV_DIR="${MARNWICK_VENV:-$ROOT_DIR/.venv}"
 PYTHON_BIN="${PYTHON:-python3}"
 LAMA_RUNTIME_REQUEST="${MARNWICK_LAMA_RUNTIME:-auto}"
 INSTALL_WEBGPU=0
+SYSTEM_NAME="$(uname -s)"
+MACHINE_ARCH="$(uname -m)"
 
 if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
   echo "Could not find Python executable: $PYTHON_BIN" >&2
@@ -17,40 +19,80 @@ if [[ ! -f "$ROOT_DIR/marnwick-icon.png" ]]; then
   exit 1
 fi
 
+webgpu_supported() {
+  if [[ "$SYSTEM_NAME" == Linux* && "$MACHINE_ARCH" == "x86_64" ]]; then
+    return 0
+  fi
+  if [[ "$SYSTEM_NAME" == Darwin* && "$MACHINE_ARCH" == "arm64" ]]; then
+    local macos_major
+    macos_major="$(sw_vers -productVersion 2>/dev/null | cut -d. -f1)"
+    [[ "$macos_major" =~ ^[0-9]+$ ]] && (( macos_major >= 14 ))
+    return
+  fi
+  return 1
+}
+
+select_automatic_runtimes() {
+  if webgpu_supported; then
+    INSTALL_WEBGPU=1
+  fi
+  if [[ "$SYSTEM_NAME" == Linux* ]] \
+    && [[ "$MACHINE_ARCH" == "x86_64" ]] \
+    && command -v nvidia-smi >/dev/null 2>&1 \
+    && nvidia-smi -L >/dev/null 2>&1; then
+    LAMA_RUNTIME="nvidia"
+  else
+    LAMA_RUNTIME="cpu"
+  fi
+}
+
 case "$LAMA_RUNTIME_REQUEST" in
   auto)
-    if [[ "$(uname -s)" == Linux* ]] && [[ "$(uname -m)" == "x86_64" ]]; then
-      INSTALL_WEBGPU=1
-      if command -v nvidia-smi >/dev/null 2>&1 \
-        && nvidia-smi -L >/dev/null 2>&1; then
-        LAMA_RUNTIME="nvidia"
-      else
-        LAMA_RUNTIME="cpu"
-      fi
-    else
-      LAMA_RUNTIME="cpu"
-    fi
+    select_automatic_runtimes
     ;;
   cpu)
     LAMA_RUNTIME="cpu"
     ;;
-  gpu|nvidia)
-    if [[ "$(uname -s)" != Linux* || "$(uname -m)" != "x86_64" ]]; then
+  gpu)
+    if ! webgpu_supported; then
+      echo "GPU LaMa setup requires x86-64 Linux or Apple silicon macOS 14 or newer." >&2
+      exit 1
+    fi
+    select_automatic_runtimes
+    ;;
+  nvidia)
+    if [[ "$SYSTEM_NAME" != Linux* || "$MACHINE_ARCH" != "x86_64" ]]; then
       echo "NVIDIA LaMa runtime requires x86-64 Linux." >&2
       exit 1
     fi
     LAMA_RUNTIME="nvidia"
     ;;
-  webgpu|vulkan)
-    if [[ "$(uname -s)" != Linux* || "$(uname -m)" != "x86_64" ]]; then
-      echo "WebGPU/Vulkan LaMa runtime requires x86-64 Linux." >&2
+  webgpu)
+    if ! webgpu_supported; then
+      echo "WebGPU LaMa runtime requires x86-64 Linux or Apple silicon macOS 14 or newer." >&2
+      exit 1
+    fi
+    LAMA_RUNTIME="cpu"
+    INSTALL_WEBGPU=1
+    ;;
+  vulkan)
+    if [[ "$SYSTEM_NAME" != Linux* || "$MACHINE_ARCH" != "x86_64" ]]; then
+      echo "WebGPU over Vulkan requires x86-64 Linux." >&2
+      exit 1
+    fi
+    LAMA_RUNTIME="cpu"
+    INSTALL_WEBGPU=1
+    ;;
+  metal)
+    if [[ "$SYSTEM_NAME" != Darwin* ]] || ! webgpu_supported; then
+      echo "WebGPU over Metal requires Apple silicon macOS 14 or newer." >&2
       exit 1
     fi
     LAMA_RUNTIME="cpu"
     INSTALL_WEBGPU=1
     ;;
   *)
-    echo "MARNWICK_LAMA_RUNTIME must be auto, cpu, gpu, nvidia, webgpu, or vulkan." >&2
+    echo "MARNWICK_LAMA_RUNTIME must be auto, cpu, gpu, nvidia, webgpu, vulkan, or metal." >&2
     exit 1
     ;;
 esac
@@ -150,7 +192,7 @@ RUNNER
   echo "Desktop launcher installed at: $desktop_file"
 }
 
-case "$(uname -s)" in
+case "$SYSTEM_NAME" in
   Linux*)
     install_linux_desktop_entry
     ;;
