@@ -15599,6 +15599,20 @@ class ImageDisplayLabel(QLabel):
         self._paint_ordinal_overlay(painter)
 
 
+@dataclass(frozen=True, slots=True)
+class ViewerPanEditSnapshot:
+    edit_mode: str
+    operation_count: int
+    drag_origin: QPoint | None
+    clone_source_center: tuple[int, int] | None
+    clone_painting: bool
+    clone_alignment_target: tuple[int, int] | None
+    clone_last_target: tuple[int, int] | None
+    lama_sample_count: int
+    lama_painting: bool
+    lama_last_target: tuple[int, int] | None
+
+
 class FullscreenViewer(QDialog):
     ZOOM_STEP = 1.25
     MAX_ZOOM = 16.0
@@ -15649,6 +15663,8 @@ class FullscreenViewer(QDialog):
         self.pan_offset = QPoint(0, 0)
         self.pan_drag_start: QPoint | None = None
         self.pan_offset_at_drag_start = QPoint(0, 0)
+        self._pan_chord_latched = False
+        self._pan_edit_snapshot: ViewerPanEditSnapshot | None = None
         self.info_overlay_enabled = False
         self._load_generation = 0
         self._load_future: Future[ViewerLoadResult] | None = None
@@ -15834,6 +15850,8 @@ class FullscreenViewer(QDialog):
         self.update_cursor_visibility()
 
     def eventFilter(self, watched: object, event: QEvent) -> bool:
+        if watched == self.label and self.handle_pan_chord_event(event):
+            return True
         if watched == self.label and self.edit_mode == "clone_heal":
             return self.handle_clone_event(event)
         if watched == self.label and self.edit_mode == "lama":
@@ -15864,32 +15882,119 @@ class FullscreenViewer(QDialog):
                 self.red_eye_overlay.update_selection(None)
                 self.complete_region_drag(rect)
                 return True
-        if watched == self.label and self.edit_mode is None and self.is_zoomed():
-            return self.handle_zoom_pan_event(event)
         return super().eventFilter(watched, event)
 
-    def handle_zoom_pan_event(self, event: QEvent) -> bool:
+    def handle_pan_chord_event(self, event: QEvent) -> bool:
+        """Pan a zoomed image while both primary mouse buttons are held."""
+
         event_type = event.type()
-        if event_type == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:  # type: ignore[attr-defined]
+        mouse_event_types = {
+            QEvent.Type.MouseButtonPress,
+            QEvent.Type.MouseButtonRelease,
+            QEvent.Type.MouseMove,
+        }
+        if event_type not in mouse_event_types:
+            return False
+        buttons = event.buttons()  # type: ignore[attr-defined]
+        pan_buttons = Qt.MouseButton.LeftButton | Qt.MouseButton.RightButton
+        if self._pan_chord_latched:
+            if event_type == QEvent.Type.MouseMove and (buttons & pan_buttons) == pan_buttons:
+                if self.pan_drag_start is not None:
+                    point = event.position().toPoint()  # type: ignore[attr-defined]
+                    delta = point - self.pan_drag_start
+                    self.set_pan_offset(self.pan_offset_at_drag_start + delta)
+                return True
+            if event_type == QEvent.Type.MouseButtonRelease:
+                self.pan_drag_start = None
+                self.update_cursor_visibility()
+                if not (buttons & pan_buttons):
+                    self._finish_pan_chord(event.position().toPoint())  # type: ignore[attr-defined]
+                return True
+            # Once a chord starts, consume its remaining presses and moves
+            # until both buttons are released. Otherwise an edit tool could
+            # resume a half-finished gesture after panning.
+            return True
+        if event_type == QEvent.Type.MouseButtonPress and self.is_zoomed():
+            if self._pan_edit_snapshot is None:
+                self._capture_pan_edit_snapshot()
+            if (buttons & pan_buttons) != pan_buttons:
+                return False
             point = event.position().toPoint()  # type: ignore[attr-defined]
             if not self.displayed_image_rect().contains(point):
                 return False
+            self._restore_pan_edit_snapshot()
+            self._pan_chord_latched = True
             self.pan_drag_start = point
             self.pan_offset_at_drag_start = QPoint(self.pan_offset)
+            self.clone_overlay.update_brush(
+                None,
+                self.clone_brush_radius_label,
+                self.clone_source_center is not None,
+            )
+            self.update_lama_overlay(None)
             self.update_cursor_visibility()
             return True
-        if event_type == QEvent.Type.MouseMove and self.pan_drag_start is not None:
-            if not (event.buttons() & Qt.MouseButton.LeftButton):  # type: ignore[attr-defined]
-                return True
-            point = event.position().toPoint()  # type: ignore[attr-defined]
-            delta = point - self.pan_drag_start
-            self.set_pan_offset(self.pan_offset_at_drag_start + delta)
-            return True
-        if event_type == QEvent.Type.MouseButtonRelease and event.button() == Qt.MouseButton.LeftButton:  # type: ignore[attr-defined]
-            self.pan_drag_start = None
-            self.update_cursor_visibility()
-            return True
+        if event_type == QEvent.Type.MouseButtonRelease and not (buttons & pan_buttons):
+            self._pan_edit_snapshot = None
         return False
+
+    def _capture_pan_edit_snapshot(self) -> None:
+        if self.edit_mode is None:
+            self._pan_edit_snapshot = None
+            return
+        self._pan_edit_snapshot = ViewerPanEditSnapshot(
+            self.edit_mode,
+            len(self.operations),
+            QPoint(self.drag_origin) if self.drag_origin is not None else None,
+            self.clone_source_center,
+            self.clone_painting,
+            self.clone_alignment_target,
+            self.clone_last_target,
+            len(self.lama_samples),
+            self.lama_painting,
+            self.lama_last_target,
+        )
+
+    def _restore_pan_edit_snapshot(self) -> None:
+        snapshot = self._pan_edit_snapshot
+        if snapshot is None or snapshot.edit_mode != self.edit_mode:
+            return
+        operations_changed = len(self.operations) > snapshot.operation_count
+        del self.operations[snapshot.operation_count :]
+        del self.lama_samples[snapshot.lama_sample_count :]
+        self.drag_origin = (
+            QPoint(snapshot.drag_origin)
+            if snapshot.drag_origin is not None
+            else None
+        )
+        self.clone_source_center = snapshot.clone_source_center
+        self.clone_painting = snapshot.clone_painting
+        self.clone_alignment_target = snapshot.clone_alignment_target
+        self.clone_last_target = snapshot.clone_last_target
+        self.lama_painting = snapshot.lama_painting
+        self.lama_last_target = snapshot.lama_last_target
+        self.rubber_band.hide()
+        self.red_eye_overlay.update_selection(None)
+        if operations_changed:
+            self.display_preview_image = None
+            self.display_preview_size = None
+            self.preview_image_current = False
+            if self.operations:
+                self.render_preview()
+            else:
+                self._cancel_preview_render()
+                self._fit_pixmap()
+
+    def _finish_pan_chord(self, point: QPoint) -> None:
+        self._clear_pan_chord_state()
+        self.update_cursor_visibility()
+        self.update_clone_overlay(point)
+        self.update_lama_overlay(point)
+
+    def _clear_pan_chord_state(self) -> None:
+        self._pan_chord_latched = False
+        self._pan_edit_snapshot = None
+        self.pan_drag_start = None
 
     def handle_clone_event(self, event: QEvent) -> bool:
         event_type = event.type()
@@ -16681,7 +16786,7 @@ class FullscreenViewer(QDialog):
         self.exit_region_edit()
         self.zoom_level = 1.0
         self.pan_offset = QPoint(0, 0)
-        self.pan_drag_start = None
+        self._clear_pan_chord_state()
         self.pan_offset_at_drag_start = QPoint(0, 0)
         self.last_viewed_rel_path = self.navigator.current
         parent = self.parent()
@@ -17391,7 +17496,7 @@ class FullscreenViewer(QDialog):
     def reset_zoom(self) -> None:
         self.zoom_level = 1.0
         self.pan_offset = QPoint(0, 0)
-        self.pan_drag_start = None
+        self._clear_pan_chord_state()
         self.pan_offset_at_drag_start = QPoint(0, 0)
         self.update_cursor_visibility()
         self._fit_pixmap()
@@ -17562,6 +17667,7 @@ class FullscreenViewer(QDialog):
     def start_region_edit(self, mode: str) -> None:
         if not self.can_edit_current():
             return
+        self._clear_pan_chord_state()
         if self.movie is not None:
             self.stop_movie()
             self._fit_pixmap()
@@ -17599,6 +17705,7 @@ class FullscreenViewer(QDialog):
         self.update_cursor_visibility()
 
     def exit_region_edit(self) -> None:
+        self._clear_pan_chord_state()
         self.edit_mode = None
         self.clone_source_center = None
         self.clone_painting = False
@@ -17623,6 +17730,10 @@ class FullscreenViewer(QDialog):
 
     def update_cursor_visibility(self) -> None:
         if not hasattr(self, "label"):
+            return
+        if self.pan_drag_start is not None:
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            self.label.setCursor(Qt.CursorShape.ClosedHandCursor)
             return
         if self.edit_mode is None:
             self.setCursor(Qt.CursorShape.BlankCursor)

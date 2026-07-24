@@ -127,6 +127,7 @@ Directory tiles remain grouped before image tiles. Directory “size” is the t
 | `Left` / `Right` | Previous or next image; at an edge, close the viewer |
 | `+` / `-` | Zoom in or out |
 | Arrow keys while zoomed | Pan the image |
+| Hold left and right mouse buttons, then drag | Pan a zoomed image while viewing or editing |
 | `Escape` | Exit a region tool, reset zoom, or close the viewer |
 | `Z` | Toggle path, file date, and position information |
 | `T` | Edit tags |

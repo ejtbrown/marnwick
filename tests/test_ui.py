@@ -1318,22 +1318,25 @@ def test_fullscreen_zoom_out_returns_to_neutral(tmp_path: Path) -> None:
             qt_app.processEvents()
 
 
-def test_fullscreen_zoom_mouse_drag_pans_image(tmp_path: Path) -> None:
+def test_fullscreen_zoom_mouse_chord_drag_pans_image(tmp_path: Path) -> None:
     qt_app = app()
     root = tmp_path / "catalog"
     root.mkdir()
-    Image.new("RGB", (400, 200), (10, 20, 30)).save(root / "image.jpg")
+    Image.new("RGB", (400, 400), (10, 20, 30)).save(root / "image.jpg")
 
     with Catalog(root) as catalog:
         viewer = FullscreenViewer(catalog, ImageNavigator.sequential(["image.jpg"], "image.jpg"))
         try:
-            viewer.label.resize(400, 400)
-            viewer.base_pixmap = QPixmap(400, 200)
+            viewer.label.resize(300, 300)
+            viewer.base_pixmap = QPixmap(400, 400)
             viewer._fit_pixmap()
             viewer.zoom_in()
 
-            press_pos = QPointF(200, 200)
-            move_pos = QPointF(240, 200)
+            press_pos = QPointF(150, 150)
+            move_pos = QPointF(190, 180)
+            both_buttons = (
+                Qt.MouseButton.LeftButton | Qt.MouseButton.RightButton
+            )
             qt_app.sendEvent(
                 viewer.label,
                 QMouseEvent(
@@ -1349,11 +1352,35 @@ def test_fullscreen_zoom_mouse_drag_pans_image(tmp_path: Path) -> None:
             qt_app.sendEvent(
                 viewer.label,
                 QMouseEvent(
+                    QEvent.Type.MouseButtonPress,
+                    press_pos,
+                    press_pos,
+                    press_pos,
+                    Qt.MouseButton.RightButton,
+                    both_buttons,
+                    Qt.KeyboardModifier.NoModifier,
+                ),
+            )
+            qt_app.sendEvent(
+                viewer.label,
+                QMouseEvent(
                     QEvent.Type.MouseMove,
                     move_pos,
                     move_pos,
                     move_pos,
                     Qt.MouseButton.NoButton,
+                    both_buttons,
+                    Qt.KeyboardModifier.NoModifier,
+                ),
+            )
+            qt_app.sendEvent(
+                viewer.label,
+                QMouseEvent(
+                    QEvent.Type.MouseButtonRelease,
+                    move_pos,
+                    move_pos,
+                    move_pos,
+                    Qt.MouseButton.RightButton,
                     Qt.MouseButton.LeftButton,
                     Qt.KeyboardModifier.NoModifier,
                 ),
@@ -1371,8 +1398,136 @@ def test_fullscreen_zoom_mouse_drag_pans_image(tmp_path: Path) -> None:
                 ),
             )
 
-            assert viewer.pan_offset.x() > 0
+            assert viewer.pan_offset == QPoint(37, 30)
+            assert not viewer._pan_chord_latched
         finally:
+            viewer.close()
+            viewer.deleteLater()
+            qt_app.processEvents()
+
+
+@pytest.mark.parametrize("mode", ["crop", "red_eye", "clone_heal", "lama"])
+def test_fullscreen_zoom_and_mouse_chord_pan_work_during_editing(
+    tmp_path: Path,
+    mode: str,
+) -> None:
+    qt_app = app()
+    root = tmp_path / mode
+    root.mkdir()
+    Image.new("RGB", (400, 400), (10, 20, 30)).save(root / "image.jpg")
+
+    with Catalog(root) as catalog:
+        viewer = FullscreenViewer(
+            catalog,
+            ImageNavigator.sequential(["image.jpg"], "image.jpg"),
+        )
+        try:
+            viewer.label.resize(300, 300)
+            viewer.base_pixmap = QPixmap(400, 400)
+            viewer._fit_pixmap()
+            viewer.start_region_edit(mode)
+            if mode == "clone_heal":
+                viewer.clone_source_center = (100, 100)
+
+            viewer.keyPressEvent(
+                QKeyEvent(
+                    QEvent.Type.KeyPress,
+                    Qt.Key.Key_Plus,
+                    Qt.KeyboardModifier.NoModifier,
+                    "+",
+                )
+            )
+            assert viewer.is_zoomed()
+            assert viewer.edit_mode == mode
+
+            press_pos = QPointF(150, 150)
+            move_pos = QPointF(180, 175)
+            both_buttons = (
+                Qt.MouseButton.LeftButton | Qt.MouseButton.RightButton
+            )
+            qt_app.sendEvent(
+                viewer.label,
+                QMouseEvent(
+                    QEvent.Type.MouseButtonPress,
+                    press_pos,
+                    press_pos,
+                    press_pos,
+                    Qt.MouseButton.LeftButton,
+                    Qt.MouseButton.LeftButton,
+                    Qt.KeyboardModifier.NoModifier,
+                ),
+            )
+            qt_app.sendEvent(
+                viewer.label,
+                QMouseEvent(
+                    QEvent.Type.MouseButtonPress,
+                    press_pos,
+                    press_pos,
+                    press_pos,
+                    Qt.MouseButton.RightButton,
+                    both_buttons,
+                    Qt.KeyboardModifier.NoModifier,
+                ),
+            )
+            qt_app.sendEvent(
+                viewer.label,
+                QMouseEvent(
+                    QEvent.Type.MouseMove,
+                    move_pos,
+                    move_pos,
+                    move_pos,
+                    Qt.MouseButton.NoButton,
+                    both_buttons,
+                    Qt.KeyboardModifier.NoModifier,
+                ),
+            )
+            qt_app.sendEvent(
+                viewer.label,
+                QMouseEvent(
+                    QEvent.Type.MouseButtonRelease,
+                    move_pos,
+                    move_pos,
+                    move_pos,
+                    Qt.MouseButton.RightButton,
+                    Qt.MouseButton.LeftButton,
+                    Qt.KeyboardModifier.NoModifier,
+                ),
+            )
+            qt_app.sendEvent(
+                viewer.label,
+                QMouseEvent(
+                    QEvent.Type.MouseButtonRelease,
+                    move_pos,
+                    move_pos,
+                    move_pos,
+                    Qt.MouseButton.LeftButton,
+                    Qt.MouseButton.NoButton,
+                    Qt.KeyboardModifier.NoModifier,
+                ),
+            )
+
+            assert viewer.pan_offset == QPoint(30, 25)
+            assert viewer.edit_mode == mode
+            assert viewer.operations == []
+            assert viewer.lama_samples == []
+            assert viewer.drag_origin is None
+            assert viewer.clone_source_center == (
+                (100, 100) if mode == "clone_heal" else None
+            )
+
+            viewer.keyPressEvent(
+                QKeyEvent(
+                    QEvent.Type.KeyPress,
+                    Qt.Key.Key_Minus,
+                    Qt.KeyboardModifier.NoModifier,
+                    "-",
+                )
+            )
+            assert not viewer.is_zoomed()
+            assert viewer.pan_offset == QPoint(0, 0)
+            assert viewer.edit_mode == mode
+        finally:
+            viewer.operations.clear()
             viewer.close()
             viewer.deleteLater()
             qt_app.processEvents()
