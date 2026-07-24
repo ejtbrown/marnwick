@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import sys
 from types import SimpleNamespace
 
 import numpy as np
@@ -8,6 +9,10 @@ from PIL import Image
 import pytest
 
 from marnwick import lama_worker
+from marnwick.config import (
+    LAMA_RUNTIME_CPU,
+    LAMA_RUNTIME_WEBGPU,
+)
 
 
 def test_run_inference_uses_pinned_tensor_contract_and_cpu_provider(
@@ -59,12 +64,17 @@ def test_run_inference_uses_pinned_tensor_contract_and_cpu_provider(
     monkeypatch.setattr(
         lama_worker.ort,
         "get_available_providers",
-        lambda: ["CPUExecutionProvider"],
+        lambda: ["CUDAExecutionProvider", "CPUExecutionProvider"],
     )
     monkeypatch.setenv("MARNWICK_LAMA_THREADS", "3")
     model_path = tmp_path / "model.onnx"
 
-    result = lama_worker.run_inference(model_path, image_path, mask_path)
+    result = lama_worker.run_inference(
+        model_path,
+        image_path,
+        mask_path,
+        runtime=LAMA_RUNTIME_CPU,
+    )
 
     assert observed == {
         "model_path": str(model_path),
@@ -191,6 +201,163 @@ def test_run_inference_falls_back_when_gpu_run_fails(
     ]
     assert provider == "CPUExecutionProvider"
     assert result.getpixel((0, 0)) == (180, 180, 180)
+
+
+def test_run_inference_uses_webgpu_plugin_device(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image_path = tmp_path / "input.png"
+    mask_path = tmp_path / "mask.png"
+    Image.new("RGB", (512, 512), "white").save(image_path)
+    Image.new("L", (512, 512), 255).save(mask_path)
+    webgpu_device = SimpleNamespace(ep_name="WebGpuExecutionProvider")
+    observed: dict[str, object] = {}
+
+    class FakeOptions:
+        def add_provider_for_devices(
+            self,
+            devices: list[object],
+            options: dict[str, str],
+        ) -> None:
+            observed["devices"] = devices
+            observed["options"] = options
+
+    class FakeWebGpuSession:
+        def __init__(
+            self,
+            model_path: str,
+            *,
+            sess_options: object,
+        ) -> None:
+            observed["model_path"] = model_path
+            observed["session_options"] = sess_options
+
+        def disable_fallback(self) -> None:
+            observed["fallback_disabled"] = True
+
+        def get_inputs(self) -> list[SimpleNamespace]:
+            return [SimpleNamespace(name="image"), SimpleNamespace(name="mask")]
+
+        def run(
+            self,
+            _outputs: object,
+            _feeds: dict[str, np.ndarray],
+        ) -> list[np.ndarray]:
+            return [np.full((1, 3, 512, 512), 210.0, dtype=np.float32)]
+
+    fake_plugin = SimpleNamespace(
+        get_library_path=lambda: "/plugins/webgpu.so",
+        get_ep_name=lambda: "WebGpuExecutionProvider",
+    )
+    monkeypatch.setitem(sys.modules, "onnxruntime_ep_webgpu", fake_plugin)
+    monkeypatch.setattr(lama_worker, "_registered_webgpu_library", None)
+    monkeypatch.setattr(lama_worker.ort, "SessionOptions", FakeOptions)
+    monkeypatch.setattr(lama_worker.ort, "InferenceSession", FakeWebGpuSession)
+    monkeypatch.setattr(
+        lama_worker.ort,
+        "register_execution_provider_library",
+        lambda name, path: observed.update(registration=(name, path)),
+    )
+    monkeypatch.setattr(
+        lama_worker.ort,
+        "get_ep_devices",
+        lambda: [SimpleNamespace(ep_name="CPUExecutionProvider"), webgpu_device],
+    )
+
+    result, provider = lama_worker.run_inference_with_provider(
+        tmp_path / "model.onnx",
+        image_path,
+        mask_path,
+        runtime=LAMA_RUNTIME_WEBGPU,
+    )
+
+    assert provider == "WebGpuExecutionProvider"
+    assert observed["registration"] == (
+        "marnwick_webgpu",
+        "/plugins/webgpu.so",
+    )
+    assert observed["devices"] == [webgpu_device]
+    assert observed["options"] == {
+        "powerPreference": "high-performance",
+        "preferredLayout": "NHWC",
+    }
+    assert observed["fallback_disabled"] is True
+    assert result.getpixel((0, 0)) == (210, 210, 210)
+
+
+def test_explicit_webgpu_falls_back_to_cpu_without_trying_cuda(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image_path = tmp_path / "input.png"
+    mask_path = tmp_path / "mask.png"
+    Image.new("RGB", (512, 512), "white").save(image_path)
+    Image.new("L", (512, 512), 255).save(mask_path)
+    sessions: list[list[str]] = []
+
+    class FakeCpuSession:
+        def __init__(
+            self,
+            _model_path: str,
+            *,
+            sess_options: object,
+            providers: list[str],
+        ) -> None:
+            del sess_options
+            self.providers = providers
+            sessions.append(providers)
+
+        def get_providers(self) -> list[str]:
+            return self.providers
+
+        def get_inputs(self) -> list[SimpleNamespace]:
+            return [SimpleNamespace(name="image"), SimpleNamespace(name="mask")]
+
+        def run(
+            self,
+            _outputs: object,
+            _feeds: dict[str, np.ndarray],
+        ) -> list[np.ndarray]:
+            return [np.full((1, 3, 512, 512), 170.0, dtype=np.float32)]
+
+    def unavailable_webgpu(_path: Path, **_kwargs: object) -> object:
+        raise RuntimeError("no Vulkan GPU")
+
+    monkeypatch.setattr(
+        lama_worker,
+        "_create_webgpu_inference_session",
+        unavailable_webgpu,
+    )
+    monkeypatch.setattr(lama_worker.ort, "InferenceSession", FakeCpuSession)
+    monkeypatch.setattr(
+        lama_worker.ort,
+        "get_available_providers",
+        lambda: ["CUDAExecutionProvider", "CPUExecutionProvider"],
+    )
+
+    result, provider = lama_worker.run_inference_with_provider(
+        tmp_path / "model.onnx",
+        image_path,
+        mask_path,
+        runtime=LAMA_RUNTIME_WEBGPU,
+    )
+
+    assert sessions == [["CPUExecutionProvider"]]
+    assert provider == "CPUExecutionProvider"
+    assert result.getpixel((0, 0)) == (170, 170, 170)
+
+
+def test_auto_webgpu_hardware_filter_rejects_virtual_adapter() -> None:
+    physical = SimpleNamespace(
+        device=SimpleNamespace(vendor_id=0x1002),
+    )
+    virtual = SimpleNamespace(
+        device=SimpleNamespace(vendor_id=0x1AF4),
+    )
+
+    assert lama_worker._is_hardware_webgpu_device(physical)
+    assert not lama_worker._is_hardware_webgpu_device(virtual)
 
 
 @pytest.mark.parametrize("value", ["0", "65", "not-a-number"])

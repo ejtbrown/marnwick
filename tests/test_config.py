@@ -10,7 +10,14 @@ from pathlib import Path
 import pytest
 
 import marnwick.config as config_module
-from marnwick.config import AppConfig, WindowConfig, load_config, save_config
+from marnwick.config import (
+    LAMA_RUNTIME_AUTO,
+    LAMA_RUNTIME_WEBGPU,
+    AppConfig,
+    WindowConfig,
+    load_config,
+    save_config,
+)
 
 
 def test_load_config_tolerates_invalid_utf8(tmp_path: Path) -> None:
@@ -43,6 +50,7 @@ def test_load_config_defaults_unexpected_scalar_types(tmp_path: Path) -> None:
                 "catalogs": ["one", 2, None, "two"],
                 "thumbnail_size": {},
                 "delete_behavior": [],
+                "lama_runtime": "unsupported",
                 "sort_order": ["date"],
             }
         ),
@@ -50,6 +58,20 @@ def test_load_config_defaults_unexpected_scalar_types(tmp_path: Path) -> None:
     )
 
     assert load_config(path) == AppConfig(catalogs=["one", "two"])
+
+
+def test_lama_runtime_round_trips_and_invalid_values_default_to_auto(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "config.json"
+
+    save_config(AppConfig(lama_runtime=LAMA_RUNTIME_WEBGPU), path)
+
+    assert load_config(path).lama_runtime == LAMA_RUNTIME_WEBGPU
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    raw["lama_runtime"] = "not-a-runtime"
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    assert load_config(path).lama_runtime == LAMA_RUNTIME_AUTO
 
 
 def test_save_config_is_atomic_and_preserves_existing_mode(tmp_path: Path, monkeypatch) -> None:

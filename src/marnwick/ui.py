@@ -51,6 +51,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFormLayout,
     QFrame,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -111,6 +112,10 @@ from .catalog import (
 )
 from .config import (
     DEFAULT_THUMBNAIL_COLUMNS,
+    LAMA_RUNTIME_AUTO,
+    LAMA_RUNTIME_CPU,
+    LAMA_RUNTIME_NVIDIA,
+    LAMA_RUNTIME_WEBGPU,
     MAX_THUMBNAIL_COLUMNS,
     MIN_THUMBNAIL_COLUMNS,
     NORMAL_DELETE,
@@ -3749,6 +3754,7 @@ class MainWindow(QMainWindow):
                 loaded.thumbnail_size = current.thumbnail_size
                 loaded.sort_order = current.sort_order
                 loaded.delete_behavior = current.delete_behavior
+                loaded.lama_runtime = current.lama_runtime
             else:
                 self.set_thumbnail_size(
                     self.thumbnail_columns_from_config(loaded.thumbnail_size)
@@ -3916,6 +3922,7 @@ class MainWindow(QMainWindow):
             thumbnail_size=self.thumbnail_columns,
             delete_behavior=self.app_config.delete_behavior,
             sort_order=self.current_sort.value,
+            lama_runtime=self.app_config.lama_runtime,
             _loaded_catalogs=self.app_config._loaded_catalogs,
         )
 
@@ -13802,6 +13809,15 @@ class AppPreferencesDialog(QDialog):
         if index >= 0:
             self.delete_behavior.setCurrentIndex(index)
 
+        self.lama_runtime = QComboBox()
+        self.lama_runtime.addItem("Auto", LAMA_RUNTIME_AUTO)
+        self.lama_runtime.addItem("CPU", LAMA_RUNTIME_CPU)
+        self.lama_runtime.addItem("NVIDIA", LAMA_RUNTIME_NVIDIA)
+        self.lama_runtime.addItem("WebGPU/Vulkan", LAMA_RUNTIME_WEBGPU)
+        lama_runtime_index = self.lama_runtime.findData(config.lama_runtime)
+        if lama_runtime_index >= 0:
+            self.lama_runtime.setCurrentIndex(lama_runtime_index)
+
         form.addRow("Window x", self.window_x)
         form.addRow("Window y", self.window_y)
         form.addRow("Window width", self.window_width)
@@ -13811,6 +13827,17 @@ class AppPreferencesDialog(QDialog):
         form.addRow("Sort order", self.sort_order)
         form.addRow("Delete behavior", self.delete_behavior)
         layout.addLayout(form)
+
+        lama_group = QGroupBox("LaMa")
+        lama_layout = QFormLayout(lama_group)
+        lama_layout.addRow("Processing runtime", self.lama_runtime)
+        lama_note = QLabel(
+            "Auto prefers available GPU runtimes and falls back to CPU. "
+            "WebGPU/Vulkan uses a compatible Linux Vulkan driver, including Mesa."
+        )
+        lama_note.setWordWrap(True)
+        lama_layout.addRow(lama_note)
+        layout.addWidget(lama_group)
 
         layout.addWidget(QLabel("Catalogs"))
         self.catalog_list = QListWidget()
@@ -13859,6 +13886,7 @@ class AppPreferencesDialog(QDialog):
             thumbnail_size=self.thumbnail_size.value(),
             delete_behavior=str(self.delete_behavior.currentData()),
             sort_order=str(self.sort_order.currentData()),
+            lama_runtime=str(self.lama_runtime.currentData()),
             _loaded_catalogs=self._loaded_catalogs,
         )
 
@@ -15678,6 +15706,12 @@ class FullscreenViewer(QDialog):
         rel_path = self.navigator.current
         preceding_operations = tuple(self.operations)
         cancel_event = Event()
+        parent = self.parent()
+        runtime = (
+            parent.app_config.lama_runtime
+            if isinstance(parent, MainWindow)
+            else LAMA_RUNTIME_AUTO
+        )
         try:
             future = self._lama_executor.submit(
                 create_lama_edit_operation,
@@ -15686,6 +15720,7 @@ class FullscreenViewer(QDialog):
                 tuple(self.lama_samples),
                 expected_identity=identity,
                 expected_size=self.image_coordinate_size,
+                runtime=runtime,
                 cancel_event=cancel_event,
             )
         except ExecutorSaturatedError:
@@ -15734,6 +15769,17 @@ class FullscreenViewer(QDialog):
             or tuple(self.operations) != preceding_operations
         ):
             return
+        provider = str((operation.params or {}).get("execution_provider", "local runtime"))
+        provider_label = {
+            "CPUExecutionProvider": "CPU",
+            "CUDAExecutionProvider": "NVIDIA",
+            "WebGpuExecutionProvider": "WebGPU/Vulkan",
+            "DmlExecutionProvider": "DirectML",
+            "ROCMExecutionProvider": "ROCm",
+            "MIGraphXExecutionProvider": "MIGraphX",
+            "CoreMLExecutionProvider": "CoreML",
+        }.get(provider, provider)
+        self.setWindowTitle(f"Marnwick — LaMa completed using {provider_label}")
         self.exit_region_edit()
         self.operations.append(operation)
         self.render_preview()

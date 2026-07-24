@@ -16,6 +16,7 @@ import urllib.request
 
 from PIL import Image, ImageDraw, ImageFilter, ImageOps
 
+from .config import LAMA_RUNTIME_AUTO, LAMA_RUNTIMES
 from .image_ops import (
     EditOperation,
     ImageFileIdentity,
@@ -38,6 +39,7 @@ LAMA_INPUT_SIZE = 512
 MAX_LAMA_WORKER_OUTPUT_BYTES = 64 * 1024
 DEFAULT_LAMA_TIMEOUT_SECONDS = 15 * 60.0
 LAMA_CPU_EXECUTION_PROVIDER = "CPUExecutionProvider"
+LAMA_WEBGPU_EXECUTION_PROVIDER = "WebGpuExecutionProvider"
 LAMA_GPU_EXECUTION_PROVIDERS = (
     "CUDAExecutionProvider",
     "ROCMExecutionProvider",
@@ -223,11 +225,14 @@ def create_lama_edit_operation(
     expected_identity: ImageFileIdentity,
     expected_size: tuple[int, int],
     model_path: Path | None = None,
+    runtime: str = LAMA_RUNTIME_AUTO,
     cancel_event: Event | None = None,
     worker_timeout: float | None = None,
 ) -> EditOperation:
     if not stroke_samples:
         raise ValueError("paint over an area before applying LaMa")
+    if runtime not in LAMA_RUNTIMES:
+        raise ValueError(f"unsupported LaMa runtime preference: {runtime}")
     checked_model_path = validate_lama_model(model_path)
     _check_canceled(cancel_event)
     if snapshot_image_file_identity(path) != expected_identity:
@@ -270,6 +275,7 @@ def create_lama_edit_operation(
             input_path,
             mask_path,
             output_path,
+            runtime=runtime,
             cancel_event=cancel_event,
             timeout=worker_timeout,
         )
@@ -369,6 +375,7 @@ def _run_lama_worker(
     mask_path: Path,
     output_path: Path,
     *,
+    runtime: str,
     cancel_event: Event | None,
     timeout: float | None,
 ) -> str:
@@ -385,6 +392,8 @@ def _run_lama_worker(
         str(mask_path),
         "--output",
         str(output_path),
+        "--runtime",
+        runtime,
     ]
     environment = dict(os.environ)
     environment["PYTHONNOUSERSITE"] = "1"
@@ -437,6 +446,7 @@ def _run_lama_worker(
             provider = status.get("provider")
             if provider not in {
                 LAMA_CPU_EXECUTION_PROVIDER,
+                LAMA_WEBGPU_EXECUTION_PROVIDER,
                 *LAMA_GPU_EXECUTION_PROVIDERS,
             }:
                 raise LamaModelError(
