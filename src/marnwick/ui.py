@@ -166,7 +166,6 @@ TREE_BUILD_BUDGET_SECONDS = 0.008
 TREE_PAGE_POLL_INTERVAL_MS = 15
 INITIAL_TREE_ENTRY_LIMIT = 512
 INITIAL_TREE_SCAN_BUDGET_SECONDS = 0.006
-MAX_AUTOMATIC_TREE_ITEMS = 4096
 TREE_CHILD_PAGE_SIZE = 400
 MAX_TREE_TAG_ITEMS = 500
 THUMBNAIL_MODEL_BATCH_SIZE = 400
@@ -6954,12 +6953,6 @@ class MainWindow(QMainWindow):
         processed_this_turn = 0
         item_work_this_turn = 0
         while task.total is None or task.processed < task.total:
-            if len(task.rebuilt_item_by_dir) >= MAX_AUTOMATIC_TREE_ITEMS:
-                # The tree is a navigation aid, not a second in-memory catalog.
-                # Expanded branches and explicit path selection fill in later
-                # rows on demand without an unbounded stream of Qt objects.
-                task.total = task.processed
-                break
             if task.index >= len(task.directories):
                 self._submit_tree_page(task)
                 return
@@ -15002,8 +14995,8 @@ class LamaBusyOverlay(QWidget):
         panel_layout.addWidget(self.progress)
 
         self.detail_label = QLabel(
-            "Running locally on the CPU. This can take a few moments. "
-            "Press Esc to cancel."
+            "Checking for a supported GPU, with local CPU fallback. "
+            "This can take a few moments. Press Esc to cancel."
         )
         self.detail_label.setObjectName("lamaBusyDetail")
         self.detail_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -17928,10 +17921,11 @@ def ask_download_lama_model(parent: QWidget, *, replace: bool) -> bool:
     box.setText(
         f"Re-download and replace the installed {size_text} LaMa model data?"
         if replace
-        else f"Download {size_text} of LaMa model data for local CPU inpainting?"
+        else f"Download {size_text} of LaMa model data for local inpainting?"
     )
     box.setInformativeText(
-        "The model runs locally through ONNX Runtime. Images are not uploaded. "
+        "The model uses a supported local GPU when available, with CPU fallback. "
+        "Images are not uploaded. "
         "Model data is downloaded from the pinned sapienkit/LaMa-ONNX release "
         "on Hugging Face and verified with SHA-256."
     )

@@ -119,7 +119,7 @@ def test_create_lama_edit_operation_retains_generated_patch(
         mask_path: Path,
         output_path: Path,
         **_kwargs: object,
-    ) -> None:
+    ) -> str:
         with Image.open(mask_path) as worker_mask:
             worker_mask.load()
             assert worker_mask.getextrema() == (0, 255)
@@ -129,6 +129,7 @@ def test_create_lama_edit_operation_retains_generated_patch(
             (lama.LAMA_INPUT_SIZE, lama.LAMA_INPUT_SIZE),
             (20, 200, 20),
         ).save(output_path)
+        return lama.LAMA_CPU_EXECUTION_PROVIDER
 
     monkeypatch.setattr(lama, "_run_lama_worker", fake_worker)
     operation = lama.create_lama_edit_operation(
@@ -144,6 +145,9 @@ def test_create_lama_edit_operation_retains_generated_patch(
     edited = apply_operation_to_image(source, operation)
     assert operation.name == "lama"
     assert isinstance((operation.params or {}).get("patch_png"), bytes)
+    assert (operation.params or {}).get("execution_provider") == (
+        lama.LAMA_CPU_EXECUTION_PROVIDER
+    )
     assert edited.getpixel((80, 60))[1] > edited.getpixel((80, 60))[0]
     assert edited.getpixel((0, 119)) == (200, 20, 20)
 

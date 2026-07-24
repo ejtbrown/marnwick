@@ -10,21 +10,27 @@ import numpy as np
 import onnxruntime as ort
 from PIL import Image
 
-from .lama import LAMA_INPUT_SIZE
+from .lama import (
+    LAMA_CPU_EXECUTION_PROVIDER,
+    LAMA_GPU_EXECUTION_PROVIDERS,
+    LAMA_INPUT_SIZE,
+)
 
 
 def run_inference(model_path: Path, input_path: Path, mask_path: Path) -> Image.Image:
-    threads = _worker_thread_count()
-    options = ort.SessionOptions()
-    options.intra_op_num_threads = threads
-    options.inter_op_num_threads = 1
-    options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
-    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-    session = ort.InferenceSession(
-        str(model_path),
-        sess_options=options,
-        providers=["CPUExecutionProvider"],
+    result, _provider = run_inference_with_provider(
+        model_path,
+        input_path,
+        mask_path,
     )
+    return result
+
+
+def run_inference_with_provider(
+    model_path: Path,
+    input_path: Path,
+    mask_path: Path,
+) -> tuple[Image.Image, str]:
     with Image.open(input_path) as source:
         source.load()
         image = source.convert("RGB")
@@ -40,6 +46,7 @@ def run_inference(model_path: Path, input_path: Path, mask_path: Path) -> Image.
     mask_array = (
         np.asarray(mask, dtype=np.uint8) > 0
     ).astype(np.float32)[None, None, ...]
+    session, provider = _preferred_inference_session(model_path)
     input_names = {item.name for item in session.get_inputs()}
     if {"image", "mask"} <= input_names:
         feeds = {"image": image_array, "mask": mask_array}
@@ -48,7 +55,17 @@ def run_inference(model_path: Path, input_path: Path, mask_path: Path) -> Image.
         if len(inputs) != 2:
             raise ValueError("LaMa model has an unexpected input contract")
         feeds = {inputs[0].name: image_array, inputs[1].name: mask_array}
-    output = session.run(None, feeds)
+    try:
+        output = session.run(None, feeds)
+    except Exception:
+        if provider == LAMA_CPU_EXECUTION_PROVIDER:
+            raise
+        session = _create_inference_session(
+            model_path,
+            LAMA_CPU_EXECUTION_PROVIDER,
+        )
+        provider = LAMA_CPU_EXECUTION_PROVIDER
+        output = session.run(None, feeds)
     if len(output) != 1:
         raise ValueError("LaMa model has an unexpected output contract")
     result = np.asarray(output[0])
@@ -59,7 +76,52 @@ def run_inference(model_path: Path, input_path: Path, mask_path: Path) -> Image.
     else:
         raise ValueError(f"LaMa model returned an unexpected shape: {result.shape}")
     result = np.clip(result, 0.0, 255.0).astype(np.uint8)
-    return Image.fromarray(result)
+    return Image.fromarray(result), provider
+
+
+def _preferred_inference_session(
+    model_path: Path,
+) -> tuple[ort.InferenceSession, str]:
+    available = set(ort.get_available_providers())
+    for provider in LAMA_GPU_EXECUTION_PROVIDERS:
+        if provider not in available:
+            continue
+        try:
+            session = _create_inference_session(model_path, provider)
+        except Exception:  # nosec B112
+            # Provider failures require trying the next local backend.
+            continue
+        if provider in session.get_providers():
+            return session, provider
+    return (
+        _create_inference_session(model_path, LAMA_CPU_EXECUTION_PROVIDER),
+        LAMA_CPU_EXECUTION_PROVIDER,
+    )
+
+
+def _create_inference_session(
+    model_path: Path,
+    provider: str,
+) -> ort.InferenceSession:
+    options = ort.SessionOptions()
+    options.intra_op_num_threads = _worker_thread_count()
+    options.inter_op_num_threads = 1
+    options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    if provider == "DmlExecutionProvider":
+        options.enable_mem_pattern = False
+    providers = [provider]
+    if provider != LAMA_CPU_EXECUTION_PROVIDER:
+        providers.append(LAMA_CPU_EXECUTION_PROVIDER)
+    session = ort.InferenceSession(
+        str(model_path),
+        sess_options=options,
+        providers=providers,
+    )
+    disable_fallback = getattr(session, "disable_fallback", None)
+    if callable(disable_fallback):
+        disable_fallback()
+    return session
 
 
 def _worker_thread_count() -> int:
@@ -87,7 +149,11 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    result = run_inference(args.model, args.input, args.mask)
+    result, provider = run_inference_with_provider(
+        args.model,
+        args.input,
+        args.mask,
+    )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     fd, temp_name = tempfile.mkstemp(
         prefix=f".{args.output.name}.",
@@ -106,7 +172,7 @@ def main() -> int:
         if fd >= 0:
             os.close(fd)
         temp_path.unlink(missing_ok=True)
-    print(json.dumps({"ok": True}, sort_keys=True))
+    print(json.dumps({"ok": True, "provider": provider}, sort_keys=True))
     return 0
 
 

@@ -5,6 +5,11 @@ $RootDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $VenvDir = if ($env:MARNWICK_VENV) { $env:MARNWICK_VENV } else { Join-Path $RootDir ".venv" }
 $IconPng = Join-Path $RootDir "marnwick-icon.png"
 $IconIco = Join-Path $RootDir "marnwick.ico"
+$LamaRuntimeRequest = if ($env:MARNWICK_LAMA_RUNTIME) {
+    $env:MARNWICK_LAMA_RUNTIME.ToLowerInvariant()
+} else {
+    "auto"
+}
 
 if ($env:OS -ne "Windows_NT") {
     throw "setup.ps1 is intended for Windows. Use ./setup.sh on Linux."
@@ -35,6 +40,31 @@ if (-not $PythonExe) {
     throw "Could not find Python. Install Python 3.11+ or set the PYTHON environment variable."
 }
 
+$IsX64 = $env:PROCESSOR_ARCHITECTURE -eq "AMD64"
+switch ($LamaRuntimeRequest) {
+    "auto" {
+        $LamaRuntime = if ($IsX64) { "directml" } else { "cpu" }
+    }
+    "cpu" {
+        $LamaRuntime = "cpu"
+    }
+    "gpu" {
+        if (-not $IsX64) {
+            throw "DirectML LaMa runtime requires 64-bit Windows on x86-64."
+        }
+        $LamaRuntime = "directml"
+    }
+    "directml" {
+        if (-not $IsX64) {
+            throw "DirectML LaMa runtime requires 64-bit Windows on x86-64."
+        }
+        $LamaRuntime = "directml"
+    }
+    default {
+        throw "MARNWICK_LAMA_RUNTIME must be auto, cpu, gpu, or directml."
+    }
+}
+
 & $PythonExe @PythonArgs -m venv $VenvDir
 
 $VenvPython = Join-Path $VenvDir "Scripts\python.exe"
@@ -43,13 +73,55 @@ if (-not (Test-Path -LiteralPath $VenvPython)) {
     throw "Virtual environment Python was not created at: $VenvPython"
 }
 
-& $VenvPython -m pip install --upgrade pip setuptools wheel
+function Invoke-Pip {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$Arguments
+    )
+
+    & $VenvPython -m pip @Arguments
+    if ($LASTEXITCODE -ne 0) {
+        throw "pip failed: $($Arguments -join ' ')"
+    }
+}
+
+Invoke-Pip -Arguments @("install", "--upgrade", "pip", "setuptools", "wheel")
 $LockFile = Join-Path $RootDir "requirements-dev.lock"
 if (Test-Path -LiteralPath $LockFile) {
-    & $VenvPython -m pip install --require-hashes -r $LockFile
-    & $VenvPython -m pip install --no-deps -e $RootDir
+    if ($LamaRuntime -eq "cpu") {
+        Invoke-Pip -Arguments @(
+            "uninstall",
+            "-y",
+            "onnxruntime",
+            "onnxruntime-gpu",
+            "onnxruntime-directml"
+        )
+    }
+    Invoke-Pip -Arguments @("install", "--require-hashes", "-r", $LockFile)
+    if ($LamaRuntime -eq "directml") {
+        Invoke-Pip -Arguments @(
+            "uninstall",
+            "-y",
+            "onnxruntime",
+            "onnxruntime-gpu",
+            "onnxruntime-directml"
+        )
+        $DirectMlLockFile = Join-Path $RootDir "requirements-lama-directml.lock"
+        Invoke-Pip -Arguments @(
+            "install",
+            "--no-deps",
+            "--require-hashes",
+            "-r",
+            $DirectMlLockFile
+        )
+    }
+    Invoke-Pip -Arguments @("install", "--no-deps", "-e", $RootDir)
 } else {
-    & $VenvPython -m pip install -e "${RootDir}[dev]"
+    if ($LamaRuntime -eq "directml") {
+        Invoke-Pip -Arguments @("install", "-e", "${RootDir}[dev,directml]")
+    } else {
+        Invoke-Pip -Arguments @("install", "-e", "${RootDir}[cpu,dev]")
+    }
 }
 
 $StartPs1 = Join-Path $RootDir "start.ps1"
@@ -120,5 +192,6 @@ $Shortcut.Description = "Marnwick photo viewer and organizer"
 $Shortcut.Save()
 
 Write-Host "Marnwick is ready."
+Write-Host "LaMa runtime: $LamaRuntime"
 Write-Host "Start it with: .\start.ps1"
 Write-Host "Start Menu shortcut installed at: $ShortcutPath"

@@ -60,7 +60,8 @@ def test_lama_busy_overlay_shows_indeterminate_local_progress(
     assert overlay.progress.minimum() == 0
     assert overlay.progress.maximum() == 0
     assert "filling the masked area" in overlay.title_label.text()
-    assert "locally on the CPU" in overlay.detail_label.text()
+    assert "supported GPU" in overlay.detail_label.text()
+    assert "CPU fallback" in overlay.detail_label.text()
 
     overlay.stop()
     assert overlay.isHidden()

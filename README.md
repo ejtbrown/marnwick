@@ -16,7 +16,7 @@ Each catalog keeps its metadata beside the photos in a `.marnwick` directory. Mo
 - View images fullscreen in display order or a randomized order.
 - Zoom, pan, show file information, copy files to the desktop clipboard, and inspect image metadata.
 - Rotate, flip, crop, reduce red eye, and clone/heal from the fullscreen viewer.
-- Remove masked objects locally with the CPU-oriented LaMa inpainting model.
+- Remove masked objects locally with GPU-accelerated LaMa inpainting and automatic CPU fallback.
 - Save edits normally or restore the original filesystem access, modification, and creation dates where the platform supports them.
 - Define catalog tags, assign them to images, and browse tag-based virtual directories.
 - Find exact duplicates using SHA-256 content hashes.
@@ -39,7 +39,7 @@ Marnwick recognizes AVIF, BMP, GIF, HEIC, HEIF, JPEG, PNG, TIFF, and WebP filena
 - Optional GNU `find` and `md5sum` for faster catalog discovery and freshness checks
 - Optional GNU `shred` for wipe-on-delete
 
-The runtime dependencies are NumPy, ONNX Runtime, Pillow, and PySide6. Development dependencies are hash-locked in `requirements-dev.lock`. LaMa's 198 MiB model data is optional and downloaded only after confirmation.
+The runtime dependencies are NumPy, Pillow, PySide6, and one ONNX Runtime variant selected for the host. Development and CPU runtime dependencies are hash-locked in `requirements-dev.lock`; the setup scripts select the NVIDIA runtime on supported x86-64 Linux systems, DirectML on x86-64 Windows, and the CPU runtime otherwise. LaMa's 198 MiB model data is optional and downloaded only after confirmation.
 
 ## Quick start
 
@@ -52,7 +52,7 @@ From a fresh clone:
 ./start.sh
 ```
 
-The setup script creates a virtual environment (by default `.venv`), installs the locked dependencies and Marnwick in editable mode, writes `start.sh`, and installs a per-user desktop entry under `${XDG_DATA_HOME:-$HOME/.local/share}/applications`.
+The setup script creates a virtual environment (by default `.venv`), installs the locked dependencies and Marnwick in editable mode, writes `start.sh`, and installs a per-user desktop entry under `${XDG_DATA_HOME:-$HOME/.local/share}/applications`. On x86-64 Linux it selects the NVIDIA ONNX Runtime when `nvidia-smi` reports a GPU; otherwise it installs the CPU runtime.
 
 ### Windows PowerShell
 
@@ -61,7 +61,7 @@ The setup script creates a virtual environment (by default `.venv`), installs th
 .\start.cmd
 ```
 
-The setup script creates a virtual environment (by default `.venv`), installs Marnwick, writes `start.ps1` and `start.cmd`, generates a Windows icon, and creates a Start Menu shortcut. `start.cmd` works without changing PowerShell's script policy; `start.ps1` is also available when local scripts are allowed. If PowerShell blocks `setup.ps1`, run:
+The setup script creates a virtual environment (by default `.venv`), installs Marnwick, writes `start.ps1` and `start.cmd`, generates a Windows icon, and creates a Start Menu shortcut. On x86-64 Windows it installs the DirectML ONNX Runtime, which can use compatible GPUs and falls back to CPU when necessary. `start.cmd` works without changing PowerShell's script policy; `start.ps1` is also available when local scripts are allowed. If PowerShell blocks `setup.ps1`, run:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\setup.ps1
@@ -71,7 +71,7 @@ powershell -ExecutionPolicy Bypass -File .\setup.ps1
 
 ```bash
 python3 -m venv .venv
-.venv/bin/python -m pip install -e ".[dev]"
+.venv/bin/python -m pip install -e ".[cpu,dev]"
 .venv/bin/python -m marnwick
 ```
 
@@ -136,7 +136,7 @@ Directory tiles remain grouped before image tiles. Directory “size” is the t
 
 The edit menu provides rotate-left, rotate-right, vertical flip, horizontal flip, red-eye selection, crop selection, clone/heal, and LaMa. LaMa is shown with the `M` hotkey. Drag over the image to select a crop or red-eye region. In clone/heal mode, right-click to set the initial source and left-drag to paint. The first left click aligns that source with the paint cursor; afterward, moving the cursor moves the source by the same amount across separate strokes until another right-click selects a new source. Use the mouse wheel to resize the brush.
 
-In LaMa mode, paint the complete area to remove, use the mouse wheel to resize the mask brush, press `Backspace` to clear the mask, and press `Enter` to apply it. A centered progress indicator remains visible while the local inference runs; `Escape` cancels the mask or a running inference. LaMa runs through ONNX Runtime in a separate CPU-only process; images are never uploaded. Marnwick crops bounded context around the mask, retains the generated pixel patch in the edit history, and does not rerun the model when saving. LaMa currently supports static images only. Choosing LaMa when its model is absent offers to download it, and **Tools > Download LaMa Model** provides the same operation on demand. Downloads are pinned and SHA-256 verified before publication.
+In LaMa mode, paint the complete area to remove, use the mouse wheel to resize the mask brush, press `Backspace` to clear the mask, and press `Enter` to apply it. A centered progress indicator remains visible while the local inference runs; `Escape` cancels the mask or a running inference. LaMa runs through ONNX Runtime in a separate local process; it tries supported GPU execution providers in priority order and explicitly retries on CPU if GPU session creation or inference fails. Images are never uploaded. Marnwick crops bounded context around the mask, retains the generated pixel patch and execution-provider record in the edit history, and does not rerun the model when saving. LaMa currently supports static images only. Choosing LaMa when its model is absent offers to download it, and **Tools > Download LaMa Model** provides the same operation on demand. Downloads are pinned and SHA-256 verified before publication.
 
 Navigation, tagging, or closing resolves pending edits by asking you to save, save while preserving filesystem dates, discard, or cancel; a tag dialog never races an asynchronous save. Save, warning, and error prompts remain owned by the fullscreen modal viewer, and focus returns to that viewer when a nested prompt closes. Returning from fullscreen keeps the directory tree at its prior scroll position while the thumbnail pane follows the last viewed image. In the main application, choosing save queues image decoding, editing, encoding, validation, and atomic replacement on a dedicated background worker; you can continue navigating while the status bar reports the save. A static PNG uses the same non-modal worker path, shares metadata inspection and editing in one traversal, and uses fast lossless compression. It no longer opens an indeterminate “preserving frames and metadata” progress dialog. After a successful replacement, Marnwick submits a targeted reindex through the catalog action queue. That reindex decodes and hashes one stable open file descriptor, compares the resulting filesystem identity and SHA-256 hash with the proof of the exact committed object, and publishes the new record and thumbnail only if they match. It does not perform a separate preliminary full-file proof hash. If a save or tag edit can change the membership or ordering of a database-paged fullscreen view, that navigator reloads from page zero asynchronously instead of continuing from a stale SQL offset. The currently displayed image stays published while bounded background pages locate its fresh position; editing pauses during that reconciliation, visible progress is reported, and an overlapping delete restarts the fresh query after its outcome is known. The main thumbnail pane also refreshes a visible physical or virtual query after save reconciliation.
 
@@ -200,6 +200,7 @@ Global window and catalog-list preferences default to `~/.config/marnwick/config
 | `MARNWICK_CONFIG_PATH` | Override the global JSON configuration path | XDG path described above |
 | `MARNWICK_DISABLE_CONFIG=1` | Disable global configuration loading and saving | Configuration enabled |
 | `MARNWICK_LAMA_MODEL_PATH` | Override the downloaded LaMa ONNX model path | Platform data directory |
+| `MARNWICK_LAMA_RUNTIME` | Select the runtime installed by setup (`auto`, `cpu`, or `gpu`; `nvidia` on Linux and `directml` on Windows are also accepted) | `auto` |
 | `MARNWICK_LAMA_THREADS` | Limit LaMa worker CPU threads from 1 to 64 | Up to 8, leaving one logical CPU free |
 | `MARNWICK_LAMA_TIMEOUT_SECONDS` | Bound one local LaMa inference | `900` |
 | `MARNWICK_MAX_IMAGE_PIXELS` | Maximum decoded Pillow image area | `50000000` |
@@ -219,7 +220,7 @@ Work that feeds the interface has explicit bounds:
 
 - Initial configuration uses one read lane. Catalog opening normally uses two daemon read lanes and can retire a bounded number of saturated generations, for a maximum of eight opening threads and eight admitted requests; superseded results cannot retake focus, and quitting does not wait for a read trapped on an unavailable mount.
 - Selected physical folders use two bounded worker pools: a current catalog page can paint first, while a filesystem worker enumerates, stats, and sorts the complete set of direct child folders and recognized image files. This full inventory is necessary to establish one stable membership and order for an unindexed or changed folder; it has no entry-count or 12-millisecond cutoff. The status bar reports the listing phase and elapsed time, stale generations cannot publish, and the Qt model exposes the completed inventory in 400-row batches rather than creating every visible item in one event-loop turn.
-- Folder-tree database reads use pages of at most 400 paths, and Qt tree construction yields after at most 400 items or roughly eight milliseconds of work. An automatic rebuild creates at most 4,096 directory items; child branches and long tag lists expose explicit load-more rows rather than allocating the entire known tree. Physical directory rows are inserted in case-insensitive lexical order regardless of whether they arrive through direct navigation, discovery, or a later page. Tree rebuilds, page publication, deep-path selection, and scroll restoration wait until either a directory drag or a thumbnail-to-tree file drag ends so drop targets cannot move under the pointer.
+- Folder-tree database reads use pages of at most 400 paths, and Qt tree construction yields after at most 400 items or roughly eight milliseconds of work. Every known physical directory is eventually materialized; large trees remain responsive because acquisition and publication are paged and time-sliced rather than truncated. Long direct-child and tag queries still expose explicit load-more rows. Physical directory rows are inserted in case-insensitive lexical order regardless of whether they arrive through direct navigation, discovery, or a later page. Tree rebuilds, page publication, deep-path selection, and scroll restoration wait until either a directory drag or a thumbnail-to-tree file drag ends so drop targets cannot move under the pointer.
 - The thumbnail model exposes records in 400-row batches, limits pending reads, and applies only a small number of completed thumbnails per UI tick. A newer thumbnail generation can start while old reads unwind.
 - Decoded thumbnail inputs are limited to 32 MiB and 4096 pixels per dimension. The primary thumbnail pixmap cache is limited to 512 entries or 256 MiB, the delegate's scaled-pixmap cache to 512 entries or 128 MiB, and remembered pane state and Very Similar result caches have fixed entry limits.
 - Fullscreen decode, edit-preview rendering, and paged navigation use three process-wide pools rather than creating threads per viewer. Decode and preview each allow eight workers and 16 admitted tasks; paging allows four workers and eight admitted tasks. Closing a viewer cancels its queued work without shutting down the shared pools.
@@ -236,7 +237,7 @@ Work that feeds the interface has explicit bounds:
 - Cross-filesystem directory moves revalidate the published destination immediately before recursively removing the isolated source, but no portable filesystem operation makes those steps atomic across mounts. An external program that replaces or removes the destination during that cleanup window can defeat compensation; do not externally mutate paths participating in a move. Marnwick's catalog lock does not control unrelated filesystem tools.
 - Moving a directory across filesystems recreates regular files, directories, and symlinks. It does not preserve hard-link relationships or guarantee filesystem-specific metadata beyond supported creation dates and modification dates; unsupported special-file entries cause the move to fail with the source retained.
 - Current physical folders can paint from bounded database pages, but an unindexed or changed physical folder materializes and sorts its complete direct-child filesystem inventory on a worker so it can publish one stable placeholder layout. A directory with an exceptionally large number of direct entries can therefore require substantial worker memory and listing time, although it does not block Qt. Tag and exact-duplicate views are database-paged. The Very Similar model exposes rows progressively, but its worker currently materializes the complete global similarity result before first publication.
-- Automatic folder-tree construction is capped and child/tag reads are paged. Expanding many branches or repeatedly choosing load-more can still create many Qt items during a long session, but initial discovery no longer requires one item per known directory.
+- Automatic folder-tree construction eventually materializes every known directory, with database acquisition and Qt publication split into bounded pages and event-loop slices. Extremely large catalogs can therefore accumulate many Qt tree items, but opening or rebuilding another catalog no longer truncates lexical-tail directories.
 - Cancellation is cooperative. Marnwick can cancel queued work, interrupt long SQLite queries, and ignore stale generations, but it cannot forcibly interrupt an operating-system filesystem call or native decoder already in progress. Generation-guarded catalog, selected-folder, tree, identity, and thumbnail read pools can retire only a bounded number of saturated worker epochs, giving newer work finite escape capacity without allowing thread growth per navigation; fullscreen pools reserve fixed lanes instead. If every permitted epoch or lane is occupied by independently stuck native calls, later work is rejected or retried until capacity returns. Obsolete calls cannot publish stale UI state, total worker counts remain capped, and read-only daemon pools do not hold up process exit.
 - Image saves are mutually excluded within each catalog and share four encoding lanes globally. Four independently stalled codecs or filesystems can occupy all lanes and delay later saves, but the admission queue remains bounded and the status bar continues to report active work. Normal in-application close waits for admitted saves, proof-aware reconciliation, and dependent deletes to settle; forcibly terminating the process can interrupt that workflow.
 - Background freshness uses path, size, modification time, and metadata change time (including Win32 `ChangeTime`) so ordinary same-size edits are detected without rehashing every image. Filesystems that do not expose reliable change fields may require **Tools > Refresh Catalog**, which forces reindexing.
@@ -299,9 +300,11 @@ The repository currently has no configured formatter, general-purpose linter, st
 Regenerate the Python 3.12 development lock after changing dependencies:
 
 ```bash
-.venv/bin/pip-compile --allow-unsafe --extra=dev --generate-hashes \
+.venv/bin/pip-compile --allow-unsafe --extra=cpu --extra=dev --generate-hashes \
   --output-file=requirements-dev.lock pyproject.toml
 ```
+
+The platform-specific GPU runtime locks are intentionally separate because ONNX Runtime distributions replace one another. Update `requirements-lama-nvidia.lock` and `requirements-lama-directml.lock` from the corresponding published wheels when changing their pinned versions.
 
 ## Performance tooling
 
