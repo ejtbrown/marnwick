@@ -10,15 +10,23 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
   "numpy>=1.26",
-  "onnxruntime>=1.20",
   "Pillow>=10",
   "PySide6>=6.6",
 ]
 
 [project.optional-dependencies]
+cpu = [
+  "onnxruntime>=1.20",
+]
+directml = [
+  "onnxruntime-directml>=1.20; platform_system == 'Windows' and platform_machine == 'AMD64'",
+]
 dev = [
   "pip-tools>=7",
   "pytest>=8",
+]
+nvidia = [
+  "onnxruntime-gpu>=1.20; platform_system == 'Linux' and platform_machine == 'x86_64'",
 ]
 
 [project.scripts]

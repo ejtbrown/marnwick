@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV_DIR="${MARNWICK_VENV:-$ROOT_DIR/.venv}"
 PYTHON_BIN="${PYTHON:-python3}"
+LAMA_RUNTIME_REQUEST="${MARNWICK_LAMA_RUNTIME:-auto}"
 
 if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
   echo "Could not find Python executable: $PYTHON_BIN" >&2
@@ -15,13 +16,56 @@ if [[ ! -f "$ROOT_DIR/marnwick-icon.png" ]]; then
   exit 1
 fi
 
+case "$LAMA_RUNTIME_REQUEST" in
+  auto)
+    if [[ "$(uname -s)" == Linux* ]] \
+      && [[ "$(uname -m)" == "x86_64" ]] \
+      && command -v nvidia-smi >/dev/null 2>&1 \
+      && nvidia-smi -L >/dev/null 2>&1; then
+      LAMA_RUNTIME="nvidia"
+    else
+      LAMA_RUNTIME="cpu"
+    fi
+    ;;
+  cpu)
+    LAMA_RUNTIME="cpu"
+    ;;
+  gpu|nvidia)
+    if [[ "$(uname -s)" != Linux* || "$(uname -m)" != "x86_64" ]]; then
+      echo "NVIDIA LaMa runtime requires x86-64 Linux." >&2
+      exit 1
+    fi
+    LAMA_RUNTIME="nvidia"
+    ;;
+  *)
+    echo "MARNWICK_LAMA_RUNTIME must be auto, cpu, gpu, or nvidia." >&2
+    exit 1
+    ;;
+esac
+
 "$PYTHON_BIN" -m venv "$VENV_DIR"
 "$VENV_DIR/bin/python" -m pip install --upgrade pip setuptools wheel
 if [[ -f "$ROOT_DIR/requirements-dev.lock" ]]; then
+  if [[ "$LAMA_RUNTIME" == "cpu" ]]; then
+    "$VENV_DIR/bin/python" -m pip uninstall -y \
+      onnxruntime onnxruntime-gpu onnxruntime-directml >/dev/null
+  fi
   "$VENV_DIR/bin/python" -m pip install --require-hashes -r "$ROOT_DIR/requirements-dev.lock"
+  if [[ "$LAMA_RUNTIME" == "nvidia" ]]; then
+    "$VENV_DIR/bin/python" -m pip uninstall -y \
+      onnxruntime onnxruntime-gpu onnxruntime-directml >/dev/null
+    "$VENV_DIR/bin/python" -m pip install \
+      --no-deps \
+      --require-hashes \
+      -r "$ROOT_DIR/requirements-lama-nvidia.lock"
+  fi
   "$VENV_DIR/bin/python" -m pip install --no-deps -e "$ROOT_DIR"
 else
-  "$VENV_DIR/bin/python" -m pip install -e "$ROOT_DIR[dev]"
+  if [[ "$LAMA_RUNTIME" == "nvidia" ]]; then
+    "$VENV_DIR/bin/python" -m pip install -e "$ROOT_DIR[dev,nvidia]"
+  else
+    "$VENV_DIR/bin/python" -m pip install -e "$ROOT_DIR[cpu,dev]"
+  fi
 fi
 
 cat > "$ROOT_DIR/start.sh" <<'RUNNER'
@@ -80,4 +124,5 @@ case "$(uname -s)" in
 esac
 
 echo "Marnwick is ready."
+echo "LaMa runtime: $LAMA_RUNTIME"
 echo "Start it with: ./start.sh"

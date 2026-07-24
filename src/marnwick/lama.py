@@ -37,6 +37,14 @@ LAMA_MODEL_SIZE_BYTES = 208_044_816
 LAMA_INPUT_SIZE = 512
 MAX_LAMA_WORKER_OUTPUT_BYTES = 64 * 1024
 DEFAULT_LAMA_TIMEOUT_SECONDS = 15 * 60.0
+LAMA_CPU_EXECUTION_PROVIDER = "CPUExecutionProvider"
+LAMA_GPU_EXECUTION_PROVIDERS = (
+    "CUDAExecutionProvider",
+    "ROCMExecutionProvider",
+    "MIGraphXExecutionProvider",
+    "DmlExecutionProvider",
+    "CoreMLExecutionProvider",
+)
 LamaProgressCallback = Callable[[int, int], None]
 LamaStrokeSample = tuple[int, int, int]
 
@@ -257,7 +265,7 @@ def create_lama_edit_operation(
         output_path = temp_dir / "output.png"
         image_crop.save(input_path, format="PNG", compress_level=1)
         model_mask.save(mask_path, format="PNG", compress_level=1)
-        _run_lama_worker(
+        execution_provider = _run_lama_worker(
             checked_model_path,
             input_path,
             mask_path,
@@ -285,6 +293,7 @@ def create_lama_edit_operation(
             "box": target_box,
             "patch_png": patch_png,
             "source_size": edited.size,
+            "execution_provider": execution_provider,
         },
     )
 
@@ -362,7 +371,7 @@ def _run_lama_worker(
     *,
     cancel_event: Event | None,
     timeout: float | None,
-) -> None:
+) -> str:
     timeout_seconds = _lama_timeout_seconds(timeout)
     command = [
         sys.executable,
@@ -425,8 +434,17 @@ def _run_lama_worker(
                 raise LamaModelError("LaMa worker returned an invalid response") from error
             if not isinstance(status, dict) or status.get("ok") is not True:
                 raise LamaModelError("LaMa worker did not confirm completion")
+            provider = status.get("provider")
+            if provider not in {
+                LAMA_CPU_EXECUTION_PROVIDER,
+                *LAMA_GPU_EXECUTION_PROVIDERS,
+            }:
+                raise LamaModelError(
+                    "LaMa worker did not report a recognized execution provider"
+                )
             if not output_path.is_file():
                 raise LamaModelError("LaMa worker did not produce an output image")
+            return str(provider)
         finally:
             if process.poll() is None:
                 _terminate_worker(process)

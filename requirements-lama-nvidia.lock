@@ -1,0 +1,9 @@
+# NVIDIA-enabled ONNX Runtime selected by setup.sh after the base dependencies.
+# Install with --no-deps because requirements-dev.lock supplies shared dependencies.
+onnxruntime-gpu==1.27.0 \
+    --hash=sha256:404fb845dc06a04a28df5a2c6d5967bcf3f534e7df0b98507ff81686a1b49594 \
+    --hash=sha256:b2b8d6afabf3c23c2c698639a16388816dc7298f388a9ddddf504b283990ea01 \
+    --hash=sha256:7e6eb554d35706ee154b583dd32e4167a93aa55d3670f59754f43860fd649b92 \
+    --hash=sha256:3b5652761f14bc74729ffbc8fdc01767e541e163459f2e10aa65af61d5db64c8 \
+    --hash=sha256:209caede76604509fb7451178f56daa5292a933478864aaff87c6c29d1257593 \
+    --hash=sha256:42696d6137d6974325a67c88a65dd41625e49bf076da79c658514b498b297142

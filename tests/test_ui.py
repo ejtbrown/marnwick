@@ -12539,7 +12539,10 @@ def test_physical_view_worker_returns_one_counted_snapshot_page(tmp_path: Path) 
         catalog.close()
 
 
-def test_automatic_tree_materialization_is_capped(tmp_path: Path, monkeypatch) -> None:
+def test_automatic_tree_materialization_loads_every_paged_directory(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
     qt_app = app()
     root = tmp_path / "catalog"
     root.mkdir()
@@ -12549,7 +12552,6 @@ def test_automatic_tree_materialization_is_capped(tmp_path: Path, monkeypatch) -
         window.idle_timer.stop()
         catalog = window.workspace.open_catalog(root)
         directories = [f"folder-{index:04d}" for index in range(100)]
-        monkeypatch.setattr(ui_module, "MAX_AUTOMATIC_TREE_ITEMS", 15)
         monkeypatch.setattr(ui_module, "TREE_BUILD_BATCH_SIZE", 5)
         monkeypatch.setattr(ui_module, "TREE_BUILD_BUDGET_SECONDS", 999.0)
 
@@ -12571,12 +12573,78 @@ def test_automatic_tree_materialization_is_capped(tmp_path: Path, monkeypatch) -
             )
 
         monkeypatch.setattr(window, "_read_tree_page_worker", synthetic_page)
-        window._start_incremental_tree_rebuild(catalog, reason="bounded-test")
+        window._start_incremental_tree_rebuild(catalog, reason="complete-test")
         settle_tree_build_tasks(window, qt_app)
 
         item_map = window._tree_item_maps[catalog.root]
-        assert len(item_map) == 15
-        assert len(item_map) < len(directories)
+        assert set(item_map) == {"", *directories}
+        assert item_map[directories[-1]].parent() is item_map[""]
+    finally:
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_opening_second_large_catalog_retains_first_catalog_lexical_tail(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    first_root = tmp_path / "first"
+    second_root = tmp_path / "second"
+    first_root.mkdir()
+    second_root.mkdir()
+    window = MainWindow()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        first = window.workspace.open_catalog(first_root)
+        first_directories = [f"folder-{index:05d}" for index in range(4_105)]
+        second_directories = ["album-a", "album-z"]
+        directories_by_root = {
+            first.root: first_directories,
+            second_root.absolute(): second_directories,
+        }
+        monkeypatch.setattr(ui_module, "TREE_BUILD_BUDGET_SECONDS", 999.0)
+
+        def synthetic_page(
+            task_root: Path,
+            _identity: tuple[int, int],
+            _storage_identity: object,
+            generation: int,
+            offset: int,
+            _cancel_event: Event,
+        ) -> ui_module.TreePageResult:
+            directories = directories_by_root[task_root]
+            page = directories[offset : offset + ui_module.TREE_BUILD_BATCH_SIZE]
+            return ui_module.TreePageResult(
+                root=task_root,
+                generation=generation,
+                offset=offset,
+                directories=page,
+                tags=() if offset == 0 else None,
+            )
+
+        monkeypatch.setattr(window, "_read_tree_page_worker", synthetic_page)
+        window.current_catalog = first
+        window.current_dir_rel = ""
+        window.rebuild_tree()
+        settle_tree_build_tasks(window, qt_app, timeout=10)
+        assert first_directories[-1] in window._tree_item_maps[first.root]
+
+        second = window.workspace.open_catalog(second_root)
+        window.current_catalog = second
+        window.current_dir_rel = ""
+        window.rebuild_tree()
+        settle_tree_build_tasks(window, qt_app, timeout=10)
+
+        first_map = window._tree_item_maps[first.root]
+        assert set(first_map) == {"", *first_directories}
+        assert first_map[first_directories[-1]].parent() is first_map[""]
+        assert set(window._tree_item_maps[second.root]) == {
+            "",
+            *second_directories,
+        }
     finally:
         window.close()
         window.deleteLater()
@@ -12621,7 +12689,7 @@ def test_physical_tree_only_forces_expanders_for_directories_with_children(
         qt_app.processEvents()
 
 
-def test_capped_tree_keeps_expander_for_unmaterialized_known_child(
+def test_complete_tree_materializes_nested_known_child(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -12634,7 +12702,6 @@ def test_capped_tree_keeps_expander_for_unmaterialized_known_child(
         window.idle_timer.stop()
         catalog = window.workspace.open_catalog(root)
         catalog.remember_directory("branch/child")
-        monkeypatch.setattr(ui_module, "MAX_AUTOMATIC_TREE_ITEMS", 2)
         monkeypatch.setattr(ui_module, "TREE_BUILD_BUDGET_SECONDS", 999.0)
 
         window._start_incremental_tree_rebuild(catalog, reason="indicator-test")
@@ -12642,7 +12709,7 @@ def test_capped_tree_keeps_expander_for_unmaterialized_known_child(
 
         item_map = window._tree_item_maps[catalog.root]
         assert "branch" in item_map
-        assert "branch/child" not in item_map
+        assert "branch/child" in item_map
         assert item_map["branch"].childIndicatorPolicy() == (
             QTreeWidgetItem.ChildIndicatorPolicy.ShowIndicator
         )
@@ -12652,7 +12719,7 @@ def test_capped_tree_keeps_expander_for_unmaterialized_known_child(
         qt_app.processEvents()
 
 
-def test_capped_tree_reloads_root_page_read_before_discovery_finished(
+def test_complete_tree_reloads_root_page_read_before_discovery_finished(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -12676,12 +12743,9 @@ def test_capped_tree_reloads_root_page_read_before_discovery_finished(
         ):
             catalog.remember_directory(dir_rel)
 
-        # A flat automatic build can spend its whole item budget in the first
-        # lexical branch. The root child page is what makes a later sibling
-        # such as ``omega`` visible. Model the large-catalog race where that
-        # page began before discovery committed the later sibling and is
-        # still registered when the completed inventory asks for a refresh.
-        monkeypatch.setattr(ui_module, "MAX_AUTOMATIC_TREE_ITEMS", 5)
+        # Model the large-catalog race where a root page began before discovery
+        # committed the later sibling and is still registered when the
+        # completed inventory asks for a refresh.
         monkeypatch.setattr(ui_module, "TREE_BUILD_BATCH_SIZE", 2)
         monkeypatch.setattr(ui_module, "TREE_BUILD_BUDGET_SECONDS", 999.0)
         stale_future: Future[ui_module.TreeChildrenPageResult] = Future()
