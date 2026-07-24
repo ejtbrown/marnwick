@@ -34,16 +34,16 @@ Marnwick recognizes AVIF, BMP, GIF, HEIC, HEIF, JPEG, PNG, TIFF, and WebP filena
 ## Requirements
 
 - Python 3.11 or newer
-- Linux or Windows for the supplied launcher setup
+- Linux, macOS, or Windows for the supplied launcher setup
 - A graphical desktop and a working Qt platform plugin for normal use
 - Optional GNU `find` and `md5sum` for faster catalog discovery and freshness checks
 - Optional GNU `shred` for wipe-on-delete
 
-The runtime dependencies are NumPy, Pillow, PySide6, and one ONNX Runtime variant selected for the host. Development and CPU runtime dependencies are hash-locked in `requirements-dev.lock`; the setup scripts select the NVIDIA runtime on supported x86-64 Linux systems, DirectML on x86-64 Windows, and the CPU runtime otherwise. Standard x86-64 Linux setup also installs the beta WebGPU plugin, which runs through Vulkan and can use compatible Mesa drivers. LaMa's 198 MiB model data is optional and downloaded only after confirmation.
+The runtime dependencies are NumPy, Pillow, PySide6, and one ONNX Runtime variant selected for the host. Development and CPU runtime dependencies are hash-locked in `requirements-dev.lock`; the setup scripts select the NVIDIA runtime on supported x86-64 Linux systems, DirectML on x86-64 Windows, and the CPU runtime otherwise. Standard setup also installs Microsoft's beta [WebGPU execution-provider plugin](https://pypi.org/project/onnxruntime-ep-webgpu/) on x86-64 Linux and Windows and on Apple-silicon macOS 14 or newer. LaMa's 198 MiB model data is optional and downloaded only after confirmation.
 
 ## Quick start
 
-### Linux
+### Linux and macOS
 
 From a fresh clone:
 
@@ -52,7 +52,7 @@ From a fresh clone:
 ./start.sh
 ```
 
-The setup script creates a virtual environment (by default `.venv`), installs the locked dependencies and Marnwick in editable mode, writes `start.sh`, and installs a per-user desktop entry under `${XDG_DATA_HOME:-$HOME/.local/share}/applications`. On x86-64 Linux it selects the NVIDIA ONNX Runtime when `nvidia-smi` reports a GPU, installs the CPU runtime otherwise, and installs the WebGPU/Vulkan plugin alongside either core runtime.
+The setup script creates a virtual environment (by default `.venv`), installs the locked dependencies and Marnwick in editable mode, and writes `start.sh`. On x86-64 Linux it selects the NVIDIA ONNX Runtime when `nvidia-smi` reports a GPU, installs the CPU runtime otherwise, and installs the WebGPU plugin alongside either core runtime. On Apple-silicon macOS 14 or newer it installs the CPU/CoreML runtime and WebGPU plugin. Linux setup also installs a per-user desktop entry under `${XDG_DATA_HOME:-$HOME/.local/share}/applications`; macOS launches through `start.sh`.
 
 ### Windows PowerShell
 
@@ -61,7 +61,7 @@ The setup script creates a virtual environment (by default `.venv`), installs th
 .\start.cmd
 ```
 
-The setup script creates a virtual environment (by default `.venv`), installs Marnwick, writes `start.ps1` and `start.cmd`, generates a Windows icon, and creates a Start Menu shortcut. On x86-64 Windows it installs the DirectML ONNX Runtime, which can use compatible GPUs and falls back to CPU when necessary. `start.cmd` works without changing PowerShell's script policy; `start.ps1` is also available when local scripts are allowed. If PowerShell blocks `setup.ps1`, run:
+The setup script creates a virtual environment (by default `.venv`), installs Marnwick, writes `start.ps1` and `start.cmd`, generates a Windows icon, and creates a Start Menu shortcut. On x86-64 Windows it installs both the DirectML ONNX Runtime and WebGPU plugin; either can use compatible GPUs and failures fall back to CPU. `start.cmd` works without changing PowerShell's script policy; `start.ps1` is also available when local scripts are allowed. If PowerShell blocks `setup.ps1`, run:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\setup.ps1
@@ -77,7 +77,7 @@ python3 -m venv .venv
 
 On Windows, replace `.venv/bin/python` with `.venv\Scripts\python.exe`.
 
-After installation, the console entry point is available as `.venv/bin/marnwick` on Linux or `.venv\Scripts\marnwick.exe` on Windows. Activate the virtual environment first if you want to invoke it as bare `marnwick`.
+After installation, the console entry point is available as `.venv/bin/marnwick` on Linux and macOS or `.venv\Scripts\marnwick.exe` on Windows. Activate the virtual environment first if you want to invoke it as bare `marnwick`.
 
 Verify the command-line entry point without opening the GUI:
 
@@ -136,7 +136,7 @@ Directory tiles remain grouped before image tiles. Directory “size” is the t
 
 The edit menu provides rotate-left, rotate-right, vertical flip, horizontal flip, red-eye selection, crop selection, clone/heal, and LaMa. LaMa is shown with the `M` hotkey. Drag over the image to select a crop or red-eye region. In clone/heal mode, right-click to set the initial source and left-drag to paint. The first left click aligns that source with the paint cursor; afterward, moving the cursor moves the source by the same amount across separate strokes until another right-click selects a new source. Use the mouse wheel to resize the brush.
 
-In LaMa mode, paint the complete area to remove, use the mouse wheel to resize the mask brush, press `Backspace` to clear the mask, and press `Enter` to apply it. A centered progress indicator remains visible while the local inference runs; `Escape` cancels the mask or a running inference. Under **Tools > Preferences > LaMa**, choose **Auto**, **CPU**, **NVIDIA**, or **WebGPU/Vulkan**. Auto prefers an available vendor GPU provider, then a physical WebGPU/Vulkan device, and finally CPU; explicit GPU selections also retry on CPU if session creation or inference fails. WebGPU is registered as an ONNX Runtime plugin in the isolated worker and uses Dawn over Vulkan on Linux, allowing compatible Mesa drivers. Images are never uploaded. Marnwick crops bounded context around the mask, retains the generated pixel patch and execution-provider record in the edit history, and does not rerun the model when saving. LaMa currently supports static images only. Choosing LaMa when its model is absent offers to download it, and **Tools > Download LaMa Model** provides the same operation on demand. Downloads are pinned and SHA-256 verified before publication.
+In LaMa mode, paint the complete area to remove, use the mouse wheel to resize the mask brush, press `Backspace` to clear the mask, and press `Enter` to apply it. A centered progress indicator remains visible while the local inference runs; `Escape` cancels the mask or a running inference. Under **Tools > Preferences > LaMa**, choose **Auto**, **CPU**, **NVIDIA**, or **WebGPU**. Auto prefers an available vendor GPU provider, then a physical WebGPU device, and finally CPU; explicit GPU selections also retry on CPU if session creation or inference fails. WebGPU is registered as an ONNX Runtime plugin in the isolated worker and uses the platform's native GPU stack across Linux, macOS, and Windows. Images are never uploaded. Marnwick crops bounded context around the mask, retains the generated pixel patch and execution-provider record in the edit history, and does not rerun the model when saving. LaMa currently supports static images only. Choosing LaMa when its model is absent offers to download it, and **Tools > Download LaMa Model** provides the same operation on demand. Downloads are pinned and SHA-256 verified before publication.
 
 Navigation, tagging, or closing resolves pending edits by asking you to save, save while preserving filesystem dates, discard, or cancel; a tag dialog never races an asynchronous save. Save, warning, and error prompts remain owned by the fullscreen modal viewer, and focus returns to that viewer when a nested prompt closes. Returning from fullscreen keeps the directory tree at its prior scroll position while the thumbnail pane follows the last viewed image. In the main application, choosing save queues image decoding, editing, encoding, validation, and atomic replacement on a dedicated background worker; you can continue navigating while the status bar reports the save. A static PNG uses the same non-modal worker path, shares metadata inspection and editing in one traversal, and uses fast lossless compression. It no longer opens an indeterminate “preserving frames and metadata” progress dialog. After a successful replacement, Marnwick submits a targeted reindex through the catalog action queue. That reindex decodes and hashes one stable open file descriptor, compares the resulting filesystem identity and SHA-256 hash with the proof of the exact committed object, and publishes the new record and thumbnail only if they match. It does not perform a separate preliminary full-file proof hash. If a save or tag edit can change the membership or ordering of a database-paged fullscreen view, that navigator reloads from page zero asynchronously instead of continuing from a stale SQL offset. The currently displayed image stays published while bounded background pages locate its fresh position; editing pauses during that reconciliation, visible progress is reported, and an overlapping delete restarts the fresh query after its outcome is known. The main thumbnail pane also refreshes a visible physical or virtual query after save reconciliation.
 
@@ -200,12 +200,12 @@ Global window and catalog-list preferences default to `~/.config/marnwick/config
 | `MARNWICK_CONFIG_PATH` | Override the global JSON configuration path | XDG path described above |
 | `MARNWICK_DISABLE_CONFIG=1` | Disable global configuration loading and saving | Configuration enabled |
 | `MARNWICK_LAMA_MODEL_PATH` | Override the downloaded LaMa ONNX model path | Platform data directory |
-| `MARNWICK_LAMA_RUNTIME` | Select runtimes installed by setup (`auto`, `cpu`, `gpu`, `nvidia`, `webgpu`, or `vulkan` on Linux; `directml` on Windows) | `auto` |
+| `MARNWICK_LAMA_RUNTIME` | Select runtimes installed by setup (`auto`, `cpu`, `gpu`, or `webgpu`; also `nvidia`/`vulkan` on Linux, `metal` on macOS, and `directml`/`d3d12` on Windows) | `auto` |
 | `MARNWICK_LAMA_THREADS` | Limit LaMa worker CPU threads from 1 to 64 | Up to 8, leaving one logical CPU free |
 | `MARNWICK_LAMA_TIMEOUT_SECONDS` | Bound one local LaMa inference | `900` |
 | `MARNWICK_MAX_IMAGE_PIXELS` | Maximum decoded Pillow image area | `50000000` |
 | `MARNWICK_VENV` | Override the virtual environment used by setup and launch scripts | `<repo>/.venv` |
-| `PYTHON` | Override the interpreter used by setup | `python3` on Linux; discovered Python on Windows |
+| `PYTHON` | Override the interpreter used by setup | `python3` on Linux/macOS; discovered Python on Windows |
 | `MARNWICK_DEBUG_TOKEN` | Authenticate the optional localhost debug protocol | Random token printed to stderr |
 
 Application preferences include window geometry, remembered catalogs, thumbnail columns, sort order, normal versus wipe deletion, and the LaMa processing runtime. Per-catalog preferences include saved thumbnail size and thumbnail-prune parallelism.
@@ -233,7 +233,7 @@ Work that feeds the interface has explicit bounds:
 - Image and directory deletion is destructive; only items explicitly moved into `T-r-a-s-h` are restorable through Marnwick.
 - Edits atomically replace the original file after an explicit save. Marnwick refuses to replace a hard-linked image because doing so cannot preserve hard-link identity; copy or unlink it explicitly before editing. If an extremely rare rollback itself fails, the error identifies the retained recovery file rather than silently deleting displaced bytes.
 - LaMa generates a plausible replacement from surrounding pixels; it does not recover the actual hidden scene and can produce incorrect structure or artifacts. It supports static images only and is limited by its fixed 512-pixel inference crop.
-- The native WebGPU execution-provider plugin is beta and its supplied Linux wheel targets x86-64. Auto mode accepts known physical GPU vendor IDs and skips virtual or software Vulkan adapters; choosing WebGPU/Vulkan explicitly permits those adapters for diagnostics, although they can be slower than the CPU provider.
+- The native WebGPU execution-provider plugin is beta. Marnwick's supplied setup supports x86-64 Linux and Windows and Apple-silicon macOS 14 or newer; upstream ONNX Runtime currently prevents a supported Intel-macOS configuration. Auto mode accepts known physical GPU vendor IDs and skips virtual or software adapters; choosing WebGPU explicitly permits those adapters for diagnostics, although they can be slower than the CPU provider.
 - Filesystem operations and one or two independent SQLite databases cannot form a single crash-atomic transaction. Runtime failures are compensated, but abrupt process or power loss can require **Tools > Refresh Catalog** to reconcile filesystem and catalog state. Keep independent backups of irreplaceable images.
 - Cross-filesystem directory moves revalidate the published destination immediately before recursively removing the isolated source, but no portable filesystem operation makes those steps atomic across mounts. An external program that replaces or removes the destination during that cleanup window can defeat compensation; do not externally mutate paths participating in a move. Marnwick's catalog lock does not control unrelated filesystem tools.
 - Moving a directory across filesystems recreates regular files, directories, and symlinks. It does not preserve hard-link relationships or guarantee filesystem-specific metadata beyond supported creation dates and modification dates; unsupported special-file entries cause the move to fail with the source retained.

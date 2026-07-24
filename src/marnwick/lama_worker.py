@@ -25,13 +25,14 @@ from .lama import (
 )
 
 _WEBGPU_REGISTRATION_NAME = "marnwick_webgpu"
-# PCI vendor identifiers for physical GPU families with Linux Vulkan drivers.
+# Vendor identifiers for physical GPU families supported by native WebGPU.
 # Auto mode skips virtual/software adapters whose successful WebGPU session
 # would merely move the same work to a slower CPU implementation. An explicit
-# WebGPU/Vulkan preference still permits those adapters for diagnostics.
+# WebGPU preference still permits those adapters for diagnostics.
 _WEBGPU_HARDWARE_VENDOR_IDS = {
     0x1002,  # AMD
     0x1010,  # Imagination Technologies
+    0x106B,  # Apple
     0x10DE,  # NVIDIA
     0x13B5,  # Arm
     0x14E4,  # Broadcom
@@ -142,7 +143,7 @@ def _preferred_inference_session(
                     provider,
                 )
             except Exception:  # nosec B112
-                # A missing plugin, Vulkan device, or supported model path
+                # A missing plugin, compatible device, or supported model path
                 # makes this backend unsuitable; continue to local CPU.
                 continue
         if provider not in available:
@@ -212,7 +213,7 @@ def _create_webgpu_inference_session(
         )
     ]
     if not devices:
-        raise RuntimeError("WebGPU plugin did not find a Vulkan device")
+        raise RuntimeError("WebGPU plugin did not find a compatible device")
     options = _session_options()
     options.add_provider_for_devices(
         devices[:1],

@@ -4022,7 +4022,7 @@ def test_app_preferences_dialog_exposes_config_settings(tmp_path: Path) -> None:
         assert [
             dialog.lama_runtime.itemText(index)
             for index in range(dialog.lama_runtime.count())
-        ] == ["Auto", "CPU", "NVIDIA", "WebGPU/Vulkan"]
+        ] == ["Auto", "CPU", "NVIDIA", "WebGPU"]
         assert dialog.lama_runtime.currentData() == LAMA_RUNTIME_NVIDIA
         dialog.thumbnail_size.setValue(9)
         dialog.sort_order.setCurrentIndex(dialog.sort_order.findData(SortOrder.DATE_ASC.value))

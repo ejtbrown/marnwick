@@ -352,11 +352,15 @@ def test_auto_webgpu_hardware_filter_rejects_virtual_adapter() -> None:
     physical = SimpleNamespace(
         device=SimpleNamespace(vendor_id=0x1002),
     )
+    apple = SimpleNamespace(
+        device=SimpleNamespace(vendor_id=0x106B),
+    )
     virtual = SimpleNamespace(
         device=SimpleNamespace(vendor_id=0x1AF4),
     )
 
     assert lama_worker._is_hardware_webgpu_device(physical)
+    assert lama_worker._is_hardware_webgpu_device(apple)
     assert not lama_worker._is_hardware_webgpu_device(virtual)
 
 
