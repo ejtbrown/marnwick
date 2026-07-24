@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -45,7 +46,8 @@ class GpuTestResult:
     status: str
     explanation: str
     setup_seconds: float | None = None
-    inference_seconds: float | None = None
+    cold_inference_seconds: float | None = None
+    warm_inference_seconds: float | None = None
 
     @property
     def display_status(self) -> str:
@@ -61,8 +63,12 @@ class GpuTestResult:
         return format_gpu_test_duration(self.setup_seconds)
 
     @property
-    def inference_display(self) -> str:
-        return format_gpu_test_duration(self.inference_seconds)
+    def cold_inference_display(self) -> str:
+        return format_gpu_test_duration(self.cold_inference_seconds)
+
+    @property
+    def warm_inference_display(self) -> str:
+        return format_gpu_test_duration(self.warm_inference_seconds)
 
 
 GPU_TEST_METHODS = (
@@ -78,6 +84,34 @@ _GPU_TEST_METHOD_BY_PROVIDER = {
     method.provider: method for method in GPU_TEST_METHODS
 }
 _WEBGPU_REGISTRATION_NAME = "marnwick_gpu_test_webgpu"
+
+# A tiny opset-13 MatMul model is used only to verify provider assignment.
+# The representative LaMa timings below remain entirely unprofiled.
+_GPU_TEST_MODEL_BASE64 = (
+    "CAgSCG1hcm53aWNrOooJCjAKBWlucHV0CgZ3ZWlnaHQSBm91dHB1dBoPZ3B1X3Rlc3Rf"
+    "bWF0bXVsIgZNYXRNdWwSD01hcm53aWNrR3B1VGVzdCqRCAgQCBAQAUIGd2VpZ2h0SoAI"
+    "AAAAvwAA4L4AAMC+AACgvgAAgL4AAEC+AAAAvgAAgL0AAAAAAACAPQAAAD4AAEA+AACAPg"
+    "AAoD4AAMA+AADgPgAAAD8AAAC/AADgvgAAwL4AAKC+AACAvgAAQL4AAAC+AACAvQAAAAAA"
+    "AIA9AAAAPgAAQD4AAIA+AACgPgAAwD4AAOA+AAAAPwAAAL8AAOC+AADAvgAAoL4AAIC+AA"
+    "BAvgAAAL4AAIC9AAAAAAAAgD0AAAA+AABAPgAAgD4AAKA+AADAPgAA4D4AAAA/AAAAvwAA"
+    "4L4AAMC+AACgvgAAgL4AAEC+AAAAvgAAgL0AAAAAAACAPQAAAD4AAEA+AACAPgAAoD4AAM"
+    "A+AADgPgAAAD8AAAC/AADgvgAAwL4AAKC+AACAvgAAQL4AAAC+AACAvQAAAAAAAIA9AAAA"
+    "PgAAQD4AAIA+AACgPgAAwD4AAOA+AAAAPwAAAL8AAOC+AADAvgAAoL4AAIC+AABAvgAAAL"
+    "4AAIC9AAAAAAAAgD0AAAA+AABAPgAAgD4AAKA+AADAPgAA4D4AAAA/AAAAvwAA4L4AAMC+"
+    "AACgvgAAgL4AAEC+AAAAvgAAgL0AAAAAAACAPQAAAD4AAEA+AACAPgAAoD4AAMA+AADgPg"
+    "AAAD8AAAC/AADgvgAAwL4AAKC+AACAvgAAQL4AAAC+AACAvQAAAAAAAIA9AAAAPgAAQD4A"
+    "AIA+AACgPgAAwD4AAOA+AAAAPwAAAL8AAOC+AADAvgAAoL4AAIC+AABAvgAAAL4AAIC9AA"
+    "AAAAAAgD0AAAA+AABAPgAAgD4AAKA+AADAPgAA4D4AAAA/AAAAvwAA4L4AAMC+AACgvgAA"
+    "gL4AAEC+AAAAvgAAgL0AAAAAAACAPQAAAD4AAEA+AACAPgAAoD4AAMA+AADgPgAAAD8AAA"
+    "C/AADgvgAAwL4AAKC+AACAvgAAQL4AAAC+AACAvQAAAAAAAIA9AAAAPgAAQD4AAIA+AACg"
+    "PgAAwD4AAOA+AAAAPwAAAL8AAOC+AADAvgAAoL4AAIC+AABAvgAAAL4AAIC9AAAAAAAAgD"
+    "0AAAA+AABAPgAAgD4AAKA+AADAPgAA4D4AAAA/AAAAvwAA4L4AAMC+AACgvgAAgL4AAEC+"
+    "AAAAvgAAgL0AAAAAAACAPQAAAD4AAEA+AACAPgAAoD4AAMA+AADgPgAAAD8AAAC/AADgvg"
+    "AAwL4AAKC+AACAvgAAQL4AAAC+AACAvQAAAAAAAIA9AAAAPgAAQD4AAIA+AACgPgAAwD4A"
+    "AOA+AAAAPwAAAL8AAOC+AADAvgAAoL4AAIC+AABAvgAAAL4AAIC9AAAAAAAAgD0AAAA+AA"
+    "BAPgAAgD4AAKA+AADAPgAA4D4AAAA/AAAAv1oXCgVpbnB1dBIOCgwIARIICgIIEAoCCBBi"
+    "GAoGb3V0cHV0Eg4KDAgBEggKAggQCgIIEEIECgAQDQ=="
+)
 
 def run_gpu_tests(
     model_path: Path,
@@ -304,9 +338,16 @@ def _result_from_worker_payload(
             "The test returned an incomplete response.",
         )
     setup_seconds = _payload_duration(payload.get("setup_seconds"))
-    inference_seconds = _payload_duration(payload.get("inference_seconds"))
+    cold_inference_seconds = _payload_duration(
+        payload.get("cold_inference_seconds")
+    )
+    warm_inference_seconds = _payload_duration(
+        payload.get("warm_inference_seconds")
+    )
     if status == GPU_TEST_STATUS_WORKS and (
-        setup_seconds is None or inference_seconds is None
+        setup_seconds is None
+        or cold_inference_seconds is None
+        or warm_inference_seconds is None
     ):
         return GpuTestResult(
             method.provider,
@@ -322,7 +363,8 @@ def _result_from_worker_payload(
         status,
         _bounded_detail(explanation),
         setup_seconds,
-        inference_seconds,
+        cold_inference_seconds,
+        warm_inference_seconds,
     )
 
 
@@ -398,33 +440,37 @@ def _worker_test_provider(provider: str, model_path: Path) -> dict[str, object]:
                 }
             else:
                 raise ValueError("LaMa model has an unexpected input contract")
-            inference_started = monotonic()
-            try:
-                output = session.run(None, feeds)
-            finally:
-                inference_seconds = monotonic() - inference_started
-                profile_path = Path(session.end_profiling())
+            cold_inference_started = monotonic()
+            cold_output = session.run(None, feeds)
+            cold_inference_seconds = monotonic() - cold_inference_started
             masked_mean_change = _validate_lama_benchmark_output(
                 np,
-                output,
+                cold_output,
                 image_array,
                 mask_array,
             )
-            provider_counts = _profile_node_provider_counts(profile_path)
-            provider_node_count = provider_counts[provider]
-            profiled_node_count = sum(provider_counts.values())
+            warm_inference_started = monotonic()
+            warm_output = session.run(None, feeds)
+            warm_inference_seconds = monotonic() - warm_inference_started
+            _validate_lama_benchmark_output(
+                np,
+                warm_output,
+                image_array,
+                mask_array,
+            )
+            provider_node_count, profiled_node_count = (
+                _verify_provider_assignment(
+                    ort,
+                    np,
+                    provider,
+                    temp_dir,
+                )
+            )
             if provider_node_count == 0:
-                assigned = ", ".join(sorted(provider_counts)) or "no provider"
-                return {
-                    "status": GPU_TEST_STATUS_FAILED,
-                    "explanation": (
-                        f"The {method.label} session initialized, but ONNX Runtime "
-                        f"assigned the LaMa operations to {assigned} instead of "
-                        f"{provider}. This would not provide the requested GPU acceleration."
-                    ),
-                    "setup_seconds": setup_seconds,
-                    "inference_seconds": inference_seconds,
-                }
+                raise RuntimeError(
+                    "ONNX Runtime did not assign the provider-verification "
+                    f"operation to {provider}"
+                )
         except _WebGpuUnavailable as error:
             return {
                 "status": GPU_TEST_STATUS_UNAVAILABLE,
@@ -442,23 +488,25 @@ def _worker_test_provider(provider: str, model_path: Path) -> dict[str, object]:
             }
 
     device_suffix = f" {device_description}" if device_description else ""
-    profile_detail = (
-        f"ONNX Runtime assigned {provider_node_count} of {profiled_node_count} "
-        f"profiled node executions to {provider}."
-    )
     return {
         "status": GPU_TEST_STATUS_WORKS,
         "explanation": (
             f"ONNX Runtime {runtime_version} completed and verified a "
             f"{LAMA_INPUT_SIZE}×{LAMA_INPUT_SIZE} LaMa masked-image repair. "
             f"Initialization took {format_gpu_test_duration(setup_seconds)} and "
-            f"inpainting took {format_gpu_test_duration(inference_seconds)}. "
+            f"the first unprofiled inpaint took "
+            f"{format_gpu_test_duration(cold_inference_seconds)}; a second inpaint "
+            f"through the same initialized session took "
+            f"{format_gpu_test_duration(warm_inference_seconds)}. "
             f"The repaired mask changed by an average of "
-            f"{masked_mean_change:.1f} pixel levels. {profile_detail}"
+            f"{masked_mean_change:.1f} pixel levels. A separate tiny diagnostic "
+            f"confirmed {provider_node_count} of {profiled_node_count} profiled "
+            f"node executions on {provider}; it is excluded from the repair timings."
             f"{device_suffix}"
         ),
         "setup_seconds": setup_seconds,
-        "inference_seconds": inference_seconds,
+        "cold_inference_seconds": cold_inference_seconds,
+        "warm_inference_seconds": warm_inference_seconds,
     }
 
 
@@ -600,15 +648,95 @@ def _create_webgpu_session(
 
 
 def _session_options(ort: Any, temp_dir: Path) -> Any:
+    del temp_dir
     options = ort.SessionOptions()
     options.intra_op_num_threads = _benchmark_thread_count()
     options.inter_op_num_threads = 1
     options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
     options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
     options.log_severity_level = 3
-    options.enable_profiling = True
-    options.profile_file_prefix = str(temp_dir / "profile")
     return options
+
+
+def _verify_provider_assignment(
+    ort: Any,
+    np: Any,
+    provider: str,
+    temp_dir: Path,
+) -> tuple[int, int]:
+    model_path = temp_dir / "provider-test.onnx"
+    model_path.write_bytes(base64.b64decode(_GPU_TEST_MODEL_BASE64))
+    options = _session_options(ort, temp_dir)
+    options.enable_profiling = True
+    options.profile_file_prefix = str(temp_dir / "provider-profile")
+    if provider == "DmlExecutionProvider":
+        options.enable_mem_pattern = False
+    if provider == "WebGpuExecutionProvider":
+        devices = [
+            device
+            for device in ort.get_ep_devices()
+            if str(getattr(device, "ep_name", "")) == provider
+        ]
+        if not devices:
+            raise RuntimeError("WebGPU adapter disappeared during provider verification")
+        options.add_provider_for_devices(
+            devices[:1],
+            {
+                "powerPreference": "high-performance",
+                "preferredLayout": "NHWC",
+            },
+        )
+        session = ort.InferenceSession(str(model_path), sess_options=options)
+    else:
+        session = ort.InferenceSession(
+            str(model_path),
+            sess_options=options,
+            providers=(
+                [provider]
+                if provider == LAMA_CPU_EXECUTION_PROVIDER
+                else [provider, LAMA_CPU_EXECUTION_PROVIDER]
+            ),
+        )
+    disable_fallback = getattr(session, "disable_fallback", None)
+    if callable(disable_fallback):
+        disable_fallback()
+    input_array = np.arange(16 * 16, dtype=np.float32).reshape(16, 16) / 32.0
+    weight = (
+        np.arange(16 * 16, dtype=np.float32).reshape(16, 16) % 17 - 8
+    ) / 16.0
+    try:
+        output = session.run(None, {"input": input_array})
+    finally:
+        profile_path = Path(session.end_profiling())
+    if (
+        not isinstance(output, (list, tuple))
+        or len(output) != 1
+        or not np.allclose(
+            np.asarray(output[0]),
+            input_array @ weight,
+            rtol=1e-4,
+            atol=1e-4,
+        )
+    ):
+        raise RuntimeError("provider verification returned an incorrect result")
+    provider_counts = _profile_node_provider_counts(profile_path)
+    return provider_counts[provider], sum(provider_counts.values())
+
+
+def _profile_node_provider_counts(profile_path: Path) -> Counter[str]:
+    if profile_path.stat().st_size > 2 * 1024 * 1024:
+        raise RuntimeError("ONNX Runtime produced an unexpectedly large test profile")
+    payload = json.loads(profile_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, list):
+        raise RuntimeError("ONNX Runtime produced an invalid test profile")
+    return Counter(
+        str(args["provider"])
+        for event in payload
+        if isinstance(event, dict)
+        and event.get("cat") == "Node"
+        and isinstance((args := event.get("args")), dict)
+        and isinstance(args.get("provider"), str)
+    )
 
 
 def _benchmark_thread_count() -> int:
@@ -622,22 +750,6 @@ def _benchmark_thread_count() -> int:
             raise ValueError("MARNWICK_LAMA_THREADS must be between 1 and 64")
         return value
     return max(1, min(8, (os.cpu_count() or 2) - 1))
-
-
-def _profile_node_provider_counts(profile_path: Path) -> Counter[str]:
-    if profile_path.stat().st_size > 64 * 1024 * 1024:
-        raise RuntimeError("ONNX Runtime produced an unexpectedly large test profile")
-    payload = json.loads(profile_path.read_text(encoding="utf-8"))
-    if not isinstance(payload, list):
-        raise RuntimeError("ONNX Runtime produced an invalid test profile")
-    return Counter(
-        str(args["provider"])
-        for event in payload
-        if isinstance(event, dict)
-        and event.get("cat") == "Node"
-        and isinstance((args := event.get("args")), dict)
-        and isinstance(args.get("provider"), str)
-    )
 
 
 def _provider_device_description(ort: Any, provider: str) -> str:

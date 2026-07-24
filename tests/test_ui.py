@@ -7727,6 +7727,7 @@ def test_gpu_test_dialog_runs_all_methods_and_copies_explanations(
                 explanation,
                 1.25 if status == ui_module.GPU_TEST_STATUS_WORKS else None,
                 0.375 if status == ui_module.GPU_TEST_STATUS_WORKS else None,
+                0.125 if status == ui_module.GPU_TEST_STATUS_WORKS else None,
             )
             results.append(result)
             result_callback(result)
@@ -7748,6 +7749,7 @@ def test_gpu_test_dialog_runs_all_methods_and_copies_explanations(
         assert dialog.results_tree.topLevelItem(0).text(1) == "Works"
         assert dialog.results_tree.topLevelItem(0).text(2) == "1.25 s"
         assert dialog.results_tree.topLevelItem(0).text(3) == "375 ms"
+        assert dialog.results_tree.topLevelItem(0).text(4) == "125 ms"
         assert dialog.results_tree.topLevelItem(1).text(1) == "Failed"
         assert dialog.results_tree.topLevelItem(2).text(1) == "Not available"
         assert dialog.status_label.text() == (
@@ -7760,7 +7762,8 @@ def test_gpu_test_dialog_runs_all_methods_and_copies_explanations(
         copied = qt_app.clipboard().text()
         assert "Marnwick GPU Test" in copied
         assert (
-            "NVIDIA (CUDA): Works; initialize 1.25 s; inpaint 375 ms"
+            "NVIDIA (CUDA): Works; initialize 1.25 s; first inpaint 375 ms; "
+            "warm inpaint 125 ms"
             in copied
         )
         assert "WebGPU: Failed" in copied

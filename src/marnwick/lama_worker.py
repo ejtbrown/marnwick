@@ -5,6 +5,7 @@ from collections.abc import Callable
 import json
 import os
 from pathlib import Path
+import sys
 import tempfile
 
 import numpy as np
@@ -41,6 +42,7 @@ _WEBGPU_HARDWARE_VENDOR_IDS = {
     0x8086,  # Intel
 }
 _registered_webgpu_library: str | None = None
+_MAX_SERVER_COMMAND_BYTES = 16 * 1024
 
 
 def run_inference(
@@ -71,6 +73,25 @@ def run_inference_with_provider(
 ) -> tuple[Image.Image, str]:
     if runtime not in LAMA_RUNTIMES:
         raise ValueError(f"unsupported LaMa runtime preference: {runtime}")
+    image_array, mask_array = _load_inference_inputs(input_path, mask_path)
+    session, provider = _preferred_inference_session(model_path, runtime)
+    if provider_callback is not None:
+        provider_callback(provider)
+    result, _session, provider = _run_with_fallback(
+        model_path,
+        session,
+        provider,
+        image_array,
+        mask_array,
+        provider_callback=provider_callback,
+    )
+    return result, provider
+
+
+def _load_inference_inputs(
+    input_path: Path,
+    mask_path: Path,
+) -> tuple[np.ndarray, np.ndarray]:
     with Image.open(input_path) as source:
         source.load()
         image = source.convert("RGB")
@@ -86,17 +107,33 @@ def run_inference_with_provider(
     mask_array = (
         np.asarray(mask, dtype=np.uint8) > 0
     ).astype(np.float32)[None, None, ...]
-    session, provider = _preferred_inference_session(model_path, runtime)
-    if provider_callback is not None:
-        provider_callback(provider)
+    return image_array, mask_array
+
+
+def _session_feeds(
+    session: ort.InferenceSession,
+    image_array: np.ndarray,
+    mask_array: np.ndarray,
+) -> dict[str, np.ndarray]:
     input_names = {item.name for item in session.get_inputs()}
     if {"image", "mask"} <= input_names:
-        feeds = {"image": image_array, "mask": mask_array}
-    else:
-        inputs = session.get_inputs()
-        if len(inputs) != 2:
-            raise ValueError("LaMa model has an unexpected input contract")
-        feeds = {inputs[0].name: image_array, inputs[1].name: mask_array}
+        return {"image": image_array, "mask": mask_array}
+    inputs = session.get_inputs()
+    if len(inputs) != 2:
+        raise ValueError("LaMa model has an unexpected input contract")
+    return {inputs[0].name: image_array, inputs[1].name: mask_array}
+
+
+def _run_with_fallback(
+    model_path: Path,
+    session: ort.InferenceSession,
+    provider: str,
+    image_array: np.ndarray,
+    mask_array: np.ndarray,
+    *,
+    provider_callback: Callable[[str], None] | None,
+) -> tuple[Image.Image, ort.InferenceSession, str]:
+    feeds = _session_feeds(session, image_array, mask_array)
     try:
         output = session.run(None, feeds)
     except Exception:
@@ -109,7 +146,16 @@ def run_inference_with_provider(
         provider = LAMA_CPU_EXECUTION_PROVIDER
         if provider_callback is not None:
             provider_callback(provider)
-        output = session.run(None, feeds)
+        output = session.run(
+            None,
+            _session_feeds(session, image_array, mask_array),
+        )
+    return _image_from_output(output), session, provider
+
+
+def _image_from_output(output: object) -> Image.Image:
+    if not isinstance(output, (list, tuple)):
+        raise ValueError("LaMa model returned an unexpected output contract")
     if len(output) != 1:
         raise ValueError("LaMa model has an unexpected output contract")
     result = np.asarray(output[0])
@@ -120,7 +166,37 @@ def run_inference_with_provider(
     else:
         raise ValueError(f"LaMa model returned an unexpected shape: {result.shape}")
     result = np.clip(result, 0.0, 255.0).astype(np.uint8)
-    return Image.fromarray(result), provider
+    return Image.fromarray(result)
+
+
+def _warm_session(
+    model_path: Path,
+    session: ort.InferenceSession,
+    provider: str,
+) -> tuple[ort.InferenceSession, str]:
+    # Match a real LaMa tensor contract so provider shader/kernel compilation,
+    # graph allocations, and the first inference all happen before the user
+    # presses Enter. The output is intentionally discarded.
+    image_array = np.full(
+        (1, 3, LAMA_INPUT_SIZE, LAMA_INPUT_SIZE),
+        0.5,
+        dtype=np.float32,
+    )
+    mask_array = np.zeros(
+        (1, 1, LAMA_INPUT_SIZE, LAMA_INPUT_SIZE),
+        dtype=np.float32,
+    )
+    center = LAMA_INPUT_SIZE // 2
+    mask_array[:, :, center - 48 : center + 48, center - 48 : center + 48] = 1.0
+    _result, session, provider = _run_with_fallback(
+        model_path,
+        session,
+        provider,
+        image_array,
+        mask_array,
+        provider_callback=None,
+    )
+    return session, provider
 
 
 def _preferred_inference_session(
@@ -276,20 +352,34 @@ def _worker_thread_count() -> int:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--model", required=True, type=Path)
-    parser.add_argument("--input", required=True, type=Path)
-    parser.add_argument("--mask", required=True, type=Path)
-    parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--input", type=Path)
+    parser.add_argument("--mask", type=Path)
+    parser.add_argument("--output", type=Path)
     parser.add_argument("--status", type=Path)
+    parser.add_argument("--serve", action="store_true")
+    parser.add_argument("--ready-status", type=Path)
     parser.add_argument(
         "--runtime",
         choices=sorted(LAMA_RUNTIMES),
         default=LAMA_RUNTIME_AUTO,
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.serve:
+        if args.ready_status is None:
+            parser.error("--serve requires --ready-status")
+    elif args.input is None or args.mask is None or args.output is None:
+        parser.error("--input, --mask, and --output are required")
+    return args
 
 
 def main() -> int:
     args = parse_args()
+    if getattr(args, "serve", False):
+        if args.ready_status is None:
+            raise ValueError("LaMa service requires a ready-status path")
+        return _serve(args.model, args.runtime, args.ready_status)
+    if args.input is None or args.mask is None or args.output is None:
+        raise ValueError("LaMa worker requires input, mask, and output paths")
 
     def report_provider(provider: str) -> None:
         if args.status is not None:
@@ -305,11 +395,72 @@ def main() -> int:
         runtime=args.runtime,
         provider_callback=report_provider,
     )
-    args.output.parent.mkdir(parents=True, exist_ok=True)
+    _save_result_image(result, args.output)
+    print(json.dumps({"ok": True, "provider": provider}, sort_keys=True))
+    return 0
+
+
+def _serve(model_path: Path, runtime: str, ready_status: Path) -> int:
+    session, provider = _preferred_inference_session(model_path, runtime)
+    session, provider = _warm_session(model_path, session, provider)
+    _write_json_atomic(
+        ready_status,
+        {"ready": True, "provider": provider},
+    )
+    while True:
+        encoded = sys.stdin.buffer.readline(_MAX_SERVER_COMMAND_BYTES + 1)
+        if not encoded:
+            return 0
+        if len(encoded) > _MAX_SERVER_COMMAND_BYTES:
+            raise ValueError("LaMa service command exceeded its safe size")
+        command = json.loads(encoded)
+        if not isinstance(command, dict):
+            raise ValueError("LaMa service command must be an object")
+        if command.get("command") == "shutdown":
+            return 0
+        if command.get("command") != "inpaint":
+            raise ValueError("LaMa service received an unknown command")
+        response_value = command.get("response")
+        if not isinstance(response_value, str) or not response_value:
+            raise ValueError("LaMa service command omitted its response path")
+        response_path = Path(response_value)
+        try:
+            input_path = _command_path(command, "input")
+            mask_path = _command_path(command, "mask")
+            output_path = _command_path(command, "output")
+            image_array, mask_array = _load_inference_inputs(input_path, mask_path)
+            result, session, provider = _run_with_fallback(
+                model_path,
+                session,
+                provider,
+                image_array,
+                mask_array,
+                provider_callback=None,
+            )
+            _save_result_image(result, output_path)
+            response = {"ok": True, "provider": provider}
+        except Exception as error:
+            response = {
+                "ok": False,
+                "provider": provider,
+                "error": _bounded_error(error),
+            }
+        _write_json_atomic(response_path, response)
+
+
+def _command_path(command: dict[str, object], name: str) -> Path:
+    value = command.get(name)
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"LaMa service command omitted its {name} path")
+    return Path(value)
+
+
+def _save_result_image(result: Image.Image, output_path: Path) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     fd, temp_name = tempfile.mkstemp(
-        prefix=f".{args.output.name}.",
+        prefix=f".{output_path.name}.",
         suffix=".tmp",
-        dir=args.output.parent,
+        dir=output_path.parent,
     )
     temp_path = Path(temp_name)
     try:
@@ -318,13 +469,37 @@ def main() -> int:
             result.save(output, format="PNG", compress_level=1)
             output.flush()
             os.fsync(output.fileno())
-        os.replace(temp_path, args.output)
+        os.replace(temp_path, output_path)
     finally:
         if fd >= 0:
             os.close(fd)
         temp_path.unlink(missing_ok=True)
-    print(json.dumps({"ok": True, "provider": provider}, sort_keys=True))
-    return 0
+
+
+def _write_json_atomic(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=path.parent,
+    )
+    temp_path = Path(temp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as output:
+            fd = -1
+            json.dump(payload, output, sort_keys=True)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temp_path, path)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        temp_path.unlink(missing_ok=True)
+
+
+def _bounded_error(error: Exception) -> str:
+    detail = " ".join(f"{type(error).__name__}: {error}".split())
+    return detail[:4096]
 
 
 if __name__ == "__main__":

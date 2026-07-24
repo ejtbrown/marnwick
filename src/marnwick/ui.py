@@ -157,6 +157,7 @@ from .lama import (
     LamaInferenceCancelled,
     LamaModelError,
     LamaStrokeSample,
+    LamaWorkerService,
     create_lama_edit_operation,
     default_lama_model_path,
     download_lama_model as download_lama_model_data,
@@ -3175,6 +3176,9 @@ class MainWindow(QMainWindow):
             thread_name_prefix="marnwick-lama-download",
             max_pending=1,
         )
+        # Keep the model isolated from Qt while retaining one initialized
+        # session for every LaMa edit made by this application instance.
+        self.lama_worker_service = LamaWorkerService()
         self._lama_download_future: Future[Path] | None = None
         self._lama_download_cancel_event: Event | None = None
         self._lama_download_progress_lock = Lock()
@@ -3484,6 +3488,7 @@ class MainWindow(QMainWindow):
             self._lama_download_future.cancel()
         self._lama_download_waiters.clear()
         self.lama_download_executor.shutdown(wait=False, cancel_futures=True)
+        self.lama_worker_service.close()
         # The executor has only a single pending slot containing the complete
         # newest snapshot.  Preserve it for a final daemon-thread durability
         # attempt instead of canceling it just because the UI is now closed.
@@ -14183,9 +14188,9 @@ class GpuTestDialog(QDialog):
         introduction = QLabel(
             "Marnwick will repair the same generated 512×512 test image and erase "
             "mask with LaMa through every available backend, plus a CPU baseline. "
-            "Initialization and first-inpaint times are measured separately. Each "
-            "backend runs in an isolated process so a native runtime failure cannot "
-            "prevent the remaining tests."
+            "Initialization, first-inpaint, and warmed-inpaint times are measured "
+            "separately without profiling overhead. Each backend runs in an isolated "
+            "process so a native runtime failure cannot prevent the remaining tests."
         )
         introduction.setWordWrap(True)
         layout.addWidget(introduction)
@@ -14196,7 +14201,14 @@ class GpuTestDialog(QDialog):
 
         self.results_tree = QTreeWidget()
         self.results_tree.setHeaderLabels(
-            ("Method", "Result", "Initialize", "Inpaint", "Explanation")
+            (
+                "Method",
+                "Result",
+                "Initialize",
+                "First inpaint",
+                "Warm inpaint",
+                "Explanation",
+            )
         )
         self.results_tree.setRootIsDecorated(False)
         self.results_tree.setAlternatingRowColors(True)
@@ -14208,16 +14220,17 @@ class GpuTestDialog(QDialog):
         self.results_tree.setColumnWidth(0, 155)
         self.results_tree.setColumnWidth(1, 105)
         self.results_tree.setColumnWidth(2, 90)
-        self.results_tree.setColumnWidth(3, 90)
+        self.results_tree.setColumnWidth(3, 100)
+        self.results_tree.setColumnWidth(4, 100)
         self.results_tree.header().setStretchLastSection(True)
         self.results_tree.currentItemChanged.connect(self._show_selected_explanation)
         layout.addWidget(self.results_tree, 1)
 
         for method in GPU_TEST_METHODS:
             item = QTreeWidgetItem(
-                (method.label, "Waiting", "—", "—", "Waiting to run…")
+                (method.label, "Waiting", "—", "—", "—", "Waiting to run…")
             )
-            item.setToolTip(4, "Waiting to run…")
+            item.setToolTip(5, "Waiting to run…")
             self.results_tree.addTopLevelItem(item)
             self._items[method.provider] = item
 
@@ -14274,8 +14287,9 @@ class GpuTestDialog(QDialog):
             item.setText(1, "Waiting")
             item.setText(2, "—")
             item.setText(3, "—")
-            item.setText(4, "Waiting to run…")
-            item.setToolTip(4, "Waiting to run…")
+            item.setText(4, "—")
+            item.setText(5, "Waiting to run…")
+            item.setToolTip(5, "Waiting to run…")
             item.setForeground(1, QBrush(QColor("#202124")))
         self.progress.setValue(0)
         self.copy_button.setEnabled(False)
@@ -14338,9 +14352,10 @@ class GpuTestDialog(QDialog):
         item = self._items[result.provider]
         item.setText(1, result.display_status)
         item.setText(2, result.setup_display)
-        item.setText(3, result.inference_display)
-        item.setText(4, result.explanation)
-        item.setToolTip(4, result.explanation)
+        item.setText(3, result.cold_inference_display)
+        item.setText(4, result.warm_inference_display)
+        item.setText(5, result.explanation)
+        item.setToolTip(5, result.explanation)
         item.setForeground(
             1,
             QBrush(
@@ -14366,10 +14381,10 @@ class GpuTestDialog(QDialog):
         item = self._items[method.provider]
         if item.text(1) == "Waiting":
             item.setText(1, "Testing…")
-            item.setText(4, "Starting isolated LaMa image repair benchmark…")
-            item.setToolTip(4, item.text(4))
+            item.setText(5, "Starting isolated LaMa image repair benchmark…")
+            item.setToolTip(5, item.text(5))
             if self.results_tree.currentItem() is item:
-                self.details.setPlainText(item.text(4))
+                self.details.setPlainText(item.text(5))
         self.status_label.setText(
             f"Testing {method.label} ({self._completed_count + 1} of "
             f"{len(GPU_TEST_METHODS)})…"
@@ -14380,7 +14395,7 @@ class GpuTestDialog(QDialog):
         current: QTreeWidgetItem | None,
         _previous: QTreeWidgetItem | None,
     ) -> None:
-        self.details.setPlainText("" if current is None else current.text(4))
+        self.details.setPlainText("" if current is None else current.text(5))
 
     def _mark_unfinished(self, status: str, explanation: str) -> None:
         for method in GPU_TEST_METHODS:
@@ -14390,8 +14405,9 @@ class GpuTestDialog(QDialog):
             item.setText(1, status)
             item.setText(2, "—")
             item.setText(3, "—")
-            item.setText(4, explanation)
-            item.setToolTip(4, explanation)
+            item.setText(4, "—")
+            item.setText(5, explanation)
+            item.setToolTip(5, explanation)
 
     def copy_results(self) -> None:
         lines = [
@@ -14404,8 +14420,9 @@ class GpuTestDialog(QDialog):
             lines.extend(
                 (
                     f"{method.label}: {item.text(1)}; "
-                    f"initialize {item.text(2)}; inpaint {item.text(3)}",
-                    item.text(4),
+                    f"initialize {item.text(2)}; first inpaint {item.text(3)}; "
+                    f"warm inpaint {item.text(4)}",
+                    item.text(5),
                     "",
                 )
             )
@@ -16039,6 +16056,11 @@ class FullscreenViewer(QDialog):
             if isinstance(parent, MainWindow)
             else LAMA_RUNTIME_AUTO
         )
+        worker_service = (
+            parent.lama_worker_service
+            if isinstance(parent, MainWindow)
+            else None
+        )
         self._lama_generation += 1
         lama_generation = self._lama_generation
         try:
@@ -16051,6 +16073,7 @@ class FullscreenViewer(QDialog):
                 expected_size=self.image_coordinate_size,
                 runtime=runtime,
                 cancel_event=cancel_event,
+                worker_service=worker_service,
                 provider_callback=lambda provider: self._lama_provider_updates.put(
                     (lama_generation, provider)
                 ),
@@ -17510,6 +17533,10 @@ class FullscreenViewer(QDialog):
                     and viewer.navigator.current == target_rel_path
                     and viewer.can_edit_current()
                 ):
+                    parent.lama_worker_service.prewarm(
+                        path,
+                        runtime=parent.app_config.lama_runtime,
+                    )
                     viewer.start_region_edit("lama")
 
             parent.ensure_lama_model(self, model_ready)
