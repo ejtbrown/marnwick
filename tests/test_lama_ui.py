@@ -60,8 +60,12 @@ def test_lama_busy_overlay_shows_indeterminate_local_progress(
     assert overlay.progress.minimum() == 0
     assert overlay.progress.maximum() == 0
     assert "filling the masked area" in overlay.title_label.text()
-    assert "supported GPU" in overlay.detail_label.text()
-    assert "CPU fallback" in overlay.detail_label.text()
+    assert "Selecting the local processing runtime" in overlay.detail_label.text()
+
+    overlay.set_execution_provider("WebGPU")
+
+    assert "Using WebGPU for local inference" in overlay.detail_label.text()
+    assert "fallback" not in overlay.detail_label.text().lower()
 
     overlay.stop()
     assert overlay.isHidden()
