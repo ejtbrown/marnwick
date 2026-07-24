@@ -33,7 +33,16 @@ from PySide6.QtWidgets import (  # noqa: E402
 )
 
 from marnwick.catalog import DuplicateMatchGroups, SIMILARITY_FEATURE_VERSION, TRASH_DIR_NAME, Catalog  # noqa: E402
-from marnwick.config import NORMAL_DELETE, WIPE_ON_DELETE, AppConfig, WindowConfig, load_config, save_config  # noqa: E402
+from marnwick.config import (  # noqa: E402
+    LAMA_RUNTIME_NVIDIA,
+    LAMA_RUNTIME_WEBGPU,
+    NORMAL_DELETE,
+    WIPE_ON_DELETE,
+    AppConfig,
+    WindowConfig,
+    load_config,
+    save_config,
+)
 from marnwick.debug import DebugCommandServer  # noqa: E402
 from marnwick.image_ops import (  # noqa: E402
     CommittedImageProof,
@@ -3569,6 +3578,7 @@ def test_config_file_round_trips_window_and_catalogs(tmp_path: Path) -> None:
             thumbnail_size=7,
             delete_behavior=WIPE_ON_DELETE,
             sort_order=SortOrder.DATE_DESC.value,
+            lama_runtime=LAMA_RUNTIME_WEBGPU,
         ),
         config_path,
     )
@@ -3584,6 +3594,7 @@ def test_config_file_round_trips_window_and_catalogs(tmp_path: Path) -> None:
     assert loaded.thumbnail_size == 7
     assert loaded.delete_behavior == WIPE_ON_DELETE
     assert loaded.sort_order == SortOrder.DATE_DESC.value
+    assert loaded.lama_runtime == LAMA_RUNTIME_WEBGPU
 
 
 def test_hung_initial_config_load_neither_blocks_construction_nor_shutdown(
@@ -3661,6 +3672,7 @@ def test_late_initial_config_applies_untouched_window_controls_and_catalogs(
         thumbnail_size=7,
         delete_behavior=WIPE_ON_DELETE,
         sort_order=SortOrder.DATE_DESC.value,
+        lama_runtime=LAMA_RUNTIME_WEBGPU,
         _loaded_catalogs=(str(catalog_root),),
     )
 
@@ -3696,6 +3708,7 @@ def test_late_initial_config_applies_untouched_window_controls_and_catalogs(
         assert window.size_slider.value() == 7
         assert window.current_sort == SortOrder.DATE_DESC
         assert window.app_config.delete_behavior == WIPE_ON_DELETE
+        assert window.app_config.lama_runtime == LAMA_RUNTIME_WEBGPU
         assert window.current_catalog is not None
         assert window.current_catalog.root == catalog_root.resolve()
     finally:
@@ -3768,6 +3781,7 @@ def test_late_initial_config_does_not_overwrite_newer_user_intent(
         thumbnail_size=2,
         delete_behavior=WIPE_ON_DELETE,
         sort_order=SortOrder.DATE_DESC.value,
+        lama_runtime=LAMA_RUNTIME_WEBGPU,
         _loaded_catalogs=(str(configured_root),),
     )
 
@@ -3790,6 +3804,7 @@ def test_late_initial_config_does_not_overwrite_newer_user_intent(
         user_size = window.size()
         window.set_thumbnail_size(9)
         window.set_sort_order(SortOrder.NAME_DESC)
+        window.app_config.lama_runtime = LAMA_RUNTIME_NVIDIA
         window.open_catalog_async(user_root)
         deadline = monotonic() + 5
         while window.current_catalog is None and monotonic() < deadline:
@@ -3815,6 +3830,7 @@ def test_late_initial_config_does_not_overwrite_newer_user_intent(
         assert window.size() == user_size
         assert window.thumbnail_columns == 9
         assert window.current_sort == SortOrder.NAME_DESC
+        assert window.app_config.lama_runtime == LAMA_RUNTIME_NVIDIA
         assert window.workspace.catalog_for_root(configured_root) is not None
         assert window.current_catalog is not None
         assert window.current_catalog.root == user_root.resolve()
@@ -3880,6 +3896,7 @@ def test_main_window_restores_and_persists_config_catalogs(tmp_path: Path) -> No
             thumbnail_size=6,
             delete_behavior=WIPE_ON_DELETE,
             sort_order=SortOrder.SIZE_DESC.value,
+            lama_runtime=LAMA_RUNTIME_WEBGPU,
         ),
         config_path,
     )
@@ -3903,6 +3920,7 @@ def test_main_window_restores_and_persists_config_catalogs(tmp_path: Path) -> No
         assert window.thumbnail_columns == 6
         assert window.size_slider.value() == 6
         assert window.app_config.delete_behavior == WIPE_ON_DELETE
+        assert window.app_config.lama_runtime == LAMA_RUNTIME_WEBGPU
         assert window.current_sort == SortOrder.SIZE_DESC
         assert window.sort_combo.currentData() == SortOrder.SIZE_DESC.value
 
@@ -3921,6 +3939,7 @@ def test_main_window_restores_and_persists_config_catalogs(tmp_path: Path) -> No
         assert saved.thumbnail_size == 8
         assert saved.delete_behavior == WIPE_ON_DELETE
         assert saved.sort_order == SortOrder.ASPECT_ASC.value
+        assert saved.lama_runtime == LAMA_RUNTIME_WEBGPU
     finally:
         window.indexer.shutdown()
         window.workspace.close()
@@ -3996,12 +4015,21 @@ def test_app_preferences_dialog_exposes_config_settings(tmp_path: Path) -> None:
             thumbnail_size=5,
             delete_behavior=NORMAL_DELETE,
             sort_order=SortOrder.NAME_ASC.value,
+            lama_runtime=LAMA_RUNTIME_NVIDIA,
         )
     )
     try:
+        assert [
+            dialog.lama_runtime.itemText(index)
+            for index in range(dialog.lama_runtime.count())
+        ] == ["Auto", "CPU", "NVIDIA", "WebGPU/Vulkan"]
+        assert dialog.lama_runtime.currentData() == LAMA_RUNTIME_NVIDIA
         dialog.thumbnail_size.setValue(9)
         dialog.sort_order.setCurrentIndex(dialog.sort_order.findData(SortOrder.DATE_ASC.value))
         dialog.delete_behavior.setCurrentIndex(dialog.delete_behavior.findData(WIPE_ON_DELETE))
+        dialog.lama_runtime.setCurrentIndex(
+            dialog.lama_runtime.findData(LAMA_RUNTIME_WEBGPU)
+        )
         dialog.catalog_list.addItem(str(tmp_path / "two"))
 
         selected = dialog.selected_config()
@@ -4009,6 +4037,7 @@ def test_app_preferences_dialog_exposes_config_settings(tmp_path: Path) -> None:
         assert selected.thumbnail_size == 9
         assert selected.delete_behavior == WIPE_ON_DELETE
         assert selected.sort_order == SortOrder.DATE_ASC.value
+        assert selected.lama_runtime == LAMA_RUNTIME_WEBGPU
         assert selected.catalogs == [str(tmp_path / "one"), str(tmp_path / "two")]
     finally:
         dialog.close()

@@ -15,6 +15,16 @@ from typing import Any, Iterator
 NORMAL_DELETE = "normal_delete"
 WIPE_ON_DELETE = "wipe_on_delete"
 DELETE_BEHAVIORS = {NORMAL_DELETE, WIPE_ON_DELETE}
+LAMA_RUNTIME_AUTO = "auto"
+LAMA_RUNTIME_CPU = "cpu"
+LAMA_RUNTIME_NVIDIA = "nvidia"
+LAMA_RUNTIME_WEBGPU = "webgpu"
+LAMA_RUNTIMES = {
+    LAMA_RUNTIME_AUTO,
+    LAMA_RUNTIME_CPU,
+    LAMA_RUNTIME_NVIDIA,
+    LAMA_RUNTIME_WEBGPU,
+}
 DEFAULT_THUMBNAIL_COLUMNS = 5
 MIN_THUMBNAIL_COLUMNS = 1
 MAX_THUMBNAIL_COLUMNS = 20
@@ -39,6 +49,7 @@ class AppConfig:
     thumbnail_size: int = DEFAULT_THUMBNAIL_COLUMNS
     delete_behavior: str = NORMAL_DELETE
     sort_order: str = "name"
+    lama_runtime: str = LAMA_RUNTIME_AUTO
     # A load-time baseline allows save_config() to merge catalog-list edits
     # made by separate Marnwick processes without resurrecting removals or
     # discarding unrelated additions.  Hand-constructed configs retain the
@@ -83,6 +94,7 @@ def load_config(path: Path | None = None) -> AppConfig:
         thumbnail_size=_thumbnail_columns_or_default(raw.get("thumbnail_size")),
         delete_behavior=_delete_behavior_or_default(raw.get("delete_behavior")),
         sort_order=_string_or_default(raw.get("sort_order"), "name"),
+        lama_runtime=_lama_runtime_or_default(raw.get("lama_runtime")),
         _loaded_catalogs=tuple(catalogs),
     )
 
@@ -115,6 +127,7 @@ def save_config(
             },
             "catalogs": catalogs,
             "delete_behavior": config.delete_behavior,
+            "lama_runtime": config.lama_runtime,
             "sort_order": config.sort_order,
             "thumbnail_size": config.thumbnail_size,
         }
@@ -188,6 +201,12 @@ def _delete_behavior_or_default(value: object) -> str:
     if isinstance(value, str) and value in DELETE_BEHAVIORS:
         return value
     return NORMAL_DELETE
+
+
+def _lama_runtime_or_default(value: object) -> str:
+    if isinstance(value, str) and value in LAMA_RUNTIMES:
+        return value
+    return LAMA_RUNTIME_AUTO
 
 
 def _thumbnail_columns_or_default(value: object) -> int:

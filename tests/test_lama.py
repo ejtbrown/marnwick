@@ -8,6 +8,7 @@ from PIL import Image, ImageDraw
 import pytest
 
 from marnwick import lama
+from marnwick.config import LAMA_RUNTIME_WEBGPU
 from marnwick.image_ops import apply_operation_to_image, snapshot_image_file_identity
 
 
@@ -118,8 +119,9 @@ def test_create_lama_edit_operation_retains_generated_patch(
         _input_path: Path,
         mask_path: Path,
         output_path: Path,
-        **_kwargs: object,
+        **kwargs: object,
     ) -> str:
+        assert kwargs["runtime"] == LAMA_RUNTIME_WEBGPU
         with Image.open(mask_path) as worker_mask:
             worker_mask.load()
             assert worker_mask.getextrema() == (0, 255)
@@ -139,6 +141,7 @@ def test_create_lama_edit_operation_retains_generated_patch(
         expected_identity=snapshot_image_file_identity(image_path),
         expected_size=(160, 120),
         model_path=model_path,
+        runtime=LAMA_RUNTIME_WEBGPU,
     )
 
     source = Image.new("RGB", (160, 120), (200, 20, 20))

@@ -1,0 +1,4 @@
+# WebGPU plugin selected by setup.sh alongside a compatible core ONNX Runtime.
+# Install with --no-deps because the selected CPU or NVIDIA runtime is installed first.
+onnxruntime-ep-webgpu==0.1.0 \
+    --hash=sha256:777c6c7a645160eb3b50473b508458feee9bd399ac98392b4c32a0d73c9fad07
