@@ -297,13 +297,18 @@ def test_refresh_indexes_images_with_relative_paths_and_thumbnails(tmp_path: Pat
         catalog.refresh()
         records = catalog.list_images("set-a")
 
-        assert [record.rel_path for record in records] == ["set-a/wide.jpg"]
-        assert records[0].catalog_root == root.resolve()
-        assert records[0].width == 640
-        assert records[0].height == 320
-        assert records[0].thumb_blob
-        assert records[0].thumb_width <= 96
-        assert records[0].thumb_height <= 96
+        assert [record.rel_path for record in records] == [
+            "set-a/notes.txt",
+            "set-a/wide.jpg",
+        ]
+        by_name = {record.filename: record for record in records}
+        assert by_name["notes.txt"].media_kind == "text"
+        assert by_name["wide.jpg"].catalog_root == root.resolve()
+        assert by_name["wide.jpg"].width == 640
+        assert by_name["wide.jpg"].height == 320
+        assert all(record.thumb_blob for record in records)
+        assert all(record.thumb_width <= 96 for record in records)
+        assert all(record.thumb_height <= 96 for record in records)
         assert catalog.list_known_directories() == ["", "set-a"]
 
 
@@ -510,7 +515,8 @@ def test_images_schema_tracks_file_identity_and_migrates_existing_catalogs(tmp_p
         columns = {row["name"] for row in catalog._conn.execute("PRAGMA table_info(images)")}
         row = catalog._conn.execute(
             """
-            SELECT size_bytes, file_size_bytes, mtime_ns, modified_at_ns, image_hash
+            SELECT size_bytes, file_size_bytes, mtime_ns, modified_at_ns, image_hash,
+                media_kind
             FROM images
             WHERE rel_path = 'old.jpg'
             """
@@ -519,9 +525,11 @@ def test_images_schema_tracks_file_identity_and_migrates_existing_catalogs(tmp_p
         assert "modified_at_ns" in columns
         assert "file_size_bytes" in columns
         assert "image_hash" in columns
+        assert "media_kind" in columns
         assert row["file_size_bytes"] == row["size_bytes"] == 12
         assert row["modified_at_ns"] == row["mtime_ns"] == 123456789
         assert row["image_hash"] is None
+        assert row["media_kind"] == "image"
 
 
 def test_index_image_stores_hash_and_skips_unchanged_modified_time_without_decoding(
@@ -1611,7 +1619,12 @@ def test_unindexed_directory_lists_placeholder_records_for_image_files(tmp_path:
     with Catalog(root) as catalog:
         records = catalog.list_images_with_placeholders("set-a", SortOrder.NAME_ASC, include_blobs=False)
 
-        assert [record.rel_path for record in records] == ["set-a/tall.jpg", "set-a/wide.jpg"]
+        assert [record.rel_path for record in records] == [
+            "set-a/notes.txt",
+            "set-a/tall.jpg",
+            "set-a/wide.jpg",
+        ]
+        assert records[0].media_kind == "text"
         assert all(record.id == -1 for record in records)
         assert all(record.thumb_blob is None for record in records)
         assert all(record.absolute_path.exists() for record in records)

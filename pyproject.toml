@@ -9,6 +9,7 @@ description = "A fast, portable photo viewer and organizer for catalog-based wor
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+  "av>=14",
   "numpy>=1.26",
   "Pillow>=10",
   "PySide6>=6.6",

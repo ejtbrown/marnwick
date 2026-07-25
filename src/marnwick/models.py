@@ -5,6 +5,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Literal
 
+from .media import MediaKind
+
 
 class SortOrder(str, Enum):
     NAME_ASC = "name"
@@ -63,10 +65,19 @@ class ImageRecord:
     # records leave this unset and use their indexed content hash when a
     # destructive action must prove that the displayed incarnation is current.
     file_identity: tuple[int, int, int, int, int, int] | None = None
+    media_kind: MediaKind = "image"
 
     @property
     def absolute_path(self) -> Path:
         return self.catalog_root / self.rel_path
+
+    @property
+    def slideshow_eligible(self) -> bool:
+        return self.media_kind != "video"
+
+    @property
+    def is_document(self) -> bool:
+        return self.media_kind in {"text", "docx", "odt", "pdf"}
 
 
 @dataclass(frozen=True, slots=True)
