@@ -29,7 +29,24 @@ from pathlib import Path
 
 from PIL import Image, ImageOps
 
+from .document_ops import (
+    DOCUMENT_RENDER_VERSION,
+    MAX_SOURCE_BYTES,
+    render_document_thumbnail,
+)
 from .image_ops import FileDateSnapshot, restore_file_dates
+from .media import (
+    IMAGE_EXTENSIONS,
+    VIDEO_EXTENSIONS,
+    MediaKind,
+    is_image_name,
+    is_image_path,
+    is_supported_file_name,
+    is_supported_file_path,
+    is_video_name,
+    media_kind_for_name,
+    media_kind_for_path,
+)
 from .models import (
     CatalogSettings,
     DirectoryRecord,
@@ -41,31 +58,7 @@ from .models import (
     SortOrder,
 )
 from .safe_image import open_catalog_image
-
-IMAGE_EXTENSIONS = {
-    ".avif",
-    ".bmp",
-    ".gif",
-    ".heic",
-    ".heif",
-    ".jpeg",
-    ".jpg",
-    ".png",
-    ".tif",
-    ".tiff",
-    ".webp",
-}
-VIDEO_EXTENSIONS = {
-    ".avi",
-    ".m4v",
-    ".mkv",
-    ".mov",
-    ".mp4",
-    ".mpeg",
-    ".mpg",
-    ".webm",
-    ".wmv",
-}
+from .video_ops import VIDEO_RENDER_VERSION, render_video_thumbnail
 
 ProgressCallback = Callable[[int, int | None, str], None]
 CancelCallback = Callable[[], None]
@@ -1146,18 +1139,6 @@ def _unlock_catalog_file(path: Path) -> None:
             os.close(fd)
 
 
-def is_image_name(name: str) -> bool:
-    return os.path.splitext(name)[1].lower() in IMAGE_EXTENSIONS
-
-
-def is_image_path(path: Path) -> bool:
-    return is_image_name(path.name)
-
-
-def is_video_name(name: str) -> bool:
-    return os.path.splitext(name)[1].lower() in VIDEO_EXTENSIONS
-
-
 def normalize_tag(name: str) -> str:
     return " ".join(name.strip().split()).casefold()
 
@@ -1286,6 +1267,7 @@ class ImageReadJob:
     path: Path
     stat: os.stat_result
     changed_ns: int
+    media_kind: MediaKind = "image"
 
 
 @dataclass(frozen=True, slots=True)
@@ -1301,12 +1283,13 @@ class ThumbnailWriteJob:
     thumb_width: int
     thumb_height: int
     thumb_size_px: int
-    image_hash: str
+    image_hash: str | None
     thumb_cache_key: str
     width: int
     height: int
     perceptual_hash: str
     color_signature: bytes
+    media_kind: MediaKind = "image"
 
 
 @dataclass(frozen=True, slots=True)
@@ -4404,7 +4387,7 @@ class Catalog:
                                 child_rel = self._rel_path_without_resolve(Path(entry.path))
                                 if self._sqlite_text_safe(child_rel):
                                     pending_scan_rows.append((child_rel, 2))
-                            elif is_image_name(entry.name) and is_file:
+                            elif is_supported_file_name(entry.name) and is_file:
                                 rel_path = self._rel_path_without_resolve(Path(entry.path))
                         except (OSError, UnicodeError):
                             uncertain_rel = f"{dir_rel}/{entry.name}" if dir_rel else entry.name
@@ -4634,7 +4617,8 @@ class Catalog:
                                 self._remember_directory(dir_rel)
                             prepared_directories.add(dir_rel)
                     path = self.abs_path(rel_path)
-                    if not path.exists() or not path.is_file() or not is_image_path(path):
+                    media_kind = media_kind_for_path(path)
+                    if not path.exists() or not path.is_file() or media_kind is None:
                         with self._db_lock:
                             self._delete_db_records([rel_path])
                         put_with_cancel(image_queue, ImageSkipJob(rel_path))
@@ -4654,7 +4638,7 @@ class Catalog:
                         continue
                     put_with_cancel(
                         image_queue,
-                        ImageReadJob(rel_path, path, stat, changed_ns),
+                        ImageReadJob(rel_path, path, stat, changed_ns, media_kind),
                     )
             except BaseException as error:
                 remember_error(error)
@@ -4694,6 +4678,7 @@ class Catalog:
                                             current_job.path,
                                             retry_stat,
                                             self._path_change_time_ns(current_job.path, retry_stat),
+                                            current_job.media_kind,
                                         )
                                     except OSError:
                                         pass
@@ -4803,7 +4788,7 @@ class Catalog:
                 """
                 SELECT file_size_bytes, modified_at_ns, ctime_ns, thumb_rel_path, thumb_cache_key,
                     thumb_size_px, image_hash, perceptual_hash, color_signature,
-                    similarity_feature_version
+                    similarity_feature_version, media_kind
                 FROM images
                 WHERE rel_path = ?
                 """,
@@ -4811,15 +4796,25 @@ class Catalog:
             ).fetchone()
         if row is None:
             return False
+        media_kind = media_kind_for_name(Path(rel_path).name)
+        if media_kind is None or str(row["media_kind"]) != media_kind:
+            return False
         if (
             int(row["file_size_bytes"]) != stat.st_size
             or int(row["modified_at_ns"]) != stat.st_mtime_ns
             or int(row["ctime_ns"]) != changed_ns
             or int(row["thumb_size_px"]) != self.settings.thumbnail_native_size
-            or not is_exact_image_hash(row["image_hash"])
             or row["thumb_cache_key"] is None
             or row["thumb_rel_path"] is None
+        ):
+            return False
+        if media_kind == "image" and (
+            not is_exact_image_hash(row["image_hash"])
             or not self._image_similarity_features_current(row)
+        ):
+            return False
+        if media_kind != "image" and str(row["thumb_cache_key"]) != (
+            self._media_thumbnail_cache_key(media_kind, stat, changed_ns)
         ):
             return False
         try:
@@ -4956,6 +4951,7 @@ class Catalog:
                 height=height,
                 perceptual_hash=perceptual_hash,
                 color_signature=color_signature,
+                media_kind=job.media_kind,
             ),
         )
 
@@ -4982,17 +4978,18 @@ class Catalog:
             self._conn.execute(
                 """
                 INSERT INTO images (
-                    rel_path, dir_rel, filename, size_bytes, file_size_bytes,
+                    rel_path, dir_rel, filename, media_kind, size_bytes, file_size_bytes,
                     mtime_ns, modified_at_ns, ctime_ns, image_hash, width, height,
                     aspect_ratio, perceptual_hash, color_signature,
                     similarity_feature_version, thumb_blob, thumb_rel_path,
                     thumb_cache_key, thumb_width, thumb_height, thumb_size_px,
                     indexed_at_ns
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(rel_path) DO UPDATE SET
                     dir_rel = excluded.dir_rel,
                     filename = excluded.filename,
+                    media_kind = excluded.media_kind,
                     size_bytes = excluded.size_bytes,
                     file_size_bytes = excluded.file_size_bytes,
                     mtime_ns = excluded.mtime_ns,
@@ -5017,6 +5014,7 @@ class Catalog:
                     job.rel_path,
                     dir_rel,
                     job.path.name,
+                    item.media_kind,
                     job.stat.st_size,
                     job.stat.st_size,
                     job.stat.st_mtime_ns,
@@ -5028,7 +5026,7 @@ class Catalog:
                     aspect_ratio,
                     item.perceptual_hash,
                     item.color_signature,
-                    SIMILARITY_FEATURE_VERSION,
+                    SIMILARITY_FEATURE_VERSION if item.media_kind == "image" else 0,
                     None,
                     item.thumb_rel_path,
                     item.thumb_cache_key,
@@ -5240,13 +5238,16 @@ class Catalog:
         ):
             raise ValueError("expected image proof is malformed")
         path = self.abs_path(rel_path)
-        if not path.exists() or not path.is_file() or not is_image_path(path):
+        media_kind = media_kind_for_path(path)
+        if not path.exists() or not path.is_file() or media_kind is None:
             if expected_proof is not None:
                 raise ImageChangedDuringIndexError(
                     f"proved image disappeared before indexing: {rel_path}"
                 )
             self._delete_db_records([rel_path])
             return None
+        if expected_proof is not None and media_kind != "image":
+            raise ValueError("content proofs are only supported for image files")
         try:
             stat = path.lstat() if expected_proof is not None else path.stat()
         except OSError as error:
@@ -5288,6 +5289,7 @@ class Catalog:
                 perceptual_hash,
                 color_signature,
                 similarity_feature_version,
+                media_kind,
                 thumb_blob,
                 thumb_blob IS NOT NULL AS has_thumb
             FROM images
@@ -5306,13 +5308,22 @@ class Catalog:
             and int(existing["modified_at_ns"]) == stat.st_mtime_ns
             and int(existing["ctime_ns"]) == changed_ns
             and int(existing["thumb_size_px"]) == self.settings.thumbnail_native_size
+            and str(existing["media_kind"]) == media_kind
+            and (
+                media_kind == "image"
+                or str(existing["thumb_cache_key"])
+                == self._media_thumbnail_cache_key(media_kind, stat, changed_ns)
+            )
             and thumbnail_ready
             and not force
         ):
-            if not is_exact_image_hash(existing["image_hash"]) or existing["thumb_cache_key"] is None:
+            if media_kind == "image" and (
+                not is_exact_image_hash(existing["image_hash"])
+                or existing["thumb_cache_key"] is None
+            ):
                 try:
                     image_hash, thumb_cache_key = self._image_file_hashes_stable(
-                        ImageReadJob(rel_path, path, stat, changed_ns),
+                        ImageReadJob(rel_path, path, stat, changed_ns, media_kind),
                         cancel_check,
                     )
                 except OSError:
@@ -5332,10 +5343,10 @@ class Catalog:
                     str(image_hash),
                     thumb_cache_key=str(thumb_cache_key),
                 )
-            if self._image_similarity_features_current(existing):
+            if media_kind != "image" or self._image_similarity_features_current(existing):
                 return self.get_image(rel_path, include_blob=False)
 
-        job = ImageReadJob(rel_path, path, stat, changed_ns)
+        job = ImageReadJob(rel_path, path, stat, changed_ns, media_kind)
         try:
             (
                 width,
@@ -5388,17 +5399,18 @@ class Catalog:
         self._conn.execute(
             """
             INSERT INTO images (
-                rel_path, dir_rel, filename, size_bytes, file_size_bytes,
+                rel_path, dir_rel, filename, media_kind, size_bytes, file_size_bytes,
                 mtime_ns, modified_at_ns, ctime_ns, image_hash, width, height,
                 aspect_ratio, perceptual_hash, color_signature,
                 similarity_feature_version, thumb_blob, thumb_rel_path,
                 thumb_cache_key, thumb_width, thumb_height, thumb_size_px,
                 indexed_at_ns
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(rel_path) DO UPDATE SET
                 dir_rel = excluded.dir_rel,
                 filename = excluded.filename,
+                media_kind = excluded.media_kind,
                 size_bytes = excluded.size_bytes,
                 file_size_bytes = excluded.file_size_bytes,
                 mtime_ns = excluded.mtime_ns,
@@ -5423,6 +5435,7 @@ class Catalog:
                 rel_path,
                 dir_rel,
                 path.name,
+                media_kind,
                 stat.st_size,
                 stat.st_size,
                 stat.st_mtime_ns,
@@ -5434,7 +5447,7 @@ class Catalog:
                 aspect_ratio,
                 perceptual_hash,
                 color_signature,
-                SIMILARITY_FEATURE_VERSION,
+                SIMILARITY_FEATURE_VERSION if media_kind == "image" else 0,
                 None,
                 thumb_rel_path,
                 thumb_cache_key,
@@ -7563,8 +7576,10 @@ class Catalog:
             or Path(new_name).name != new_name
             or is_marnwick_internal_artifact_name(new_name)
         ):
-            raise ValueError("image name must be a single non-empty file name")
+            raise ValueError("file name must be a single non-empty file name")
         source_path = self._mutation_path(rel_path)
+        if media_kind_for_name(new_name) != media_kind_for_name(source_path.name):
+            raise ValueError("the renamed file must keep the same supported file type")
         source_identity = self._catalog_file_identity(source_path)
         if expected_identity is not None and source_identity != expected_identity:
             raise OSError(f"image changed after rename was requested: {rel_path}")
@@ -8668,7 +8683,7 @@ class Catalog:
                     """
                     SELECT
                         id, rel_path, file_size_bytes, modified_at_ns, ctime_ns, thumb_rel_path,
-                        thumb_cache_key, thumb_size_px, image_hash, thumb_blob
+                        thumb_cache_key, thumb_size_px, image_hash, thumb_blob, media_kind
                     FROM images
                     WHERE id > ?
                     ORDER BY id ASC
@@ -8737,16 +8752,24 @@ class Catalog:
             if cancel_check is not None:
                 cancel_check()
             path = self.abs_path(rel_path)
-            if not path.is_file() or not is_image_path(path):
+            if not path.is_file() or not is_supported_file_path(path):
                 self._delete_db_records([rel_path])
                 return ThumbnailPruneRowResult(rel_path, stale_removed=1)
             stat = path.stat()
             changed_ns = self._path_change_time_ns(path, stat)
+            media_kind = media_kind_for_path(path)
+            assert media_kind is not None
             if (
                 int(row["file_size_bytes"] or 0) != stat.st_size
                 or int(row["modified_at_ns"] or 0) != stat.st_mtime_ns
                 or int(row["ctime_ns"] or 0) != changed_ns
                 or int(row["thumb_size_px"] or 0) != self.settings.thumbnail_native_size
+                or row["media_kind"] != media_kind
+                or (
+                    media_kind != "image"
+                    and row["thumb_cache_key"]
+                    != self._media_thumbnail_cache_key(media_kind, stat, changed_ns)
+                )
             ):
                 rebuilt = 1 if self.index_image(rel_path, cancel_check=cancel_check) is not None else 0
                 return ThumbnailPruneRowResult(rel_path, rebuilt=rebuilt)
@@ -8799,6 +8822,7 @@ class Catalog:
                 rel_path TEXT NOT NULL UNIQUE,
                 dir_rel TEXT NOT NULL,
                 filename TEXT NOT NULL,
+                media_kind TEXT NOT NULL DEFAULT 'image',
                 size_bytes INTEGER NOT NULL,
                 file_size_bytes INTEGER NOT NULL DEFAULT 0,
                 mtime_ns INTEGER NOT NULL,
@@ -8906,6 +8930,10 @@ class Catalog:
         }
         if "file_size_bytes" not in columns:
             self._conn.execute("ALTER TABLE images ADD COLUMN file_size_bytes INTEGER NOT NULL DEFAULT 0")
+        if "media_kind" not in columns:
+            self._conn.execute(
+                "ALTER TABLE images ADD COLUMN media_kind TEXT NOT NULL DEFAULT 'image'"
+            )
         if "modified_at_ns" not in columns:
             self._conn.execute("ALTER TABLE images ADD COLUMN modified_at_ns INTEGER NOT NULL DEFAULT 0")
         if "ctime_ns" not in columns:
@@ -9413,7 +9441,7 @@ class Catalog:
                         break
                     if is_marnwick_internal_artifact_name(entry.name):
                         continue
-                    if not is_image_name(entry.name):
+                    if not is_supported_file_name(entry.name):
                         continue
                     try:
                         if entry.is_file(follow_symlinks=False):
@@ -9459,6 +9487,7 @@ class Catalog:
             thumb_blob=None,
             image_hash=None,
             ctime_ns=self._path_change_time_ns(path, stat),
+            media_kind=media_kind_for_path(path) or "image",
         )
 
     def _record_sort_key(self, sort_order: SortOrder) -> Callable[[ImageRecord], tuple[object, ...]]:
@@ -9616,7 +9645,7 @@ class Catalog:
         self,
         job: ImageReadJob,
         cancel_check: CancelCallback | None = None,
-    ) -> tuple[int, int, bytes, int, int, str, bytes, str, str]:
+    ) -> tuple[int, int, bytes, int, int, str, bytes, str | None, str]:
         """Decode and hash one stable open file description.
 
         A pathname can be replaced between two ordinary reads. Keeping one
@@ -9624,6 +9653,9 @@ class Catalog:
         a thumbnail from version A being published under version B's content
         key without retaining an entire large source file in memory.
         """
+
+        if job.media_kind != "image":
+            return self._read_document_or_video_thumbnail(job, cancel_check)
 
         flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0)
         nofollow = getattr(os, "O_NOFOLLOW", 0)
@@ -9708,6 +9740,121 @@ class Catalog:
             raise OSError(f"image metadata was not produced: {job.rel_path}")
         value = digest.hexdigest()
         return (*metadata, value, value)
+
+    def _read_document_or_video_thumbnail(
+        self,
+        job: ImageReadJob,
+        cancel_check: CancelCallback | None = None,
+    ) -> tuple[int, int, bytes, int, int, str, bytes, None, str]:
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        if nofollow:
+            flags |= nofollow
+        elif job.path.is_symlink():
+            raise ImageChangedDuringIndexError(
+                errno.ELOOP,
+                "refusing symbolic-link media file",
+                job.path,
+            )
+        try:
+            fd = os.open(job.path, flags)
+        except OSError as error:
+            raise ImageChangedDuringIndexError(
+                f"media changed before indexing: {job.rel_path}"
+            ) from error
+        try:
+            before = os.fstat(fd)
+            if not stat_module.S_ISREG(before.st_mode) or not self._index_stat_matches_job(
+                before,
+                job,
+            ):
+                raise ImageChangedDuringIndexError(
+                    f"media changed before indexing: {job.rel_path}"
+                )
+            if cancel_check is not None:
+                cancel_check()
+            with os.fdopen(fd, "rb", closefd=False) as handle:
+                if job.media_kind == "video":
+                    thumbnail, width, height = render_video_thumbnail(
+                        handle,
+                        self.settings.thumbnail_native_size,
+                    )
+                    render_version = VIDEO_RENDER_VERSION
+                else:
+                    source_data = handle.read(MAX_SOURCE_BYTES + 1)
+                    if len(source_data) > MAX_SOURCE_BYTES:
+                        raise ValueError(
+                            f"document exceeds the {MAX_SOURCE_BYTES:,}-byte preview limit"
+                        )
+                    thumbnail, width, height = render_document_thumbnail(
+                        job.path,
+                        job.media_kind,
+                        self.settings.thumbnail_native_size,
+                        source_data=source_data,
+                    )
+                    render_version = DOCUMENT_RENDER_VERSION
+            if cancel_check is not None:
+                cancel_check()
+            after = os.fstat(fd)
+        finally:
+            os.close(fd)
+        try:
+            current = job.path.lstat()
+            current_changed_ns = self._path_change_time_ns(job.path, current)
+        except OSError as error:
+            raise ImageChangedDuringIndexError(
+                f"media changed after indexing: {job.rel_path}"
+            ) from error
+        if (
+            self._index_stat_token(before) != self._index_stat_token(after)
+            or not self._index_stat_matches_job(current, job)
+            or current_changed_ns != job.changed_ns
+        ):
+            raise ImageChangedDuringIndexError(
+                f"media changed while it was being indexed: {job.rel_path}"
+            )
+        thumb_blob, thumb_width, thumb_height = self._thumbnail_jpeg_blob(
+            thumbnail,
+            copy_image=False,
+        )
+        thumb_cache_key = self._media_thumbnail_cache_key(
+            job.media_kind,
+            job.stat,
+            job.changed_ns,
+            render_version=render_version,
+        )
+        return (
+            width,
+            height,
+            thumb_blob,
+            thumb_width,
+            thumb_height,
+            "",
+            b"",
+            None,
+            thumb_cache_key,
+        )
+
+    def _media_thumbnail_cache_key(
+        self,
+        media_kind: MediaKind,
+        file_stat: os.stat_result,
+        changed_ns: int,
+        *,
+        render_version: int | None = None,
+    ) -> str:
+        if render_version is None:
+            render_version = (
+                VIDEO_RENDER_VERSION
+                if media_kind == "video"
+                else DOCUMENT_RENDER_VERSION
+            )
+        cache_material = (
+            f"{media_kind}:{render_version}:{self.settings.thumbnail_native_size}:"
+            f"{file_stat.st_dev}:{file_stat.st_ino}:{file_stat.st_size}:"
+            f"{file_stat.st_mtime_ns}:{changed_ns}"
+        )
+        return hashlib.sha256(cache_material.encode("utf-8")).hexdigest()
 
     @staticmethod
     def _index_stat_token(file_stat: os.stat_result) -> tuple[int, int, int, int, int, int]:
@@ -9898,7 +10045,7 @@ class Catalog:
             else "NULL AS thumb_blob"
         )
         return (
-            "id, rel_path, dir_rel, filename, file_size_bytes AS size_bytes, "
+            "id, rel_path, dir_rel, filename, media_kind, file_size_bytes AS size_bytes, "
             "modified_at_ns AS mtime_ns, ctime_ns, width, height, aspect_ratio, thumb_width, "
             f"thumb_height, image_hash, thumb_rel_path, thumb_cache_key, thumb_size_px, {thumb_column}"
         )
@@ -9920,6 +10067,7 @@ class Catalog:
             thumb_blob=self._thumbnail_blob_for_row(row, str(row["rel_path"])) if include_blob else None,
             image_hash=str(row["image_hash"]) if row["image_hash"] is not None else None,
             ctime_ns=int(row["ctime_ns"]),
+            media_kind=str(row["media_kind"]),
         )
 
     def _delete_db_records(self, rel_paths: Iterable[str]) -> None:
@@ -11757,18 +11905,19 @@ class Catalog:
         self._conn.execute(
             """
             INSERT INTO images (
-                rel_path, dir_rel, filename, size_bytes, file_size_bytes,
+                rel_path, dir_rel, filename, media_kind, size_bytes, file_size_bytes,
                 mtime_ns, modified_at_ns, ctime_ns, image_hash, width, height,
                 aspect_ratio, perceptual_hash, color_signature,
                 similarity_feature_version, thumb_blob, thumb_rel_path,
                 thumb_cache_key, thumb_width, thumb_height, thumb_size_px,
                 indexed_at_ns
             )
-            VALUES (?, ?, ?, 0, 0, 0, 0, 0, NULL, 0, 0, 0.0, NULL, NULL,
+            VALUES (?, ?, ?, ?, 0, 0, 0, 0, 0, NULL, 0, 0, 0.0, NULL, NULL,
                 0, NULL, NULL, NULL, 0, 0, 0, 0)
             ON CONFLICT(rel_path) DO UPDATE SET
                 dir_rel = excluded.dir_rel,
                 filename = excluded.filename,
+                media_kind = excluded.media_kind,
                 size_bytes = 0,
                 file_size_bytes = 0,
                 mtime_ns = 0,
@@ -11789,7 +11938,12 @@ class Catalog:
                 thumb_size_px = 0,
                 indexed_at_ns = 0
             """,
-            (dest_rel_path, dir_rel, Path(dest_rel_path).name),
+            (
+                dest_rel_path,
+                dir_rel,
+                Path(dest_rel_path).name,
+                media_kind_for_name(dest_rel_path) or "image",
+            ),
         )
         self.set_image_tags(dest_rel_path, tag_names, replace=True)
 
@@ -11990,8 +12144,25 @@ class Catalog:
         dest_path = self.abs_path(dest_rel_path)
         stat = dest_path.stat()
         changed_ns = self._path_change_time_ns(dest_path, stat)
+        media_kind = media_kind_for_path(dest_path)
+        if media_kind is None:
+            raise ValueError(f"destination is not a supported file: {dest_rel_path}")
+        if media_kind != "image":
+            if remember_directory:
+                self._remember_directory(self._parent_dir_rel(dest_rel_path))
+            indexed = self.index_image(
+                dest_rel_path,
+                cancel_check=cancel_check,
+                force=True,
+            )
+            if indexed is None:
+                raise OSError(
+                    f"destination changed while transfer was being indexed: {dest_rel_path}"
+                )
+            self.set_image_tags(dest_rel_path, tag_names, replace=True)
+            return
         image_hash, thumb_cache_key = self._image_file_hashes_stable(
-            ImageReadJob(dest_rel_path, dest_path, stat, changed_ns),
+            ImageReadJob(dest_rel_path, dest_path, stat, changed_ns, media_kind),
             cancel_check,
         )
         source_image_hash = row["image_hash"]

@@ -10,10 +10,12 @@ Each catalog keeps its metadata beside the photos in a `.marnwick` directory. Mo
 - Open and restore multiple photo catalogs without blocking the application window.
 - Paint current indexed rows immediately when available; otherwise enumerate the selected folder away from the UI thread, publish one complete sorted placeholder layout, and replace placeholders with thumbnails individually.
 - Discover deeply nested folder trees independently of the currently selected folder, read the known inventory in bounded database pages, and build Qt tree items in short event-loop slices.
-- Browse folders and images in a sortable thumbnail grid with configurable columns.
-- Preview child folders using up to four indexed image thumbnails.
+- Browse folders, images, videos, and documents in a sortable thumbnail grid with configurable columns.
+- Preview child folders using up to four indexed file thumbnails.
 - Sort thumbnail views by name, file size, modification date, or aspect ratio.
-- View images fullscreen in display order or a randomized order.
+- View images and documents fullscreen in display order or a randomized order.
+- Read text, DOCX, ODT, and PDF files fit to the viewer width, with keyboard and mouse-wheel scrolling.
+- Open videos in the system's default player and preview them with midpoint film-strip thumbnails.
 - Zoom, pan, show file information, copy files to the desktop clipboard, and inspect image metadata.
 - Rotate, flip, crop, reduce red eye, and clone/heal from the fullscreen viewer.
 - Remove masked objects locally with GPU-accelerated LaMa inpainting and automatic CPU fallback.
@@ -29,7 +31,7 @@ Each catalog keeps its metadata beside the photos in a `.marnwick` directory. Mo
 - Rebuild stale thumbnails and prune unreferenced cache files.
 - Generate deterministic large test catalogs and drive performance runs through an authenticated localhost debug interface.
 
-Marnwick recognizes AVIF, BMP, GIF, HEIC, HEIF, JPEG, PNG, TIFF, and WebP filenames. Actual decoding depends on the codecs available to Pillow and Qt; HEIC, HEIF, and AVIF commonly require additional platform or Pillow plugins. GIF animation is played in the fullscreen viewer. Marnwick does not index or play video.
+Marnwick recognizes AVIF, BMP, GIF, HEIC, HEIF, JPEG, PNG, TIFF, and WebP images; AVI, M4V, MKV, MOV, MP4, MPEG, MPG, WebM, and WMV videos; plain-text and common structured-text files; and DOCX, ODT, and PDF documents. Actual image decoding depends on the codecs available to Pillow and Qt; HEIC, HEIF, and AVIF commonly require additional platform or Pillow plugins. GIF animation is played in the fullscreen viewer. Videos are opened by the system's default player.
 
 ## Requirements
 
@@ -39,7 +41,7 @@ Marnwick recognizes AVIF, BMP, GIF, HEIC, HEIF, JPEG, PNG, TIFF, and WebP filena
 - Optional GNU `find` and `md5sum` for faster catalog discovery and freshness checks
 - Optional GNU `shred` for wipe-on-delete
 
-The runtime dependencies are NumPy, Pillow, PySide6, and one ONNX Runtime variant selected for the host. Development and CPU runtime dependencies are hash-locked in `requirements-dev.lock`; the setup scripts select the NVIDIA runtime on supported x86-64 Linux systems, DirectML on x86-64 Windows, and the CPU runtime otherwise. Standard setup also installs Microsoft's beta [WebGPU execution-provider plugin](https://pypi.org/project/onnxruntime-ep-webgpu/) on x86-64 Linux and Windows and on Apple-silicon macOS 14 or newer. LaMa's 198 MiB model data is optional and downloaded only after confirmation.
+The runtime dependencies are NumPy, Pillow, PyAV, PySide6, and one ONNX Runtime variant selected for the host. PyAV's binary wheels provide the FFmpeg libraries used to extract video preview frames. Development and CPU runtime dependencies are hash-locked in `requirements-dev.lock`; the setup scripts select the NVIDIA runtime on supported x86-64 Linux systems, DirectML on x86-64 Windows, and the CPU runtime otherwise. Standard setup also installs Microsoft's beta [WebGPU execution-provider plugin](https://pypi.org/project/onnxruntime-ep-webgpu/) on x86-64 Linux and Windows and on Apple-silicon macOS 14 or newer. LaMa's 198 MiB model data is optional and downloaded only after confirmation.
 
 ## Quick start
 
@@ -92,7 +94,7 @@ Verify the command-line entry point without opening the GUI:
 3. Select a folder in the left tree. Marnwick gives that folder's work priority over deep discovery and idle maintenance, starts a catalog-page read and a complete direct-child filesystem inventory in parallel, and reports the active phase in the status bar. A nonempty current catalog page can paint immediately. For an unindexed or changed folder, the filesystem worker publishes every recognized direct image and child folder in one stable sorted layout as soon as enumeration finishes; it does not wait for image decoding or recursive descendant discovery.
 4. The thumbnail model exposes that layout to Qt in 400-row batches. Thumbnail files are read away from the UI thread and replace placeholders at their existing rows as they become available. Metadata updates also apply in place. An aspect-ratio or directory-aggregate sort can require one final reconciliation after indexing supplies the previously unknown values, but it does not rebuild the pane for every completed thumbnail. Tag and exact-duplicate panes remain database-paged, while folder-tree database reads are paged and Qt item construction is time-sliced into bounded batches.
 5. Deep folder discovery continues independently in the background. The status bar reports folders found, images checked, the current path, and other active phases.
-6. Double-click an image for fullscreen viewing, or double-click a folder tile to enter it.
+6. Double-click an image or document for fullscreen viewing, a video to launch the default player, or a folder tile to enter it.
 
 You can open more catalogs with **File > Open** or manage remembered catalogs under **Tools > Preferences**. Global configuration is read on a bounded background lane, so the window can open with safe defaults even if the configuration path is slow. A late configuration result does not overwrite newer window geometry, controls, or catalog choices made in that window. Remembered catalogs are then restored asynchronously. If several open requests overlap, every catalog that opens successfully is retained in the workspace, while the most recently requested successful catalog becomes active. A slow earlier request cannot take focus back from a newer successful request; if the newest request fails, Marnwick falls back to the newest earlier success. An unavailable remembered path remains configured for a later retry.
 
@@ -102,13 +104,13 @@ You can open more catalogs with **File > Open** or manage remembered catalogs un
 
 | Input | Action |
 | --- | --- |
-| Double-click or `Enter` | Open the selected image or folder |
-| `S` | Open the selected image in randomized navigation mode |
-| `T` | Edit tags for one selected image |
-| `Ctrl+C` | Copy selected image files to the desktop clipboard |
-| `Delete` or `Backspace` | Permanently delete selected image files after confirmation |
-| Drag | Move selected images or folders to a physical folder tile or folder-tree item |
-| `Ctrl` while dragging | Copy selected images or folders; the drag cursor shows a `+` badge |
+| Double-click or `Enter` | Open an image/document, launch a video, or enter a folder |
+| `S` | Open images and documents in randomized navigation mode |
+| `T` | Edit tags for one selected file |
+| `Ctrl+C` | Copy selected files to the desktop clipboard |
+| `Delete` or `Backspace` | Permanently delete selected files after confirmation |
+| Drag | Move selected files or folders to a physical folder tile or folder-tree item |
+| `Ctrl` while dragging | Copy selected files or folders; the drag cursor shows a `+` badge |
 
 Use the slider to choose the number of thumbnail columns and the sort menu to change ordering. Scroll positions and selections are remembered separately for each physical or virtual directory during the session.
 
@@ -116,15 +118,16 @@ Physical-folder navigation is progressive. Marnwick checks and lists only the se
 
 Deep discovery walks descendants separately from the selected-pane load and commits its directory inventory in batches. The folder tree reads that inventory from SQLite in bounded pages and performs only a short batch of Qt item work per event-loop turn. If tree work for an older catalog is still pending, the current catalog takes priority; selecting an already visible directory does not wait for the full descendant tree to finish.
 
-Right-click an image tile for duplicate matches, deletion, or metadata. Right-click a folder tile for open, properties, deletion, or trash restore. The folder-tree context menu also provides directory creation and, at a catalog root, catalog preferences, tag definitions, and close.
+Right-click a file tile for rename or deletion; image tiles also offer duplicate matches and metadata. Right-click a folder tile for open, properties, deletion, or trash restore. The folder-tree context menu also provides directory creation and, at a catalog root, catalog preferences, tag definitions, and close.
 
-Directory tiles remain grouped before image tiles. Directory “size” is the total byte size of currently indexed images below that directory, not total filesystem usage. Directory aspect ratio is the mean aspect ratio of indexed descendant images. Both aggregates are calculated in one batched database query.
+Directory tiles remain grouped before file tiles. Directory “size” is the total byte size of currently indexed supported files below that directory, not total filesystem usage. Directory aspect ratio is the mean aspect ratio of indexed descendant thumbnails. Both aggregates are calculated in one batched database query.
 
 ### Fullscreen viewer
 
 | Input | Action |
 | --- | --- |
 | `Left` / `Right` | Previous or next image; at an edge, close the viewer |
+| `Up` / `Down` or mouse wheel | Scroll the current document |
 | `+` / `-` | Zoom in or out |
 | Arrow keys while zoomed | Pan the image |
 | Hold left and right mouse buttons, then drag | Pan a zoomed image while viewing or editing |
@@ -144,6 +147,8 @@ In LaMa mode, paint the complete area to remove, use the mouse wheel to resize t
 Navigation, tagging, or closing resolves pending edits by asking you to save, save while preserving filesystem dates, discard, or cancel; a tag dialog never races an asynchronous save. Save, warning, and error prompts remain owned by the fullscreen modal viewer, and focus returns to that viewer when a nested prompt closes. Returning from fullscreen keeps the directory tree at its prior scroll position while the thumbnail pane follows the last viewed image. In the main application, choosing save queues image decoding, editing, encoding, validation, and atomic replacement on a dedicated background worker; you can continue navigating while the status bar reports the save. A static PNG uses the same non-modal worker path, shares metadata inspection and editing in one traversal, and uses fast lossless compression. It no longer opens an indeterminate “preserving frames and metadata” progress dialog. After a successful replacement, Marnwick submits a targeted reindex through the catalog action queue. That reindex decodes and hashes one stable open file descriptor, compares the resulting filesystem identity and SHA-256 hash with the proof of the exact committed object, and publishes the new record and thumbnail only if they match. It does not perform a separate preliminary full-file proof hash. If a save or tag edit can change the membership or ordering of a database-paged fullscreen view, that navigator reloads from page zero asynchronously instead of continuing from a stale SQL offset. The currently displayed image stays published while bounded background pages locate its fresh position; editing pauses during that reconciliation, visible progress is reported, and an overlapping delete restarts the fresh query after its outcome is known. The main thumbnail pane also refreshes a visible physical or virtual query after save reconciliation.
 
 A persistent `current / total` image counter appears vertically in the bottom-left corner. Its text is rotated counterclockwise so the current ordinal is nearest the corner, and it switches between black and white according to the average brightness beneath it.
+
+Text, DOCX, and ODT files are rendered as safe extracted rich text rather than through an office-suite engine. Their thumbnails and fullscreen view preserve readable structure such as paragraphs, headings, emphasis, and simple tables, but complex page layout, embedded objects, tracked changes, and exact pagination can differ from the originating editor. PDFs use Qt's PDF renderer and retain their real page layout.
 
 Saves preserve supported EXIF/GPS with orientation normalized, ICC profiles, PNG text, JPEG/WebP/AVIF XMP, and—where the platform supports them—permissions, ownership, and extended attributes. Preserved PNG text and XMP are each limited to 4 MiB; JPEG's single-marker XMP limit is 65,504 bytes. Edits are applied to every GIF, APNG, animated WebP/AVIF, or TIFF frame/page instead of flattening the file, with supported timing, loop, disposal, and blend metadata checked after encoding. Marnwick refuses the save if the original changed after it was opened, the complete edit sequence exceeds the aggregate pixel budget, embedded metadata exceeds a preservation limit, the destination format cannot carry that metadata or sequence, or the encoder cannot reproduce supported metadata and multi-frame structure.
 
@@ -234,6 +239,7 @@ Work that feeds the interface has explicit bounds:
 ## Current limitations and safety notes
 
 - Image and directory deletion is destructive; only items explicitly moved into `T-r-a-s-h` are restorable through Marnwick.
+- Video playback depends on a system-default player registered for the video's file type. Marnwick extracts only the thumbnail frame itself.
 - Edits atomically replace the original file after an explicit save. Marnwick refuses to replace a hard-linked image because doing so cannot preserve hard-link identity; copy or unlink it explicitly before editing. If an extremely rare rollback itself fails, the error identifies the retained recovery file rather than silently deleting displaced bytes.
 - LaMa generates a plausible replacement from surrounding pixels; it does not recover the actual hidden scene and can produce incorrect structure or artifacts. It supports static images only and is limited by its fixed 512-pixel inference crop.
 - The native WebGPU execution-provider plugin is beta. Marnwick's supplied setup supports x86-64 Linux and Windows and Apple-silicon macOS 14 or newer; upstream ONNX Runtime currently prevents a supported Intel-macOS configuration. Auto mode accepts known physical GPU vendor IDs and skips virtual or software adapters; choosing WebGPU explicitly permits those adapters for diagnostics, although they can be slower than the CPU provider.
@@ -343,6 +349,9 @@ The debug server listens only on localhost, requires a token, and caps connectio
 | Background actions | [`src/marnwick/indexer.py`](src/marnwick/indexer.py) | Prioritized bounded action workers, serialized protected mutations, cancellation, progress snapshots, selected-folder indexing, discovery, and idle work |
 | Image editing | [`src/marnwick/image_ops.py`](src/marnwick/image_ops.py) | Edit operations, format-aware encoding, atomic saves, and filesystem-date handling |
 | Image safety | [`src/marnwick/safe_image.py`](src/marnwick/safe_image.py) | Pillow pixel-limit enforcement |
+| Document rendering | [`src/marnwick/document_ops.py`](src/marnwick/document_ops.py) | Safe text/office extraction, PDF first-page rendering, and folded document thumbnails |
+| Video rendering | [`src/marnwick/video_ops.py`](src/marnwick/video_ops.py) | Midpoint frame extraction and film-strip thumbnails |
+| Media types | [`src/marnwick/media.py`](src/marnwick/media.py) | Supported extensions and media classification |
 | Domain records | [`src/marnwick/models.py`](src/marnwick/models.py) | Sort orders, image/folder records, settings, and result objects |
 | Workspace | [`src/marnwick/workspace.py`](src/marnwick/workspace.py) | Identity and lifetime of open catalogs |
 | Global configuration | [`src/marnwick/config.py`](src/marnwick/config.py) | JSON configuration defaults, validation, loading, and saving |

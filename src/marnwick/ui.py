@@ -40,8 +40,10 @@ from PySide6.QtCore import (
     QUrl,
     QIODevice,
 )
-from PySide6.QtGui import QAction, QBrush, QColor, QCursor, QDrag, QIcon, QImage, QImageReader, QKeySequence, QMovie, QPen, QPixmap, QShortcut
+from PySide6.QtGui import QAction, QBrush, QColor, QCursor, QDesktopServices, QDrag, QIcon, QImage, QImageReader, QKeySequence, QMovie, QPen, QPixmap, QShortcut
 from PySide6.QtGui import QFont, QFontMetrics, QPainter
+from PySide6.QtPdf import QPdfDocument
+from PySide6.QtPdfWidgets import QPdfView
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -75,6 +77,7 @@ from PySide6.QtWidgets import (
     QStyledItemDelegate,
     QTreeWidget,
     QTreeWidgetItem,
+    QTextBrowser,
     QVBoxLayout,
     QWidget,
 )
@@ -128,6 +131,7 @@ from .config import (
     load_config,
     save_config,
 )
+from .document_ops import MAX_SOURCE_BYTES, load_document_html
 from .folder_icon import render_folder_icon
 from .gpu_test import (
     GPU_TEST_METHODS,
@@ -165,6 +169,7 @@ from .lama import (
     lama_model_appears_installed,
 )
 from .models import CatalogSettings, DirectoryRecord, FolderPreviewRecord, ImageRecord, PaneRecord, SortOrder
+from .media import is_supported_file_name, media_kind_for_name
 from .navigation import ImageNavigator
 from .safe_image import MAX_IMAGE_PIXELS, open_catalog_image
 from .workspace import Workspace
@@ -240,6 +245,9 @@ class ViewerLoadResult:
     original_file_dates: FileDateSnapshot
     image: QImage
     movie_bytes: bytes | None = None
+    media_kind: str = "image"
+    document_html: str | None = None
+    document_data: bytes | None = None
 
 
 @dataclass(slots=True)
@@ -8576,7 +8584,7 @@ class MainWindow(QMainWindow):
             order_hash.update(b"d\0" if is_directory else b"i\0")
             order_hash.update(record.rel_path.encode("utf-8"))
             order_hash.update(b"\0")
-            if not is_directory:
+            if isinstance(record, ImageRecord) and record.slideshow_eligible:
                 image_order.append(record.rel_path)
         if cancel_event.is_set():
             raise IndexTaskCancelled()
@@ -8824,7 +8832,7 @@ class MainWindow(QMainWindow):
                                 )
                             )
                         elif (
-                            is_image_name(entry.name)
+                            is_supported_file_name(entry.name)
                             and not is_marnwick_internal_artifact_name(entry.name)
                             and rel_path not in excluded_image_rels
                             and not inside_excluded_directory(rel_path)
@@ -8858,6 +8866,7 @@ class MainWindow(QMainWindow):
                                         int(entry_stat.st_mtime_ns),
                                         entry_change_ns,
                                     ),
+                                    media_kind=media_kind_for_name(entry.name) or "image",
                                 )
                             )
                     except OSError:
@@ -8962,7 +8971,8 @@ class MainWindow(QMainWindow):
         for row, record in enumerate(sorted_images):
             if row % 256 == 0 and cancel_event.is_set():
                 raise IndexTaskCancelled()
-            stable_image_order.append(record.rel_path)
+            if record.slideshow_eligible:
+                stable_image_order.append(record.rel_path)
         filesystem._assert_catalog_root_identity()  # noqa: SLF001 - stale-result guard
         return VirtualViewResult(
             root=root,
@@ -8973,7 +8983,7 @@ class MainWindow(QMainWindow):
             images=records,
             duration_ms=(monotonic() - started_at) * 1000,
             total_records=len(records),
-            total_images=len(image_records),
+            total_images=sum(record.slideshow_eligible for record in image_records),
             stable_row_by_key=stable_row_by_key,
             stable_order_token=order_hash.hexdigest(),
             stable_image_order=stable_image_order,
@@ -9124,13 +9134,14 @@ class MainWindow(QMainWindow):
         for row, record in enumerate(images):
             if row % 256 == 0:
                 check_canceled()
-            stable_image_order.append(record.rel_path)
+            if record.slideshow_eligible:
+                stable_image_order.append(record.rel_path)
         result.images = records
         result.stable_row_by_key = row_by_key
         result.stable_order_token = order_hash.hexdigest()
         result.stable_image_order = stable_image_order
         result.total_records = len(records)
-        result.total_images = len(images)
+        result.total_images = sum(record.slideshow_eligible for record in images)
         return result
 
     def _physical_view_worker(
@@ -9773,7 +9784,9 @@ class MainWindow(QMainWindow):
             raise ValueError(f"unsupported paged viewer kind: {kind}")
         return ViewerNavigationPage(
             rel_paths=[
-                record.rel_path for record in result.images if isinstance(record, ImageRecord)
+                record.rel_path
+                for record in result.images
+                if isinstance(record, ImageRecord) and record.slideshow_eligible
             ],
             next_offset=result.next_offset,
             has_more=result.has_more,
@@ -10316,9 +10329,11 @@ class MainWindow(QMainWindow):
                             record.rel_path
                             for record in preview_records
                             if isinstance(record, ImageRecord)
+                            and record.slideshow_eligible
                         ]
                         total_images = sum(
                             isinstance(record, ImageRecord)
+                            and record.slideshow_eligible
                             for record in preview_records
                         )
 
@@ -12117,9 +12132,11 @@ class MainWindow(QMainWindow):
                 actions["delete_directory"] = menu.addAction("Delete Directory")
             return actions
         actions["rename"] = menu.addAction("Rename")
-        actions["list_duplicates"] = menu.addAction("List Duplicates")
+        if record.media_kind == "image":
+            actions["list_duplicates"] = menu.addAction("List Duplicates")
         actions["delete"] = menu.addAction("Delete")
-        actions["metadata"] = menu.addAction("Metadata")
+        if record.media_kind == "image":
+            actions["metadata"] = menu.addAction("Metadata")
         return actions
 
     def open_duplicate_list_dialog(self, record: ImageRecord, *, catalog: Catalog | None = None) -> None:
@@ -12175,19 +12192,38 @@ class MainWindow(QMainWindow):
         if isinstance(selected_record, DirectoryRecord):
             self.navigate_to_directory(selected_record.dir_rel)
             return
+        if selected_record.media_kind == "video" and not random_mode:
+            if not QDesktopServices.openUrl(
+                QUrl.fromLocalFile(str(selected_record.absolute_path))
+            ):
+                show_error(
+                    self,
+                    "Open Video",
+                    f"The system could not open {selected_record.filename} in the default video player.",
+                )
+            return
         complete_order = self.model.complete_image_order
         if complete_order is not None:
             order = complete_order
-            first_image_row = self.model.first_image_row or 0
-            start_index = index.row() - first_image_row
         else:
             order = [
                 record.rel_path
                 for record in self.model.images
-                if isinstance(record, ImageRecord)
+                if isinstance(record, ImageRecord) and record.slideshow_eligible
             ]
-            start_index = order.index(selected_record.rel_path)
-        start = selected_record.rel_path
+        if not order:
+            self.statusBar().showMessage(
+                "This view does not contain any images or documents for a slideshow.",
+                3000,
+            )
+            return
+        start = (
+            selected_record.rel_path
+            if selected_record.slideshow_eligible
+            and selected_record.rel_path in order
+            else order[0]
+        )
+        start_index = order.index(start)
         catalog = self.current_catalog
         if self.model.is_paged and self.current_virtual_kind in {
             None,
@@ -12326,7 +12362,7 @@ class MainWindow(QMainWindow):
                     continue
                 group = directory_groups
             else:
-                if not is_image_name(Path(rel_path).name):
+                if not is_supported_file_name(Path(rel_path).name):
                     continue
                 group = image_groups
             group[source_root].append(rel_path)
@@ -14623,7 +14659,7 @@ class DirectoryNameDialog(QDialog):
 class ImageRenameDialog(QDialog):
     def __init__(self, filename: str, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Rename Image")
+        self.setWindowTitle("Rename File")
         self.setWindowIcon(load_app_icon())
         self.setStyleSheet(DIALOG_STYLESHEET)
 
@@ -15653,6 +15689,7 @@ class FullscreenViewer(QDialog):
         self.load_error: str | None = None
         self.loaded_file_identity: ImageFileIdentity | None = None
         self.loaded_file_dates: FileDateSnapshot | None = None
+        self.active_media_kind = media_kind_for_name(navigator.current) or "image"
         self.movie: QMovie | None = None
         self._movie_data: QByteArray | None = None
         self._movie_buffer: QBuffer | None = None
@@ -15738,7 +15775,40 @@ class FullscreenViewer(QDialog):
         self.label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.label.setMouseTracking(True)
         self.label.installEventFilter(self)
-        self.info_overlay = QLabel(self.label)
+        self.document_text = QTextBrowser()
+        self.document_text.setReadOnly(True)
+        self.document_text.setOpenExternalLinks(False)
+        self.document_text.setStyleSheet(
+            "QTextBrowser { background: white; color: #181818; border: 0; }"
+        )
+        self.document_text.hide()
+        self.pdf_document = QPdfDocument(self)
+        self._pdf_data: QByteArray | None = None
+        self._pdf_buffer: QBuffer | None = None
+        self.pdf_view = QPdfView()
+        self.pdf_view.setDocument(self.pdf_document)
+        self.pdf_view.setPageMode(QPdfView.PageMode.MultiPage)
+        self.pdf_view.setZoomMode(QPdfView.ZoomMode.FitToWidth)
+        self.pdf_view.setStyleSheet("QPdfView { background: #30343a; border: 0; }")
+        self.pdf_view.hide()
+        self._document_event_targets = {
+            self.document_text,
+            self.document_text.viewport(),
+            self.pdf_view,
+            self.pdf_view.viewport(),
+        }
+        for target in self._document_event_targets:
+            target.installEventFilter(self)
+        self.document_ordinal_overlay = QLabel(self)
+        self.document_ordinal_overlay.setAttribute(
+            Qt.WidgetAttribute.WA_TransparentForMouseEvents
+        )
+        self.document_ordinal_overlay.setStyleSheet(
+            "color: white; background: rgba(0, 0, 0, 150); "
+            "padding: 5px 8px; border-radius: 4px; font-weight: bold;"
+        )
+        self.document_ordinal_overlay.hide()
+        self.info_overlay = QLabel(self)
         self.info_overlay.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self.info_overlay.setTextFormat(Qt.TextFormat.PlainText)
         self.info_overlay.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
@@ -15755,6 +15825,8 @@ class FullscreenViewer(QDialog):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self.label, 1)
+        layout.addWidget(self.document_text, 1)
+        layout.addWidget(self.pdf_view, 1)
         self.load_current()
         self.update_cursor_visibility()
 
@@ -15814,6 +15886,12 @@ class FullscreenViewer(QDialog):
         if key == Qt.Key.Key_Z:
             self.toggle_info_overlay()
             return
+        if self.active_media_kind in {"text", "docx", "odt", "pdf"} and key in {
+            Qt.Key.Key_Up,
+            Qt.Key.Key_Down,
+        }:
+            self.scroll_document(-1 if key == Qt.Key.Key_Up else 1)
+            return
         if self.is_zoomed() and key in (Qt.Key.Key_Left, Qt.Key.Key_Right, Qt.Key.Key_Up, Qt.Key.Key_Down):
             if key == Qt.Key.Key_Left:
                 self.pan_by(-self.PAN_KEY_STEP, 0)
@@ -15850,6 +15928,20 @@ class FullscreenViewer(QDialog):
         self.update_cursor_visibility()
 
     def eventFilter(self, watched: object, event: QEvent) -> bool:
+        if (
+            watched in self._document_event_targets
+            and event.type() == QEvent.Type.KeyPress
+            and event.key()  # type: ignore[attr-defined]
+            in {
+                Qt.Key.Key_Left,
+                Qt.Key.Key_Right,
+                Qt.Key.Key_Up,
+                Qt.Key.Key_Down,
+                Qt.Key.Key_Escape,
+            }
+        ):
+            self.keyPressEvent(event)
+            return True
         if watched == self.label and self.handle_pan_chord_event(event):
             return True
         if watched == self.label and self.edit_mode == "clone_heal":
@@ -15883,6 +15975,16 @@ class FullscreenViewer(QDialog):
                 self.complete_region_drag(rect)
                 return True
         return super().eventFilter(watched, event)
+
+    def scroll_document(self, direction: int) -> None:
+        if self.active_media_kind == "pdf":
+            scrollbar = self.pdf_view.verticalScrollBar()
+        elif self.active_media_kind in {"text", "docx", "odt"}:
+            scrollbar = self.document_text.verticalScrollBar()
+        else:
+            return
+        step = max(scrollbar.singleStep(), min(120, max(24, scrollbar.pageStep() // 8)))
+        scrollbar.setValue(scrollbar.value() + (step * direction))
 
     def handle_pan_chord_event(self, event: QEvent) -> bool:
         """Pan a zoomed image while both primary mouse buttons are held."""
@@ -16280,6 +16382,8 @@ class FullscreenViewer(QDialog):
         self._fit_pixmap()
         if hasattr(self, "info_overlay"):
             self.update_info_overlay()
+        if hasattr(self, "document_ordinal_overlay"):
+            self.position_document_ordinal_overlay()
 
     def closeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         if not self.confirm_pending_edits():
@@ -16781,6 +16885,16 @@ class FullscreenViewer(QDialog):
     def load_current(self) -> None:
         self.update_ordinal_overlay()
         self.stop_movie()
+        self.pdf_document.close()
+        if self._pdf_buffer is not None:
+            self._pdf_buffer.close()
+            self._pdf_buffer.deleteLater()
+        self._pdf_buffer = None
+        self._pdf_data = None
+        self.pdf_view.hide()
+        self.document_text.clear()
+        self.document_text.hide()
+        self.label.show()
         self.cleanup_preview()
         self.operations.clear()
         self.exit_region_edit()
@@ -16789,6 +16903,8 @@ class FullscreenViewer(QDialog):
         self._clear_pan_chord_state()
         self.pan_offset_at_drag_start = QPoint(0, 0)
         self.last_viewed_rel_path = self.navigator.current
+        self.active_media_kind = media_kind_for_name(self.navigator.current) or "image"
+        self.update_ordinal_overlay()
         parent = self.parent()
         if isinstance(parent, MainWindow):
             parent.sync_thumbnail_to_rel_path(self.catalog, self.last_viewed_rel_path)
@@ -16806,6 +16922,16 @@ class FullscreenViewer(QDialog):
             self.label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self.label.setText(f"Loading {Path(self.navigator.current).name}…")
             self._start_async_load(self.navigator.current)
+            return
+        if self.active_media_kind in {"text", "docx", "odt", "pdf"}:
+            try:
+                result = self._load_viewer_image(self.catalog, self.navigator.current)
+                self._display_document_result(result)
+            except Exception as error:
+                self.load_error = str(error)
+                self.label.setText(f"Unable to display document\n{error}")
+                self.label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                self.update_info_overlay()
             return
         try:
             path = self.catalog.mutation_path(self.navigator.current)
@@ -16904,21 +17030,29 @@ class FullscreenViewer(QDialog):
 
         if identity.size <= 0 or identity.size > MAX_ANIMATED_IMAGE_BYTES:
             return None
+        return cls._read_verified_file_bytes(path, identity)
+
+    @classmethod
+    def _read_verified_file_bytes(
+        cls,
+        path: Path,
+        identity: ImageFileIdentity,
+    ) -> bytes:
         flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
         fd = os.open(path, flags)
         try:
             if not cls._stat_matches_image_identity(os.fstat(fd), identity):
-                raise OSError(f"{path.name} changed before animation loading")
+                raise OSError(f"{path.name} changed before file loading")
             remaining = identity.size
             chunks: list[bytes] = []
             while remaining:
                 chunk = os.read(fd, min(1024 * 1024, remaining))
                 if not chunk:
-                    raise OSError(f"{path.name} ended while animation was loading")
+                    raise OSError(f"{path.name} ended while the file was loading")
                 chunks.append(chunk)
                 remaining -= len(chunk)
             if not cls._stat_matches_image_identity(os.fstat(fd), identity):
-                raise OSError(f"{path.name} changed while animation was loading")
+                raise OSError(f"{path.name} changed while the file was loading")
             return b"".join(chunks)
         finally:
             os.close(fd)
@@ -16930,6 +17064,40 @@ class FullscreenViewer(QDialog):
         if not path.is_file():
             raise FileNotFoundError(path)
         identity, original_file_dates = snapshot_image_file_identity_with_dates(path)
+        media_kind = media_kind_for_name(path.name)
+        if media_kind in {"text", "docx", "odt", "pdf"}:
+            if identity.size < 0 or identity.size > MAX_SOURCE_BYTES:
+                raise ValueError(
+                    f"document exceeds the {MAX_SOURCE_BYTES:,}-byte viewer limit"
+                )
+            document_data = FullscreenViewer._read_verified_file_bytes(path, identity)
+            document_html = (
+                load_document_html(path, media_kind, source_data=document_data)
+                if media_kind in {"text", "docx", "odt"}
+                else None
+            )
+            post_decode_stat = path.stat(follow_symlinks=False)
+            if not FullscreenViewer._stat_matches_image_identity(
+                post_decode_stat,
+                identity,
+            ):
+                raise OSError(
+                    f"{path.name} changed while it was being opened; reload it before viewing"
+                )
+            catalog._assert_catalog_root_identity()  # noqa: SLF001 - reject replaced catalog
+            return ViewerLoadResult(
+                rel_path,
+                path,
+                identity,
+                original_file_dates,
+                QImage(),
+                None,
+                media_kind,
+                document_html,
+                document_data,
+            )
+        if media_kind == "video":
+            raise ValueError("videos open in the system video player")
         reader = QImageReader(str(path))
         reader.setAutoTransform(True)
         source_size = validate_qimage_reader_size(reader, path)
@@ -17069,8 +17237,11 @@ class FullscreenViewer(QDialog):
             self._load_timer.stop()
             self.load_error = str(error)
             self.base_pixmap = QPixmap()
+            self.pdf_view.hide()
+            self.document_text.hide()
+            self.label.show()
             self.label.clear_display_pixmap()
-            self.label.setText(f"Unable to display image\n{error}")
+            self.label.setText(f"Unable to display file\n{error}")
             self.label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self.update_info_overlay()
             return
@@ -17079,6 +17250,18 @@ class FullscreenViewer(QDialog):
         if self._pending_load_request == (generation, result.rel_path):
             self._pending_load_request = None
         self._load_timer.stop()
+        if result.media_kind in {"text", "docx", "odt", "pdf"}:
+            try:
+                self._display_document_result(result)
+            except Exception as error:
+                self.load_error = str(error)
+                self.pdf_view.hide()
+                self.document_text.hide()
+                self.label.show()
+                self.label.setText(f"Unable to display document\n{error}")
+                self.label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                self.update_info_overlay()
+            return
         self.base_pixmap = QPixmap.fromImage(result.image)
         try:
             coordinate_width = int(result.image.text("marnwick-coordinate-width"))
@@ -17111,6 +17294,42 @@ class FullscreenViewer(QDialog):
         self._fit_pixmap()
         if result.movie_bytes is not None:
             self._queue_movie_validation(result, generation)
+        self.update_info_overlay()
+
+    def _display_document_result(self, result: ViewerLoadResult) -> None:
+        self.active_media_kind = result.media_kind
+        self.loaded_file_identity = result.identity
+        self.loaded_file_dates = result.original_file_dates
+        self.base_pixmap = QPixmap()
+        self.image_coordinate_size = (0, 0)
+        self.label.clear_display_pixmap()
+        self.label.hide()
+        if result.media_kind == "pdf":
+            self.document_text.hide()
+            self.pdf_document.close()
+            if result.document_data is None:
+                raise ValueError(f"PDF data was not loaded for {result.path.name}")
+            self._pdf_data = QByteArray(result.document_data)
+            self._pdf_buffer = QBuffer(self._pdf_data, self)
+            if not self._pdf_buffer.open(QIODevice.OpenModeFlag.ReadOnly):
+                raise ValueError(f"Unable to open {result.path.name} from memory")
+            self.pdf_document.load(self._pdf_buffer)
+            if self.pdf_document.status() != QPdfDocument.Status.Ready:
+                self.label.show()
+                raise ValueError(
+                    f"Unable to render {result.path.name}: {self.pdf_document.error()}"
+                )
+            self.pdf_view.setPageMode(QPdfView.PageMode.MultiPage)
+            self.pdf_view.setZoomMode(QPdfView.ZoomMode.FitToWidth)
+            self.pdf_view.show()
+            self.pdf_view.setFocus()
+            QTimer.singleShot(0, lambda: self.pdf_view.verticalScrollBar().setValue(0))
+        else:
+            self.pdf_view.hide()
+            self.document_text.setHtml(result.document_html or "")
+            self.document_text.show()
+            self.document_text.setFocus()
+            self.document_text.verticalScrollBar().setValue(0)
         self.update_info_overlay()
 
     @classmethod
@@ -17291,6 +17510,8 @@ class FullscreenViewer(QDialog):
             return False
         if self.navigator.current in self._pending_save_rels:
             return False
+        if self.active_media_kind != "image":
+            return False
         if self._load_future is not None and not self._load_future.done():
             return False
         return self._preview_future is None and self._lama_future is None
@@ -17310,7 +17531,31 @@ class FullscreenViewer(QDialog):
 
     def update_ordinal_overlay(self) -> None:
         ordinal, total = self.image_position()
-        self.label.set_ordinal_text(f"{ordinal} / {total}" if ordinal and total else "")
+        text = f"{ordinal} / {total}" if ordinal and total else ""
+        self.label.set_ordinal_text(text)
+        if not hasattr(self, "document_ordinal_overlay"):
+            return
+        is_document = (
+            bool(self.navigator.order)
+            and media_kind_for_name(self.navigator.current)
+            in {"text", "docx", "odt", "pdf"}
+        )
+        self.document_ordinal_overlay.setText(text)
+        if text and is_document:
+            self.position_document_ordinal_overlay()
+            self.document_ordinal_overlay.show()
+            self.document_ordinal_overlay.raise_()
+        else:
+            self.document_ordinal_overlay.hide()
+
+    def position_document_ordinal_overlay(self) -> None:
+        overlay = self.document_ordinal_overlay
+        overlay.adjustSize()
+        margin = 16
+        overlay.move(
+            margin,
+            max(margin, self.height() - overlay.height() - margin),
+        )
 
     def update_info_overlay(self) -> None:
         self.update_ordinal_overlay()
@@ -17344,21 +17589,28 @@ class FullscreenViewer(QDialog):
 
     def position_info_overlay(self) -> None:
         margin = 16
-        ordinal_rect = self.label.ordinal_overlay_rect()
+        document_mode = self.active_media_kind in {"text", "docx", "odt", "pdf"}
+        ordinal_rect = (
+            self.document_ordinal_overlay.geometry()
+            if document_mode and not self.document_ordinal_overlay.isHidden()
+            else self.label.ordinal_overlay_rect()
+        )
         left = (
             ordinal_rect.right() + 1 + margin
             if not ordinal_rect.isEmpty()
             else margin
         )
-        max_width = max(1, self.label.width() - left - margin)
-        max_height = max(1, self.label.height() - 2 * margin)
+        surface_width = self.width() if document_mode else self.label.width()
+        surface_height = self.height() if document_mode else self.label.height()
+        max_width = max(1, surface_width - left - margin)
+        max_height = max(1, surface_height - 2 * margin)
         self.info_overlay.setMaximumWidth(max_width)
         self.info_overlay.adjustSize()
         width = min(max_width, max(1, self.info_overlay.width()))
         height = min(max_height, max(1, self.info_overlay.height()))
         self.info_overlay.setGeometry(
             left,
-            max(margin, self.label.height() - height - margin),
+            max(margin, surface_height - height - margin),
             width,
             height,
         )
