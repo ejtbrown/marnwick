@@ -1699,7 +1699,11 @@ class Catalog:
                 "SELECT rel_path, dir_rel, thumb_rel_path FROM images LIMIT 0"
             )
             writer._conn.execute(
-                "SELECT dir_rel, parent_dir_rel FROM directories LIMIT 0"
+                """
+                SELECT dir_rel, parent_dir_rel, last_refreshed_at_ns
+                FROM directories
+                LIMIT 0
+                """
             )
             writer._assert_catalog_storage_identity()
         except BaseException:
@@ -4231,30 +4235,61 @@ class Catalog:
         total_dirs = max(1, self.known_directory_count())
         processed_dirs = 0
         pending_table = f"refresh_pending_{threading.get_ident()}_{time.time_ns()}"
+        priority_index = f"{pending_table}_priority"
         with self._db_lock:
             self._conn.execute(
-                f"CREATE TEMP TABLE {pending_table}(seq INTEGER PRIMARY KEY AUTOINCREMENT, dir_rel TEXT UNIQUE)"
+                f"""
+                CREATE TEMP TABLE {pending_table}(
+                    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                    dir_rel TEXT UNIQUE,
+                    processed INTEGER NOT NULL DEFAULT 0,
+                    has_been_refreshed INTEGER NOT NULL,
+                    last_refreshed_at_ns INTEGER,
+                    random_order INTEGER NOT NULL
+                )
+                """
             )
-            self._conn.execute(f"INSERT INTO {pending_table}(dir_rel) VALUES ('')")
+            self._conn.execute(
+                f"""
+                CREATE INDEX {priority_index}
+                ON {pending_table}(
+                    processed,
+                    has_been_refreshed,
+                    last_refreshed_at_ns,
+                    random_order,
+                    dir_rel COLLATE NOCASE,
+                    dir_rel
+                )
+                """
+            )
+            self._conn.execute(
+                f"""
+                INSERT OR IGNORE INTO {pending_table}(
+                    dir_rel,
+                    has_been_refreshed,
+                    last_refreshed_at_ns,
+                    random_order
+                )
+                SELECT
+                    dir_rel,
+                    last_refreshed_at_ns IS NOT NULL,
+                    last_refreshed_at_ns,
+                    random()
+                FROM directories
+                """
+            )
         if progress is not None:
             progress(0, total_dirs, ".")
         try:
             while True:
-                with self._db_lock:
-                    pending = self._conn.execute(
-                        f"SELECT seq, dir_rel FROM {pending_table} ORDER BY seq DESC LIMIT 1"
-                    ).fetchone()
-                    if pending is not None:
-                        self._conn.execute(
-                            f"DELETE FROM {pending_table} WHERE seq = ?",
-                            (int(pending["seq"]),),
-                        )
+                pending = self._take_next_refresh_directory(pending_table)
                 if pending is None:
                     break
                 dir_rel = str(pending["dir_rel"])
                 if cancel_check is not None:
                     cancel_check()
                 if not force and self.directory_hash_matches(dir_rel, cancel_check, require_complete=True):
+                    self._mark_directory_refreshed(dir_rel)
                     if progress is not None:
                         progress(processed_dirs, total_dirs, dir_rel or ".")
                     processed_dirs += 1
@@ -4277,20 +4312,34 @@ class Catalog:
                         scan_result.entry_hash,
                         remember_directory=False,
                     )
+                    self._mark_directory_refreshed(dir_rel)
                 with self._db_lock:
                     self._conn.execute(
                         f"""
-                        INSERT OR IGNORE INTO {pending_table}(dir_rel)
-                        SELECT dir_rel
+                        INSERT OR IGNORE INTO {pending_table}(
+                            dir_rel,
+                            has_been_refreshed,
+                            last_refreshed_at_ns,
+                            random_order
+                        )
+                        SELECT
+                            dir_rel,
+                            last_refreshed_at_ns IS NOT NULL,
+                            last_refreshed_at_ns,
+                            random()
                         FROM directories
                         WHERE parent_dir_rel = ? AND dir_rel != ?
-                        ORDER BY dir_rel COLLATE NOCASE DESC
                         """,
                         (dir_rel, dir_rel),
                     )
                     pending_count = int(
                         self._conn.execute(
-                            f"SELECT COUNT(*) AS count FROM {pending_table}"
+                            f"""
+                            SELECT COUNT(*) AS count
+                            FROM {pending_table} AS pending
+                            JOIN directories AS known USING (dir_rel)
+                            WHERE pending.processed = 0
+                            """
                         ).fetchone()["count"]
                     )
                 total_dirs = max(total_dirs, processed_dirs + pending_count + 1)
@@ -4304,6 +4353,42 @@ class Catalog:
         if progress is not None:
             progress(processed_dirs, processed_dirs, "Catalog scan complete")
         return refreshed
+
+    def _take_next_refresh_directory(self, pending_table: str) -> sqlite3.Row | None:
+        """Take the stalest known directory from one catalog refresh sweep."""
+
+        with self._db_lock:
+            pending = self._conn.execute(
+                f"""
+                SELECT pending.seq, pending.dir_rel
+                FROM {pending_table} AS pending
+                JOIN directories AS known USING (dir_rel)
+                WHERE pending.processed = 0
+                ORDER BY
+                    pending.has_been_refreshed,
+                    pending.last_refreshed_at_ns,
+                    pending.random_order,
+                    pending.dir_rel COLLATE NOCASE,
+                    pending.dir_rel
+                LIMIT 1
+                """
+            ).fetchone()
+            if pending is not None:
+                self._conn.execute(
+                    f"UPDATE {pending_table} SET processed = 1 WHERE seq = ?",
+                    (int(pending["seq"]),),
+                )
+            return pending
+
+    def _mark_directory_refreshed(self, dir_rel: str) -> None:
+        self._conn.execute(
+            """
+            UPDATE directories
+            SET last_refreshed_at_ns = ?
+            WHERE dir_rel = ?
+            """,
+            (time.time_ns(), dir_rel),
+        )
 
     def _refresh_directory_contents(
         self,
@@ -5081,6 +5166,7 @@ class Catalog:
                 stored_hash is not None
                 and self.directory_entry_find_hash(dir_rel, cancel_check) == stored_hash
             ):
+                self._mark_directory_refreshed(dir_rel)
                 if progress is not None:
                     progress(0, 0, "Directory up to date")
                 return False
@@ -5105,6 +5191,7 @@ class Catalog:
                 stable_hash,
                 remember_directory=False,
             )
+            self._mark_directory_refreshed(dir_rel)
         else:
             self._conn.execute(
                 "UPDATE directories SET entry_find_hash = NULL, entry_hash_at_ns = 0 WHERE dir_rel = ?",
@@ -5188,6 +5275,7 @@ class Catalog:
                         scan_result.entry_hash,
                         remember_directory=False,
                     )
+                    self._mark_directory_refreshed(current_rel)
                 with self._db_lock:
                     self._conn.execute(
                         f"""
@@ -8857,6 +8945,7 @@ class Catalog:
                 dir_rel TEXT PRIMARY KEY,
                 parent_dir_rel TEXT NOT NULL DEFAULT '',
                 scanned_at_ns INTEGER NOT NULL,
+                last_refreshed_at_ns INTEGER,
                 find_hash TEXT,
                 hash_at_ns INTEGER NOT NULL DEFAULT 0,
                 find_hash_complete INTEGER NOT NULL DEFAULT 0,
@@ -9030,6 +9119,10 @@ class Catalog:
             self._conn.execute(
                 "ALTER TABLE directories ADD COLUMN entry_hash_at_ns INTEGER NOT NULL DEFAULT 0"
             )
+        if "last_refreshed_at_ns" not in columns:
+            self._conn.execute(
+                "ALTER TABLE directories ADD COLUMN last_refreshed_at_ns INTEGER"
+            )
         migration = self._conn.execute(
             "SELECT value FROM settings WHERE key = 'directory_parent_schema_version'"
         ).fetchone()
@@ -9070,6 +9163,12 @@ class Catalog:
         )
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_directories_name ON directories(dir_rel COLLATE NOCASE, dir_rel)"
+        )
+        self._conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_directories_last_refresh
+                ON directories(last_refreshed_at_ns, dir_rel)
+            """
         )
 
     def _expand_directory_paths_once(self, dir_rels: Iterable[str]) -> set[str]:

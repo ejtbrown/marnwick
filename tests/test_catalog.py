@@ -182,8 +182,19 @@ def test_directory_parent_index_migration_backfills_existing_rows(tmp_path: Path
                 "SELECT dir_rel, parent_dir_rel FROM directories ORDER BY dir_rel"
             )
         }
+        refresh_times = {
+            str(row["dir_rel"]): row["last_refreshed_at_ns"]
+            for row in catalog._conn.execute(
+                """
+                SELECT dir_rel, last_refreshed_at_ns
+                FROM directories
+                ORDER BY dir_rel
+                """
+            )
+        }
 
         assert parents == {"": "", "album": "", "album/child": "album"}
+        assert refresh_times == {"": None, "album": None, "album/child": None}
         assert catalog._direct_child_directories("") == ["album"]
         assert catalog._direct_child_directories("album") == ["album/child"]
 
@@ -705,6 +716,119 @@ def test_complete_refresh_reuses_direct_directory_fingerprint(
         monkeypatch.setattr(catalog, "_refresh_directory_contents", fail_if_scanned)
 
         assert catalog.refresh_directory("set-a", force=False) is False
+
+
+def test_refresh_records_last_refresh_for_every_known_directory(tmp_path: Path) -> None:
+    root = tmp_path / "catalog"
+    make_image(root / "set-a" / "nested" / "wide.jpg", (120, 80))
+
+    with Catalog(root) as catalog:
+        catalog.discover_directories()
+        before = {
+            str(row["dir_rel"]): row["last_refreshed_at_ns"]
+            for row in catalog._conn.execute(
+                "SELECT dir_rel, last_refreshed_at_ns FROM directories"
+            )
+        }
+
+        assert before == {"": None, "set-a": None, "set-a/nested": None}
+        assert catalog.refresh()
+
+        after = {
+            str(row["dir_rel"]): row["last_refreshed_at_ns"]
+            for row in catalog._conn.execute(
+                "SELECT dir_rel, last_refreshed_at_ns FROM directories"
+            )
+        }
+        assert set(after) == set(before)
+        assert all(isinstance(timestamp, int) and timestamp > 0 for timestamp in after.values())
+
+
+def test_catalog_refresh_chooses_oldest_directory_first(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "catalog"
+    (root / "alpha").mkdir(parents=True)
+    (root / "zulu").mkdir()
+
+    with Catalog(root) as catalog:
+        catalog.discover_directories()
+        catalog._conn.executemany(
+            """
+            UPDATE directories
+            SET last_refreshed_at_ns = ?
+            WHERE dir_rel = ?
+            """,
+            ((300, ""), (100, "alpha"), (200, "zulu")),
+        )
+        selected: list[str] = []
+        take_next = catalog._take_next_refresh_directory
+
+        def record_selection(pending_table: str):  # type: ignore[no-untyped-def]
+            pending = take_next(pending_table)
+            if pending is not None:
+                selected.append(str(pending["dir_rel"]))
+            return pending
+
+        monkeypatch.setattr(catalog, "_take_next_refresh_directory", record_selection)
+
+        assert catalog._refresh_catalog_tree(None, None, force=True)
+        assert selected == ["alpha", "zulu", ""]
+
+
+def test_catalog_refresh_randomizes_never_refreshed_directories(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "catalog"
+    (root / "alpha").mkdir(parents=True)
+    (root / "zulu").mkdir()
+
+    with Catalog(root) as catalog:
+        catalog.discover_directories()
+        catalog._conn.execute(
+            """
+            UPDATE directories
+            SET last_refreshed_at_ns = CASE dir_rel
+                WHEN '' THEN 100
+                ELSE NULL
+            END
+            """
+        )
+        random_values = iter((50, 40, -40))
+        catalog._conn.create_function(
+            "random",
+            0,
+            lambda: next(random_values, 0),
+        )
+        pending_priorities: dict[str, int] = {}
+        selected: list[str] = []
+        take_next = catalog._take_next_refresh_directory
+
+        def record_selection(pending_table: str):  # type: ignore[no-untyped-def]
+            if not pending_priorities:
+                pending_priorities.update(
+                    {
+                        str(row["dir_rel"]): int(row["random_order"])
+                        for row in catalog._conn.execute(
+                            f"""
+                            SELECT dir_rel, random_order
+                            FROM {pending_table}
+                            WHERE has_been_refreshed = 0
+                            """
+                        )
+                    }
+                )
+            pending = take_next(pending_table)
+            if pending is not None:
+                selected.append(str(pending["dir_rel"]))
+            return pending
+
+        monkeypatch.setattr(catalog, "_take_next_refresh_directory", record_selection)
+
+        assert catalog._refresh_catalog_tree(None, None, force=True)
+        expected_first = min(pending_priorities, key=pending_priorities.__getitem__)
+        assert set(selected[:2]) == {"alpha", "zulu"}
+        assert selected[0] == expected_first
+        assert selected[-1] == ""
 
 
 def test_directory_find_hash_uses_resolved_helper_paths(tmp_path: Path, monkeypatch) -> None:
