@@ -921,7 +921,7 @@ def test_fullscreen_z_toggles_file_info_overlay(tmp_path: Path) -> None:
             qt_app.processEvents()
 
 
-def test_fullscreen_image_ordinal_is_rotated_and_uses_adaptive_contrast(
+def test_fullscreen_position_labels_are_rotated_and_use_adaptive_contrast(
     tmp_path: Path,
 ) -> None:
     qt_app = app()
@@ -947,11 +947,17 @@ def test_fullscreen_image_ordinal_is_rotated_and_uses_adaptive_contrast(
             qt_app.processEvents()
 
             assert viewer.label.ordinal_text() == "1 / 25"
+            assert viewer.label.filename_text() == "image-01.png"
             overlay_rect = viewer.label.ordinal_overlay_rect()
+            filename_rect = viewer.label.filename_overlay_rect()
             assert overlay_rect.left() == viewer.label.ORDINAL_MARGIN
             assert overlay_rect.bottom() == viewer.label.height() - viewer.label.ORDINAL_MARGIN - 1
             assert overlay_rect.height() > overlay_rect.width()
+            assert filename_rect.right() == viewer.label.width() - viewer.label.ORDINAL_MARGIN - 1
+            assert filename_rect.bottom() == viewer.label.height() - viewer.label.ORDINAL_MARGIN - 1
+            assert filename_rect.height() > filename_rect.width()
             assert viewer.label.ordinal_text_color() == QColor("white")
+            assert viewer.label.filename_text_color() == QColor("white")
 
             rendered = viewer.label.grab().toImage()
             bright_points = [
@@ -964,20 +970,103 @@ def test_fullscreen_image_ordinal_is_rotated_and_uses_adaptive_contrast(
             bright_width = max(x for x, _y in bright_points) - min(x for x, _y in bright_points)
             bright_height = max(y for _x, y in bright_points) - min(y for _x, y in bright_points)
             assert bright_height > bright_width
+            filename_bright_points = [
+                (x, y)
+                for y in range(filename_rect.top(), filename_rect.bottom() + 1)
+                for x in range(filename_rect.left(), filename_rect.right() + 1)
+                if rendered.pixelColor(x, y).lightness() >= 150
+            ]
+            assert filename_bright_points
+            filename_bright_width = (
+                max(x for x, _y in filename_bright_points)
+                - min(x for x, _y in filename_bright_points)
+            )
+            filename_bright_height = (
+                max(y for _x, y in filename_bright_points)
+                - min(y for _x, y in filename_bright_points)
+            )
+            assert filename_bright_height > filename_bright_width
 
             light = QPixmap(viewer.label.size())
             light.fill(QColor(245, 245, 245))
             viewer.label.set_display_pixmap(light, viewer.label.rect())
 
             assert viewer.label.ordinal_text_color() == QColor("black")
+            assert viewer.label.filename_text_color() == QColor("black")
 
             viewer.navigate(1)
 
             assert viewer.label.ordinal_text() == "2 / 25"
+            assert viewer.label.filename_text() == "image-02.png"
         finally:
             viewer.close()
             viewer.deleteLater()
             qt_app.processEvents()
+
+
+def test_fullscreen_l_toggle_persists_for_the_main_window_session(
+    tmp_path: Path,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    Image.new("RGB", (8, 8), (10, 20, 30)).save(root / "image.png")
+    window = MainWindow()
+    first_viewer: FullscreenViewer | None = None
+    second_viewer: FullscreenViewer | None = None
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        with Catalog(root) as catalog:
+            navigator = ImageNavigator.sequential(["image.png"], "image.png")
+            first_viewer = FullscreenViewer(catalog, navigator, window)
+
+            assert first_viewer.label.ordinal_text() == "1 / 1"
+            assert first_viewer.label.filename_text() == "image.png"
+
+            first_viewer.keyPressEvent(
+                QKeyEvent(
+                    QEvent.Type.KeyPress,
+                    Qt.Key.Key_L,
+                    Qt.KeyboardModifier.NoModifier,
+                    "l",
+                )
+            )
+
+            assert not window.fullscreen_position_labels_enabled
+            assert first_viewer.label.ordinal_text() == ""
+            assert first_viewer.label.filename_text() == ""
+
+            second_viewer = FullscreenViewer(catalog, navigator, window)
+
+            assert not second_viewer.position_labels_enabled
+            assert second_viewer.label.ordinal_text() == ""
+            assert second_viewer.label.filename_text() == ""
+
+            second_viewer.keyPressEvent(
+                QKeyEvent(
+                    QEvent.Type.KeyPress,
+                    Qt.Key.Key_L,
+                    Qt.KeyboardModifier.NoModifier,
+                    "l",
+                )
+            )
+
+            assert window.fullscreen_position_labels_enabled
+            assert second_viewer.label.ordinal_text() == "1 / 1"
+            assert second_viewer.label.filename_text() == "image.png"
+    finally:
+        for viewer in (first_viewer, second_viewer):
+            if viewer is not None:
+                viewer.close()
+                viewer.deleteLater()
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        window.indexer.shutdown()
+        window.workspace.close()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
 
 
 def test_fullscreen_virtual_directory_ordinal_uses_complete_image_count(
@@ -1528,6 +1617,77 @@ def test_fullscreen_zoom_and_mouse_chord_pan_work_during_editing(
             assert viewer.pan_offset == QPoint(0, 0)
             assert viewer.edit_mode == mode
         finally:
+            viewer.operations.clear()
+            viewer.close()
+            viewer.deleteLater()
+            qt_app.processEvents()
+
+
+def test_lama_processing_keeps_the_unmasked_image_visible(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    Image.new("RGB", (320, 240), (180, 40, 30)).save(root / "image.png")
+
+    with Catalog(root) as catalog:
+        viewer = FullscreenViewer(
+            catalog,
+            ImageNavigator.sequential(["image.png"], "image.png"),
+        )
+        pending: Future[EditOperation] = Future()
+        try:
+            viewer.resize(640, 480)
+            viewer.show()
+            qt_app.processEvents()
+            original_center = viewer.screen().grabWindow(
+                int(viewer.winId())
+            ).toImage().pixelColor(
+                viewer.width() // 2,
+                viewer.height() // 2,
+            )
+            original_mask_area = viewer.screen().grabWindow(
+                int(viewer.winId())
+            ).toImage().pixelColor(80, 80)
+            viewer.start_region_edit("lama")
+            viewer.lama_samples.append((40, 40, 12))
+            viewer.update_lama_overlay(None)
+            assert not viewer.lama_overlay.isHidden()
+            monkeypatch.setattr(
+                viewer._lama_executor,
+                "submit",
+                lambda *_args, **_kwargs: pending,
+            )
+
+            viewer.apply_lama_mask()
+            qt_app.processEvents()
+
+            assert viewer._lama_future is pending
+            assert viewer.lama_processing_image.isVisible()
+            assert viewer.lama_busy_overlay.isVisible()
+            assert viewer.lama_processing_image.pixmap().toImage().pixelColor(
+                viewer.label.width() // 2,
+                viewer.label.height() // 2,
+            ) == original_center
+            assert viewer.lama_busy_overlay.x() <= 24
+            assert (
+                viewer.lama_busy_overlay.geometry().bottom()
+                >= viewer.label.height() - 25
+            )
+            processing_center = viewer.screen().grabWindow(
+                int(viewer.winId())
+            ).toImage().pixelColor(
+                viewer.width() // 2,
+                viewer.height() // 2,
+            )
+            assert processing_center == original_center
+            assert viewer.screen().grabWindow(
+                int(viewer.winId())
+            ).toImage().pixelColor(80, 80) == original_mask_area
+        finally:
+            viewer._cancel_lama_inference()
             viewer.operations.clear()
             viewer.close()
             viewer.deleteLater()

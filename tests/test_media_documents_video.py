@@ -168,7 +168,41 @@ def test_document_viewer_fits_width_and_scrolls_with_keys_and_wheel(tmp_path: Pa
             assert viewer.document_text.isVisible()
             assert not viewer.document_ordinal_overlay.isHidden()
             assert viewer.document_ordinal_overlay.text() == "1 / 1"
+            assert not viewer.document_filename_overlay.isHidden()
+            assert viewer.document_filename_overlay.text() == "notes.txt"
+            assert (
+                viewer.document_filename_overlay.geometry().right()
+                == viewer.width() - 17
+            )
+            assert (
+                viewer.document_filename_overlay.height()
+                > viewer.document_filename_overlay.width()
+            )
             assert scrollbar.maximum() > 0
+
+            QApplication.sendEvent(
+                viewer.document_text.viewport(),
+                QKeyEvent(
+                    QEvent.Type.KeyPress,
+                    Qt.Key.Key_L,
+                    Qt.KeyboardModifier.NoModifier,
+                    "l",
+                ),
+            )
+            assert viewer.document_ordinal_overlay.isHidden()
+            assert viewer.document_filename_overlay.isHidden()
+
+            QApplication.sendEvent(
+                viewer.document_text.viewport(),
+                QKeyEvent(
+                    QEvent.Type.KeyPress,
+                    Qt.Key.Key_L,
+                    Qt.KeyboardModifier.NoModifier,
+                    "l",
+                ),
+            )
+            assert not viewer.document_ordinal_overlay.isHidden()
+            assert not viewer.document_filename_overlay.isHidden()
 
             viewer.keyPressEvent(
                 QKeyEvent(

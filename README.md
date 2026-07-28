@@ -133,6 +133,7 @@ Directory tiles remain grouped before file tiles. Directory “size” is the to
 | Hold left and right mouse buttons, then drag | Pan a zoomed image while viewing or editing |
 | `Escape` | Exit a region tool, reset zoom, or close the viewer |
 | `Z` | Toggle path, file date, and position information |
+| `L` | Toggle the rotated position and filename labels for this session |
 | `T` | Edit tags |
 | `E` | Open edit tools |
 | `Ctrl+C` | Copy the current file to the desktop clipboard |

@@ -3115,6 +3115,9 @@ class MainWindow(QMainWindow):
         self.config_path = config_path or default_config_path()
         self.config_enabled = config_path is not None or not config_disabled()
         self.app_config = AppConfig()
+        # Fullscreen position labels are a session preference: new viewers
+        # inherit the latest toggle without adding it to the saved config.
+        self.fullscreen_position_labels_enabled = True
         self._applying_initial_config = False
         self._initial_config_controls_changed = False
         self._initial_config_catalog_interacted = False
@@ -15361,21 +15364,14 @@ class LamaMaskOverlay(QWidget):
             )
 
 
-class LamaBusyOverlay(QWidget):
+class LamaBusyOverlay(QFrame):
     def __init__(self, parent: QWidget) -> None:
         super().__init__(parent)
+        self.setObjectName("lamaBusyPanel")
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-
-        outer_layout = QVBoxLayout(self)
-        outer_layout.setContentsMargins(24, 24, 24, 24)
-        outer_layout.addStretch(1)
-
-        self.panel = QFrame()
-        self.panel.setObjectName("lamaBusyPanel")
-        self.panel.setMinimumWidth(340)
-        self.panel.setMaximumWidth(440)
-        panel_layout = QVBoxLayout(self.panel)
+        self.setMinimumWidth(340)
+        self.setMaximumWidth(440)
+        panel_layout = QVBoxLayout(self)
         panel_layout.setContentsMargins(24, 20, 24, 20)
         panel_layout.setSpacing(10)
 
@@ -15400,7 +15396,7 @@ class LamaBusyOverlay(QWidget):
         self.detail_label.setMinimumHeight(32)
         panel_layout.addWidget(self.detail_label)
 
-        self.panel.setStyleSheet(
+        self.setStyleSheet(
             """
             QFrame#lamaBusyPanel {
                 background-color: rgba(15, 23, 42, 230);
@@ -15429,12 +15425,6 @@ class LamaBusyOverlay(QWidget):
             }
             """
         )
-        outer_layout.addWidget(
-            self.panel,
-            0,
-            Qt.AlignmentFlag.AlignHCenter,
-        )
-        outer_layout.addStretch(1)
         self.hide()
 
     def start(self) -> None:
@@ -15442,8 +15432,24 @@ class LamaBusyOverlay(QWidget):
             "Selecting the local processing runtime. "
             "This can take a few moments. Press Esc to cancel."
         )
+        self.position_over_parent()
         self.show()
         self.raise_()
+
+    def position_over_parent(self) -> None:
+        parent = self.parentWidget()
+        if parent is None:
+            return
+        margin = 24
+        preferred = self.sizeHint()
+        width = min(preferred.width(), max(1, parent.width() - 2 * margin))
+        height = min(preferred.height(), max(1, parent.height() - 2 * margin))
+        self.setGeometry(
+            margin,
+            max(margin, parent.height() - height - margin),
+            width,
+            height,
+        )
 
     def set_execution_provider(self, provider_label: str) -> None:
         self.detail_label.setText(
@@ -15454,9 +15460,36 @@ class LamaBusyOverlay(QWidget):
     def stop(self) -> None:
         self.hide()
 
+
+class RotatedTextOverlay(QLabel):
+    """A compact bottom-up label for document viewer surfaces."""
+
+    PADDING = 2
+
+    def sizeHint(self) -> QSize:
+        metrics = QFontMetrics(self.font())
+        return QSize(
+            metrics.height() + 2 * self.PADDING,
+            metrics.horizontalAdvance(self.text()) + 2 * self.PADDING,
+        )
+
+    def minimumSizeHint(self) -> QSize:
+        return self.sizeHint()
+
     def paintEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        if not self.text():
+            return
         painter = QPainter(self)
-        painter.fillRect(self.rect(), QColor(0, 0, 0, 88))
+        painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+        painter.setFont(self.font())
+        painter.setPen(self.palette().windowText().color())
+        painter.translate(0, self.height())
+        painter.rotate(-90.0)
+        painter.drawText(
+            QRect(0, 0, self.height(), self.width()),
+            Qt.AlignmentFlag.AlignCenter,
+            self.text(),
+        )
 
 
 class CircularSelectionOverlay(QWidget):
@@ -15495,6 +15528,7 @@ class ImageDisplayLabel(QLabel):
         self._display_pixmap = QPixmap()
         self._target_rect: QRect | None = None
         self._ordinal_text = ""
+        self._filename_text = ""
 
     def set_display_pixmap(self, pixmap: QPixmap, target_rect: QRect | None = None) -> None:
         self._display_pixmap = QPixmap(pixmap)
@@ -15510,6 +15544,29 @@ class ImageDisplayLabel(QLabel):
     def display_pixmap(self) -> QPixmap:
         return QPixmap(self._display_pixmap)
 
+    def rendered_display_pixmap(self) -> QPixmap:
+        """Render the current viewport without child edit overlays."""
+
+        device_pixel_ratio = max(1.0, self.devicePixelRatioF())
+        physical_size = physical_size_for_logical(
+            self.size(),
+            device_pixel_ratio,
+        )
+        frozen = QPixmap(physical_size)
+        frozen.setDevicePixelRatio(device_pixel_ratio)
+        frozen.fill(QColor("black"))
+        painter = QPainter(frozen)
+        if not self._display_pixmap.isNull():
+            painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+            painter.drawPixmap(
+                self._display_target_rect(),
+                self._display_pixmap,
+                self._display_pixmap.rect(),
+            )
+        self._paint_position_overlays(painter)
+        painter.end()
+        return frozen
+
     def set_ordinal_text(self, text: str) -> None:
         if text == self._ordinal_text:
             return
@@ -15519,20 +15576,40 @@ class ImageDisplayLabel(QLabel):
     def ordinal_text(self) -> str:
         return self._ordinal_text
 
+    def set_filename_text(self, text: str) -> None:
+        if text == self._filename_text:
+            return
+        self._filename_text = text
+        self.update()
+
+    def filename_text(self) -> str:
+        return self._filename_text
+
     def ordinal_overlay_rect(self) -> QRect:
-        if not self._ordinal_text:
+        return self._vertical_overlay_rect(self._ordinal_text, right_aligned=False)
+
+    def filename_overlay_rect(self) -> QRect:
+        return self._vertical_overlay_rect(self._filename_text, right_aligned=True)
+
+    def _vertical_overlay_rect(self, text: str, *, right_aligned: bool) -> QRect:
+        if not text:
             return QRect()
         font = QFont(self.font())
         font.setPointSize(max(font.pointSize(), self.ORDINAL_FONT_POINT_SIZE))
         metrics = QFontMetrics(font)
-        unrotated_width = metrics.horizontalAdvance(self._ordinal_text) + 2 * self.ORDINAL_PADDING
+        unrotated_width = metrics.horizontalAdvance(text) + 2 * self.ORDINAL_PADDING
         unrotated_height = metrics.height() + 2 * self.ORDINAL_PADDING
         available_height = max(0, self.height() - 2 * self.ORDINAL_MARGIN)
         rotated_height = min(unrotated_width, available_height)
         if rotated_height <= 0:
             return QRect()
+        left = (
+            self.width() - self.ORDINAL_MARGIN - unrotated_height
+            if right_aligned
+            else self.ORDINAL_MARGIN
+        )
         return QRect(
-            self.ORDINAL_MARGIN,
+            left,
             self.height() - self.ORDINAL_MARGIN - rotated_height,
             unrotated_height,
             rotated_height,
@@ -15540,6 +15617,10 @@ class ImageDisplayLabel(QLabel):
 
     def ordinal_text_color(self) -> QColor:
         luminance = self._average_display_luminance(self.ordinal_overlay_rect())
+        return QColor("black" if luminance >= self.LIGHT_BACKGROUND_LUMINANCE else "white")
+
+    def filename_text_color(self) -> QColor:
+        luminance = self._average_display_luminance(self.filename_overlay_rect())
         return QColor("black" if luminance >= self.LIGHT_BACKGROUND_LUMINANCE else "white")
 
     def _display_target_rect(self) -> QRect:
@@ -15557,7 +15638,7 @@ class ImageDisplayLabel(QLabel):
         )
 
     def _average_display_luminance(self, sample_rect: QRect) -> float:
-        """Return the average displayed brightness beneath the ordinal text."""
+        """Return the average displayed brightness beneath an overlay."""
 
         sample_rect = sample_rect.intersected(self.rect())
         if sample_rect.isEmpty() or self._display_pixmap.isNull():
@@ -15596,8 +15677,13 @@ class ImageDisplayLabel(QLabel):
                 )
         return luminance_total / (sample.width() * sample.height())
 
-    def _paint_ordinal_overlay(self, painter: QPainter) -> None:
-        overlay_rect = self.ordinal_overlay_rect()
+    def _paint_vertical_overlay(
+        self,
+        painter: QPainter,
+        text: str,
+        overlay_rect: QRect,
+        color: QColor,
+    ) -> None:
         if overlay_rect.isEmpty():
             return
         font = QFont(self.font())
@@ -15605,7 +15691,7 @@ class ImageDisplayLabel(QLabel):
         painter.save()
         painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
         painter.setFont(font)
-        painter.setPen(self.ordinal_text_color())
+        painter.setPen(color)
         # Rotating the normal left-to-right text counterclockwise maps its
         # first character to the bottom of the screen.
         painter.translate(overlay_rect.left(), overlay_rect.bottom() + 1)
@@ -15613,26 +15699,40 @@ class ImageDisplayLabel(QLabel):
         painter.drawText(
             QRect(0, 0, overlay_rect.height(), overlay_rect.width()),
             Qt.AlignmentFlag.AlignCenter,
-            self._ordinal_text,
+            text,
         )
         painter.restore()
+
+    def _paint_position_overlays(self, painter: QPainter) -> None:
+        self._paint_vertical_overlay(
+            painter,
+            self._ordinal_text,
+            self.ordinal_overlay_rect(),
+            self.ordinal_text_color(),
+        )
+        self._paint_vertical_overlay(
+            painter,
+            self._filename_text,
+            self.filename_overlay_rect(),
+            self.filename_text_color(),
+        )
 
     def paintEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         if self._display_pixmap.isNull():
             super().paintEvent(event)
             painter = QPainter(self)
-            self._paint_ordinal_overlay(painter)
+            self._paint_position_overlays(painter)
             return
         painter = QPainter(self)
-        painter.fillRect(self.rect(), QColor("black"))
         # A zoomed target can be many times larger than the viewport. Keep
         # the source bounded and transform only the invalidated visible area;
         # never manufacture a target-sized raster on the GUI thread.
         painter.setClipRegion(event.region())
+        painter.fillRect(self.rect(), QColor("black"))
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         target = self._display_target_rect()
         painter.drawPixmap(target, self._display_pixmap, self._display_pixmap.rect())
-        self._paint_ordinal_overlay(painter)
+        self._paint_position_overlays(painter)
 
 
 @dataclass(frozen=True, slots=True)
@@ -15703,6 +15803,11 @@ class FullscreenViewer(QDialog):
         self._pan_chord_latched = False
         self._pan_edit_snapshot: ViewerPanEditSnapshot | None = None
         self.info_overlay_enabled = False
+        self.position_labels_enabled = (
+            parent.fullscreen_position_labels_enabled
+            if isinstance(parent, MainWindow)
+            else True
+        )
         self._load_generation = 0
         self._load_future: Future[ViewerLoadResult] | None = None
         self._load_future_generation = 0
@@ -15799,15 +15904,26 @@ class FullscreenViewer(QDialog):
         }
         for target in self._document_event_targets:
             target.installEventFilter(self)
-        self.document_ordinal_overlay = QLabel(self)
+        self.document_ordinal_overlay = RotatedTextOverlay(self)
         self.document_ordinal_overlay.setAttribute(
             Qt.WidgetAttribute.WA_TransparentForMouseEvents
         )
+        self.document_ordinal_overlay.setTextFormat(Qt.TextFormat.PlainText)
         self.document_ordinal_overlay.setStyleSheet(
-            "color: white; background: rgba(0, 0, 0, 150); "
-            "padding: 5px 8px; border-radius: 4px; font-weight: bold;"
+            "color: white; background: transparent; font-size: 12pt; "
+            "font-weight: bold;"
         )
         self.document_ordinal_overlay.hide()
+        self.document_filename_overlay = RotatedTextOverlay(self)
+        self.document_filename_overlay.setAttribute(
+            Qt.WidgetAttribute.WA_TransparentForMouseEvents
+        )
+        self.document_filename_overlay.setTextFormat(Qt.TextFormat.PlainText)
+        self.document_filename_overlay.setStyleSheet(
+            "color: white; background: transparent; font-size: 12pt; "
+            "font-weight: bold;"
+        )
+        self.document_filename_overlay.hide()
         self.info_overlay = QLabel(self)
         self.info_overlay.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self.info_overlay.setTextFormat(Qt.TextFormat.PlainText)
@@ -15821,7 +15937,12 @@ class FullscreenViewer(QDialog):
         self.clone_overlay = CloneBrushOverlay(self.label)
         self.lama_overlay = LamaMaskOverlay(self.label)
         self.red_eye_overlay = CircularSelectionOverlay(self.label)
-        self.lama_busy_overlay = LamaBusyOverlay(self.label)
+        self.lama_processing_image = QLabel(self.label)
+        self.lama_processing_image.setAttribute(
+            Qt.WidgetAttribute.WA_TransparentForMouseEvents
+        )
+        self.lama_processing_image.hide()
+        self.lama_busy_overlay = LamaBusyOverlay(self)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self.label, 1)
@@ -15851,10 +15972,14 @@ class FullscreenViewer(QDialog):
             Qt.Key.Key_Left,
             Qt.Key.Key_Right,
             Qt.Key.Key_Escape,
+            Qt.Key.Key_L,
         }:
             # A successful delete can leave a paged navigator briefly empty
             # while its rebased first page is loading. Current-image actions
             # must remain inert during that bounded gap.
+            return
+        if key == Qt.Key.Key_L:
+            self.toggle_position_labels()
             return
         if self._lama_future is not None:
             if key == Qt.Key.Key_Escape:
@@ -15938,6 +16063,7 @@ class FullscreenViewer(QDialog):
                 Qt.Key.Key_Up,
                 Qt.Key.Key_Down,
                 Qt.Key.Key_Escape,
+                Qt.Key.Key_L,
             }
         ):
             self.keyPressEvent(event)
@@ -16294,8 +16420,15 @@ class FullscreenViewer(QDialog):
         self._lama_cancel_event = cancel_event
         self._lama_rel_path = rel_path
         self._lama_preceding_operations = preceding_operations
+        # Keep the source/preview visible during inference, but remove the red
+        # editing mask until an error makes the same stroke editable again.
+        self.lama_processing_image.setGeometry(self.label.rect())
+        self.lama_processing_image.setPixmap(
+            self.label.rendered_display_pixmap()
+        )
+        self.lama_processing_image.show()
+        self.lama_processing_image.raise_()
         self.setWindowTitle("Marnwick — LaMa is filling the masked area locally…")
-        self.lama_busy_overlay.setGeometry(self.label.rect())
         self.lama_busy_overlay.start()
         self._lama_timer.start()
 
@@ -16311,18 +16444,23 @@ class FullscreenViewer(QDialog):
         self._lama_rel_path = None
         self._lama_preceding_operations = ()
         self._lama_timer.stop()
-        self.lama_busy_overlay.stop()
-        if future.cancelled() or self._load_closed:
+        self._hide_lama_processing_display()
+        if self._load_closed:
+            return
+        if future.cancelled():
+            self.update_lama_overlay(None)
             return
         try:
             operation = future.result()
         except LamaInferenceCancelled:
+            self.update_lama_overlay(None)
             return
         except Exception as error:
             self.setWindowTitle(
                 "Marnwick — LaMa: paint; Enter applies; Backspace clears; "
                 "wheel changes brush; Esc cancels"
             )
+            self.update_lama_overlay(None)
             show_error(self, "LaMa", str(error))
             return
         if (
@@ -16331,6 +16469,7 @@ class FullscreenViewer(QDialog):
             or self.navigator.current != rel_path
             or tuple(self.operations) != preceding_operations
         ):
+            self.update_lama_overlay(None)
             return
         provider = str((operation.params or {}).get("execution_provider", "local runtime"))
         provider_label = lama_execution_provider_label(provider)
@@ -16364,7 +16503,12 @@ class FullscreenViewer(QDialog):
         self._lama_cancel_event = None
         self._lama_rel_path = None
         self._lama_preceding_operations = ()
+        self._hide_lama_processing_display()
+
+    def _hide_lama_processing_display(self) -> None:
         self.lama_busy_overlay.stop()
+        self.lama_processing_image.hide()
+        self.lama_processing_image.clear()
 
     def resizeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         super().resizeEvent(event)
@@ -16376,10 +16520,20 @@ class FullscreenViewer(QDialog):
         if hasattr(self, "red_eye_overlay"):
             self.red_eye_overlay.setGeometry(self.label.rect())
         if hasattr(self, "lama_busy_overlay"):
-            self.lama_busy_overlay.setGeometry(self.label.rect())
+            self.lama_busy_overlay.position_over_parent()
         if hasattr(self, "pan_offset"):
             self.pan_offset = self.clamped_pan_offset(self.pan_offset)
         self._fit_pixmap()
+        if (
+            hasattr(self, "lama_processing_image")
+            and self.lama_processing_image.isVisible()
+        ):
+            self.lama_processing_image.setGeometry(self.label.rect())
+            self.lama_processing_image.setPixmap(
+                self.label.rendered_display_pixmap()
+            )
+            self.lama_processing_image.raise_()
+            self.lama_busy_overlay.raise_()
         if hasattr(self, "info_overlay"):
             self.update_info_overlay()
         if hasattr(self, "document_ordinal_overlay"):
@@ -17520,6 +17674,17 @@ class FullscreenViewer(QDialog):
         self.info_overlay_enabled = not self.info_overlay_enabled
         self.update_info_overlay()
 
+    def toggle_position_labels(self) -> None:
+        self.position_labels_enabled = not self.position_labels_enabled
+        parent = self.parent()
+        if isinstance(parent, MainWindow):
+            parent.fullscreen_position_labels_enabled = self.position_labels_enabled
+        self.update_info_overlay()
+        if self.lama_processing_image.isVisible():
+            self.lama_processing_image.setPixmap(
+                self.label.rendered_display_pixmap()
+            )
+
     def image_position(self) -> tuple[int, int]:
         total = (
             self.navigator.total_count
@@ -17531,8 +17696,18 @@ class FullscreenViewer(QDialog):
 
     def update_ordinal_overlay(self) -> None:
         ordinal, total = self.image_position()
-        text = f"{ordinal} / {total}" if ordinal and total else ""
-        self.label.set_ordinal_text(text)
+        ordinal_text = f"{ordinal} / {total}" if ordinal and total else ""
+        filename_text = (
+            Path(self.navigator.current).name
+            if self.navigator.order
+            else ""
+        )
+        self.label.set_ordinal_text(
+            ordinal_text if self.position_labels_enabled else ""
+        )
+        self.label.set_filename_text(
+            filename_text if self.position_labels_enabled else ""
+        )
         if not hasattr(self, "document_ordinal_overlay"):
             return
         is_document = (
@@ -17540,22 +17715,50 @@ class FullscreenViewer(QDialog):
             and media_kind_for_name(self.navigator.current)
             in {"text", "docx", "odt", "pdf"}
         )
-        self.document_ordinal_overlay.setText(text)
-        if text and is_document:
+        self.document_ordinal_overlay.setText(ordinal_text)
+        self.document_filename_overlay.setText(filename_text)
+        self._set_document_position_label_color()
+        if (
+            ordinal_text
+            and filename_text
+            and is_document
+            and self.position_labels_enabled
+        ):
             self.position_document_ordinal_overlay()
             self.document_ordinal_overlay.show()
             self.document_ordinal_overlay.raise_()
+            self.document_filename_overlay.show()
+            self.document_filename_overlay.raise_()
         else:
             self.document_ordinal_overlay.hide()
+            self.document_filename_overlay.hide()
 
     def position_document_ordinal_overlay(self) -> None:
-        overlay = self.document_ordinal_overlay
-        overlay.adjustSize()
         margin = 16
-        overlay.move(
-            margin,
-            max(margin, self.height() - overlay.height() - margin),
+        available_height = max(0, self.height() - 2 * margin)
+        for overlay, right_aligned in (
+            (self.document_ordinal_overlay, False),
+            (self.document_filename_overlay, True),
+        ):
+            preferred = overlay.sizeHint()
+            width = preferred.width()
+            height = min(preferred.height(), available_height)
+            left = self.width() - margin - width if right_aligned else margin
+            overlay.setGeometry(
+                left,
+                max(margin, self.height() - height - margin),
+                width,
+                height,
+            )
+
+    def _set_document_position_label_color(self) -> None:
+        color = "white" if self.active_media_kind == "pdf" else "#181818"
+        style = (
+            f"color: {color}; background: transparent; font-size: 12pt; "
+            "font-weight: bold;"
         )
+        self.document_ordinal_overlay.setStyleSheet(style)
+        self.document_filename_overlay.setStyleSheet(style)
 
     def update_info_overlay(self) -> None:
         self.update_ordinal_overlay()
@@ -17595,6 +17798,11 @@ class FullscreenViewer(QDialog):
             if document_mode and not self.document_ordinal_overlay.isHidden()
             else self.label.ordinal_overlay_rect()
         )
+        filename_rect = (
+            self.document_filename_overlay.geometry()
+            if document_mode and not self.document_filename_overlay.isHidden()
+            else self.label.filename_overlay_rect()
+        )
         left = (
             ordinal_rect.right() + 1 + margin
             if not ordinal_rect.isEmpty()
@@ -17602,7 +17810,12 @@ class FullscreenViewer(QDialog):
         )
         surface_width = self.width() if document_mode else self.label.width()
         surface_height = self.height() if document_mode else self.label.height()
-        max_width = max(1, surface_width - left - margin)
+        right = (
+            filename_rect.left() - margin
+            if not filename_rect.isEmpty()
+            else surface_width - margin
+        )
+        max_width = max(1, right - left)
         max_height = max(1, surface_height - 2 * margin)
         self.info_overlay.setMaximumWidth(max_width)
         self.info_overlay.adjustSize()
