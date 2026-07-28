@@ -15365,6 +15365,8 @@ class LamaMaskOverlay(QWidget):
 
 
 class LamaBusyOverlay(QFrame):
+    EDGE_MARGIN = 24
+
     def __init__(self, parent: QWidget) -> None:
         super().__init__(parent)
         self.setObjectName("lamaBusyPanel")
@@ -15427,25 +15429,26 @@ class LamaBusyOverlay(QFrame):
         )
         self.hide()
 
-    def start(self) -> None:
+    def start(self, *, left_margin: int | None = None) -> None:
         self.detail_label.setText(
             "Selecting the local processing runtime. "
             "This can take a few moments. Press Esc to cancel."
         )
-        self.position_over_parent()
+        self.position_over_parent(left_margin=left_margin)
         self.show()
         self.raise_()
 
-    def position_over_parent(self) -> None:
+    def position_over_parent(self, *, left_margin: int | None = None) -> None:
         parent = self.parentWidget()
         if parent is None:
             return
-        margin = 24
+        margin = self.EDGE_MARGIN
+        left = max(margin, left_margin if left_margin is not None else margin)
         preferred = self.sizeHint()
-        width = min(preferred.width(), max(1, parent.width() - 2 * margin))
+        width = min(preferred.width(), max(1, parent.width() - left - margin))
         height = min(preferred.height(), max(1, parent.height() - 2 * margin))
         self.setGeometry(
-            margin,
+            left,
             max(margin, parent.height() - height - margin),
             width,
             height,
@@ -15753,6 +15756,7 @@ class FullscreenViewer(QDialog):
     ZOOM_STEP = 1.25
     MAX_ZOOM = 16.0
     PAN_KEY_STEP = 80
+    LAMA_PROGRESS_LABEL_GAP = 16
 
     def __init__(
         self,
@@ -16429,8 +16433,20 @@ class FullscreenViewer(QDialog):
         self.lama_processing_image.show()
         self.lama_processing_image.raise_()
         self.setWindowTitle("Marnwick — LaMa is filling the masked area locally…")
-        self.lama_busy_overlay.start()
+        self.lama_busy_overlay.start(
+            left_margin=self._lama_progress_left_margin()
+        )
         self._lama_timer.start()
+
+    def _lama_progress_left_margin(self) -> int:
+        ordinal_rect = self.label.ordinal_overlay_rect()
+        if ordinal_rect.isEmpty():
+            return self.lama_busy_overlay.EDGE_MARGIN
+        return (
+            ordinal_rect.right()
+            + 1
+            + self.LAMA_PROGRESS_LABEL_GAP
+        )
 
     def _settle_lama_inference(self) -> None:
         self._settle_lama_provider_updates()
@@ -16520,7 +16536,9 @@ class FullscreenViewer(QDialog):
         if hasattr(self, "red_eye_overlay"):
             self.red_eye_overlay.setGeometry(self.label.rect())
         if hasattr(self, "lama_busy_overlay"):
-            self.lama_busy_overlay.position_over_parent()
+            self.lama_busy_overlay.position_over_parent(
+                left_margin=self._lama_progress_left_margin()
+            )
         if hasattr(self, "pan_offset"):
             self.pan_offset = self.clamped_pan_offset(self.pan_offset)
         self._fit_pixmap()
@@ -17683,6 +17701,9 @@ class FullscreenViewer(QDialog):
         if self.lama_processing_image.isVisible():
             self.lama_processing_image.setPixmap(
                 self.label.rendered_display_pixmap()
+            )
+            self.lama_busy_overlay.position_over_parent(
+                left_margin=self._lama_progress_left_margin()
             )
 
     def image_position(self) -> tuple[int, int]:

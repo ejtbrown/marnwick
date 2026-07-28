@@ -1671,7 +1671,12 @@ def test_lama_processing_keeps_the_unmasked_image_visible(
                 viewer.label.width() // 2,
                 viewer.label.height() // 2,
             ) == original_center
-            assert viewer.lama_busy_overlay.x() <= 24
+            ordinal_rect = viewer.label.ordinal_overlay_rect()
+            assert viewer.lama_busy_overlay.x() >= (
+                ordinal_rect.right()
+                + 1
+                + viewer.LAMA_PROGRESS_LABEL_GAP
+            )
             assert (
                 viewer.lama_busy_overlay.geometry().bottom()
                 >= viewer.label.height() - 25
