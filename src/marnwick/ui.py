@@ -12281,7 +12281,19 @@ class MainWindow(QMainWindow):
         finally:
             viewer.deleteLater()
             if last_viewed is not None and self.current_catalog is catalog:
-                self.select_rel_path(last_viewed)
+                self._restore_thumbnail_after_fullscreen(catalog, last_viewed)
+                # A queued layout or scroll restoration can run as the modal
+                # viewer relinquishes control. Reapply the final selection
+                # once the main window has resumed processing events so the
+                # selected thumbnail remains in its viewport.
+                QTimer.singleShot(
+                    0,
+                    partial(
+                        self._restore_thumbnail_after_fullscreen,
+                        catalog,
+                        last_viewed,
+                    ),
+                )
             # Modal activation and any discovery publication that completed
             # behind the viewer must not repurpose the user's tree viewport.
             self._restore_tree_scroll_position(tree_scroll_position)
@@ -13039,6 +13051,15 @@ class MainWindow(QMainWindow):
 
     def sync_thumbnail_to_rel_path(self, catalog: Catalog, rel_path: str) -> None:
         if self.current_catalog is None or self.current_catalog.root != catalog.root:
+            return
+        self.select_rel_path(rel_path)
+
+    def _restore_thumbnail_after_fullscreen(
+        self,
+        catalog: Catalog,
+        rel_path: str,
+    ) -> None:
+        if self.current_catalog is not catalog:
             return
         self.select_rel_path(rel_path)
 
