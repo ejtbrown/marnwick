@@ -5364,10 +5364,23 @@ def test_two_preflighted_moves_to_same_destination_both_commit(
 
 
 @pytest.mark.parametrize("large_snapshot", [False, True])
-def test_move_payload_removal_preserves_thumbnail_scrollbar(
+@pytest.mark.parametrize(
+    ("moved_rel_paths", "expected_selection"),
+    [
+        (("image-70.jpg",), "image-71.jpg"),
+        (
+            ("image-68.jpg", "image-69.jpg", "image-70.jpg"),
+            "image-71.jpg",
+        ),
+        (("image-78.jpg", "image-79.jpg"), "image-77.jpg"),
+    ],
+)
+def test_move_payload_removal_selects_adjacent_and_preserves_thumbnail_scrollbar(
     tmp_path: Path,
     monkeypatch,
     large_snapshot: bool,
+    moved_rel_paths: tuple[str, ...],
+    expected_selection: str,
 ) -> None:
     qt_app = app()
     root = tmp_path / "catalog"
@@ -5393,6 +5406,21 @@ def test_move_payload_removal_preserves_thumbnail_scrollbar(
         window.show()
         window.load_current_directory()
         settle_virtual_view_tasks(window, qt_app)
+        moved_rows = [
+            window.model.row_for_key(("image", rel_path))
+            for rel_path in moved_rel_paths
+        ]
+        assert all(row is not None for row in moved_rows)
+        exposed_rows = [int(row) for row in moved_rows if row is not None]
+        target_row = max(exposed_rows)
+        deadline = monotonic() + 1.0
+        while (
+            not window.model.ensure_row_loaded(target_row)
+            and monotonic() < deadline
+        ):
+            qt_app.processEvents()
+        assert window.model.ensure_row_loaded(target_row)
+        select_thumbnail_rows(window, exposed_rows)
 
         scroll_bar = window.thumbnail_view.verticalScrollBar()
         deadline = monotonic() + 1.0
@@ -5422,12 +5450,22 @@ def test_move_payload_removal_preserves_thumbnail_scrollbar(
             if not release.wait(timeout=1.0):
                 raise TimeoutError("move worker was not allowed to finish")
             task.mark_done()
-            return MovePayloadResult(requested=1, moved=0, affected_roots={catalog.root})
+            return MovePayloadResult(
+                requested=len(moved_rel_paths),
+                moved=0,
+                affected_roots={catalog.root},
+            )
 
         monkeypatch.setattr(window, "_move_payload_worker", slow_move_worker)
 
         window.move_payload_to_directory(
-            [{"catalog_root": str(catalog.root), "rel_path": "image-70.jpg"}],
+            [
+                {
+                    "catalog_root": str(catalog.root),
+                    "rel_path": rel_path,
+                }
+                for rel_path in moved_rel_paths
+            ],
             catalog.root,
             "target",
         )
@@ -5435,9 +5473,15 @@ def test_move_payload_removal_preserves_thumbnail_scrollbar(
 
         assert started.wait(timeout=1.0)
         settle_virtual_view_tasks(window, qt_app)
-        if not large_snapshot:
-            assert window.selected_rel_paths() == ["image-71.jpg"]
-        assert "image-70.jpg" not in {
+        deadline = monotonic() + 1.0
+        while (
+            window.selected_rel_paths() != [expected_selection]
+            and monotonic() < deadline
+        ):
+            qt_app.processEvents()
+            sleep(0.01)
+        assert window.selected_rel_paths() == [expected_selection]
+        assert not set(moved_rel_paths) & {
             record.rel_path
             for record in window.model.images
             if isinstance(record, ImageRecord)
