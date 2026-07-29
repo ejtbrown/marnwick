@@ -12918,16 +12918,27 @@ class MainWindow(QMainWindow):
                 active_preview.cancel_event.set()
                 active_preview.future.cancel()
                 self._virtual_view_tasks.pop(active_preview.future, None)
+            removed_keys = {
+                ("image", rel_path) for rel_path in image_rels
+            }
+            removed_keys.update(
+                ("directory", rel_path) for rel_path in directory_rels
+            )
+            anchor_key = self._thumbnail_anchor_key_for_model_removal(
+                removed_keys
+            )
+            selection_keys = {anchor_key} if anchor_key is not None else set()
+            self._restore_thumbnail_selection(selection_keys, anchor_key)
+            self.update_selection_status()
+            self._restore_thumbnail_scroll_position(scroll_key)
             self._submit_filtered_physical_snapshot_task(
                 self.current_catalog,
                 self.current_dir_rel,
                 self.current_sort,
                 fingerprint,
-                self._thumbnail_selection_keys()
-                - {("image", rel_path) for rel_path in image_rels}
-                - {("directory", rel_path) for rel_path in directory_rels},
-                None,
-                self._current_thumbnail_scroll_key(),
+                selection_keys,
+                anchor_key,
+                scroll_key,
             )
             return
         records = list(self.model.images)
@@ -12971,6 +12982,45 @@ class MainWindow(QMainWindow):
         finally:
             self.thumbnail_view.setUpdatesEnabled(True)
             self.thumbnail_view.viewport().update()
+
+    def _thumbnail_anchor_key_for_model_removal(
+        self,
+        removed_keys: set[tuple[str, str]],
+    ) -> tuple[str, str] | None:
+        """Choose the next remaining record, or the previous one at the end."""
+
+        removed_rows = sorted(
+            {
+                row
+                for key in removed_keys
+                if (row := self.model.row_for_key(key)) is not None
+                and row < len(self.model.images)
+            }
+        )
+        if not removed_rows:
+            return None
+        removed_row_set = set(removed_rows)
+        current = self.thumbnail_view.currentIndex()
+        if (
+            current.isValid()
+            and current.row() < len(self.model.images)
+            and current.row() not in removed_row_set
+        ):
+            return self._thumbnail_record_key(self.model.images[current.row()])
+
+        next_row = removed_rows[0]
+        for removed_row in removed_rows:
+            if removed_row < next_row:
+                continue
+            if removed_row != next_row:
+                break
+            next_row += 1
+        if next_row < len(self.model.images):
+            return self._thumbnail_record_key(self.model.images[next_row])
+        previous_row = removed_rows[0] - 1
+        if previous_row >= 0:
+            return self._thumbnail_record_key(self.model.images[previous_row])
+        return None
 
     def _thumbnail_anchor_key_after_removal(
         self,
