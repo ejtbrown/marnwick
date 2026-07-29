@@ -3058,6 +3058,97 @@ def test_fullscreen_navigation_syncs_thumbnail_scroll_to_current_image(tmp_path:
         qt_app.processEvents()
 
 
+def test_random_fullscreen_exit_keeps_last_thumbnail_selected_and_visible(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    for index in range(80):
+        Image.new("RGB", (8, 8), (index % 255, 20, 30)).save(
+            root / f"image-{index:02d}.jpg"
+        )
+
+    target_rel_path = "image-70.jpg"
+
+    class FakeViewer:
+        def __init__(self, _catalog, navigator, parent, **_kwargs):  # type: ignore[no-untyped-def]
+            assert navigator.current == "image-00.jpg"
+            assert set(navigator.order) == {
+                f"image-{index:02d}.jpg" for index in range(80)
+            }
+            self.last_viewed_rel_path = target_rel_path
+            self.parent = parent
+
+        def exec_fullscreen(self) -> None:
+            # Model a queued scroll adjustment released when the modal viewer
+            # closes. The exit handoff must win this event-loop race.
+            QTimer.singleShot(
+                0,
+                lambda: self.parent.thumbnail_view.verticalScrollBar().setValue(0),
+            )
+
+        def deleteLater(self) -> None:  # noqa: N802 - Qt-compatible fake
+            return None
+
+    window = MainWindow()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        catalog.refresh()
+        window.current_catalog = catalog
+        window.current_dir_rel = ""
+        window.set_thumbnail_size(2)
+        window.resize(520, 260)
+        window.show()
+        window.load_current_directory()
+        settle_virtual_view_tasks(window, qt_app)
+
+        scroll_bar = window.thumbnail_view.verticalScrollBar()
+        deadline = monotonic() + 1.0
+        while scroll_bar.maximum() == 0 and monotonic() < deadline:
+            qt_app.processEvents()
+            sleep(0.01)
+        assert scroll_bar.maximum() > 0
+
+        start_row = next(
+            row
+            for row, record in enumerate(window.model.images)
+            if isinstance(record, ImageRecord)
+            and record.rel_path == "image-00.jpg"
+        )
+        monkeypatch.setattr(ui_module, "FullscreenViewer", FakeViewer)
+
+        window.open_viewer(window.model.index(start_row, 0), random_mode=True)
+        deadline = monotonic() + 0.2
+        while monotonic() < deadline:
+            qt_app.processEvents()
+            sleep(0.01)
+
+        target_row = next(
+            row
+            for row, record in enumerate(window.model.images)
+            if isinstance(record, ImageRecord)
+            and record.rel_path == target_rel_path
+        )
+        target_index = window.model.index(target_row, 0)
+        assert window.selected_rel_paths() == [target_rel_path]
+        assert scroll_bar.value() > 0
+        assert window.thumbnail_view.visualRect(target_index).intersects(
+            window.thumbnail_view.viewport().rect()
+        )
+    finally:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        window.indexer.shutdown()
+        window.workspace.close()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
 def test_duplicate_list_dialog_double_click_navigates_to_image(tmp_path: Path) -> None:
     qt_app = app()
     root = tmp_path / "catalog"
