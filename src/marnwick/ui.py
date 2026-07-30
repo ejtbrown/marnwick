@@ -3528,6 +3528,9 @@ class MainWindow(QMainWindow):
         ] = OrderedDict()
         self._thumbnail_scroll_key: TreeStateKey | None = None
         self._thumbnail_scroll_restore_generation = 0
+        self._pending_move_thumbnail_visibility: (
+            tuple[TreeStateKey, tuple[str, str]] | None
+        ) = None
         self._indexing_was_active = False
         self._catalog_intent_root: Path | None = None
         self._catalog_intent_sequence = 0
@@ -9587,8 +9590,10 @@ class MainWindow(QMainWindow):
         vertical_bar.setValue(max(vertical_bar.minimum(), min(vertical, vertical_bar.maximum())))
         horizontal_bar.setValue(max(horizontal_bar.minimum(), min(horizontal, horizontal_bar.maximum())))
         if retries <= 0:
+            self._ensure_pending_move_thumbnail_visible(key)
             return
         if vertical <= vertical_bar.maximum() and horizontal <= horizontal_bar.maximum():
+            self._ensure_pending_move_thumbnail_visible(key)
             return
         next_retries = retries - 1
         QTimer.singleShot(
@@ -9603,10 +9608,70 @@ class MainWindow(QMainWindow):
             ),
         )
 
+    def _ensure_pending_move_thumbnail_visible(
+        self,
+        scroll_key: TreeStateKey | None,
+        *,
+        retries: int = 5,
+    ) -> None:
+        """Keep the move anchor visible through scroll and batched-layout restores."""
+
+        pending = self._pending_move_thumbnail_visibility
+        if pending is None:
+            return
+        if scroll_key != pending[0]:
+            if not self._has_pending_move_payload_tasks():
+                self._pending_move_thumbnail_visibility = None
+            return
+        record_key = pending[1]
+        if self._current_thumbnail_selection_key() != record_key:
+            if (
+                not self._has_pending_move_payload_tasks()
+                and self._pending_thumbnail_index_restore is None
+                and not self.model.record_indexes_pending
+            ):
+                self._pending_move_thumbnail_visibility = None
+            return
+        row = self.model.row_for_key(record_key)
+        if row is None:
+            if (
+                not self._has_pending_move_payload_tasks()
+                and self._pending_thumbnail_index_restore is None
+                and not self.model.record_indexes_pending
+            ):
+                self._pending_move_thumbnail_visibility = None
+            return
+        if not self.model.ensure_row_loaded(row):
+            return
+        index = self.model.index(row, 0)
+        if not self.thumbnail_view.visualRect(index).intersects(
+            self.thumbnail_view.viewport().rect()
+        ):
+            self.thumbnail_view.scrollTo(
+                index,
+                QListView.ScrollHint.PositionAtCenter,
+            )
+        self._remember_thumbnail_scroll_position()
+        if retries > 0:
+            # QListView's batched layout can shift rows on later event-loop
+            # turns, after the saved scrollbar position has been restored.
+            QTimer.singleShot(
+                0,
+                partial(
+                    self._ensure_pending_move_thumbnail_visible,
+                    scroll_key,
+                    retries=retries - 1,
+                ),
+            )
+            return
+        if not self._has_pending_move_payload_tasks():
+            self._pending_move_thumbnail_visibility = None
+
     def _cancel_thumbnail_scroll_restore(self) -> None:
         self._thumbnail_scroll_restore_generation += 1
 
     def _thumbnail_scroll_user_action(self) -> None:
+        self._pending_move_thumbnail_visibility = None
         self._cancel_thumbnail_scroll_restore()
         scroll_key = self._thumbnail_scroll_key
         QTimer.singleShot(
@@ -10277,6 +10342,7 @@ class MainWindow(QMainWindow):
         self._pending_thumbnail_index_restore = None
         if pending is not None:
             self._restore_thumbnail_selection(*pending)
+        self._ensure_pending_move_thumbnail_visible(self._thumbnail_scroll_key)
         self.update_selection_status()
         self._apply_pending_rel_path_selection(self._physical_pane_generation)
         self._apply_pending_file_ordinal_selection()
@@ -12957,6 +13023,7 @@ class MainWindow(QMainWindow):
             root,
             image_rels=set(image_payload.get(root, ())),
             directory_rels=set(directory_payload.get(root, ())),
+            ensure_selection_visible=True,
         )
 
     def _move_payload_worker(
@@ -13169,6 +13236,7 @@ class MainWindow(QMainWindow):
         *,
         image_rels: set[str] | None = None,
         directory_rels: set[str] | None = None,
+        ensure_selection_visible: bool = False,
     ) -> None:
         if self.current_catalog is None or self.current_catalog.root != root:
             return
@@ -13217,6 +13285,12 @@ class MainWindow(QMainWindow):
                 removed_keys
             )
             selection_keys = {anchor_key} if anchor_key is not None else set()
+            if (
+                ensure_selection_visible
+                and scroll_key is not None
+                and anchor_key is not None
+            ):
+                self._pending_move_thumbnail_visibility = (scroll_key, anchor_key)
             self._restore_thumbnail_selection(selection_keys, anchor_key)
             self.update_selection_status()
             self._restore_thumbnail_scroll_position(scroll_key)
@@ -13260,6 +13334,12 @@ class MainWindow(QMainWindow):
         if not removed_rows:
             return
         anchor_key = self._thumbnail_anchor_key_after_removal(records, remove_flags, removed_rows)
+        if (
+            ensure_selection_visible
+            and scroll_key is not None
+            and anchor_key is not None
+        ):
+            self._pending_move_thumbnail_visibility = (scroll_key, anchor_key)
         self.thumbnail_view.setUpdatesEnabled(False)
         try:
             self.model.replace_loaded_records(filtered)
