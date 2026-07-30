@@ -1762,6 +1762,114 @@ def test_lama_processing_keeps_the_unmasked_image_visible(
             qt_app.processEvents()
 
 
+def test_lama_r_repeats_last_successful_mask_across_viewers(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    Image.new("RGB", (320, 240), (180, 40, 30)).save(root / "first.png")
+    Image.new("RGB", (320, 240), (30, 40, 180)).save(root / "second.png")
+    pattern = ((40, 50, 12), (60, 70, 16))
+    window = MainWindow()
+    first_viewer: FullscreenViewer | None = None
+    second_viewer: FullscreenViewer | None = None
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        catalog.refresh()
+        first_viewer = FullscreenViewer(
+            catalog,
+            ImageNavigator.sequential(["first.png"], "first.png"),
+            window,
+        )
+        settle_viewer_load(first_viewer, qt_app)
+        completed: Future[EditOperation] = Future()
+        completed.set_result(
+            EditOperation(
+                "lama",
+                {"execution_provider": "CPUExecutionProvider"},
+            )
+        )
+        first_submissions: list[tuple[tuple[int, int, int], ...]] = []
+
+        def complete_lama(*args, **_kwargs):  # type: ignore[no-untyped-def]
+            first_submissions.append(args[3])
+            return completed
+
+        monkeypatch.setattr(first_viewer._lama_executor, "submit", complete_lama)
+        monkeypatch.setattr(first_viewer, "render_preview", lambda: None)
+        first_viewer.start_region_edit("lama")
+
+        first_viewer.keyPressEvent(
+            QKeyEvent(
+                QEvent.Type.KeyPress,
+                Qt.Key.Key_R,
+                Qt.KeyboardModifier.NoModifier,
+                "r",
+            )
+        )
+        assert first_submissions == []
+
+        first_viewer.lama_samples.extend(pattern)
+        first_viewer.apply_lama_mask()
+        first_viewer._settle_lama_inference()
+
+        assert first_submissions == [pattern]
+        assert window._last_lama_mask_pattern == pattern
+
+        second_viewer = FullscreenViewer(
+            catalog,
+            ImageNavigator.sequential(["second.png"], "second.png"),
+            window,
+        )
+        settle_viewer_load(second_viewer, qt_app)
+        pending: Future[EditOperation] = Future()
+        repeated_submissions: list[tuple[tuple[int, int, int], ...]] = []
+
+        def hold_repeated_lama(*args, **_kwargs):  # type: ignore[no-untyped-def]
+            repeated_submissions.append(args[3])
+            return pending
+
+        monkeypatch.setattr(
+            second_viewer._lama_executor,
+            "submit",
+            hold_repeated_lama,
+        )
+        second_viewer.start_region_edit("lama")
+        second_viewer.lama_samples.append((5, 5, 4))
+
+        second_viewer.keyPressEvent(
+            QKeyEvent(
+                QEvent.Type.KeyPress,
+                Qt.Key.Key_R,
+                Qt.KeyboardModifier.NoModifier,
+                "r",
+            )
+        )
+
+        assert repeated_submissions == [pattern]
+        assert second_viewer.lama_samples == list(pattern)
+        assert second_viewer._lama_future is pending
+    finally:
+        for viewer in (first_viewer, second_viewer):
+            if viewer is None:
+                continue
+            viewer._cancel_lama_inference()
+            viewer.operations.clear()
+            viewer.close()
+            viewer.deleteLater()
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        window.indexer.shutdown()
+        window.workspace.close()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
 def test_metadata_text_includes_file_and_exif_metadata(tmp_path: Path) -> None:
     path = tmp_path / "metadata.jpg"
     image = Image.new("RGB", (20, 10), (120, 80, 40))
