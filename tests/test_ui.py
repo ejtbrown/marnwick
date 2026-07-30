@@ -932,6 +932,7 @@ def test_fullscreen_position_labels_are_rotated_and_use_adaptive_contrast(
     root.mkdir()
     for index in range(1, 26):
         Image.new("RGB", (8, 8), (10, 20, 30)).save(root / f"image-{index:02}.png")
+    Image.new("RGB", (12, 6), (10, 20, 30)).save(root / "image-02.png")
     order = [f"image-{index:02}.png" for index in range(1, 26)]
 
     with Catalog(root) as catalog:
@@ -951,16 +952,23 @@ def test_fullscreen_position_labels_are_rotated_and_use_adaptive_contrast(
 
             assert viewer.label.ordinal_text() == "1 / 25"
             assert viewer.label.filename_text() == "image-01.png"
+            assert viewer.label.resolution_text() == "8 x 8"
             overlay_rect = viewer.label.ordinal_overlay_rect()
             filename_rect = viewer.label.filename_overlay_rect()
+            resolution_rect = viewer.label.resolution_overlay_rect()
             assert overlay_rect.left() == viewer.label.ORDINAL_MARGIN
             assert overlay_rect.bottom() == viewer.label.height() - viewer.label.ORDINAL_MARGIN - 1
             assert overlay_rect.height() > overlay_rect.width()
             assert filename_rect.right() == viewer.label.width() - viewer.label.ORDINAL_MARGIN - 1
             assert filename_rect.bottom() == viewer.label.height() - viewer.label.ORDINAL_MARGIN - 1
             assert filename_rect.height() > filename_rect.width()
+            assert resolution_rect.right() == viewer.label.width() - viewer.label.ORDINAL_MARGIN - 1
+            assert resolution_rect.top() == viewer.label.ORDINAL_MARGIN
+            assert resolution_rect.height() > resolution_rect.width()
+            assert resolution_rect.bottom() < filename_rect.top()
             assert viewer.label.ordinal_text_color() == QColor("white")
             assert viewer.label.filename_text_color() == QColor("white")
+            assert viewer.label.resolution_text_color() == QColor("white")
 
             rendered = viewer.label.grab().toImage()
             bright_points = [
@@ -989,6 +997,22 @@ def test_fullscreen_position_labels_are_rotated_and_use_adaptive_contrast(
                 - min(y for _x, y in filename_bright_points)
             )
             assert filename_bright_height > filename_bright_width
+            resolution_bright_points = [
+                (x, y)
+                for y in range(resolution_rect.top(), resolution_rect.bottom() + 1)
+                for x in range(resolution_rect.left(), resolution_rect.right() + 1)
+                if rendered.pixelColor(x, y).lightness() >= 150
+            ]
+            assert resolution_bright_points
+            resolution_bright_width = (
+                max(x for x, _y in resolution_bright_points)
+                - min(x for x, _y in resolution_bright_points)
+            )
+            resolution_bright_height = (
+                max(y for _x, y in resolution_bright_points)
+                - min(y for _x, y in resolution_bright_points)
+            )
+            assert resolution_bright_height > resolution_bright_width
 
             light = QPixmap(viewer.label.size())
             light.fill(QColor(245, 245, 245))
@@ -996,11 +1020,13 @@ def test_fullscreen_position_labels_are_rotated_and_use_adaptive_contrast(
 
             assert viewer.label.ordinal_text_color() == QColor("black")
             assert viewer.label.filename_text_color() == QColor("black")
+            assert viewer.label.resolution_text_color() == QColor("black")
 
             viewer.navigate(1)
 
             assert viewer.label.ordinal_text() == "2 / 25"
             assert viewer.label.filename_text() == "image-02.png"
+            assert viewer.label.resolution_text() == "12 x 6"
         finally:
             viewer.close()
             viewer.deleteLater()
@@ -1023,9 +1049,11 @@ def test_fullscreen_l_toggle_persists_for_the_main_window_session(
         with Catalog(root) as catalog:
             navigator = ImageNavigator.sequential(["image.png"], "image.png")
             first_viewer = FullscreenViewer(catalog, navigator, window)
+            settle_viewer_load(first_viewer, qt_app)
 
             assert first_viewer.label.ordinal_text() == "1 / 1"
             assert first_viewer.label.filename_text() == "image.png"
+            assert first_viewer.label.resolution_text() == "8 x 8"
 
             first_viewer.keyPressEvent(
                 QKeyEvent(
@@ -1039,12 +1067,15 @@ def test_fullscreen_l_toggle_persists_for_the_main_window_session(
             assert not window.fullscreen_position_labels_enabled
             assert first_viewer.label.ordinal_text() == ""
             assert first_viewer.label.filename_text() == ""
+            assert first_viewer.label.resolution_text() == ""
 
             second_viewer = FullscreenViewer(catalog, navigator, window)
+            settle_viewer_load(second_viewer, qt_app)
 
             assert not second_viewer.position_labels_enabled
             assert second_viewer.label.ordinal_text() == ""
             assert second_viewer.label.filename_text() == ""
+            assert second_viewer.label.resolution_text() == ""
 
             second_viewer.keyPressEvent(
                 QKeyEvent(
@@ -1058,6 +1089,7 @@ def test_fullscreen_l_toggle_persists_for_the_main_window_session(
             assert window.fullscreen_position_labels_enabled
             assert second_viewer.label.ordinal_text() == "1 / 1"
             assert second_viewer.label.filename_text() == "image.png"
+            assert second_viewer.label.resolution_text() == "8 x 8"
     finally:
         for viewer in (first_viewer, second_viewer):
             if viewer is not None:
