@@ -1352,14 +1352,14 @@ def test_fullscreen_zoom_arrows_pan_and_escape_resets(tmp_path: Path) -> None:
     qt_app = app()
     root = tmp_path / "catalog"
     root.mkdir()
-    Image.new("RGB", (400, 200), (10, 20, 30)).save(root / "first.jpg")
-    Image.new("RGB", (400, 200), (40, 50, 60)).save(root / "second.jpg")
+    Image.new("RGB", (400, 400), (10, 20, 30)).save(root / "first.jpg")
+    Image.new("RGB", (400, 400), (40, 50, 60)).save(root / "second.jpg")
 
     with Catalog(root) as catalog:
         viewer = FullscreenViewer(catalog, ImageNavigator.sequential(["first.jpg", "second.jpg"], "first.jpg"))
         try:
             viewer.label.resize(400, 400)
-            viewer.base_pixmap = QPixmap(400, 200)
+            viewer.base_pixmap = QPixmap(400, 400)
             viewer._fit_pixmap()
 
             neutral_rect = viewer.displayed_image_rect()
@@ -1372,7 +1372,19 @@ def test_fullscreen_zoom_arrows_pan_and_escape_resets(tmp_path: Path) -> None:
             viewer.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Right, Qt.KeyboardModifier.NoModifier))
 
             assert viewer.navigator.current == "first.jpg"
+            assert viewer.pan_offset.x() < 0
+
+            viewer.set_pan_offset(QPoint(0, 0))
+            viewer.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Left, Qt.KeyboardModifier.NoModifier))
             assert viewer.pan_offset.x() > 0
+
+            viewer.set_pan_offset(QPoint(0, 0))
+            viewer.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Down, Qt.KeyboardModifier.NoModifier))
+            assert viewer.pan_offset.y() < 0
+
+            viewer.set_pan_offset(QPoint(0, 0))
+            viewer.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Up, Qt.KeyboardModifier.NoModifier))
+            assert viewer.pan_offset.y() > 0
 
             viewer.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Escape, Qt.KeyboardModifier.NoModifier))
 
