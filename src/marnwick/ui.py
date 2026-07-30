@@ -15908,6 +15908,7 @@ class EditCommandDialog(QDialog):
         ("C", "Crop", "crop"),
         ("X", "Clone and heal", "clone_heal"),
         ("M", "LaMa", "lama"),
+        ("Z", "Undo most recent edit", "undo"),
     ]
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -16481,6 +16482,7 @@ class ImageDisplayLabel(QLabel):
 class ViewerPanEditSnapshot:
     edit_mode: str
     operation_count: int
+    undo_checkpoint_count: int
     drag_origin: QPoint | None
     clone_source_center: tuple[int, int] | None
     clone_painting: bool
@@ -16524,6 +16526,7 @@ class FullscreenViewer(QDialog):
         self._display_seen = set(self._display_order)
         self.last_viewed_rel_path = navigator.current
         self.operations: list[EditOperation] = []
+        self._edit_undo_starts: list[int] = []
         self.edit_mode: str | None = None
         self.clone_source_center: tuple[int, int] | None = None
         self.clone_brush_radius_label = 32
@@ -16766,6 +16769,13 @@ class FullscreenViewer(QDialog):
                 self._cancel_lama_inference()
                 self.exit_region_edit()
             return
+        if (
+            key == Qt.Key.Key_Z
+            and event.modifiers() == Qt.KeyboardModifier.NoModifier
+            and (self.edit_mode is not None or self.operations)
+        ):
+            self.undo_last_edit()
+            return
         if self.edit_mode == "lama":
             if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
                 self.apply_lama_mask()
@@ -16967,6 +16977,7 @@ class FullscreenViewer(QDialog):
         self._pan_edit_snapshot = ViewerPanEditSnapshot(
             self.edit_mode,
             len(self.operations),
+            len(self._edit_undo_starts),
             QPoint(self.drag_origin) if self.drag_origin is not None else None,
             self.clone_source_center,
             self.clone_painting,
@@ -16983,6 +16994,7 @@ class FullscreenViewer(QDialog):
             return
         operations_changed = len(self.operations) > snapshot.operation_count
         del self.operations[snapshot.operation_count :]
+        del self._edit_undo_starts[snapshot.undo_checkpoint_count :]
         del self.lama_samples[snapshot.lama_sample_count :]
         self.drag_origin = (
             QPoint(snapshot.drag_origin)
@@ -17060,6 +17072,7 @@ class FullscreenViewer(QDialog):
             if self.clone_alignment_target is None:
                 self.clone_alignment_target = image_point
             self.clone_last_target = None
+            self._begin_edit_operation_group()
             self.paint_clone_to(image_point)
             return True
         if event_type == QEvent.Type.MouseButtonRelease and event.button() == Qt.MouseButton.LeftButton:  # type: ignore[attr-defined]
@@ -17314,7 +17327,7 @@ class FullscreenViewer(QDialog):
         self.setWindowTitle(f"Marnwick — LaMa completed using {provider_label}")
         self._remember_lama_mask_pattern(submitted_samples)
         self.exit_region_edit()
-        self.operations.append(operation)
+        self._append_edit_operations((operation,))
         self.render_preview()
 
     def _settle_lama_provider_updates(self) -> None:
@@ -18018,6 +18031,7 @@ class FullscreenViewer(QDialog):
         self.label.show()
         self.cleanup_preview()
         self.operations.clear()
+        self._edit_undo_starts.clear()
         self.exit_region_edit()
         self.zoom_level = 1.0
         self.pan_offset = QPoint(0, 0)
@@ -18088,7 +18102,7 @@ class FullscreenViewer(QDialog):
                     self.navigator.current,
                 )
             if retained_operations:
-                self.operations.extend(retained_operations)
+                self._restore_edit_operations(retained_operations)
                 self.render_preview()
                 if not self.operations and isinstance(parent, MainWindow):
                     parent.retain_failed_image_edit(
@@ -18407,7 +18421,7 @@ class FullscreenViewer(QDialog):
             parent.retain_failed_image_edit(self.catalog, result.rel_path, retained_operations)
             self._retained_preview_rel = result.rel_path
             self._retained_preview_operations = retained_operations
-            self.operations.extend(retained_operations)
+            self._restore_edit_operations(retained_operations)
             self.render_preview()
             self.update_info_overlay()
             return
@@ -18564,7 +18578,7 @@ class FullscreenViewer(QDialog):
             or self.operations
         ):
             return False
-        self.operations.extend(operations)
+        self._restore_edit_operations(operations)
         self.render_preview()
         return bool(self.operations)
 
@@ -19052,7 +19066,9 @@ class FullscreenViewer(QDialog):
             dialog.deleteLater()
         if not accepted or command is None:
             return
-        if command in {"rotate_left", "rotate_right", "flip_horizontal", "flip_vertical"}:
+        if command == "undo":
+            self.undo_last_edit()
+        elif command in {"rotate_left", "rotate_right", "flip_horizontal", "flip_vertical"}:
             self.apply_instant_operation(command)
         elif command == "crop":
             self.start_region_edit("crop")
@@ -19108,7 +19124,57 @@ class FullscreenViewer(QDialog):
         if not self.can_edit_current():
             return
         self.exit_region_edit()
-        self.operations.append(EditOperation(name))
+        self._append_edit_operations((EditOperation(name),))
+        self.render_preview()
+
+    def _begin_edit_operation_group(self) -> None:
+        start = len(self.operations)
+        if not self._edit_undo_starts or self._edit_undo_starts[-1] != start:
+            self._edit_undo_starts.append(start)
+
+    def _append_edit_operations(
+        self,
+        operations: Sequence[EditOperation],
+    ) -> None:
+        pending = tuple(operations)
+        if not pending:
+            return
+        self._begin_edit_operation_group()
+        self.operations.extend(pending)
+
+    def _restore_edit_operations(
+        self,
+        operations: Sequence[EditOperation],
+    ) -> None:
+        """Restore operations whose original user-action grouping is unavailable."""
+
+        start = len(self.operations)
+        self.operations.extend(operations)
+        self._edit_undo_starts.extend(range(start, len(self.operations)))
+
+    def undo_last_edit(self) -> None:
+        if self._lama_future is not None or not self.operations:
+            return
+        while (
+            self._edit_undo_starts
+            and self._edit_undo_starts[-1] >= len(self.operations)
+        ):
+            self._edit_undo_starts.pop()
+        operation_start = (
+            self._edit_undo_starts.pop()
+            if self._edit_undo_starts
+            else len(self.operations) - 1
+        )
+        del self.operations[max(0, operation_start) :]
+        if self.navigator.order:
+            self._release_retained_preview_backup(self.navigator.current)
+        self.clone_painting = False
+        self.clone_last_target = None
+        self.preview_image_current = False
+        self.display_preview_image = None
+        self.display_preview_size = None
+        # Rendering an empty operation list is intentional: it restores the
+        # source image after undoing the final pending edit.
         self.render_preview()
 
     def start_region_edit(self, mode: str) -> None:
@@ -19221,20 +19287,35 @@ class FullscreenViewer(QDialog):
         if box is None:
             return
         if self.edit_mode == "crop":
-            self.operations.append(
-                EditOperation(
-                    "crop",
-                    {"left": box[0], "top": box[1], "right": box[2], "bottom": box[3]},
+            self._append_edit_operations(
+                (
+                    EditOperation(
+                        "crop",
+                        {
+                            "left": box[0],
+                            "top": box[1],
+                            "right": box[2],
+                            "bottom": box[3],
+                        },
+                    ),
                 )
             )
             self.exit_region_edit()
             self.render_preview()
             return
         if self.edit_mode == "red_eye":
-            self.operations.append(
-                EditOperation(
-                    "red_eye",
-                    {"left": box[0], "top": box[1], "right": box[2], "bottom": box[3], "ellipse": True},
+            self._append_edit_operations(
+                (
+                    EditOperation(
+                        "red_eye",
+                        {
+                            "left": box[0],
+                            "top": box[1],
+                            "right": box[2],
+                            "bottom": box[3],
+                            "ellipse": True,
+                        },
+                    ),
                 )
             )
             self.render_preview()
@@ -19387,7 +19468,7 @@ class FullscreenViewer(QDialog):
         self.preview_image_current = False
         self.display_preview_image = None
         self.display_preview_size = None
-        if not self.operations or self._load_closed or not self.navigator.order:
+        if self._load_closed or not self.navigator.order:
             return
         self._preview_generation += 1
         generation = self._preview_generation
@@ -19529,7 +19610,7 @@ class FullscreenViewer(QDialog):
     def apply_operations_to_preview(self, operations: list[EditOperation]) -> None:
         if not self.can_edit_current():
             return
-        self.operations.extend(operations)
+        self._append_edit_operations(operations)
         self.render_preview()
 
     def display_preview_target_size(self) -> tuple[int, int]:
@@ -19646,6 +19727,7 @@ class FullscreenViewer(QDialog):
         # case the preview-restoration safety copy is no longer needed.
         self._release_retained_preview_backup(rel_path)
         self.operations.clear()
+        self._edit_undo_starts.clear()
         self.cleanup_preview()
         if committed_warning is not None:
             show_error(

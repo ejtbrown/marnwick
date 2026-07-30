@@ -140,14 +140,14 @@ Directory tiles remain grouped before file tiles. Directory “size” is the to
 | Hold left and right mouse buttons, then drag | Pan a zoomed image while viewing or editing |
 | `Escape` | Exit a region tool, reset zoom, or close the viewer |
 | `G` | Go to a file number in the pane's display order |
-| `Z` | Toggle path, file date, and position information |
+| `Z` | Toggle path, file date, and position information; undo the latest pending edit while editing |
 | `L` | Toggle the rotated position and filename labels for this session |
 | `T` | Edit tags |
 | `E` | Open edit tools |
 | `Ctrl+C` | Copy the current file to the desktop clipboard |
 | `Delete` or `Backspace` | Delete the current image and advance |
 
-The edit menu provides rotate-left, rotate-right, vertical flip, horizontal flip, red-eye selection, crop selection, clone/heal, and LaMa. LaMa is shown with the `M` hotkey. Drag over the image to select a crop or red-eye region. In clone/heal mode, right-click to set the initial source and left-drag to paint. The first left click aligns that source with the paint cursor; afterward, moving the cursor moves the source by the same amount across separate strokes until another right-click selects a new source. Use the mouse wheel to resize the brush.
+The edit menu provides rotate-left, rotate-right, vertical flip, horizontal flip, red-eye selection, crop selection, clone/heal, LaMa, and undo. LaMa is shown with the `M` hotkey, and `Z` undoes the most recent pending edit. Drag over the image to select a crop or red-eye region. In clone/heal mode, right-click to set the initial source and left-drag to paint. The first left click aligns that source with the paint cursor; afterward, moving the cursor moves the source by the same amount across separate strokes until another right-click selects a new source. Undo removes the complete most recent stroke. Use the mouse wheel to resize the brush.
 
 In LaMa mode, paint the complete area to remove, use the mouse wheel to resize the mask brush, press `Backspace` to clear the mask, and press `Enter` to apply it. A centered progress indicator remains visible while the local inference runs and reports the execution provider actually in use; `Escape` cancels the mask or a running inference. Under **Tools > Preferences > LaMa**, choose **Auto**, **CPU**, **NVIDIA**, or **WebGPU**. Auto prefers an available vendor GPU provider, then a physical WebGPU device, and finally CPU; explicit GPU selections also retry on CPU if session creation or inference fails. WebGPU is registered as an ONNX Runtime plugin in the isolated worker and uses the platform's native GPU stack across Linux, macOS, and Windows. Images are never uploaded. Selecting LaMa starts an opportunistic background warm-up, and one isolated worker retains the initialized model session for subsequent edits until the application closes or the runtime/model changes. Marnwick crops bounded context around the mask, retains the generated pixel patch and execution-provider record in the edit history, and does not rerun the model when saving. LaMa currently supports static images only. Choosing LaMa when its model is absent offers to download it, and **Tools > Download LaMa Model** provides the same operation on demand. Downloads are pinned and SHA-256 verified before publication.
 

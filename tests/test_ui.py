@@ -721,6 +721,34 @@ def test_edit_command_dialog_hotkeys_work_when_list_has_focus() -> None:
         qt_app.processEvents()
 
 
+def test_edit_command_dialog_exposes_z_as_undo_hotkey() -> None:
+    qt_app = app()
+    dialog = EditCommandDialog()
+    try:
+        undo_items = [
+            dialog.list_widget.item(row)
+            for row in range(dialog.list_widget.count())
+            if dialog.list_widget.item(row).data(Qt.ItemDataRole.UserRole) == "undo"
+        ]
+
+        assert [item.text() for item in undo_items] == ["Z    Undo most recent edit"]
+
+        dialog.keyPressEvent(
+            QKeyEvent(
+                QEvent.Type.KeyPress,
+                Qt.Key.Key_Z,
+                Qt.KeyboardModifier.NoModifier,
+                "z",
+            )
+        )
+
+        assert dialog.selected_command() == "undo"
+    finally:
+        dialog.close()
+        dialog.deleteLater()
+        qt_app.processEvents()
+
+
 def test_edit_command_dialog_shows_every_command_without_scrolling() -> None:
     qt_app = app()
     dialog = EditCommandDialog()
@@ -919,6 +947,109 @@ def test_fullscreen_z_toggles_file_info_overlay(tmp_path: Path) -> None:
             assert not viewer.info_overlay_enabled
             assert viewer.info_overlay.isHidden()
         finally:
+            viewer.close()
+            viewer.deleteLater()
+            qt_app.processEvents()
+
+
+def test_fullscreen_z_undoes_edits_and_restores_source_pixels(tmp_path: Path) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    Image.new("RGB", (12, 6), (10, 20, 30)).save(root / "image.png")
+
+    with Catalog(root) as catalog:
+        viewer = FullscreenViewer(
+            catalog,
+            ImageNavigator.sequential(["image.png"], "image.png"),
+        )
+        try:
+            viewer.apply_instant_operation("rotate_right")
+            deadline = monotonic() + 3
+            while viewer._preview_future is not None and monotonic() < deadline:
+                qt_app.processEvents()
+                viewer._settle_preview_render()
+                sleep(0.001)
+
+            assert viewer.image_coordinate_size == (6, 12)
+            assert [operation.name for operation in viewer.operations] == [
+                "rotate_right"
+            ]
+
+            viewer.keyPressEvent(
+                QKeyEvent(
+                    QEvent.Type.KeyPress,
+                    Qt.Key.Key_Z,
+                    Qt.KeyboardModifier.NoModifier,
+                    "z",
+                )
+            )
+            deadline = monotonic() + 3
+            while viewer._preview_future is not None and monotonic() < deadline:
+                qt_app.processEvents()
+                viewer._settle_preview_render()
+                sleep(0.001)
+
+            assert viewer.operations == []
+            assert viewer.image_coordinate_size == (12, 6)
+            assert not viewer.info_overlay_enabled
+
+            viewer.keyPressEvent(
+                QKeyEvent(
+                    QEvent.Type.KeyPress,
+                    Qt.Key.Key_Z,
+                    Qt.KeyboardModifier.NoModifier,
+                    "z",
+                )
+            )
+
+            assert viewer.info_overlay_enabled
+        finally:
+            viewer.operations.clear()
+            viewer.close()
+            viewer.deleteLater()
+            qt_app.processEvents()
+
+
+def test_edit_dialog_z_command_undoes_the_latest_operation(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    Image.new("RGB", (12, 6), (10, 20, 30)).save(root / "image.png")
+
+    def choose_undo(dialog: EditCommandDialog) -> int:
+        dialog.choose_command("undo")
+        return int(QDialog.DialogCode.Accepted)
+
+    monkeypatch.setattr(EditCommandDialog, "exec", choose_undo)
+    with Catalog(root) as catalog:
+        viewer = FullscreenViewer(
+            catalog,
+            ImageNavigator.sequential(["image.png"], "image.png"),
+        )
+        try:
+            rendered_operations: list[tuple[str, ...]] = []
+            monkeypatch.setattr(
+                viewer,
+                "render_preview",
+                lambda: rendered_operations.append(
+                    tuple(operation.name for operation in viewer.operations)
+                ),
+            )
+            viewer.apply_instant_operation("rotate_right")
+            viewer.apply_instant_operation("flip_horizontal")
+
+            viewer.open_edit_tools()
+
+            assert [operation.name for operation in viewer.operations] == [
+                "rotate_right"
+            ]
+            assert rendered_operations[-1] == ("rotate_right",)
+        finally:
+            viewer.operations.clear()
             viewer.close()
             viewer.deleteLater()
             qt_app.processEvents()
@@ -1248,6 +1379,33 @@ def test_clone_brush_keeps_source_aligned_across_separate_strokes(tmp_path: Path
             assert second["source_center"] == (30, 10)
             assert second["target_center"] == (60, 40)
             assert viewer.clone_alignment_target == (40, 50)
+
+            third_target = QPointF(90, 40)
+            send_mouse_event(
+                QEvent.Type.MouseMove,
+                third_target,
+                Qt.MouseButton.NoButton,
+                Qt.MouseButton.LeftButton,
+            )
+            send_mouse_event(
+                QEvent.Type.MouseButtonRelease,
+                third_target,
+                Qt.MouseButton.LeftButton,
+                Qt.MouseButton.NoButton,
+            )
+            assert len(viewer.operations) > 2
+
+            viewer.keyPressEvent(
+                QKeyEvent(
+                    QEvent.Type.KeyPress,
+                    Qt.Key.Key_Z,
+                    Qt.KeyboardModifier.NoModifier,
+                    "z",
+                )
+            )
+
+            assert len(viewer.operations) == 1
+            assert (viewer.operations[0].params or {})["target_center"] == (40, 50)
         finally:
             viewer.operations.clear()
             viewer.close()
