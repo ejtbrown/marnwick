@@ -105,6 +105,7 @@ You can open more catalogs with **File > Open** or manage remembered catalogs un
 | Input | Action |
 | --- | --- |
 | Double-click or `Enter` | Open an image/document, launch a video, or enter a folder |
+| `G` | Select a file by its number in the current pane |
 | `S` | Open images and documents in randomized navigation mode |
 | `T` | Edit tags for one selected file |
 | `Ctrl+C` | Copy selected files to the desktop clipboard |
@@ -132,6 +133,7 @@ Directory tiles remain grouped before file tiles. Directory “size” is the to
 | Arrow keys while zoomed | Pan the image |
 | Hold left and right mouse buttons, then drag | Pan a zoomed image while viewing or editing |
 | `Escape` | Exit a region tool, reset zoom, or close the viewer |
+| `G` | Go to a file number in the pane's display order |
 | `Z` | Toggle path, file date, and position information |
 | `L` | Toggle the rotated position and filename labels for this session |
 | `T` | Edit tags |

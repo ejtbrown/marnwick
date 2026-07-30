@@ -40,8 +40,26 @@ from PySide6.QtCore import (
     QUrl,
     QIODevice,
 )
-from PySide6.QtGui import QAction, QBrush, QColor, QCursor, QDesktopServices, QDrag, QIcon, QImage, QImageReader, QKeySequence, QMovie, QPen, QPixmap, QShortcut
-from PySide6.QtGui import QFont, QFontMetrics, QPainter
+from PySide6.QtGui import (
+    QAction,
+    QBrush,
+    QColor,
+    QCursor,
+    QDesktopServices,
+    QDrag,
+    QFont,
+    QFontMetrics,
+    QIcon,
+    QImage,
+    QImageReader,
+    QIntValidator,
+    QKeySequence,
+    QMovie,
+    QPainter,
+    QPen,
+    QPixmap,
+    QShortcut,
+)
 from PySide6.QtPdf import QPdfDocument
 from PySide6.QtPdfWidgets import QPdfView
 from PySide6.QtWidgets import (
@@ -322,6 +340,7 @@ class ViewerDeletePending:
 
     rel_path: str
     removed_index: int
+    display_index: int | None = None
 
 
 @dataclass(slots=True)
@@ -1466,6 +1485,20 @@ class ThumbnailModel(QAbstractListModel):
         ):
             ordinal = row - self._first_image_row + 1
         return ordinal
+
+    def row_for_image_ordinal(self, ordinal: int) -> int | None:
+        """Return the loaded row for a one-based file ordinal."""
+
+        if (
+            ordinal < 1
+            or ordinal > self._image_count
+            or self._first_image_row is None
+        ):
+            return None
+        row = self._first_image_row + ordinal - 1
+        if row >= len(self.images) or not isinstance(self.images[row], ImageRecord):
+            return None
+        return row
 
     def row_for_key(self, key: tuple[str, str]) -> int | None:
         row = self._row_by_key.get(key)
@@ -3344,6 +3377,11 @@ class MainWindow(QMainWindow):
             tuple[str, str] | None,
         ] | None = None
         self._pending_rel_path_selection: tuple[Path, str, int] | None = None
+        self._pending_file_ordinal_selection: tuple[
+            TreeStateKey,
+            int,
+            int,
+        ] | None = None
 
         self.tree = DirectoryTree(self)
         self.tree.itemClicked.connect(self._directory_clicked)
@@ -4102,6 +4140,8 @@ class MainWindow(QMainWindow):
         self.tools_menu.aboutToShow.connect(self._update_tools_menu_actions)
 
         QShortcut(QKeySequence("Ctrl+O"), self, activated=self.open_catalog_dialog)
+        self.go_to_file_shortcut = QShortcut(QKeySequence("G"), self)
+        self.go_to_file_shortcut.activated.connect(self.open_go_to_file_dialog)
 
     def _update_tools_menu_actions(self) -> None:
         duplicate_view_selected = self.current_virtual_kind in {
@@ -8282,6 +8322,9 @@ class MainWindow(QMainWindow):
         pending_selection = self._pending_rel_path_selection
         if pending_selection is not None and pending_selection[2] != pane_generation:
             self._pending_rel_path_selection = None
+        pending_ordinal = self._pending_file_ordinal_selection
+        if pending_ordinal is not None and pending_ordinal[1] != pane_generation:
+            self._pending_file_ordinal_selection = None
         self._remember_thumbnail_scroll_position()
         self._remember_thumbnail_selection()
         target_scroll_key = self._current_thumbnail_scroll_key()
@@ -8600,7 +8643,7 @@ class MainWindow(QMainWindow):
             images=filtered,
             duration_ms=(monotonic() - started_at) * 1000,
             total_records=len(filtered),
-            total_images=len(image_order),
+            total_images=sum(isinstance(record, ImageRecord) for record in filtered),
             stable_row_by_key=row_by_key,
             stable_order_token=order_hash.hexdigest(),
             stable_image_order=image_order,
@@ -8986,7 +9029,7 @@ class MainWindow(QMainWindow):
             images=records,
             duration_ms=(monotonic() - started_at) * 1000,
             total_records=len(records),
-            total_images=sum(record.slideshow_eligible for record in image_records),
+            total_images=len(image_records),
             stable_row_by_key=stable_row_by_key,
             stable_order_token=order_hash.hexdigest(),
             stable_image_order=stable_image_order,
@@ -9144,7 +9187,7 @@ class MainWindow(QMainWindow):
         result.stable_order_token = order_hash.hexdigest()
         result.stable_image_order = stable_image_order
         result.total_records = len(records)
-        result.total_images = sum(record.slideshow_eligible for record in images)
+        result.total_images = len(images)
         return result
 
     def _physical_view_worker(
@@ -9243,6 +9286,20 @@ class MainWindow(QMainWindow):
                 self.current_virtual_value,
             )
         return self._tree_state_key_for_directory(self.current_catalog.root, self.current_dir_rel)
+
+    def _current_tree_pane_is_selected(self) -> bool:
+        item = self.tree.currentItem()
+        pane_key = self._current_thumbnail_scroll_key()
+        if item is None or not item.isSelected() or pane_key is None:
+            return False
+        if (
+            item.data(0, TREE_LOAD_MORE_ROLE) is not None
+            or item.data(0, TREE_LOAD_MORE_TAGS_ROLE) is not None
+        ):
+            return False
+        with suppress(TypeError, ValueError):
+            return self._tree_item_state_key(item) == pane_key
+        return False
 
     def _remember_thumbnail_scroll_position(self) -> None:
         if self._thumbnail_scroll_key is None:
@@ -9993,6 +10050,7 @@ class MainWindow(QMainWindow):
             self._restore_thumbnail_selection(*pending)
         self.update_selection_status()
         self._apply_pending_rel_path_selection(self._physical_pane_generation)
+        self._apply_pending_file_ordinal_selection()
 
     def _thumbnail_rows_exposed(self) -> None:
         pending = self._pending_thumbnail_index_restore
@@ -10002,6 +10060,7 @@ class MainWindow(QMainWindow):
         if self._thumbnail_scroll_key is not None:
             self._restore_thumbnail_scroll_position(self._thumbnail_scroll_key)
         self._apply_pending_rel_path_selection(self._physical_pane_generation)
+        self._apply_pending_file_ordinal_selection()
 
     def _load_very_similar_virtual_directory(
         self,
@@ -10336,7 +10395,6 @@ class MainWindow(QMainWindow):
                         ]
                         total_images = sum(
                             isinstance(record, ImageRecord)
-                            and record.slideshow_eligible
                             for record in preview_records
                         )
 
@@ -12273,6 +12331,8 @@ class MainWindow(QMainWindow):
             navigator,
             self,
             wipe_on_delete=self.wipe_on_delete_enabled(),
+            display_order=order,
+            random_mode=random_mode,
         )
         last_viewed: str | None = None
         try:
@@ -13057,6 +13117,64 @@ class MainWindow(QMainWindow):
         self._remember_thumbnail_scroll_position()
         return True
 
+    def open_go_to_file_dialog(self) -> None:
+        if not self._current_tree_pane_is_selected():
+            return
+        total_files = self.model.image_count
+        if total_files <= 0:
+            return
+        default_file_number = 1
+        row = self.current_selected_row()
+        if (
+            row is not None
+            and row < len(self.model.images)
+            and isinstance(self.model.images[row], ImageRecord)
+        ):
+            default_file_number = self.model.image_ordinal(row) or 1
+        dialog = GoToFileDialog(total_files, default_file_number, self)
+        try:
+            if dialog.exec() == QDialog.DialogCode.Accepted:
+                self.go_to_file_number(dialog.file_number())
+        finally:
+            dialog.deleteLater()
+
+    def go_to_file_number(self, file_number: int) -> None:
+        pane_key = self._current_thumbnail_scroll_key()
+        if (
+            pane_key is None
+            or file_number < 1
+            or file_number > self.model.image_count
+        ):
+            return
+        self._pending_file_ordinal_selection = (
+            pane_key,
+            self._physical_pane_generation,
+            file_number,
+        )
+        self._apply_pending_file_ordinal_selection()
+
+    def _apply_pending_file_ordinal_selection(self) -> None:
+        pending = self._pending_file_ordinal_selection
+        if pending is None:
+            return
+        pane_key, generation, file_number = pending
+        if (
+            generation != self._physical_pane_generation
+            or pane_key != self._current_thumbnail_scroll_key()
+        ):
+            self._pending_file_ordinal_selection = None
+            return
+        row = self.model.row_for_image_ordinal(file_number)
+        if row is None:
+            if self.model.canFetchMore():
+                QTimer.singleShot(0, self.model.fetchMore)
+            elif not self.model.may_have_more_pages and not self.model.record_indexes_pending:
+                self._pending_file_ordinal_selection = None
+            return
+        record = self.model.images[row]
+        if self._select_thumbnail_record_key(("image", record.rel_path)):
+            self._pending_file_ordinal_selection = None
+
     def select_rel_path(self, rel_path: str) -> None:
         selected = self._select_thumbnail_record_key(("image", rel_path))
         catalog = self.current_catalog
@@ -13510,6 +13628,79 @@ class MainWindow(QMainWindow):
                 self._pruned_catalog_roots.add(root)
                 if self.current_catalog is not None and self.current_catalog.root == root:
                     self.load_current_directory(preserve_selection=True)
+
+
+class GoToFileDialog(QDialog):
+    """Collect and validate a one-based file position."""
+
+    def __init__(
+        self,
+        total_files: int,
+        default_file_number: int,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.total_files = max(0, int(total_files))
+        self.setWindowTitle("Go to File")
+        self.setWindowIcon(load_app_icon())
+        self.setStyleSheet(DIALOG_STYLESHEET)
+
+        layout = QVBoxLayout(self)
+        entry_layout = QHBoxLayout()
+        self.prompt_label = QLabel("Go to file number:")
+        entry_layout.addWidget(self.prompt_label)
+        self.entry = QLineEdit(str(default_file_number))
+        self.entry.setValidator(QIntValidator(0, 2_147_483_647, self.entry))
+        self.entry.setAlignment(Qt.AlignmentFlag.AlignRight)
+        self.entry.setMinimumWidth(90)
+        self.entry.setMaximumWidth(130)
+        entry_layout.addWidget(self.entry)
+        self.total_label = QLabel(f"of {self.total_files}")
+        entry_layout.addWidget(self.total_label)
+        layout.addLayout(entry_layout)
+
+        self.buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        self.ok_button = self.buttons.button(QDialogButtonBox.StandardButton.Ok)
+        self.ok_button.setText("Ok")
+        self.ok_button.setDefault(True)
+        self.cancel_button = self.buttons.button(
+            QDialogButtonBox.StandardButton.Cancel
+        )
+        layout.addWidget(self.buttons)
+
+        self.entry.textChanged.connect(self._validate)
+        self.entry.returnPressed.connect(self._accept_if_valid)
+        self.buttons.accepted.connect(self._accept_if_valid)
+        self.buttons.rejected.connect(self.reject)
+        self._validate(self.entry.text())
+        self.entry.setFocus()
+        self.entry.selectAll()
+        self.setFixedSize(self.sizeHint())
+
+    def _validate(self, text: str) -> None:
+        try:
+            file_number = int(text)
+        except (TypeError, ValueError):
+            file_number = 0
+        valid = bool(text) and 1 <= file_number <= self.total_files
+        self.ok_button.setEnabled(valid)
+        self.entry.setStyleSheet(
+            "QLineEdit { color: #c62828; }" if text and not valid else ""
+        )
+
+    def _accept_if_valid(self) -> None:
+        if self.ok_button.isEnabled():
+            self.accept()
+
+    def file_number(self) -> int:
+        return int(self.entry.text())
+
+    def showEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        super().showEvent(event)
+        QTimer.singleShot(0, self.entry.selectAll)
 
 
 class TagDialog(QDialog):
@@ -15836,11 +16027,24 @@ class FullscreenViewer(QDialog):
         parent: QWidget | None = None,
         *,
         wipe_on_delete: bool = False,
+        display_order: Sequence[str] | None = None,
+        random_mode: bool = False,
     ) -> None:
         super().__init__(parent)
         self.catalog = catalog
         self.navigator = navigator
         self.wipe_on_delete = wipe_on_delete
+        self.random_mode = bool(
+            random_mode
+            or (
+                isinstance(navigator, PagedImageNavigator)
+                and navigator.random_mode
+            )
+        )
+        self._display_order = list(
+            navigator.order if display_order is None else display_order
+        )
+        self._display_seen = set(self._display_order)
         self.last_viewed_rel_path = navigator.current
         self.operations: list[EditOperation] = []
         self.edit_mode: str | None = None
@@ -15893,6 +16097,7 @@ class FullscreenViewer(QDialog):
         self._navigation_page_future: Future[ViewerNavigationPage] | None = None
         self._navigation_page_cancel_event: Event | None = None
         self._pending_navigation_step = 0
+        self._pending_go_to_file_ordinal: int | None = None
         self._navigation_page_select_first = False
         self._navigation_page_replace_all = False
         self._navigation_rebuild_required = False
@@ -15900,6 +16105,8 @@ class FullscreenViewer(QDialog):
         self._navigation_rebuild_fallback_index = 0
         self._navigation_rebuild_rel_paths: list[str] = []
         self._navigation_rebuild_seen: set[str] = set()
+        self._navigation_rebuild_display_order: list[str] = []
+        self._navigation_rebuild_display_seen: set[str] = set()
         self._navigation_rebuild_next_offset: int | None = None
         self._navigation_rebuild_total_count = 0
         self._pending_image_delete: ViewerDeletePending | None = None
@@ -16047,6 +16254,7 @@ class FullscreenViewer(QDialog):
             Qt.Key.Key_Left,
             Qt.Key.Key_Right,
             Qt.Key.Key_Escape,
+            Qt.Key.Key_G,
             Qt.Key.Key_L,
         }:
             # A successful delete can leave a paged navigator briefly empty
@@ -16055,6 +16263,9 @@ class FullscreenViewer(QDialog):
             return
         if key == Qt.Key.Key_L:
             self.toggle_position_labels()
+            return
+        if key == Qt.Key.Key_G:
+            self.open_go_to_file_dialog()
             return
         if self._lama_future is not None:
             if key == Qt.Key.Key_Escape:
@@ -16138,6 +16349,7 @@ class FullscreenViewer(QDialog):
                 Qt.Key.Key_Up,
                 Qt.Key.Key_Down,
                 Qt.Key.Key_Escape,
+                Qt.Key.Key_G,
                 Qt.Key.Key_L,
             }
         ):
@@ -16658,9 +16870,74 @@ class FullscreenViewer(QDialog):
         self.catalog._validate_catalog_entry_parts(relative.parts)  # noqa: SLF001
         return self.catalog.root.joinpath(*relative.parts)
 
+    def _go_to_file_total(self) -> int:
+        if isinstance(self.navigator, PagedImageNavigator):
+            return max(len(self._display_order), self.navigator.total_count)
+        return len(self._display_order)
+
+    def _current_display_ordinal(self) -> int:
+        if self.navigator.order:
+            with suppress(ValueError):
+                return self._display_order.index(self.navigator.current) + 1
+            return min(self.navigator.index + 1, max(1, self._go_to_file_total()))
+        return 1
+
+    def open_go_to_file_dialog(self) -> None:
+        total_files = self._go_to_file_total()
+        if total_files <= 0:
+            return
+        dialog = GoToFileDialog(
+            total_files,
+            self._current_display_ordinal(),
+            self,
+        )
+        try:
+            accepted = self.run_with_visible_cursor(dialog.exec)
+            if accepted == int(QDialog.DialogCode.Accepted):
+                self.go_to_file_number(dialog.file_number())
+        finally:
+            dialog.deleteLater()
+
+    def go_to_file_number(self, file_number: int) -> None:
+        if file_number < 1 or file_number > self._go_to_file_total():
+            return
+        if not self.confirm_pending_edits():
+            return
+        if self._navigation_rebuild_required:
+            self.setWindowTitle("Marnwick — refreshing image order…")
+            return
+        self._pending_navigation_step = 0
+        if self._go_to_loaded_file_number(file_number):
+            return
+        navigator = self.navigator
+        if isinstance(navigator, PagedImageNavigator) and navigator.has_more:
+            self._pending_go_to_file_ordinal = file_number
+            self._start_navigation_page(0)
+
+    def _go_to_loaded_file_number(self, file_number: int) -> bool:
+        if file_number > len(self._display_order):
+            return False
+        target_rel_path = self._display_order[file_number - 1]
+        try:
+            target_index = self.navigator.order.index(target_rel_path)
+        except ValueError:
+            return False
+        self._pending_go_to_file_ordinal = None
+        if self.random_mode:
+            current_index = self.navigator.index
+            self.navigator.order[current_index], self.navigator.order[target_index] = (
+                self.navigator.order[target_index],
+                self.navigator.order[current_index],
+            )
+        else:
+            self.navigator.index = target_index
+        self.load_current()
+        return True
+
     def navigate(self, step: int) -> None:
         if not self.confirm_pending_edits():
             return
+        self._pending_go_to_file_ordinal = None
         if self._navigation_rebuild_required:
             # Keep the displayed row stable while a fresh OFFSET prefix is
             # assembled. Navigating the old prefix here could select a row
@@ -16733,7 +17010,11 @@ class FullscreenViewer(QDialog):
                 cancel_event,
             )
         except RuntimeError:
-            if select_first or replace_all:
+            if (
+                select_first
+                or replace_all
+                or self._pending_go_to_file_ordinal is not None
+            ):
                 self._navigation_page_select_first = select_first
                 self._navigation_page_replace_all = replace_all
                 self.setWindowTitle("Marnwick — waiting for catalog reader…")
@@ -16769,6 +17050,11 @@ class FullscreenViewer(QDialog):
             or self._pending_image_delete is not None
             or self._navigation_page_select_first != select_first
             or self._navigation_page_replace_all != replace_all
+            or (
+                not select_first
+                and not replace_all
+                and self._pending_go_to_file_ordinal is None
+            )
         ):
             return
         self._start_navigation_page(
@@ -16805,7 +17091,11 @@ class FullscreenViewer(QDialog):
             if (
                 replace_all
                 or (
-                    (pending_step > 0 or select_first)
+                    (
+                        pending_step > 0
+                        or select_first
+                        or self._pending_go_to_file_ordinal is not None
+                    )
                     and navigator.has_more
                 )
             ) and not self._load_closed:
@@ -16819,6 +17109,7 @@ class FullscreenViewer(QDialog):
         except Exception as error:
             self._navigation_page_select_first = False
             self._navigation_page_replace_all = False
+            self._pending_go_to_file_ordinal = None
             if replace_all:
                 self._reset_navigation_rebuild()
                 self.accept()
@@ -16831,7 +17122,13 @@ class FullscreenViewer(QDialog):
             self.update_info_overlay()
             return
         if replace_all:
-            rel_paths = list(dict.fromkeys(page.rel_paths))
+            canonical_rel_paths = list(dict.fromkeys(page.rel_paths))
+            for rel_path in canonical_rel_paths:
+                if rel_path in self._navigation_rebuild_display_seen:
+                    continue
+                self._navigation_rebuild_display_seen.add(rel_path)
+                self._navigation_rebuild_display_order.append(rel_path)
+            rel_paths = canonical_rel_paths
             if navigator.random_mode and rel_paths:
                 rel_paths = ImageNavigator.random(rel_paths, rel_paths[0]).order
             for rel_path in rel_paths:
@@ -16875,6 +17172,8 @@ class FullscreenViewer(QDialog):
             navigator.next_offset = next_offset
             navigator.has_more = page.has_more
             navigator.total_count = max(len(rebuilt_order), total_count)
+            self._display_order = list(self._navigation_rebuild_display_order)
+            self._display_seen = set(self._display_order)
             self._reset_navigation_rebuild()
             if navigator.order:
                 navigator.index = (
@@ -16888,14 +17187,29 @@ class FullscreenViewer(QDialog):
             else:
                 self.accept()
             return
+        for rel_path in page.rel_paths:
+            if rel_path in self._display_seen:
+                continue
+            self._display_seen.add(rel_path)
+            self._display_order.append(rel_path)
         added = navigator.append_page(page)
         self.update_ordinal_overlay()
         self._navigation_page_select_first = False
         self._navigation_page_replace_all = False
         if page.has_more and page.next_offset <= old_offset:
             navigator.has_more = False
+            self._pending_go_to_file_ordinal = None
             self.load_error = "Catalog navigation page did not advance"
             self.update_info_overlay()
+            return
+        pending_file_ordinal = self._pending_go_to_file_ordinal
+        if pending_file_ordinal is not None:
+            if self._go_to_loaded_file_number(pending_file_ordinal):
+                return
+            if navigator.has_more:
+                self._start_navigation_page(0)
+            else:
+                self._pending_go_to_file_ordinal = None
             return
         if select_first:
             if added:
@@ -16929,6 +17243,8 @@ class FullscreenViewer(QDialog):
         self._navigation_rebuild_fallback_index = 0
         self._navigation_rebuild_rel_paths.clear()
         self._navigation_rebuild_seen.clear()
+        self._navigation_rebuild_display_order.clear()
+        self._navigation_rebuild_display_seen.clear()
         self._navigation_rebuild_next_offset = None
         self._navigation_rebuild_total_count = 0
 
@@ -16994,6 +17310,7 @@ class FullscreenViewer(QDialog):
         *,
         preserve_rebuild: bool = False,
     ) -> None:
+        self._pending_go_to_file_ordinal = None
         self._navigation_page_timer.stop()
         if self._navigation_page_cancel_event is not None:
             self._navigation_page_cancel_event.set()
@@ -17009,6 +17326,8 @@ class FullscreenViewer(QDialog):
             # zero after the worker proves success or failure.
             self._navigation_rebuild_rel_paths.clear()
             self._navigation_rebuild_seen.clear()
+            self._navigation_rebuild_display_order.clear()
+            self._navigation_rebuild_display_seen.clear()
             self._navigation_rebuild_next_offset = None
             self._navigation_rebuild_total_count = 0
         else:
@@ -17027,7 +17346,18 @@ class FullscreenViewer(QDialog):
         except ValueError:
             return
         self._cancel_navigation_page_for_delete(preserve_rebuild=True)
-        self._pending_image_delete = ViewerDeletePending(rel_path, removed_index)
+        try:
+            display_index = self._display_order.index(rel_path)
+        except ValueError:
+            display_index = None
+        else:
+            self._display_order.pop(display_index)
+            self._display_seen.discard(rel_path)
+        self._pending_image_delete = ViewerDeletePending(
+            rel_path,
+            removed_index,
+            display_index,
+        )
         self.navigator.order.pop(removed_index)
         self.update_ordinal_overlay()
         if not self.navigator.order:
@@ -17051,6 +17381,12 @@ class FullscreenViewer(QDialog):
             current_rel_path = navigator.current if navigator.order else None
             restored_index = min(pending.removed_index, len(navigator.order))
             navigator.order.insert(restored_index, rel_path)
+            if pending.display_index is not None:
+                self._display_order.insert(
+                    min(pending.display_index, len(self._display_order)),
+                    rel_path,
+                )
+                self._display_seen.add(rel_path)
             if isinstance(navigator, PagedImageNavigator):
                 navigator._seen.add(rel_path)
             if current_rel_path is None:
