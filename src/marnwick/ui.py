@@ -16305,13 +16305,13 @@ class FullscreenViewer(QDialog):
             return
         if self.is_zoomed() and key in (Qt.Key.Key_Left, Qt.Key.Key_Right, Qt.Key.Key_Up, Qt.Key.Key_Down):
             if key == Qt.Key.Key_Left:
-                self.pan_by(-self.PAN_KEY_STEP, 0)
-            elif key == Qt.Key.Key_Right:
                 self.pan_by(self.PAN_KEY_STEP, 0)
+            elif key == Qt.Key.Key_Right:
+                self.pan_by(-self.PAN_KEY_STEP, 0)
             elif key == Qt.Key.Key_Up:
-                self.pan_by(0, -self.PAN_KEY_STEP)
-            else:
                 self.pan_by(0, self.PAN_KEY_STEP)
+            else:
+                self.pan_by(0, -self.PAN_KEY_STEP)
             return
         if key == Qt.Key.Key_Right:
             self.navigate(1)
