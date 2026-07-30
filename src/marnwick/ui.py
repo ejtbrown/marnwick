@@ -16234,6 +16234,7 @@ class ImageDisplayLabel(QLabel):
         self._target_rect: QRect | None = None
         self._ordinal_text = ""
         self._filename_text = ""
+        self._resolution_text = ""
 
     def set_display_pixmap(self, pixmap: QPixmap, target_rect: QRect | None = None) -> None:
         self._display_pixmap = QPixmap(pixmap)
@@ -16290,13 +16291,35 @@ class ImageDisplayLabel(QLabel):
     def filename_text(self) -> str:
         return self._filename_text
 
+    def set_resolution_text(self, text: str) -> None:
+        if text == self._resolution_text:
+            return
+        self._resolution_text = text
+        self.update()
+
+    def resolution_text(self) -> str:
+        return self._resolution_text
+
     def ordinal_overlay_rect(self) -> QRect:
         return self._vertical_overlay_rect(self._ordinal_text, right_aligned=False)
 
     def filename_overlay_rect(self) -> QRect:
         return self._vertical_overlay_rect(self._filename_text, right_aligned=True)
 
-    def _vertical_overlay_rect(self, text: str, *, right_aligned: bool) -> QRect:
+    def resolution_overlay_rect(self) -> QRect:
+        return self._vertical_overlay_rect(
+            self._resolution_text,
+            right_aligned=True,
+            top_aligned=True,
+        )
+
+    def _vertical_overlay_rect(
+        self,
+        text: str,
+        *,
+        right_aligned: bool,
+        top_aligned: bool = False,
+    ) -> QRect:
         if not text:
             return QRect()
         font = QFont(self.font())
@@ -16315,7 +16338,11 @@ class ImageDisplayLabel(QLabel):
         )
         return QRect(
             left,
-            self.height() - self.ORDINAL_MARGIN - rotated_height,
+            (
+                self.ORDINAL_MARGIN
+                if top_aligned
+                else self.height() - self.ORDINAL_MARGIN - rotated_height
+            ),
             unrotated_height,
             rotated_height,
         )
@@ -16326,6 +16353,10 @@ class ImageDisplayLabel(QLabel):
 
     def filename_text_color(self) -> QColor:
         luminance = self._average_display_luminance(self.filename_overlay_rect())
+        return QColor("black" if luminance >= self.LIGHT_BACKGROUND_LUMINANCE else "white")
+
+    def resolution_text_color(self) -> QColor:
+        luminance = self._average_display_luminance(self.resolution_overlay_rect())
         return QColor("black" if luminance >= self.LIGHT_BACKGROUND_LUMINANCE else "white")
 
     def _display_target_rect(self) -> QRect:
@@ -16420,6 +16451,12 @@ class ImageDisplayLabel(QLabel):
             self._filename_text,
             self.filename_overlay_rect(),
             self.filename_text_color(),
+        )
+        self._paint_vertical_overlay(
+            painter,
+            self._resolution_text,
+            self.resolution_overlay_rect(),
+            self.resolution_text_color(),
         )
 
     def paintEvent(self, event) -> None:  # type: ignore[no-untyped-def]
@@ -17966,6 +18003,7 @@ class FullscreenViewer(QDialog):
         self.image_delete_started(rel_path)
 
     def load_current(self) -> None:
+        self.image_coordinate_size = (0, 0)
         self.update_ordinal_overlay()
         self.stop_movie()
         self.pdf_document.close()
@@ -17998,7 +18036,6 @@ class FullscreenViewer(QDialog):
         self.load_error = None
         self.loaded_file_identity = None
         self.loaded_file_dates = None
-        self.image_coordinate_size = (0, 0)
         if isinstance(parent, MainWindow):
             self.base_pixmap = QPixmap()
             self.label.clear_display_pixmap()
@@ -18634,11 +18671,24 @@ class FullscreenViewer(QDialog):
             if self.navigator.order
             else ""
         )
+        image_width, image_height = self.image_coordinate_size
+        resolution_text = (
+            f"{image_width} x {image_height}"
+            if (
+                self.active_media_kind == "image"
+                and image_width > 0
+                and image_height > 0
+            )
+            else ""
+        )
         self.label.set_ordinal_text(
             ordinal_text if self.position_labels_enabled else ""
         )
         self.label.set_filename_text(
             filename_text if self.position_labels_enabled else ""
+        )
+        self.label.set_resolution_text(
+            resolution_text if self.position_labels_enabled else ""
         )
         if not hasattr(self, "document_ordinal_overlay"):
             return
@@ -19463,6 +19513,7 @@ class FullscreenViewer(QDialog):
         )
         self._commit_retained_preview_backup(result.rel_path, result.operations)
         self._fit_pixmap()
+        self.update_info_overlay()
 
     def _cancel_preview_render(self) -> None:
         self._preview_generation += 1
