@@ -250,6 +250,8 @@ VIRTUAL_KIND_VERY_SIMILAR = "very-similar"
 VIRTUAL_KIND_PHYSICAL = "physical"
 VIRTUAL_KIND_PHYSICAL_PREVIEW = "physical-preview"
 TreeStateKey = tuple[Path, str, str, str]
+LamaMaskPercentageSample = tuple[float, float, float]
+LamaMaskPercentagePattern = tuple[LamaMaskPercentageSample, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -3406,7 +3408,7 @@ class MainWindow(QMainWindow):
         # Keep the model isolated from Qt while retaining one initialized
         # session for every LaMa edit made by this application instance.
         self.lama_worker_service = LamaWorkerService()
-        self._last_lama_mask_pattern: tuple[LamaStrokeSample, ...] | None = None
+        self._last_lama_mask_pattern: LamaMaskPercentagePattern | None = None
         self._lama_download_future: Future[Path] | None = None
         self._lama_download_cancel_event: Event | None = None
         self._lama_download_progress_lock = Lock()
@@ -16537,7 +16539,7 @@ class FullscreenViewer(QDialog):
         self.lama_brush_radius_label = 32
         self.lama_painting = False
         self.lama_last_target: tuple[int, int] | None = None
-        self._last_lama_mask_pattern: tuple[LamaStrokeSample, ...] | None = None
+        self._last_lama_mask_pattern: LamaMaskPercentagePattern | None = None
         self.drag_origin: QPoint | None = None
         self.preview_path: Path | None = None
         self.preview_image: Image.Image | None = None
@@ -16619,7 +16621,7 @@ class FullscreenViewer(QDialog):
         self._lama_cancel_event: Event | None = None
         self._lama_rel_path: str | None = None
         self._lama_preceding_operations: tuple[EditOperation, ...] = ()
-        self._lama_submitted_samples: tuple[LamaStrokeSample, ...] = ()
+        self._lama_submitted_mask_pattern: LamaMaskPercentagePattern = ()
         self._lama_generation = 0
         self._lama_provider_updates: SimpleQueue[tuple[int, str]] = SimpleQueue()
         self._load_timer = QTimer(self)
@@ -17186,15 +17188,57 @@ class FullscreenViewer(QDialog):
         )
         if not pattern:
             return
-        self.lama_samples = list(pattern)
+        samples = self._lama_samples_from_percentage_pattern(
+            pattern,
+            self.image_coordinate_size,
+        )
+        if not samples:
+            return
+        self.lama_samples = samples
         self.lama_painting = False
         self.lama_last_target = None
         self.update_lama_overlay(None)
         self.apply_lama_mask()
 
+    @staticmethod
+    def _lama_mask_percentage_pattern(
+        samples: Sequence[LamaStrokeSample],
+        image_size: tuple[int, int],
+    ) -> LamaMaskPercentagePattern:
+        width, height = image_size
+        if width <= 0 or height <= 0:
+            return ()
+        radius_scale = min(width, height)
+        return tuple(
+            (
+                max(0.0, min(100.0, (x * 100.0) / width)),
+                max(0.0, min(100.0, (y * 100.0) / height)),
+                max(0.0, (radius * 100.0) / radius_scale),
+            )
+            for x, y, radius in samples
+        )
+
+    @staticmethod
+    def _lama_samples_from_percentage_pattern(
+        pattern: Sequence[LamaMaskPercentageSample],
+        image_size: tuple[int, int],
+    ) -> list[LamaStrokeSample]:
+        width, height = image_size
+        if width <= 0 or height <= 0:
+            return []
+        radius_scale = min(width, height)
+        return [
+            (
+                max(0, min(width - 1, round((x_percent * width) / 100.0))),
+                max(0, min(height - 1, round((y_percent * height) / 100.0))),
+                max(1, round((radius_percent * radius_scale) / 100.0)),
+            )
+            for x_percent, y_percent, radius_percent in pattern
+        ]
+
     def _remember_lama_mask_pattern(
         self,
-        pattern: tuple[LamaStrokeSample, ...],
+        pattern: LamaMaskPercentagePattern,
     ) -> None:
         if not pattern:
             return
@@ -17256,7 +17300,10 @@ class FullscreenViewer(QDialog):
         self._lama_cancel_event = cancel_event
         self._lama_rel_path = rel_path
         self._lama_preceding_operations = preceding_operations
-        self._lama_submitted_samples = submitted_samples
+        self._lama_submitted_mask_pattern = self._lama_mask_percentage_pattern(
+            submitted_samples,
+            self.image_coordinate_size,
+        )
         # Keep the source/preview visible during inference, but remove the red
         # editing mask until an error makes the same stroke editable again.
         self.lama_processing_image.setGeometry(self.label.rect())
@@ -17288,12 +17335,12 @@ class FullscreenViewer(QDialog):
             return
         rel_path = self._lama_rel_path
         preceding_operations = self._lama_preceding_operations
-        submitted_samples = self._lama_submitted_samples
+        submitted_mask_pattern = self._lama_submitted_mask_pattern
         self._lama_future = None
         self._lama_cancel_event = None
         self._lama_rel_path = None
         self._lama_preceding_operations = ()
-        self._lama_submitted_samples = ()
+        self._lama_submitted_mask_pattern = ()
         self._lama_timer.stop()
         self._hide_lama_processing_display()
         if self._load_closed:
@@ -17325,7 +17372,7 @@ class FullscreenViewer(QDialog):
         provider = str((operation.params or {}).get("execution_provider", "local runtime"))
         provider_label = lama_execution_provider_label(provider)
         self.setWindowTitle(f"Marnwick — LaMa completed using {provider_label}")
-        self._remember_lama_mask_pattern(submitted_samples)
+        self._remember_lama_mask_pattern(submitted_mask_pattern)
         self.exit_region_edit()
         self._append_edit_operations((operation,))
         self.render_preview()
@@ -17355,7 +17402,7 @@ class FullscreenViewer(QDialog):
         self._lama_cancel_event = None
         self._lama_rel_path = None
         self._lama_preceding_operations = ()
-        self._lama_submitted_samples = ()
+        self._lama_submitted_mask_pattern = ()
         self._hide_lama_processing_display()
 
     def _hide_lama_processing_display(self) -> None:

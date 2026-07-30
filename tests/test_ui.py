@@ -1960,8 +1960,13 @@ def test_lama_r_repeats_last_successful_mask_across_viewers(
     root = tmp_path / "catalog"
     root.mkdir()
     Image.new("RGB", (320, 240), (180, 40, 30)).save(root / "first.png")
-    Image.new("RGB", (320, 240), (30, 40, 180)).save(root / "second.png")
+    Image.new("RGB", (640, 360), (30, 40, 180)).save(root / "second.png")
     pattern = ((40, 50, 12), (60, 70, 16))
+    percentage_pattern = (
+        (12.5, (50 * 100) / 240, 5.0),
+        (18.75, (70 * 100) / 240, (16 * 100) / 240),
+    )
+    repeated_pattern = ((80, 75, 18), (120, 105, 24))
     window = MainWindow()
     first_viewer: FullscreenViewer | None = None
     second_viewer: FullscreenViewer | None = None
@@ -2008,7 +2013,14 @@ def test_lama_r_repeats_last_successful_mask_across_viewers(
         first_viewer._settle_lama_inference()
 
         assert first_submissions == [pattern]
-        assert window._last_lama_mask_pattern == pattern
+        assert window._last_lama_mask_pattern is not None
+        assert len(window._last_lama_mask_pattern) == len(percentage_pattern)
+        for actual, expected in zip(
+            window._last_lama_mask_pattern,
+            percentage_pattern,
+            strict=True,
+        ):
+            assert actual == pytest.approx(expected)
 
         second_viewer = FullscreenViewer(
             catalog,
@@ -2040,8 +2052,8 @@ def test_lama_r_repeats_last_successful_mask_across_viewers(
             )
         )
 
-        assert repeated_submissions == [pattern]
-        assert second_viewer.lama_samples == list(pattern)
+        assert repeated_submissions == [repeated_pattern]
+        assert second_viewer.lama_samples == list(repeated_pattern)
         assert second_viewer._lama_future is pending
     finally:
         for viewer in (first_viewer, second_viewer):
