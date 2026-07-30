@@ -3406,6 +3406,7 @@ class MainWindow(QMainWindow):
         # Keep the model isolated from Qt while retaining one initialized
         # session for every LaMa edit made by this application instance.
         self.lama_worker_service = LamaWorkerService()
+        self._last_lama_mask_pattern: tuple[LamaStrokeSample, ...] | None = None
         self._lama_download_future: Future[Path] | None = None
         self._lama_download_cancel_event: Event | None = None
         self._lama_download_progress_lock = Lock()
@@ -16496,6 +16497,7 @@ class FullscreenViewer(QDialog):
         self.lama_brush_radius_label = 32
         self.lama_painting = False
         self.lama_last_target: tuple[int, int] | None = None
+        self._last_lama_mask_pattern: tuple[LamaStrokeSample, ...] | None = None
         self.drag_origin: QPoint | None = None
         self.preview_path: Path | None = None
         self.preview_image: Image.Image | None = None
@@ -16577,6 +16579,7 @@ class FullscreenViewer(QDialog):
         self._lama_cancel_event: Event | None = None
         self._lama_rel_path: str | None = None
         self._lama_preceding_operations: tuple[EditOperation, ...] = ()
+        self._lama_submitted_samples: tuple[LamaStrokeSample, ...] = ()
         self._lama_generation = 0
         self._lama_provider_updates: SimpleQueue[tuple[int, str]] = SimpleQueue()
         self._load_timer = QTimer(self)
@@ -16732,6 +16735,12 @@ class FullscreenViewer(QDialog):
                 return
             if key in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
                 self.clear_lama_mask()
+                return
+            if (
+                key == Qt.Key.Key_R
+                and event.modifiers() == Qt.KeyboardModifier.NoModifier
+            ):
+                self.repeat_last_lama_mask()
                 return
         if self.hotkey_matches_any(
             event,
@@ -17116,6 +17125,34 @@ class FullscreenViewer(QDialog):
         self.lama_last_target = None
         self.update_lama_overlay(None)
 
+    def repeat_last_lama_mask(self) -> None:
+        if self.edit_mode != "lama" or self._lama_future is not None:
+            return
+        parent = self.parent()
+        pattern = (
+            parent._last_lama_mask_pattern
+            if isinstance(parent, MainWindow)
+            else self._last_lama_mask_pattern
+        )
+        if not pattern:
+            return
+        self.lama_samples = list(pattern)
+        self.lama_painting = False
+        self.lama_last_target = None
+        self.update_lama_overlay(None)
+        self.apply_lama_mask()
+
+    def _remember_lama_mask_pattern(
+        self,
+        pattern: tuple[LamaStrokeSample, ...],
+    ) -> None:
+        if not pattern:
+            return
+        self._last_lama_mask_pattern = pattern
+        parent = self.parent()
+        if isinstance(parent, MainWindow):
+            parent._last_lama_mask_pattern = pattern
+
     def apply_lama_mask(self) -> None:
         if (
             self.edit_mode != "lama"
@@ -17144,12 +17181,13 @@ class FullscreenViewer(QDialog):
         )
         self._lama_generation += 1
         lama_generation = self._lama_generation
+        submitted_samples = tuple(self.lama_samples)
         try:
             future = self._lama_executor.submit(
                 create_lama_edit_operation,
                 self.current_path,
                 preceding_operations,
-                tuple(self.lama_samples),
+                submitted_samples,
                 expected_identity=identity,
                 expected_size=self.image_coordinate_size,
                 runtime=runtime,
@@ -17168,6 +17206,7 @@ class FullscreenViewer(QDialog):
         self._lama_cancel_event = cancel_event
         self._lama_rel_path = rel_path
         self._lama_preceding_operations = preceding_operations
+        self._lama_submitted_samples = submitted_samples
         # Keep the source/preview visible during inference, but remove the red
         # editing mask until an error makes the same stroke editable again.
         self.lama_processing_image.setGeometry(self.label.rect())
@@ -17199,10 +17238,12 @@ class FullscreenViewer(QDialog):
             return
         rel_path = self._lama_rel_path
         preceding_operations = self._lama_preceding_operations
+        submitted_samples = self._lama_submitted_samples
         self._lama_future = None
         self._lama_cancel_event = None
         self._lama_rel_path = None
         self._lama_preceding_operations = ()
+        self._lama_submitted_samples = ()
         self._lama_timer.stop()
         self._hide_lama_processing_display()
         if self._load_closed:
@@ -17218,7 +17259,7 @@ class FullscreenViewer(QDialog):
         except Exception as error:
             self.setWindowTitle(
                 "Marnwick — LaMa: paint; Enter applies; Backspace clears; "
-                "wheel changes brush; Esc cancels"
+                "R repeats last; wheel changes brush; Esc cancels"
             )
             self.update_lama_overlay(None)
             show_error(self, "LaMa", str(error))
@@ -17234,6 +17275,7 @@ class FullscreenViewer(QDialog):
         provider = str((operation.params or {}).get("execution_provider", "local runtime"))
         provider_label = lama_execution_provider_label(provider)
         self.setWindowTitle(f"Marnwick — LaMa completed using {provider_label}")
+        self._remember_lama_mask_pattern(submitted_samples)
         self.exit_region_edit()
         self.operations.append(operation)
         self.render_preview()
@@ -17263,6 +17305,7 @@ class FullscreenViewer(QDialog):
         self._lama_cancel_event = None
         self._lama_rel_path = None
         self._lama_preceding_operations = ()
+        self._lama_submitted_samples = ()
         self._hide_lama_processing_display()
 
     def _hide_lama_processing_display(self) -> None:
@@ -19047,7 +19090,7 @@ class FullscreenViewer(QDialog):
             self.update_lama_overlay(None)
             self.setWindowTitle(
                 "Marnwick — LaMa: paint; Enter applies; Backspace clears; "
-                "wheel changes brush; Esc cancels"
+                "R repeats last; wheel changes brush; Esc cancels"
             )
         else:
             self.clone_overlay.update_brush(None, self.clone_brush_radius_label, False)
