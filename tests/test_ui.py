@@ -5703,7 +5703,7 @@ def test_two_preflighted_moves_to_same_destination_both_commit(
         (("image-78.jpg", "image-79.jpg"), "image-77.jpg"),
     ],
 )
-def test_move_payload_removal_selects_adjacent_and_preserves_thumbnail_scrollbar(
+def test_move_payload_removal_keeps_adjacent_selection_visible_during_scroll_restore(
     tmp_path: Path,
     monkeypatch,
     large_snapshot: bool,
@@ -5759,30 +5759,15 @@ def test_move_payload_removal_selects_adjacent_and_preserves_thumbnail_scrollbar
         expected_scroll = max(1, scroll_bar.maximum() * 2 // 3)
         scroll_bar.setValue(expected_scroll)
         qt_app.processEvents()
+        original_move_worker = window._move_payload_worker
 
-        def slow_move_worker(
-            _image_groups,
-            _directory_groups,
-            _dest_root,
-            _dest_dir_rel,
-            _expected_images,
-            _expected_directories,
-            _expected_destination,
-            _wipe_on_delete,
-            _expected_root_identities,
-            _expected_storage_identities,
-            task,
-        ):
+        def slow_move_worker(*worker_args, **worker_kwargs):
+            task = worker_args[-1]
             started.set()
             task.update(0, 1, "waiting")
             if not release.wait(timeout=1.0):
                 raise TimeoutError("move worker was not allowed to finish")
-            task.mark_done()
-            return MovePayloadResult(
-                requested=len(moved_rel_paths),
-                moved=0,
-                affected_roots={catalog.root},
-            )
+            return original_move_worker(*worker_args, **worker_kwargs)
 
         monkeypatch.setattr(window, "_move_payload_worker", slow_move_worker)
 
@@ -5814,13 +5799,31 @@ def test_move_payload_removal_selects_adjacent_and_preserves_thumbnail_scrollbar
             for record in window.model.images
             if isinstance(record, ImageRecord)
         }
-        assert scroll_bar.value() == expected_scroll
-
+        selected_index = window.thumbnail_view.currentIndex()
+        assert selected_index.isValid()
+        assert window.thumbnail_view.visualRect(selected_index).intersects(
+            window.thumbnail_view.viewport().rect()
+        )
+        preserved_scroll = scroll_bar.value()
         release.set()
         settle_move_payload_task(window, qt_app)
+        settle_post_move_reconcile_tasks(window, qt_app)
         settle_virtual_view_tasks(window, qt_app)
 
-        assert scroll_bar.value() == expected_scroll
+        deadline = monotonic() + 1.0
+        while (
+            window.selected_rel_paths() != [expected_selection]
+            and monotonic() < deadline
+        ):
+            qt_app.processEvents()
+            sleep(0.01)
+        assert window.selected_rel_paths() == [expected_selection]
+        assert scroll_bar.value() == preserved_scroll
+        selected_index = window.thumbnail_view.currentIndex()
+        assert selected_index.isValid()
+        assert window.thumbnail_view.visualRect(selected_index).intersects(
+            window.thumbnail_view.viewport().rect()
+        )
     finally:
         release.set()
         window.progress_timer.stop()
