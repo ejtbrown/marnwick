@@ -74,6 +74,36 @@ def test_lama_runtime_round_trips_and_invalid_values_default_to_auto(
     assert load_config(path).lama_runtime == LAMA_RUNTIME_AUTO
 
 
+def test_hotkey_overrides_round_trip_and_reject_invalid_entries(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "config.json"
+    save_config(
+        AppConfig(
+            hotkeys={
+                "fullscreen.edit": "X",
+                "thumbnail.go_to_file": "",
+            }
+        ),
+        path,
+    )
+
+    assert load_config(path).hotkeys == {
+        "fullscreen.edit": "X",
+        "thumbnail.go_to_file": "",
+    }
+
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    raw["hotkeys"] = {
+        "fullscreen.edit": "J",
+        "non-string": 12,
+        "": "G",
+    }
+    path.write_text(json.dumps(raw), encoding="utf-8")
+
+    assert load_config(path).hotkeys == {"fullscreen.edit": "J"}
+
+
 def test_save_config_is_atomic_and_preserves_existing_mode(tmp_path: Path, monkeypatch) -> None:
     path = tmp_path / "config.json"
     path.write_text('{"old": true}\n', encoding="utf-8")

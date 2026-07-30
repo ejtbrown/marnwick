@@ -100,6 +100,12 @@ You can open more catalogs with **File > Open** or manage remembered catalogs un
 
 ## Main controls
 
+Use **Tools > Hotkeys** to view or reassign the application, thumbnail-pane,
+and fullscreen-viewer keyboard shortcuts. Assignments are saved in the
+application configuration. The command keys shown inside the image edit dialog
+remain local to that dialog and are not included; the fullscreen `E` shortcut
+that opens the dialog is configurable.
+
 ### Thumbnail browser
 
 | Input | Action |
