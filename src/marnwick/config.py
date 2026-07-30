@@ -29,6 +29,9 @@ DEFAULT_THUMBNAIL_COLUMNS = 5
 MIN_THUMBNAIL_COLUMNS = 1
 MAX_THUMBNAIL_COLUMNS = 20
 MAX_CONFIG_BYTES = 1024 * 1024
+MAX_CONFIG_HOTKEYS = 128
+MAX_CONFIG_HOTKEY_ID_CHARS = 128
+MAX_CONFIG_HOTKEY_SEQUENCE_CHARS = 128
 DEFAULT_CONFIG_LOCK_TIMEOUT = 1.0
 CONFIG_LOCK_POLL_INTERVAL = 0.02
 
@@ -50,6 +53,7 @@ class AppConfig:
     delete_behavior: str = NORMAL_DELETE
     sort_order: str = "name"
     lama_runtime: str = LAMA_RUNTIME_AUTO
+    hotkeys: dict[str, str] = field(default_factory=dict)
     # A load-time baseline allows save_config() to merge catalog-list edits
     # made by separate Marnwick processes without resurrecting removals or
     # discarding unrelated additions.  Hand-constructed configs retain the
@@ -95,6 +99,7 @@ def load_config(path: Path | None = None) -> AppConfig:
         delete_behavior=_delete_behavior_or_default(raw.get("delete_behavior")),
         sort_order=_string_or_default(raw.get("sort_order"), "name"),
         lama_runtime=_lama_runtime_or_default(raw.get("lama_runtime")),
+        hotkeys=_hotkeys_or_default(raw.get("hotkeys")),
         _loaded_catalogs=tuple(catalogs),
     )
 
@@ -127,6 +132,7 @@ def save_config(
             },
             "catalogs": catalogs,
             "delete_behavior": config.delete_behavior,
+            "hotkeys": _hotkeys_or_default(config.hotkeys),
             "lama_runtime": config.lama_runtime,
             "sort_order": config.sort_order,
             "thumbnail_size": config.thumbnail_size,
@@ -207,6 +213,25 @@ def _lama_runtime_or_default(value: object) -> str:
     if isinstance(value, str) and value in LAMA_RUNTIMES:
         return value
     return LAMA_RUNTIME_AUTO
+
+
+def _hotkeys_or_default(value: object) -> dict[str, str]:
+    if not isinstance(value, dict):
+        return {}
+    hotkeys: dict[str, str] = {}
+    for hotkey_id, sequence in value.items():
+        if len(hotkeys) >= MAX_CONFIG_HOTKEYS:
+            break
+        if (
+            not isinstance(hotkey_id, str)
+            or not isinstance(sequence, str)
+            or not hotkey_id
+            or len(hotkey_id) > MAX_CONFIG_HOTKEY_ID_CHARS
+            or len(sequence) > MAX_CONFIG_HOTKEY_SEQUENCE_CHARS
+        ):
+            continue
+        hotkeys[hotkey_id] = sequence
+    return hotkeys
 
 
 def _thumbnail_columns_or_default(value: object) -> int:

@@ -74,6 +74,7 @@ from PySide6.QtWidgets import (
     QFrame,
     QGroupBox,
     QHBoxLayout,
+    QKeySequenceEdit,
     QLabel,
     QLineEdit,
     QListView,
@@ -93,6 +94,8 @@ from PySide6.QtWidgets import (
     QSplitter,
     QStyle,
     QStyledItemDelegate,
+    QTableWidget,
+    QTableWidgetItem,
     QTreeWidget,
     QTreeWidgetItem,
     QTextBrowser,
@@ -247,6 +250,186 @@ VIRTUAL_KIND_VERY_SIMILAR = "very-similar"
 VIRTUAL_KIND_PHYSICAL = "physical"
 VIRTUAL_KIND_PHYSICAL_PREVIEW = "physical-preview"
 TreeStateKey = tuple[Path, str, str, str]
+
+
+@dataclass(frozen=True, slots=True)
+class HotkeyDefinition:
+    hotkey_id: str
+    action: str
+    location: str
+    context: str
+    default_sequence: str
+
+
+HOTKEY_DEFINITIONS = (
+    HotkeyDefinition(
+        "main.open_catalog",
+        "Open catalog",
+        "Application",
+        "main",
+        "Meta+O" if sys.platform == "darwin" else "Ctrl+O",
+    ),
+    HotkeyDefinition(
+        "main.quit",
+        "Quit",
+        "Application",
+        "main",
+        "Meta+Q" if sys.platform == "darwin" else "Ctrl+Q",
+    ),
+    HotkeyDefinition("thumbnail.go_to_file", "Go to file number", "Thumbnail pane", "main", "G"),
+    HotkeyDefinition("thumbnail.open", "Open selected item", "Thumbnail pane", "main", "Return"),
+    HotkeyDefinition(
+        "thumbnail.open_alternate",
+        "Open selected item (alternate)",
+        "Thumbnail pane",
+        "main",
+        "Enter",
+    ),
+    HotkeyDefinition(
+        "thumbnail.random",
+        "Open randomized slideshow",
+        "Thumbnail pane",
+        "main",
+        "S",
+    ),
+    HotkeyDefinition("thumbnail.tags", "Edit tags", "Thumbnail pane", "main", "T"),
+    HotkeyDefinition("thumbnail.copy", "Copy selected files", "Thumbnail pane", "main", "Ctrl+C"),
+    HotkeyDefinition("thumbnail.delete", "Delete selected files", "Thumbnail pane", "main", "Delete"),
+    HotkeyDefinition(
+        "thumbnail.delete_alternate",
+        "Delete selected files (alternate)",
+        "Thumbnail pane",
+        "main",
+        "Backspace",
+    ),
+    HotkeyDefinition(
+        "fullscreen.go_to_file",
+        "Go to file number",
+        "Fullscreen viewer",
+        "fullscreen",
+        "G",
+    ),
+    HotkeyDefinition("fullscreen.previous", "Previous file", "Fullscreen viewer", "fullscreen", "Left"),
+    HotkeyDefinition("fullscreen.next", "Next file", "Fullscreen viewer", "fullscreen", "Right"),
+    HotkeyDefinition("fullscreen.up", "Pan or scroll up", "Fullscreen viewer", "fullscreen", "Up"),
+    HotkeyDefinition("fullscreen.down", "Pan or scroll down", "Fullscreen viewer", "fullscreen", "Down"),
+    HotkeyDefinition("fullscreen.zoom_in", "Zoom in", "Fullscreen viewer", "fullscreen", "+"),
+    HotkeyDefinition(
+        "fullscreen.zoom_in_alternate",
+        "Zoom in (alternate)",
+        "Fullscreen viewer",
+        "fullscreen",
+        "=",
+    ),
+    HotkeyDefinition("fullscreen.zoom_out", "Zoom out", "Fullscreen viewer", "fullscreen", "-"),
+    HotkeyDefinition(
+        "fullscreen.zoom_out_alternate",
+        "Zoom out (alternate)",
+        "Fullscreen viewer",
+        "fullscreen",
+        "_",
+    ),
+    HotkeyDefinition(
+        "fullscreen.cancel",
+        "Exit tool, reset zoom, or close",
+        "Fullscreen viewer",
+        "fullscreen",
+        "Esc",
+    ),
+    HotkeyDefinition(
+        "fullscreen.info",
+        "Toggle file information",
+        "Fullscreen viewer",
+        "fullscreen",
+        "Z",
+    ),
+    HotkeyDefinition(
+        "fullscreen.labels",
+        "Toggle position and filename labels",
+        "Fullscreen viewer",
+        "fullscreen",
+        "L",
+    ),
+    HotkeyDefinition("fullscreen.tags", "Edit tags", "Fullscreen viewer", "fullscreen", "T"),
+    HotkeyDefinition(
+        "fullscreen.edit",
+        "Open image edit tools",
+        "Fullscreen viewer",
+        "fullscreen",
+        "E",
+    ),
+    HotkeyDefinition("fullscreen.copy", "Copy current file", "Fullscreen viewer", "fullscreen", "Ctrl+C"),
+    HotkeyDefinition("fullscreen.delete", "Delete current file", "Fullscreen viewer", "fullscreen", "Delete"),
+    HotkeyDefinition(
+        "fullscreen.delete_alternate",
+        "Delete current file (alternate)",
+        "Fullscreen viewer",
+        "fullscreen",
+        "Backspace",
+    ),
+)
+HOTKEY_DEFINITION_BY_ID = {
+    definition.hotkey_id: definition for definition in HOTKEY_DEFINITIONS
+}
+FULLSCREEN_HOTKEY_IDS = tuple(
+    definition.hotkey_id
+    for definition in HOTKEY_DEFINITIONS
+    if definition.context == "fullscreen"
+)
+
+
+def normalized_hotkey_sequence(sequence_text: str) -> str:
+    sequence = QKeySequence.fromString(
+        sequence_text,
+        QKeySequence.SequenceFormat.PortableText,
+    )
+    if sequence.isEmpty() or sequence.count() != 1:
+        return ""
+    return sequence.toString(QKeySequence.SequenceFormat.PortableText)
+
+
+def resolved_hotkey_sequence(
+    overrides: Mapping[str, str],
+    hotkey_id: str,
+) -> str:
+    definition = HOTKEY_DEFINITION_BY_ID[hotkey_id]
+    if hotkey_id not in overrides:
+        return normalized_hotkey_sequence(definition.default_sequence)
+    configured = overrides[hotkey_id]
+    if not configured:
+        return ""
+    return (
+        normalized_hotkey_sequence(configured)
+        or normalized_hotkey_sequence(definition.default_sequence)
+    )
+
+
+def hotkey_event_matches(event: object, sequence_text: str) -> bool:
+    if not sequence_text:
+        return False
+    configured = QKeySequence.fromString(
+        sequence_text,
+        QKeySequence.SequenceFormat.PortableText,
+    )
+    if configured.isEmpty() or configured.count() != 1:
+        return False
+    event_sequence = QKeySequence(event.keyCombination())  # type: ignore[attr-defined]
+    if event_sequence.matches(configured) == QKeySequence.SequenceMatch.ExactMatch:
+        return True
+    combination = configured[0]
+    if combination.keyboardModifiers() != Qt.KeyboardModifier.NoModifier:
+        return False
+    event_key = event.key()  # type: ignore[attr-defined]
+    event_modifiers = event.modifiers()  # type: ignore[attr-defined]
+    if event_key != combination.key():
+        return False
+    return (
+        event_key == Qt.Key.Key_Enter
+        and event_modifiers == Qt.KeyboardModifier.KeypadModifier
+    ) or (
+        event_key in {Qt.Key.Key_Plus, Qt.Key.Key_Underscore}
+        and event_modifiers == Qt.KeyboardModifier.ShiftModifier
+    )
 
 
 @dataclass(slots=True)
@@ -3823,6 +4006,7 @@ class MainWindow(QMainWindow):
                 loaded.sort_order = current.sort_order
                 loaded.delete_behavior = current.delete_behavior
                 loaded.lama_runtime = current.lama_runtime
+                loaded.hotkeys = dict(current.hotkeys)
             else:
                 self.set_thumbnail_size(
                     self.thumbnail_columns_from_config(loaded.thumbnail_size)
@@ -3835,6 +4019,7 @@ class MainWindow(QMainWindow):
                 self.restore_window_config()
         finally:
             self._applying_initial_config = False
+        self._apply_hotkey_bindings()
 
         if not controls_changed and prior_sort != self.current_sort and self.current_catalog is not None:
             self._cancel_virtual_view_tasks(self.current_catalog.root)
@@ -3991,6 +4176,7 @@ class MainWindow(QMainWindow):
             delete_behavior=self.app_config.delete_behavior,
             sort_order=self.current_sort.value,
             lama_runtime=self.app_config.lama_runtime,
+            hotkeys=dict(self.app_config.hotkeys),
             _loaded_catalogs=self.app_config._loaded_catalogs,
         )
 
@@ -4023,6 +4209,7 @@ class MainWindow(QMainWindow):
         self._mark_initial_config_geometry_interaction()
         self._mark_initial_config_catalog_interaction(replaced=True)
         self.app_config = config
+        self._apply_hotkey_bindings()
         self.set_thumbnail_size(self.thumbnail_columns_from_config(config.thumbnail_size))
         self.set_sort_order(self.sort_order_from_config(config.sort_order))
         self.sync_catalogs_to_config(config.catalogs)
@@ -4081,21 +4268,27 @@ class MainWindow(QMainWindow):
 
     def eventFilter(self, watched: object, event: QEvent) -> bool:
         if watched == self.thumbnail_view and event.type() == QEvent.Type.KeyPress:
-            key = event.key()  # type: ignore[attr-defined]
-            modifiers = event.modifiers()  # type: ignore[attr-defined]
-            if key == Qt.Key.Key_C and modifiers & Qt.KeyboardModifier.ControlModifier:
+            if self.hotkey_matches(event, "thumbnail.copy"):
                 self.copy_selected_files()
                 return True
-            if key in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+            if self.hotkey_matches_any(
+                event,
+                "thumbnail.delete",
+                "thumbnail.delete_alternate",
+            ):
                 self.delete_selected()
                 return True
-            if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            if self.hotkey_matches_any(
+                event,
+                "thumbnail.open",
+                "thumbnail.open_alternate",
+            ):
                 self.open_viewer(self.thumbnail_keyboard_activation_index(), random_mode=False)
                 return True
-            if key == Qt.Key.Key_S:
+            if self.hotkey_matches(event, "thumbnail.random"):
                 self.open_viewer(self.thumbnail_keyboard_activation_index(), random_mode=True)
                 return True
-            if key == Qt.Key.Key_T:
+            if self.hotkey_matches(event, "thumbnail.tags"):
                 self.open_tag_dialog_for_selection()
                 return True
         return super().eventFilter(watched, event)
@@ -4103,15 +4296,13 @@ class MainWindow(QMainWindow):
     def _build_menus(self) -> None:
         self.file_menu = QMenu("File", self)
         self.menuBar().addMenu(self.file_menu)
-        open_action = QAction("Open", self)
-        open_action.setShortcut(QKeySequence.StandardKey.Open)
-        open_action.triggered.connect(self.open_catalog_dialog)
-        self.file_menu.addAction(open_action)
+        self.open_action = QAction("Open", self)
+        self.open_action.triggered.connect(self.open_catalog_dialog)
+        self.file_menu.addAction(self.open_action)
 
-        quit_action = QAction("Quit", self)
-        quit_action.setShortcut(QKeySequence.StandardKey.Quit)
-        quit_action.triggered.connect(self.close)
-        self.file_menu.addAction(quit_action)
+        self.quit_action = QAction("Quit", self)
+        self.quit_action.triggered.connect(self.close)
+        self.file_menu.addAction(self.quit_action)
 
         self.tools_menu = QMenu("Tools", self)
         self.menuBar().addMenu(self.tools_menu)
@@ -4134,14 +4325,39 @@ class MainWindow(QMainWindow):
         self.gpu_test_action = QAction("GPU Test", self)
         self.gpu_test_action.triggered.connect(self.open_gpu_test)
         self.tools_menu.addAction(self.gpu_test_action)
+        self.hotkeys_action = QAction("Hotkeys", self)
+        self.hotkeys_action.triggered.connect(self.open_hotkeys)
+        self.tools_menu.addAction(self.hotkeys_action)
         self.preferences_action = QAction("Preferences", self)
         self.preferences_action.triggered.connect(self.open_app_preferences)
         self.tools_menu.addAction(self.preferences_action)
         self.tools_menu.aboutToShow.connect(self._update_tools_menu_actions)
 
-        QShortcut(QKeySequence("Ctrl+O"), self, activated=self.open_catalog_dialog)
-        self.go_to_file_shortcut = QShortcut(QKeySequence("G"), self)
+        self.go_to_file_shortcut = QShortcut(QKeySequence(), self)
         self.go_to_file_shortcut.activated.connect(self.open_go_to_file_dialog)
+        self._apply_hotkey_bindings()
+
+    def hotkey_sequence(self, hotkey_id: str) -> str:
+        return resolved_hotkey_sequence(self.app_config.hotkeys, hotkey_id)
+
+    def hotkey_matches(self, event: object, hotkey_id: str) -> bool:
+        return hotkey_event_matches(event, self.hotkey_sequence(hotkey_id))
+
+    def hotkey_matches_any(self, event: object, *hotkey_ids: str) -> bool:
+        return any(self.hotkey_matches(event, hotkey_id) for hotkey_id in hotkey_ids)
+
+    def _apply_hotkey_bindings(self) -> None:
+        if not hasattr(self, "open_action"):
+            return
+        self.open_action.setShortcut(
+            QKeySequence(self.hotkey_sequence("main.open_catalog"))
+        )
+        self.quit_action.setShortcut(
+            QKeySequence(self.hotkey_sequence("main.quit"))
+        )
+        self.go_to_file_shortcut.setKey(
+            QKeySequence(self.hotkey_sequence("thumbnail.go_to_file"))
+        )
 
     def _update_tools_menu_actions(self) -> None:
         duplicate_view_selected = self.current_virtual_kind in {
@@ -4202,6 +4418,19 @@ class MainWindow(QMainWindow):
         if selected is None:
             return
         self.apply_app_config(selected)
+
+    def open_hotkeys(self) -> None:
+        dialog = HotkeysDialog(self.app_config.hotkeys, self)
+        accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        selected = dialog.selected_overrides() if accepted else None
+        dialog.deleteLater()
+        if selected is None:
+            return
+        self._mark_initial_config_controls_interaction()
+        self.app_config.hotkeys = selected
+        self._apply_hotkey_bindings()
+        if self.config_enabled:
+            self.save_window_config(wait=False)
 
     def open_logs(self) -> None:
         dialog = LogsDialog(self.workspace.catalogs, self)
@@ -14102,10 +14331,139 @@ class DuplicateListDialog(QDialog):
         self.accept()
 
 
+class HotkeysDialog(QDialog):
+    def __init__(
+        self,
+        overrides: Mapping[str, str],
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._original_overrides = dict(overrides)
+        self.editors: dict[str, QKeySequenceEdit] = {}
+        self.setWindowTitle("Hotkeys")
+        self.setWindowIcon(load_app_icon())
+        self.setStyleSheet(DIALOG_STYLESHEET)
+
+        layout = QVBoxLayout(self)
+        instructions = QLabel(
+            "Select a hotkey field and press a new key combination. "
+            "Clear a field to leave that action unassigned."
+        )
+        instructions.setWordWrap(True)
+        layout.addWidget(instructions)
+
+        self.table = QTableWidget(len(HOTKEY_DEFINITIONS), 3)
+        self.table.setHorizontalHeaderLabels(["Action", "Location", "Hotkey"])
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.table.setColumnWidth(0, 300)
+        self.table.setColumnWidth(1, 150)
+        self.table.setColumnWidth(2, 180)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        for row, definition in enumerate(HOTKEY_DEFINITIONS):
+            self.table.setItem(row, 0, QTableWidgetItem(definition.action))
+            self.table.setItem(row, 1, QTableWidgetItem(definition.location))
+            editor = QKeySequenceEdit(
+                QKeySequence(
+                    resolved_hotkey_sequence(overrides, definition.hotkey_id)
+                )
+            )
+            editor.setMaximumSequenceLength(1)
+            editor.setClearButtonEnabled(True)
+            editor.keySequenceChanged.connect(self._validate)
+            self.editors[definition.hotkey_id] = editor
+            self.table.setCellWidget(row, 2, editor)
+        self.table.resizeRowsToContents()
+        layout.addWidget(self.table, 1)
+
+        self.validation_label = QLabel()
+        self.validation_label.setWordWrap(True)
+        self.validation_label.setStyleSheet("color: #c62828;")
+        self.validation_label.setMinimumHeight(
+            self.validation_label.fontMetrics().height()
+        )
+        layout.addWidget(self.validation_label)
+
+        self.buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.RestoreDefaults
+            | QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        self.restore_defaults_button = self.buttons.button(
+            QDialogButtonBox.StandardButton.RestoreDefaults
+        )
+        self.ok_button = self.buttons.button(QDialogButtonBox.StandardButton.Ok)
+        self.restore_defaults_button.clicked.connect(self.restore_defaults)
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        layout.addWidget(self.buttons)
+        self._validate()
+        self.resize(720, 640)
+
+    def _editor_sequence(self, hotkey_id: str) -> str:
+        return self.editors[hotkey_id].keySequence().toString(
+            QKeySequence.SequenceFormat.PortableText
+        )
+
+    def _validate(self, *_args: object) -> None:
+        conflicts: list[tuple[HotkeyDefinition, HotkeyDefinition, str]] = []
+        assigned: dict[tuple[str, str], HotkeyDefinition] = {}
+        conflicting_ids: set[str] = set()
+        for definition in HOTKEY_DEFINITIONS:
+            sequence_text = self._editor_sequence(definition.hotkey_id)
+            if not sequence_text:
+                continue
+            key = (definition.context, sequence_text.casefold())
+            existing = assigned.get(key)
+            if existing is None:
+                assigned[key] = definition
+                continue
+            conflicts.append((existing, definition, sequence_text))
+            conflicting_ids.update({existing.hotkey_id, definition.hotkey_id})
+        for hotkey_id, editor in self.editors.items():
+            editor.setStyleSheet(
+                "QKeySequenceEdit { color: #c62828; border: 1px solid #c62828; }"
+                if hotkey_id in conflicting_ids
+                else ""
+            )
+        self.ok_button.setEnabled(not conflicts)
+        if conflicts:
+            first, second, sequence_text = conflicts[0]
+            self.validation_label.setText(
+                f"{sequence_text} is assigned to both “{first.action}” "
+                f"and “{second.action}” in {first.location.lower()}."
+            )
+        else:
+            self.validation_label.clear()
+
+    def restore_defaults(self) -> None:
+        for definition in HOTKEY_DEFINITIONS:
+            self.editors[definition.hotkey_id].setKeySequence(
+                QKeySequence(definition.default_sequence)
+            )
+        self._validate()
+
+    def selected_overrides(self) -> dict[str, str]:
+        selected = {
+            hotkey_id: sequence
+            for hotkey_id, sequence in self._original_overrides.items()
+            if hotkey_id not in HOTKEY_DEFINITION_BY_ID
+        }
+        for definition in HOTKEY_DEFINITIONS:
+            sequence_text = self._editor_sequence(definition.hotkey_id)
+            default_text = normalized_hotkey_sequence(
+                definition.default_sequence
+            )
+            if sequence_text != default_text:
+                selected[definition.hotkey_id] = sequence_text
+        return selected
+
+
 class AppPreferencesDialog(QDialog):
     def __init__(self, config: AppConfig, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._loaded_catalogs = config._loaded_catalogs
+        self._hotkeys = dict(config.hotkeys)
         self.setWindowTitle("Preferences")
         self.setWindowIcon(load_app_icon())
         self.setStyleSheet(DIALOG_STYLESHEET)
@@ -14227,6 +14585,7 @@ class AppPreferencesDialog(QDialog):
             delete_behavior=str(self.delete_behavior.currentData()),
             sort_order=str(self.sort_order.currentData()),
             lama_runtime=str(self.lama_runtime.currentData()),
+            hotkeys=dict(self._hotkeys),
             _loaded_catalogs=self._loaded_catalogs,
         )
 
@@ -16247,28 +16606,43 @@ class FullscreenViewer(QDialog):
         self.setWindowState(self.windowState() | Qt.WindowState.WindowFullScreen)
         return int(self.exec())
 
+    def hotkey_sequence(self, hotkey_id: str) -> str:
+        parent = self.parent()
+        overrides = (
+            parent.app_config.hotkeys
+            if isinstance(parent, MainWindow)
+            else {}
+        )
+        return resolved_hotkey_sequence(overrides, hotkey_id)
+
+    def hotkey_matches(self, event: object, hotkey_id: str) -> bool:
+        return hotkey_event_matches(event, self.hotkey_sequence(hotkey_id))
+
+    def hotkey_matches_any(self, event: object, *hotkey_ids: str) -> bool:
+        return any(self.hotkey_matches(event, hotkey_id) for hotkey_id in hotkey_ids)
+
     def keyPressEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         key = event.key()
-        modifiers = event.modifiers()
-        if not self.navigator.order and key not in {
-            Qt.Key.Key_Left,
-            Qt.Key.Key_Right,
-            Qt.Key.Key_Escape,
-            Qt.Key.Key_G,
-            Qt.Key.Key_L,
-        }:
+        if not self.navigator.order and not self.hotkey_matches_any(
+            event,
+            "fullscreen.previous",
+            "fullscreen.next",
+            "fullscreen.cancel",
+            "fullscreen.go_to_file",
+            "fullscreen.labels",
+        ):
             # A successful delete can leave a paged navigator briefly empty
             # while its rebased first page is loading. Current-image actions
             # must remain inert during that bounded gap.
             return
-        if key == Qt.Key.Key_L:
+        if self.hotkey_matches(event, "fullscreen.labels"):
             self.toggle_position_labels()
             return
-        if key == Qt.Key.Key_G:
+        if self.hotkey_matches(event, "fullscreen.go_to_file"):
             self.open_go_to_file_dialog()
             return
         if self._lama_future is not None:
-            if key == Qt.Key.Key_Escape:
+            if self.hotkey_matches(event, "fullscreen.cancel"):
                 self._cancel_lama_inference()
                 self.exit_region_edit()
             return
@@ -16279,50 +16653,66 @@ class FullscreenViewer(QDialog):
             if key in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
                 self.clear_lama_mask()
                 return
-        if key in (Qt.Key.Key_Plus, Qt.Key.Key_Equal):
+        if self.hotkey_matches_any(
+            event,
+            "fullscreen.zoom_in",
+            "fullscreen.zoom_in_alternate",
+        ):
             self.zoom_in()
             return
-        if key in (Qt.Key.Key_Minus, Qt.Key.Key_Underscore):
+        if self.hotkey_matches_any(
+            event,
+            "fullscreen.zoom_out",
+            "fullscreen.zoom_out_alternate",
+        ):
             self.zoom_out()
             return
-        if key == Qt.Key.Key_C and modifiers & Qt.KeyboardModifier.ControlModifier:
+        if self.hotkey_matches(event, "fullscreen.copy"):
             copy_files_to_clipboard([self.current_path])
             return
-        if key in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+        if self.hotkey_matches_any(
+            event,
+            "fullscreen.delete",
+            "fullscreen.delete_alternate",
+        ):
             self.delete_current_image()
             return
-        if key == Qt.Key.Key_E:
+        if self.hotkey_matches(event, "fullscreen.edit"):
             self.open_edit_tools()
             return
-        if key == Qt.Key.Key_Z:
+        if self.hotkey_matches(event, "fullscreen.info"):
             self.toggle_info_overlay()
             return
-        if self.active_media_kind in {"text", "docx", "odt", "pdf"} and key in {
-            Qt.Key.Key_Up,
-            Qt.Key.Key_Down,
-        }:
-            self.scroll_document(-1 if key == Qt.Key.Key_Up else 1)
-            return
-        if self.is_zoomed() and key in (Qt.Key.Key_Left, Qt.Key.Key_Right, Qt.Key.Key_Up, Qt.Key.Key_Down):
-            if key == Qt.Key.Key_Left:
+        if self.active_media_kind in {"text", "docx", "odt", "pdf"}:
+            if self.hotkey_matches(event, "fullscreen.up"):
+                self.scroll_document(-1)
+                return
+            if self.hotkey_matches(event, "fullscreen.down"):
+                self.scroll_document(1)
+                return
+        if self.is_zoomed():
+            if self.hotkey_matches(event, "fullscreen.previous"):
                 self.pan_by(self.PAN_KEY_STEP, 0)
-            elif key == Qt.Key.Key_Right:
+                return
+            if self.hotkey_matches(event, "fullscreen.next"):
                 self.pan_by(-self.PAN_KEY_STEP, 0)
-            elif key == Qt.Key.Key_Up:
+                return
+            if self.hotkey_matches(event, "fullscreen.up"):
                 self.pan_by(0, self.PAN_KEY_STEP)
-            else:
+                return
+            if self.hotkey_matches(event, "fullscreen.down"):
                 self.pan_by(0, -self.PAN_KEY_STEP)
-            return
-        if key == Qt.Key.Key_Right:
+                return
+        if self.hotkey_matches(event, "fullscreen.next"):
             self.navigate(1)
             return
-        if key == Qt.Key.Key_Left:
+        if self.hotkey_matches(event, "fullscreen.previous"):
             self.navigate(-1)
             return
-        if key == Qt.Key.Key_T:
+        if self.hotkey_matches(event, "fullscreen.tags"):
             self.open_tags()
             return
-        if key == Qt.Key.Key_Escape:
+        if self.hotkey_matches(event, "fullscreen.cancel"):
             if self.edit_mode is not None:
                 self.exit_region_edit()
                 return
@@ -16342,16 +16732,7 @@ class FullscreenViewer(QDialog):
         if (
             watched in self._document_event_targets
             and event.type() == QEvent.Type.KeyPress
-            and event.key()  # type: ignore[attr-defined]
-            in {
-                Qt.Key.Key_Left,
-                Qt.Key.Key_Right,
-                Qt.Key.Key_Up,
-                Qt.Key.Key_Down,
-                Qt.Key.Key_Escape,
-                Qt.Key.Key_G,
-                Qt.Key.Key_L,
-            }
+            and self.hotkey_matches_any(event, *FULLSCREEN_HOTKEY_IDS)
         ):
             self.keyPressEvent(event)
             return True

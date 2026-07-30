@@ -20,7 +20,7 @@ os.environ.setdefault("MARNWICK_DISABLE_CONFIG", "1")
 import marnwick.ui as ui_module  # noqa: E402
 
 from PySide6.QtCore import QEvent, QItemSelectionModel, QModelIndex, QPoint, QPointF, QRect, Qt, QTimer  # noqa: E402
-from PySide6.QtGui import QColor, QCursor, QFontMetrics, QImage, QKeyEvent, QMouseEvent, QPainter, QPixmap  # noqa: E402
+from PySide6.QtGui import QColor, QCursor, QFontMetrics, QImage, QKeyEvent, QKeySequence, QMouseEvent, QPainter, QPixmap  # noqa: E402
 from PySide6.QtWidgets import (  # noqa: E402
     QAbstractItemView,
     QApplication,
@@ -65,6 +65,8 @@ from marnwick.ui import (  # noqa: E402
     FullscreenViewer,
     GoToFileDialog,
     GpuTestDialog,
+    HOTKEY_DEFINITIONS,
+    HotkeysDialog,
     ImageRenameDialog,
     LogsDialog,
     MAX_PENDING_THUMBNAIL_RETRIES,
@@ -1395,6 +1397,54 @@ def test_fullscreen_zoom_arrows_pan_and_escape_resets(tmp_path: Path) -> None:
             viewer.close()
             viewer.deleteLater()
             qt_app.processEvents()
+
+
+def test_fullscreen_uses_reassigned_edit_dialog_hotkey(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    Image.new("RGB", (4, 4), (10, 20, 30)).save(root / "image.jpg")
+    window = MainWindow()
+    catalog = Catalog(root)
+    viewer = FullscreenViewer(
+        catalog,
+        ImageNavigator.sequential(["image.jpg"], "image.jpg"),
+        window,
+    )
+    opened: list[bool] = []
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        window.app_config.hotkeys = {"fullscreen.edit": "X"}
+        monkeypatch.setattr(viewer, "open_edit_tools", lambda: opened.append(True))
+
+        viewer.keyPressEvent(
+            QKeyEvent(
+                QEvent.Type.KeyPress,
+                Qt.Key.Key_E,
+                Qt.KeyboardModifier.NoModifier,
+            )
+        )
+        assert opened == []
+
+        viewer.keyPressEvent(
+            QKeyEvent(
+                QEvent.Type.KeyPress,
+                Qt.Key.Key_X,
+                Qt.KeyboardModifier.NoModifier,
+            )
+        )
+        assert opened == [True]
+    finally:
+        viewer._shutdown_async_load()
+        viewer.deleteLater()
+        catalog.close()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
 
 
 def test_fullscreen_zoom_out_returns_to_neutral(tmp_path: Path) -> None:
@@ -3351,6 +3401,122 @@ def test_go_to_file_dialog_validates_range_and_selects_default() -> None:
         qt_app.processEvents()
 
 
+def test_hotkeys_dialog_displays_bindings_and_rejects_context_conflicts() -> None:
+    qt_app = app()
+    dialog = HotkeysDialog({"fullscreen.edit": "X"})
+    try:
+        assert dialog.table.rowCount() == len(HOTKEY_DEFINITIONS)
+        assert {
+            dialog.table.item(row, 0).text()
+            for row in range(dialog.table.rowCount())
+        }.isdisjoint(
+            {
+                "Rotate 90 left",
+                "Rotate 90 right",
+                "Flip vertical",
+                "Flip horizontal",
+                "Remove red eye",
+                "Crop",
+                "Clone and heal",
+                "LaMa",
+            }
+        )
+        assert dialog.editors["fullscreen.edit"].keySequence().toString() == "X"
+        assert next(
+            definition.default_sequence
+            for definition in HOTKEY_DEFINITIONS
+            if definition.hotkey_id == "fullscreen.edit"
+        ) == "E"
+
+        dialog.editors["thumbnail.go_to_file"].setKeySequence(
+            QKeySequence("S")
+        )
+        assert not dialog.ok_button.isEnabled()
+        assert "Open randomized slideshow" in dialog.validation_label.text()
+
+        dialog.editors["thumbnail.go_to_file"].setKeySequence(
+            QKeySequence("J")
+        )
+        assert dialog.ok_button.isEnabled()
+        assert dialog.selected_overrides() == {
+            "fullscreen.edit": "X",
+            "thumbnail.go_to_file": "J",
+        }
+
+        dialog.restore_defaults()
+        assert dialog.ok_button.isEnabled()
+        assert dialog.selected_overrides() == {}
+    finally:
+        dialog.close()
+        dialog.deleteLater()
+        qt_app.processEvents()
+
+
+def test_tools_hotkeys_applies_reassigned_thumbnail_binding(
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    opened: list[bool] = []
+
+    class FakeHotkeysDialog:
+        def __init__(self, overrides: dict[str, str], _parent=None) -> None:  # type: ignore[no-untyped-def]
+            assert overrides == {}
+
+        def exec(self) -> QDialog.DialogCode:
+            return QDialog.DialogCode.Accepted
+
+        def selected_overrides(self) -> dict[str, str]:
+            return {
+                "thumbnail.go_to_file": "J",
+                "thumbnail.random": "R",
+            }
+
+        def deleteLater(self) -> None:
+            return None
+
+    window = MainWindow()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        assert window.hotkeys_action.text() == "Hotkeys"
+        assert window.hotkeys_action in window.tools_menu.actions()
+        monkeypatch.setattr(ui_module, "HotkeysDialog", FakeHotkeysDialog)
+        monkeypatch.setattr(
+            window,
+            "open_viewer",
+            lambda _index, *, random_mode: opened.append(random_mode),
+        )
+
+        window.open_hotkeys()
+
+        assert window.app_config.hotkeys == {
+            "thumbnail.go_to_file": "J",
+            "thumbnail.random": "R",
+        }
+        assert window.go_to_file_shortcut.key().toString() == "J"
+        assert window.eventFilter(
+            window.thumbnail_view,
+            QKeyEvent(
+                QEvent.Type.KeyPress,
+                Qt.Key.Key_R,
+                Qt.KeyboardModifier.NoModifier,
+            ),
+        )
+        assert opened == [True]
+        assert not window.eventFilter(
+            window.thumbnail_view,
+            QKeyEvent(
+                QEvent.Type.KeyPress,
+                Qt.Key.Key_S,
+                Qt.KeyboardModifier.NoModifier,
+            ),
+        )
+    finally:
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
 def test_main_go_to_file_selects_and_scrolls_to_number(
     tmp_path: Path,
     monkeypatch,
@@ -4159,6 +4325,36 @@ def test_config_file_round_trips_window_and_catalogs(tmp_path: Path) -> None:
     assert loaded.delete_behavior == WIPE_ON_DELETE
     assert loaded.sort_order == SortOrder.DATE_DESC.value
     assert loaded.lama_runtime == LAMA_RUNTIME_WEBGPU
+
+
+def test_main_window_restores_persisted_hotkey_bindings(tmp_path: Path) -> None:
+    qt_app = app()
+    config_path = tmp_path / "config.json"
+    save_config(
+        AppConfig(
+            hotkeys={
+                "main.open_catalog": "F2",
+                "thumbnail.go_to_file": "J",
+            }
+        ),
+        config_path,
+    )
+    window = MainWindow(config_path=config_path)
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        settle_initial_config_load(window, qt_app)
+
+        assert window.open_action.shortcut().toString() == "F2"
+        assert window.go_to_file_shortcut.key().toString() == "J"
+        assert window.current_app_config().hotkeys == {
+            "main.open_catalog": "F2",
+            "thumbnail.go_to_file": "J",
+        }
+    finally:
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
 
 
 def test_hung_initial_config_load_neither_blocks_construction_nor_shutdown(
