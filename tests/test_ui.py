@@ -63,6 +63,7 @@ from marnwick.ui import (  # noqa: E402
     DuplicateDeleteTask,
     DuplicateListDialog,
     FullscreenViewer,
+    GoToFileDialog,
     GpuTestDialog,
     ImageRenameDialog,
     LogsDialog,
@@ -3291,6 +3292,125 @@ def test_image_rename_dialog_selects_stem_and_keeps_extension() -> None:
     finally:
         dialog.close()
         dialog.deleteLater()
+        qt_app.processEvents()
+
+
+def test_go_to_file_dialog_validates_range_and_selects_default() -> None:
+    qt_app = app()
+    dialog = GoToFileDialog(12, 3)
+    try:
+        assert dialog.prompt_label.text() == "Go to file number:"
+        assert dialog.total_label.text() == "of 12"
+        assert dialog.entry.text() == "3"
+        assert dialog.entry.selectedText() == "3"
+        assert dialog.ok_button.isEnabled()
+
+        dialog.entry.setText("13")
+        assert not dialog.ok_button.isEnabled()
+        assert "#c62828" in dialog.entry.styleSheet()
+
+        dialog.entry.clear()
+        dialog.entry.insert("letters")
+        assert dialog.entry.text() == ""
+        assert not dialog.ok_button.isEnabled()
+
+        dialog.entry.setText("7")
+        dialog.entry.returnPressed.emit()
+        assert dialog.result() == int(QDialog.DialogCode.Accepted)
+        assert dialog.file_number() == 7
+    finally:
+        dialog.close()
+        dialog.deleteLater()
+        qt_app.processEvents()
+
+    canceled_dialog = GoToFileDialog(12, 3)
+    try:
+        canceled_dialog.keyPressEvent(
+            QKeyEvent(
+                QEvent.Type.KeyPress,
+                Qt.Key.Key_Escape,
+                Qt.KeyboardModifier.NoModifier,
+            )
+        )
+        assert canceled_dialog.result() == int(QDialog.DialogCode.Rejected)
+    finally:
+        canceled_dialog.close()
+        canceled_dialog.deleteLater()
+        qt_app.processEvents()
+
+
+def test_main_go_to_file_selects_and_scrolls_to_number(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    captured: list[tuple[int, int]] = []
+
+    class FakeGoToFileDialog:
+        def __init__(self, total: int, default: int, _parent=None) -> None:  # type: ignore[no-untyped-def]
+            captured.append((total, default))
+
+        def exec(self) -> QDialog.DialogCode:
+            return QDialog.DialogCode.Accepted
+
+        def file_number(self) -> int:
+            return 70
+
+        def deleteLater(self) -> None:
+            return None
+
+    window = MainWindow()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        records = [
+            ImageRecord(
+                id=index,
+                catalog_root=root,
+                rel_path=f"image-{index:03d}.jpg",
+                dir_rel="",
+                filename=f"image-{index:03d}.jpg",
+                size_bytes=1,
+                mtime_ns=index,
+                width=1,
+                height=1,
+                aspect_ratio=1.0,
+                thumb_width=1,
+                thumb_height=1,
+            )
+            for index in range(80)
+        ]
+        window.current_catalog = catalog
+        window.current_dir_rel = ""
+        window.model.set_images(catalog, records)
+        root_item = QTreeWidgetItem(["catalog"])
+        root_item.setData(0, ui_module.CATALOG_ROOT_ROLE, str(catalog.root))
+        root_item.setData(0, ui_module.DIR_REL_ROLE, "")
+        window.tree.addTopLevelItem(root_item)
+        window.tree.setCurrentItem(root_item)
+        window.resize(640, 420)
+        window.show()
+        select_thumbnail_rows(window, [4])
+        qt_app.processEvents()
+        monkeypatch.setattr(ui_module, "GoToFileDialog", FakeGoToFileDialog)
+
+        window.open_go_to_file_dialog()
+        qt_app.processEvents()
+
+        assert captured == [(80, 5)]
+        assert window.current_selected_row() == 69
+        assert window.model.images[69].rel_path == "image-069.jpg"
+        assert window.thumbnail_view.verticalScrollBar().value() > 0
+
+        window.tree.setCurrentItem(None)
+        window.open_go_to_file_dialog()
+        assert captured == [(80, 5)]
+    finally:
+        window.close()
+        window.deleteLater()
         qt_app.processEvents()
 
 
@@ -13127,6 +13247,71 @@ def test_paged_thumbnail_model_fetches_bounded_pages_and_stops_stale_mutation_cu
         catalog.close()
 
 
+def test_main_go_to_file_keeps_request_across_thumbnail_page_load(
+    tmp_path: Path,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    window = MainWindow()
+
+    def record(index: int) -> ImageRecord:
+        filename = f"image-{index}.png"
+        return ImageRecord(
+            id=index,
+            catalog_root=root,
+            rel_path=filename,
+            dir_rel="",
+            filename=filename,
+            size_bytes=1,
+            mtime_ns=index,
+            width=1,
+            height=1,
+            aspect_ratio=1.0,
+            thumb_width=1,
+            thumb_height=1,
+        )
+
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        records = [record(index) for index in range(3)]
+        requested_offsets: list[int] = []
+        window.current_catalog = catalog
+        window.current_dir_rel = ""
+        window.model.set_paged_images(
+            catalog,
+            records[:1],
+            total_records=3,
+            total_images=3,
+            next_offset=1,
+            has_more=True,
+            request_page=requested_offsets.append,
+        )
+
+        window.go_to_file_number(3)
+        qt_app.processEvents()
+        assert requested_offsets == [1]
+        assert window._pending_file_ordinal_selection is not None
+
+        assert window.model.append_page(
+            records[1:],
+            expected_offset=1,
+            next_offset=3,
+            has_more=False,
+            total_records=3,
+            total_images=3,
+        )
+
+        assert window.current_selected_row() == 2
+        assert window._pending_file_ordinal_selection is None
+    finally:
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
 def test_physical_view_worker_returns_one_counted_snapshot_page(tmp_path: Path) -> None:
     root = tmp_path / "catalog"
     (root / "a").mkdir(parents=True)
@@ -14362,6 +14547,133 @@ def test_random_paged_viewer_crosses_page_boundary_without_repeats(tmp_path: Pat
         assert set(navigator.order) == {"a.png", "b.png", "c.png"}
         assert len(navigator.order) == len(set(navigator.order))
         assert not viewer._load_closed
+    finally:
+        viewer._shutdown_async_load()
+        viewer.deleteLater()
+        catalog.close()
+        qt_app.processEvents()
+
+
+def test_fullscreen_go_to_dialog_uses_display_ordinal_and_g_hotkey(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    order = ["a.png", "b.png", "c.png", "d.png"]
+    for index, filename in enumerate(order):
+        Image.new("RGB", (2, 2), (index, index, index)).save(root / filename)
+    captured: list[tuple[int, int]] = []
+
+    class FakeGoToFileDialog:
+        def __init__(self, total: int, default: int, _parent=None) -> None:  # type: ignore[no-untyped-def]
+            captured.append((total, default))
+
+        def exec(self) -> QDialog.DialogCode:
+            return QDialog.DialogCode.Accepted
+
+        def file_number(self) -> int:
+            return 4
+
+        def deleteLater(self) -> None:
+            return None
+
+    catalog = Catalog(root)
+    navigator = ImageNavigator.sequential(order, "b.png")
+    viewer = FullscreenViewer(catalog, navigator, display_order=order)
+    try:
+        monkeypatch.setattr(ui_module, "GoToFileDialog", FakeGoToFileDialog)
+        viewer.keyPressEvent(
+            QKeyEvent(
+                QEvent.Type.KeyPress,
+                Qt.Key.Key_G,
+                Qt.KeyboardModifier.NoModifier,
+            )
+        )
+
+        assert captured == [(4, 2)]
+        assert navigator.current == "d.png"
+    finally:
+        viewer._shutdown_async_load()
+        viewer.deleteLater()
+        catalog.close()
+        qt_app.processEvents()
+
+
+def test_random_fullscreen_go_to_updates_order_at_current_slot(
+    tmp_path: Path,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    display_order = ["a.png", "b.png", "c.png", "d.png"]
+    for index, filename in enumerate(display_order):
+        Image.new("RGB", (2, 2), (index, index, index)).save(root / filename)
+    catalog = Catalog(root)
+    navigator = ImageNavigator(["b.png", "d.png", "a.png", "c.png"], 0)
+    viewer = FullscreenViewer(
+        catalog,
+        navigator,
+        display_order=display_order,
+        random_mode=True,
+    )
+    try:
+        viewer.go_to_file_number(3)
+
+        assert navigator.index == 0
+        assert navigator.current == "c.png"
+        assert navigator.order == ["c.png", "d.png", "a.png", "b.png"]
+        assert set(navigator.order) == set(display_order)
+    finally:
+        viewer._shutdown_async_load()
+        viewer.deleteLater()
+        catalog.close()
+        qt_app.processEvents()
+
+
+def test_paged_fullscreen_go_to_loads_until_ordinal_is_available(
+    tmp_path: Path,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    order = ["a.png", "b.png", "c.png"]
+    for index, filename in enumerate(order):
+        Image.new("RGB", (2, 2), (index, index, index)).save(root / filename)
+    calls: list[int] = []
+
+    def load_page(offset: int, _limit: int, _cancel_event: Event):
+        calls.append(offset)
+        return ui_module.ViewerNavigationPage(
+            rel_paths=["b.png", "c.png"],
+            next_offset=3,
+            has_more=False,
+            total_images=3,
+        )
+
+    catalog = Catalog(root)
+    navigator = ui_module.PagedImageNavigator(
+        order=["a.png"],
+        index=0,
+        next_offset=1,
+        has_more=True,
+        total_count=3,
+        page_loader=load_page,
+    )
+    viewer = FullscreenViewer(catalog, navigator, display_order=["a.png"])
+    try:
+        viewer.go_to_file_number(3)
+        deadline = monotonic() + 2
+        while viewer._navigation_page_future is not None and monotonic() < deadline:
+            qt_app.processEvents()
+            viewer._settle_navigation_page()
+            sleep(0.001)
+
+        assert calls == [1]
+        assert navigator.current == "c.png"
+        assert viewer._display_order == order
+        assert viewer._pending_go_to_file_ordinal is None
     finally:
         viewer._shutdown_async_load()
         viewer.deleteLater()
