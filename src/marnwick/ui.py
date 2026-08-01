@@ -297,6 +297,13 @@ HOTKEY_DEFINITIONS = (
         "S",
     ),
     HotkeyDefinition("thumbnail.tags", "Edit tags", "Thumbnail pane", "main", "T"),
+    HotkeyDefinition(
+        "tags.repeat",
+        "Repeat last assigned tag set",
+        "Tags dialog",
+        "tags",
+        "Ctrl+R",
+    ),
     HotkeyDefinition("thumbnail.copy", "Copy selected files", "Thumbnail pane", "main", "Ctrl+C"),
     HotkeyDefinition("thumbnail.delete", "Delete selected files", "Thumbnail pane", "main", "Delete"),
     HotkeyDefinition(
@@ -3407,6 +3414,11 @@ class MainWindow(QMainWindow):
         # Fullscreen position labels are a session preference: new viewers
         # inherit the latest toggle without adding it to the saved config.
         self.fullscreen_position_labels_enabled = True
+        # Tag assignment recency is deliberately session-scoped. The catalog
+        # schema has no assignment timestamp, and the useful ordering is the
+        # user's current tagging run rather than a permanent global ranking.
+        self._recent_assigned_tags: tuple[str, ...] = ()
+        self._last_assigned_tags: tuple[str, ...] | None = None
         self._applying_initial_config = False
         self._initial_config_controls_changed = False
         self._initial_config_catalog_interacted = False
@@ -4841,7 +4853,30 @@ class MainWindow(QMainWindow):
         )
         if mutation is not None:
             mutation.navigation_owner = owner
+            self._remember_image_tag_assignment(requested_names)
         return mutation
+
+    def _remember_image_tag_assignment(self, names: Sequence[str]) -> None:
+        assigned: list[str] = []
+        assigned_keys: set[str] = set()
+        for name in names:
+            cleaned = " ".join(name.strip().split())
+            key = normalize_tag(cleaned)
+            if cleaned and key not in assigned_keys:
+                assigned.append(cleaned)
+                assigned_keys.add(key)
+
+        # Names later in one submitted set were entered later and win an
+        # otherwise simultaneous recency tie. Previously used tags retain
+        # their relative order behind the newly assigned set.
+        newest_first = list(reversed(assigned))
+        newest_first.extend(
+            name
+            for name in self._recent_assigned_tags
+            if normalize_tag(name) not in assigned_keys
+        )
+        self._recent_assigned_tags = tuple(newest_first)
+        self._last_assigned_tags = tuple(assigned)
 
     def rename_image(self, catalog: Catalog, record: ImageRecord) -> None:
         if (
@@ -12591,7 +12626,14 @@ class MainWindow(QMainWindow):
             return
         catalog = self.current_catalog
         rel_path = rel_paths[0]
-        dialog = TagDialog(catalog, rel_path, self)
+        dialog = TagDialog(
+            catalog,
+            rel_path,
+            self,
+            recent_tags=self._recent_assigned_tags,
+            repeat_tags=self._last_assigned_tags,
+            repeat_shortcut=self.hotkey_sequence("tags.repeat"),
+        )
         accepted = dialog.exec() == QDialog.DialogCode.Accepted
         selected_tags = dialog.selected_tags() if accepted else []
         expected_identity = getattr(dialog, "loaded_file_identity", None)
@@ -14089,10 +14131,25 @@ class GoToFileDialog(QDialog):
 class TagDialog(QDialog):
     MAX_VISIBLE_TAGS = 500
 
-    def __init__(self, catalog: Catalog, rel_path: str, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        catalog: Catalog,
+        rel_path: str,
+        parent: QWidget | None = None,
+        *,
+        recent_tags: Sequence[str] = (),
+        repeat_tags: Sequence[str] | None = None,
+        repeat_shortcut: str = "Ctrl+R",
+    ) -> None:
         super().__init__(parent)
         self.catalog = catalog
         self.rel_path = rel_path
+        self._recent_tags = self._unique_names(recent_tags)
+        self._repeat_tags = (
+            None if repeat_tags is None else self._unique_names(repeat_tags)
+        )
+        self._repeat_pending = False
+        self._repeat_shortcut_text = repeat_shortcut
         self._load_closed = False
         self._load_finished = False
         self._accept_pending = False
@@ -14118,15 +14175,34 @@ class TagDialog(QDialog):
         layout.addWidget(scroll)
         self.entry = QLineEdit()
         self.entry.setPlaceholderText("Comma-separated tags")
-        self.entry.returnPressed.connect(self._accept_when_ready)
+        self.entry.textChanged.connect(self._filter_tag_checkboxes)
+        self.entry.installEventFilter(self)
         self.setFocusProxy(self.entry)
         layout.addWidget(self.entry)
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+
+        button_row = QHBoxLayout()
+        shortcut_label = repeat_shortcut.replace("+", "-")
+        repeat_label = f"Repeat ({shortcut_label})" if shortcut_label else "Repeat"
+        self.repeat_button = QPushButton(repeat_label)
+        self.repeat_button.setEnabled(self._repeat_tags is not None)
+        self.repeat_button.clicked.connect(self.repeat_last_tags)
+        button_row.addWidget(self.repeat_button)
+        button_row.addStretch(1)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
         buttons.accepted.connect(self._accept_when_ready)
         buttons.rejected.connect(self.reject)
         self.ok_button = buttons.button(QDialogButtonBox.StandardButton.Ok)
         self.ok_button.setEnabled(False)
-        layout.addWidget(buttons)
+        button_row.addWidget(buttons)
+        layout.addLayout(button_row)
+        self._repeat_shortcut = QShortcut(QKeySequence(repeat_shortcut), self)
+        self._repeat_shortcut.setContext(
+            Qt.ShortcutContext.WidgetWithChildrenShortcut
+        )
+        self._repeat_shortcut.activated.connect(self.repeat_last_tags)
         self._load_future = self._load_executor.submit(
             self._load_tag_state,
             catalog.root,
@@ -14140,6 +14216,18 @@ class TagDialog(QDialog):
         self._load_timer.timeout.connect(self._settle_tag_state)
         self._load_timer.start()
         self.resize(360, 420)
+
+    @staticmethod
+    def _unique_names(names: Sequence[str]) -> tuple[str, ...]:
+        unique: list[str] = []
+        seen: set[str] = set()
+        for name in names:
+            cleaned = " ".join(name.strip().split())
+            key = normalize_tag(cleaned)
+            if cleaned and key not in seen:
+                seen.add(key)
+                unique.append(cleaned)
+        return tuple(unique)
 
     @classmethod
     def _load_tag_state(
@@ -14203,18 +14291,18 @@ class TagDialog(QDialog):
             self._accept_pending = False
             return
         self.loaded_file_identity = image_identity
-        selected_by_key = {name.casefold(): name for name in selected}
-        visible_by_key = {name.casefold(): name for name in tags}
+        selected_by_key = {normalize_tag(name): name for name in selected}
+        visible_by_key = {normalize_tag(name): name for name in tags}
         # Always show selected tags first. This preserves a selection even when
         # it falls beyond the bounded alphabetical catalog page.
         visible_names = list(selected)
         visible_names.extend(
             name
             for name in tags
-            if name.casefold() not in selected_by_key
+            if normalize_tag(name) not in selected_by_key
         )
         visible_names = visible_names[: self.MAX_VISIBLE_TAGS]
-        visible_keys = {name.casefold() for name in visible_names}
+        visible_keys = {normalize_tag(name) for name in visible_names}
         self._hidden_selected_tags = [
             name for key, name in selected_by_key.items() if key not in visible_keys
         ]
@@ -14222,7 +14310,8 @@ class TagDialog(QDialog):
         for tag in visible_names:
             checkbox = QCheckBox(tag)
             checkbox.setStyleSheet("background: transparent; color: #202124;")
-            checkbox.setChecked(tag.casefold() in selected_by_key)
+            checkbox.setChecked(normalize_tag(tag) in selected_by_key)
+            checkbox.installEventFilter(self)
             self.checkboxes.append(checkbox)
             self.tag_layout.addWidget(checkbox)
         if len(visible_by_key) >= self.MAX_VISIBLE_TAGS:
@@ -14236,14 +14325,127 @@ class TagDialog(QDialog):
         self.tag_layout.addStretch(1)
         self._load_finished = True
         self.ok_button.setEnabled(True)
+        if self._repeat_pending:
+            self._apply_repeat_tags()
+        else:
+            self._filter_tag_checkboxes(self.entry.text())
         if self._accept_pending:
             self.accept()
+
+    @staticmethod
+    def _active_entry_prefix(text: str) -> str:
+        fragment = text.rpartition(",")[2].lstrip()
+        if fragment.startswith('"'):
+            fragment = fragment[1:]
+        return fragment.casefold()
+
+    def _filter_tag_checkboxes(self, text: str) -> None:
+        prefix = self._active_entry_prefix(text)
+        for checkbox in self.checkboxes:
+            checkbox.setHidden(
+                bool(prefix) and not checkbox.text().casefold().startswith(prefix)
+            )
+
+    def _tab_completion(self) -> None:
+        prefix = self._active_entry_prefix(self.entry.text())
+        if not prefix:
+            return
+        matches = [
+            checkbox.text()
+            for checkbox in self.checkboxes
+            if checkbox.text().casefold().startswith(prefix)
+        ]
+        if not matches:
+            return
+        matches_by_key = {normalize_tag(name): name for name in matches}
+        match = next(
+            (
+                matches_by_key[key]
+                for key in map(normalize_tag, self._recent_tags)
+                if key in matches_by_key
+            ),
+            matches[0],
+        )
+        self._replace_active_entry_tag(match)
+
+    def _replace_active_entry_tag(self, name: str) -> None:
+        text = self.entry.text()
+        cursor = self.entry.cursorPosition()
+        start = text.rfind(",", 0, cursor) + 1
+        end = text.find(",", cursor)
+        if end < 0:
+            end = len(text)
+        fragment = text[start:end]
+        leading = fragment[: len(fragment) - len(fragment.lstrip())]
+        quoted = fragment.lstrip().startswith('"')
+        if quoted or "," in name or '"' in name:
+            escaped_name = name.replace('"', '""')
+            replacement = f'"{escaped_name}"'
+        else:
+            replacement = name
+        completed = f"{text[:start]}{leading}{replacement}{text[end:]}"
+        self.entry.setText(completed)
+        self.entry.setCursorPosition(start + len(leading) + len(replacement))
+
+    def repeat_last_tags(self) -> None:
+        if self._repeat_tags is None:
+            return
+        self._repeat_pending = True
+        self.entry.clear()
+        if self._load_finished:
+            self._apply_repeat_tags()
+
+    def _apply_repeat_tags(self) -> None:
+        if self._repeat_tags is None:
+            return
+        repeated_by_key = {
+            normalize_tag(name): name for name in self._repeat_tags
+        }
+        visible_keys: set[str] = set()
+        for checkbox in self.checkboxes:
+            key = normalize_tag(checkbox.text())
+            visible_keys.add(key)
+            checkbox.setChecked(key in repeated_by_key)
+        self._hidden_selected_tags = [
+            name
+            for key, name in repeated_by_key.items()
+            if key not in visible_keys
+        ]
+        self._repeat_pending = False
+        self._filter_tag_checkboxes("")
+        self.focus_entry()
 
     def _accept_when_ready(self) -> None:
         if self._load_finished:
             self.accept()
         else:
             self._accept_pending = True
+
+    def eventFilter(self, watched: object, event: QEvent) -> bool:
+        if event.type() == QEvent.Type.KeyPress:
+            if event.key() in {Qt.Key.Key_Return, Qt.Key.Key_Enter}:  # type: ignore[attr-defined]
+                self._accept_when_ready()
+                return True
+            if (
+                watched is self.entry
+                and event.key() == Qt.Key.Key_Tab  # type: ignore[attr-defined]
+                and event.modifiers() == Qt.KeyboardModifier.NoModifier  # type: ignore[attr-defined]
+            ):
+                self._tab_completion()
+                return True
+            if hotkey_event_matches(event, self._repeat_shortcut_text):
+                self.repeat_last_tags()
+                return True
+        return super().eventFilter(watched, event)
+
+    def keyPressEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        if event.key() in {Qt.Key.Key_Return, Qt.Key.Key_Enter}:
+            self._accept_when_ready()
+            return
+        if hotkey_event_matches(event, self._repeat_shortcut_text):
+            self.repeat_last_tags()
+            return
+        super().keyPressEvent(event)
 
     def showEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         super().showEvent(event)
@@ -14259,7 +14461,7 @@ class TagDialog(QDialog):
         seen: set[str] = set()
         result: list[str] = []
         for name in names:
-            key = name.casefold()
+            key = normalize_tag(name)
             if key not in seen:
                 seen.add(key)
                 result.append(name)
@@ -19123,10 +19325,31 @@ class FullscreenViewer(QDialog):
             self.setWindowTitle("Marnwick — finish saving before editing tags…")
             return
         dialog: TagDialog | None = None
+        parent = self.parent()
+        main_window = parent if isinstance(parent, MainWindow) else None
 
         def exec_dialog() -> int:
             nonlocal dialog
-            dialog = TagDialog(self.catalog, target_rel_path, self)
+            dialog = TagDialog(
+                self.catalog,
+                target_rel_path,
+                self,
+                recent_tags=(
+                    main_window._recent_assigned_tags
+                    if main_window is not None
+                    else ()
+                ),
+                repeat_tags=(
+                    main_window._last_assigned_tags
+                    if main_window is not None
+                    else None
+                ),
+                repeat_shortcut=(
+                    main_window.hotkey_sequence("tags.repeat")
+                    if main_window is not None
+                    else "Ctrl+R"
+                ),
+            )
             return int(dialog.exec())
 
         accepted = self.run_with_visible_cursor(exec_dialog) == int(QDialog.DialogCode.Accepted)
@@ -19139,8 +19362,7 @@ class FullscreenViewer(QDialog):
         if dialog is not None:
             dialog.deleteLater()
         if accepted:
-            parent = self.parent()
-            if isinstance(parent, MainWindow):
+            if main_window is not None:
                 if target_rel_path in self._pending_save_rels:
                     self.setWindowTitle("Marnwick — finish saving before editing tags…")
                     return
@@ -19151,7 +19373,7 @@ class FullscreenViewer(QDialog):
                         "The image identity was unavailable; tags were not changed.",
                     )
                     return
-                parent.queue_image_tags(
+                main_window.queue_image_tags(
                     self.catalog,
                     target_rel_path,
                     selected_tags,
