@@ -32,6 +32,7 @@ from PySide6.QtCore import (
     QMimeData,
     QModelIndex,
     QPoint,
+    QPointF,
     QRect,
     QSize,
     Signal,
@@ -56,6 +57,7 @@ from PySide6.QtGui import (
     QKeySequence,
     QMovie,
     QPainter,
+    QPainterPath,
     QPen,
     QPixmap,
     QShortcut,
@@ -2437,10 +2439,11 @@ class ThumbnailModel(QAbstractListModel):
         return Qt.DropAction.MoveAction | Qt.DropAction.CopyAction
 
     def mimeTypes(self) -> list[str]:
-        return [self.MIME_TYPE]
+        return [self.MIME_TYPE, "text/uri-list"]
 
     def mimeData(self, indexes: list[QModelIndex]) -> QMimeData:
         payload = []
+        urls: list[QUrl] = []
         seen: set[int] = set()
         if self.catalog is None:
             return QMimeData()
@@ -2456,8 +2459,10 @@ class ThumbnailModel(QAbstractListModel):
                     "kind": "directory" if isinstance(record, DirectoryRecord) else "image",
                 }
             )
+            urls.append(QUrl.fromLocalFile(str(record.absolute_path)))
         mime = QMimeData()
         mime.setData(self.MIME_TYPE, json.dumps(payload).encode("utf-8"))
+        mime.setUrls(urls)
         return mime
 
     def _placeholder_pixmap(self) -> QPixmap:
@@ -2702,10 +2707,12 @@ class ThumbnailView(QListView):
         self._drag_start_pos: QPoint | None = None
         self._drag_indexes: list[QModelIndex] = []
         self._drag_payload: list[dict[str, str]] = []
+        self._drag_urls: list[QUrl] = []
         self._drag_destination_item: QTreeWidgetItem | None = None
         self._drag_destination_root: Path | None = None
         self._drag_destination_dir_rel: str | None = None
         self._manual_drag_active = False
+        self._native_file_drag_active = False
         self._drag_copy_requested = False
         self._drag_cursor_active = False
         self._drag_cursor_restore_count = 0
@@ -2737,11 +2744,11 @@ class ThumbnailView(QListView):
             self.main_window.refresh_thumbnail_layout()
 
     def event(self, event: QEvent) -> bool:
-        if self._manual_drag_active and event.type() in {
-            QEvent.Type.Hide,
-            QEvent.Type.WindowDeactivate,
-        }:
-            self.cleanup_manual_drag()
+        if self._manual_drag_active:
+            if event.type() == QEvent.Type.Hide:
+                self.cleanup_manual_drag()
+            elif event.type() == QEvent.Type.WindowDeactivate:
+                QTimer.singleShot(0, self._handoff_deactivated_file_drag)
         return super().event(event)
 
     def mousePressEvent(self, event) -> None:  # type: ignore[no-untyped-def]
@@ -2755,6 +2762,11 @@ class ThumbnailView(QListView):
         if self._manual_drag_active:
             if not (event.buttons() & Qt.MouseButton.LeftButton):
                 self.finish_manual_drag(event.globalPosition().toPoint())
+                event.accept()
+                return
+            if self._maybe_start_external_file_drag(
+                event.globalPosition().toPoint()
+            ):
                 event.accept()
                 return
             self.update_manual_drag(event.globalPosition().toPoint())
@@ -2807,7 +2819,7 @@ class ThumbnailView(QListView):
         super().wheelEvent(event)
 
     def manual_drag_active(self) -> bool:
-        return self._manual_drag_active
+        return self._manual_drag_active or self._native_file_drag_active
 
     def startDrag(self, supported_actions: Qt.DropAction) -> None:
         selection = self.selectionModel()
@@ -2869,8 +2881,10 @@ class ThumbnailView(QListView):
         payload = self.drag_payload_for_indexes(valid_indexes)
         if not payload:
             return False
+        mime_data = model.mimeData(valid_indexes)
         self._drag_indexes = valid_indexes
         self._drag_payload = payload
+        self._drag_urls = list(mime_data.urls())
         self._drag_copy_requested = bool(
             QApplication.keyboardModifiers()
             & Qt.KeyboardModifier.ControlModifier
@@ -2904,9 +2918,65 @@ class ThumbnailView(QListView):
             )
         )
         if QApplication.mouseButtons() & Qt.MouseButton.LeftButton:
+            if self._maybe_start_external_file_drag(global_pos):
+                return
             self.update_manual_drag(global_pos)
             return
         self.finish_manual_drag(global_pos)
+
+    def _handoff_deactivated_file_drag(self) -> None:
+        if not self._manual_drag_active:
+            return
+        if (
+            not self._drag_urls
+            or not (QApplication.mouseButtons() & Qt.MouseButton.LeftButton)
+        ):
+            self.cleanup_manual_drag()
+            return
+        self._maybe_start_external_file_drag(QCursor.pos(), force=True)
+
+    def _maybe_start_external_file_drag(
+        self,
+        global_pos: QPoint,
+        *,
+        force: bool = False,
+    ) -> bool:
+        if (
+            not self._manual_drag_active
+            or not self._drag_urls
+            or (
+                not force
+                and self.window().rect().contains(
+                    self.window().mapFromGlobal(global_pos)
+                )
+            )
+        ):
+            return False
+        payload = list(self._drag_payload)
+        urls = list(self._drag_urls)
+        multiple = len(urls) > 1
+        self._native_file_drag_active = True
+        self.cleanup_manual_drag()
+
+        mime = QMimeData()
+        mime.setData(ThumbnailModel.MIME_TYPE, json.dumps(payload).encode("utf-8"))
+        mime.setUrls(urls)
+        drag = QDrag(self)
+        drag.setMimeData(mime)
+        pixmap = self.static_drag_pixmap(multiple=multiple, copy=True)
+        drag.setPixmap(pixmap)
+        drag.setHotSpot(QPoint(int(pixmap.width() / 2), int(pixmap.height() / 2)))
+        drag.setDragCursor(pixmap, Qt.DropAction.CopyAction)
+        try:
+            drag.exec(Qt.DropAction.CopyAction, Qt.DropAction.CopyAction)
+        finally:
+            self._native_file_drag_active = False
+            if self.main_window is not None:
+                QTimer.singleShot(
+                    0,
+                    self.main_window._resume_deferred_tree_publication,
+                )
+        return True
 
     def update_manual_drag(self, global_pos: QPoint) -> None:
         self._set_drag_copy_requested(
@@ -3001,6 +3071,7 @@ class ThumbnailView(QListView):
         self._drag_start_pos = None
         self._drag_indexes = []
         self._drag_payload = []
+        self._drag_urls = []
         self._drag_destination_item = None
         self._drag_destination_root = None
         self._drag_destination_dir_rel = None
@@ -16051,14 +16122,16 @@ class LamaMaskOverlay(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor(239, 68, 68, 105))
+        mask_path = QPainterPath()
+        mask_path.setFillRule(Qt.FillRule.WindingFill)
         for x, y, radius in self.samples:
-            center = QPoint(
+            center = QPointF(
                 self.display_rect.left() + round(x * scale_x),
                 self.display_rect.top() + round(y * scale_y),
             )
             display_radius = max(1, round(radius * max(scale_x, scale_y)))
-            painter.drawEllipse(center, display_radius, display_radius)
+            mask_path.addEllipse(center, display_radius, display_radius)
+        painter.fillPath(mask_path, QColor(239, 68, 68, 105))
         if self.brush_center is not None:
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.setPen(QPen(QColor("#f8fafc"), 2))

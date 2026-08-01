@@ -1952,6 +1952,33 @@ def test_lama_processing_keeps_the_unmasked_image_visible(
             qt_app.processEvents()
 
 
+def test_lama_mask_drag_overlap_keeps_constant_translucency() -> None:
+    qt_app = app()
+    overlay = ui_module.LamaMaskOverlay(None)
+    try:
+        overlay.resize(100, 100)
+        overlay.update_mask(
+            ((35, 50, 20), (65, 50, 20)),
+            (100, 100),
+            QRect(0, 0, 100, 100),
+        )
+        overlay.show()
+        qt_app.processEvents()
+        rendered = QImage(100, 100, QImage.Format.Format_ARGB32_Premultiplied)
+        rendered.fill(Qt.GlobalColor.transparent)
+
+        overlay.render(rendered)
+
+        single_sample_alpha = rendered.pixelColor(30, 50).alpha()
+        overlapping_samples_alpha = rendered.pixelColor(50, 50).alpha()
+        assert 100 <= single_sample_alpha <= 110
+        assert overlapping_samples_alpha == single_sample_alpha
+    finally:
+        overlay.close()
+        overlay.deleteLater()
+        qt_app.processEvents()
+
+
 def test_lama_r_repeats_last_successful_mask_across_viewers(
     tmp_path: Path,
     monkeypatch,
@@ -3219,6 +3246,124 @@ def test_thumbnail_view_builds_visible_drag_pixmap(tmp_path: Path) -> None:
         view.close()
         view.deleteLater()
         qt_app.processEvents()
+
+
+def test_thumbnail_drag_mime_includes_standard_file_urls(tmp_path: Path) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    for name in ("first.jpg", "second.jpg"):
+        Image.new("RGB", (8, 8), (10, 20, 30)).save(root / name)
+
+    with Catalog(root) as catalog:
+        catalog.refresh()
+        records = [
+            record
+            for name in ("first.jpg", "second.jpg")
+            if (record := catalog.get_image(name, include_blob=False)) is not None
+        ]
+        model = ThumbnailModel()
+        try:
+            model.set_images(catalog, records)
+
+            mime = model.mimeData([model.index(0, 0), model.index(1, 0)])
+
+            assert mime.hasFormat(ThumbnailModel.MIME_TYPE)
+            assert mime.hasFormat("text/uri-list")
+            assert [Path(url.toLocalFile()) for url in mime.urls()] == [
+                root / "first.jpg",
+                root / "second.jpg",
+            ]
+            assert json.loads(
+                bytes(mime.data(ThumbnailModel.MIME_TYPE)).decode("utf-8")
+            ) == [
+                {
+                    "catalog_root": str(catalog.root),
+                    "rel_path": "first.jpg",
+                    "kind": "image",
+                },
+                {
+                    "catalog_root": str(catalog.root),
+                    "rel_path": "second.jpg",
+                    "kind": "image",
+                },
+            ]
+        finally:
+            model.close()
+            model.deleteLater()
+            qt_app.processEvents()
+
+
+def test_thumbnail_drag_hands_off_to_native_file_drag_outside_window(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    Image.new("RGB", (8, 8), (10, 20, 30)).save(root / "image.jpg")
+    recorded: dict[str, object] = {}
+
+    class RecordingDrag:
+        def __init__(self, source) -> None:  # type: ignore[no-untyped-def]
+            recorded["source"] = source
+
+        def setMimeData(self, mime) -> None:  # type: ignore[no-untyped-def]
+            recorded["mime"] = mime
+
+        def setPixmap(self, pixmap) -> None:  # type: ignore[no-untyped-def]
+            recorded["pixmap"] = pixmap
+
+        def setHotSpot(self, hotspot) -> None:  # type: ignore[no-untyped-def]
+            recorded["hotspot"] = hotspot
+
+        def setDragCursor(self, pixmap, action) -> None:  # type: ignore[no-untyped-def]
+            recorded["cursor"] = (pixmap, action)
+
+        def exec(self, actions, default_action):  # type: ignore[no-untyped-def]
+            recorded["actions"] = (actions, default_action)
+            recorded["active_during_exec"] = view.manual_drag_active()
+            return Qt.DropAction.CopyAction
+
+    monkeypatch.setattr(ui_module, "QDrag", RecordingDrag)
+    with Catalog(root) as catalog:
+        catalog.refresh()
+        record = catalog.get_image("image.jpg", include_blob=False)
+        assert record is not None
+        model = ThumbnailModel()
+        view = ThumbnailView()
+        try:
+            model.set_images(catalog, [record])
+            view.setModel(model)
+            view.resize(320, 240)
+            view.show()
+            qt_app.processEvents()
+            index = model.index(0, 0)
+            inside = view.mapToGlobal(view.rect().center())
+
+            assert view.begin_manual_drag([index], inside)
+            outside = view.mapToGlobal(QPoint(view.width() + 20, view.height() // 2))
+            assert view._maybe_start_external_file_drag(outside)
+
+            mime = recorded["mime"]
+            assert mime.hasFormat(ThumbnailModel.MIME_TYPE)  # type: ignore[union-attr]
+            assert [Path(url.toLocalFile()) for url in mime.urls()] == [  # type: ignore[union-attr]
+                root / "image.jpg"
+            ]
+            assert recorded["actions"] == (
+                Qt.DropAction.CopyAction,
+                Qt.DropAction.CopyAction,
+            )
+            assert recorded["active_during_exec"] is True
+            assert not view.manual_drag_active()
+            assert QApplication.overrideCursor() is None
+        finally:
+            view.cleanup_manual_drag()
+            view.close()
+            view.deleteLater()
+            model.close()
+            model.deleteLater()
+            qt_app.processEvents()
 
 
 def test_thumbnail_view_uses_pixel_scrolling_for_smooth_movement() -> None:
