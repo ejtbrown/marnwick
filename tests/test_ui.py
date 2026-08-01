@@ -3882,6 +3882,7 @@ def test_hotkeys_dialog_displays_bindings_and_rejects_context_conflicts() -> Non
             for definition in HOTKEY_DEFINITIONS
             if definition.hotkey_id == "fullscreen.edit"
         ) == "E"
+        assert dialog.editors["tags.repeat"].keySequence().toString() == "Ctrl+R"
 
         dialog.editors["thumbnail.go_to_file"].setKeySequence(
             QKeySequence("S")
@@ -4650,6 +4651,140 @@ def test_tag_dialog_return_from_entry_accepts_csv_tags(tmp_path: Path) -> None:
 
             assert dialog.result() == QDialog.DialogCode.Accepted
             assert catalog.get_image_tags("image.jpg") == ["Black and White", "Travel"]
+        finally:
+            dialog.close()
+            dialog.deleteLater()
+            qt_app.processEvents()
+
+
+def test_tag_dialog_filters_and_completes_with_most_recent_match(
+    tmp_path: Path,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    Image.new("RGB", (8, 8), (10, 20, 30)).save(root / "image.jpg")
+
+    with Catalog(root) as catalog:
+        catalog.refresh()
+        catalog.define_tags(["Alpha", "Alpine", "Beta"])
+        dialog = TagDialog(
+            catalog,
+            "image.jpg",
+            recent_tags=["Alpine", "Alpha"],
+        )
+        try:
+            dialog.show()
+            deadline = monotonic() + 2
+            while not dialog._load_finished and monotonic() < deadline:
+                qt_app.processEvents()
+                sleep(0.01)
+
+            by_name = {checkbox.text(): checkbox for checkbox in dialog.checkboxes}
+            dialog.entry.setText("Al")
+            qt_app.processEvents()
+
+            assert not by_name["Alpha"].isHidden()
+            assert not by_name["Alpine"].isHidden()
+            assert by_name["Beta"].isHidden()
+
+            qt_app.sendEvent(
+                dialog.entry,
+                QKeyEvent(
+                    QEvent.Type.KeyPress,
+                    Qt.Key.Key_Tab,
+                    Qt.KeyboardModifier.NoModifier,
+                    "\t",
+                ),
+            )
+
+            assert dialog.entry.text() == "Alpine"
+            assert by_name["Alpha"].isHidden()
+            assert not by_name["Alpine"].isHidden()
+        finally:
+            dialog.close()
+            dialog.deleteLater()
+            qt_app.processEvents()
+
+
+def test_tag_dialog_repeat_button_and_ctrl_r_replace_the_tag_set(
+    tmp_path: Path,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    Image.new("RGB", (8, 8), (10, 20, 30)).save(root / "image.jpg")
+
+    with Catalog(root) as catalog:
+        catalog.refresh()
+        catalog.define_tags(["Alpha", "Beta"])
+        catalog.set_image_tags("image.jpg", ["Alpha"], replace=True)
+        dialog = TagDialog(catalog, "image.jpg", repeat_tags=["Beta"])
+        try:
+            dialog.show()
+            deadline = monotonic() + 2
+            while not dialog._load_finished and monotonic() < deadline:
+                qt_app.processEvents()
+                sleep(0.01)
+
+            by_name = {checkbox.text(): checkbox for checkbox in dialog.checkboxes}
+            assert dialog.repeat_button.text() == "Repeat (Ctrl-R)"
+            dialog.repeat_button.click()
+            assert dialog.selected_tags() == ["Beta"]
+
+            by_name["Alpha"].setChecked(True)
+            by_name["Beta"].setChecked(False)
+            dialog.entry.setText("New")
+            qt_app.sendEvent(
+                dialog.entry,
+                QKeyEvent(
+                    QEvent.Type.KeyPress,
+                    Qt.Key.Key_R,
+                    Qt.KeyboardModifier.ControlModifier,
+                    "r",
+                ),
+            )
+
+            assert dialog.entry.text() == ""
+            assert dialog.selected_tags() == ["Beta"]
+        finally:
+            dialog.close()
+            dialog.deleteLater()
+            qt_app.processEvents()
+
+
+def test_tag_dialog_return_from_checkbox_always_accepts(tmp_path: Path) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    Image.new("RGB", (8, 8), (10, 20, 30)).save(root / "image.jpg")
+
+    with Catalog(root) as catalog:
+        catalog.refresh()
+        catalog.define_tags(["Family"])
+        dialog = TagDialog(catalog, "image.jpg")
+        try:
+            dialog.show()
+            deadline = monotonic() + 2
+            while not dialog._load_finished and monotonic() < deadline:
+                qt_app.processEvents()
+                sleep(0.01)
+            checkbox = dialog.checkboxes[0]
+            checkbox.setChecked(True)
+            checkbox.setFocus()
+
+            qt_app.sendEvent(
+                checkbox,
+                QKeyEvent(
+                    QEvent.Type.KeyPress,
+                    Qt.Key.Key_Return,
+                    Qt.KeyboardModifier.NoModifier,
+                    "\r",
+                ),
+            )
+
+            assert dialog.result() == QDialog.DialogCode.Accepted
+            assert dialog.selected_tags() == ["Family"]
         finally:
             dialog.close()
             dialog.deleteLater()
@@ -8558,9 +8693,14 @@ def test_image_tag_update_waits_in_protected_worker_lane(
         window.current_dir_rel = ""
         window.model.set_images(catalog, [record])
         select_thumbnail_rows(window, [0])
+        window._remember_image_tag_assignment(["Prior"])
+        window.app_config.hotkeys = {"tags.repeat": "Alt+R"}
 
         class FakeTagDialog:
-            def __init__(self, *_args, **_kwargs) -> None:  # type: ignore[no-untyped-def]
+            def __init__(self, *_args, **kwargs) -> None:  # type: ignore[no-untyped-def]
+                assert kwargs["recent_tags"] == ("Prior",)
+                assert kwargs["repeat_tags"] == ("Prior",)
+                assert kwargs["repeat_shortcut"] == "Alt+R"
                 self.loaded_file_identity = expected_identity
 
             def exec(self) -> int:
@@ -8579,6 +8719,8 @@ def test_image_tag_update_waits_in_protected_worker_lane(
         window.open_tag_dialog_for_selection()
         assert monotonic() - started_at < 0.1
         assert catalog.get_image_tags("image.jpg") == []
+        assert window._last_assigned_tags == ("Queued",)
+        assert window._recent_assigned_tags[:2] == ("Queued", "Prior")
 
         release.set()
         blocker.result(timeout=2)
@@ -8611,9 +8753,14 @@ def test_fullscreen_tag_update_forwards_loaded_image_identity(
         catalog = window.workspace.open_catalog(root)
         catalog.refresh()
         expected_identity = catalog.file_identity("image.jpg")
+        window._remember_image_tag_assignment(["Prior"])
+        window.app_config.hotkeys = {"tags.repeat": "Alt+R"}
 
         class FakeTagDialog:
-            def __init__(self, *_args, **_kwargs) -> None:  # type: ignore[no-untyped-def]
+            def __init__(self, *_args, **kwargs) -> None:  # type: ignore[no-untyped-def]
+                assert kwargs["recent_tags"] == ("Prior",)
+                assert kwargs["repeat_tags"] == ("Prior",)
+                assert kwargs["repeat_shortcut"] == "Alt+R"
                 self.loaded_file_identity = expected_identity
 
             def exec(self) -> int:

@@ -101,10 +101,10 @@ You can open more catalogs with **File > Open** or manage remembered catalogs un
 ## Main controls
 
 Use **Tools > Hotkeys** to view or reassign the application, thumbnail-pane,
-and fullscreen-viewer keyboard shortcuts. Assignments are saved in the
-application configuration. The command keys shown inside the image edit dialog
-remain local to that dialog and are not included; the fullscreen `E` shortcut
-that opens the dialog is configurable.
+fullscreen-viewer, and tag-dialog keyboard shortcuts. Assignments are saved in
+the application configuration. The command keys shown inside the image edit
+dialog remain local to that dialog and are not included; the fullscreen `E`
+shortcut that opens the dialog is configurable.
 
 ### Thumbnail browser
 
@@ -128,6 +128,13 @@ Physical-folder navigation is progressive. Marnwick checks and lists only the se
 Deep discovery walks descendants separately from the selected-pane load and commits its directory inventory in batches. The folder tree reads that inventory from SQLite in bounded pages and performs only a short batch of Qt item work per event-loop turn. If tree work for an older catalog is still pending, the current catalog takes priority; selecting an already visible directory does not wait for the full descendant tree to finish.
 
 Right-click a file tile for rename or deletion; image tiles also offer duplicate matches and metadata. Right-click a folder tile for open, properties, deletion, or trash restore. The folder-tree context menu also provides directory creation and, at a catalog root, catalog preferences, tag definitions, and close.
+
+While the tag dialog is open, typing filters the existing-tag list to names
+with that prefix. `Tab` completes the matching tag used most recently during
+the current session, and `Enter` applies the dialog from either the entry or a
+tag checkbox. **Repeat (Ctrl-R)** replaces the pending selection with the exact
+tag set from the most recent image tagged in the session, including an empty
+set; it can be reassigned under **Tools > Hotkeys**.
 
 Directory tiles remain grouped before file tiles. Directory “size” is the total byte size of currently indexed supported files below that directory, not total filesystem usage. Directory aspect ratio is the mean aspect ratio of indexed descendant thumbnails. Both aggregates are calculated in one batched database query.
 
