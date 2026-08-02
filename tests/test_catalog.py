@@ -27,6 +27,7 @@ from marnwick.catalog import (
     TRASH_DIR_NAME,
     Catalog,
     CatalogRefreshUnstableError,
+    VirtualDirectoryRule,
     is_exact_image_hash,
     parse_tag_entry,
 )
@@ -1856,6 +1857,202 @@ def test_tags_are_catalog_defined_and_csv_entry_selects_new_tags(tmp_path: Path)
 
         assert selected == ["Black and White", "Family", "travel"]
         assert catalog.list_tags() == ["Black and White", "Family", "travel"]
+
+
+def test_delete_tag_removes_unused_and_assigned_tags_atomically(tmp_path: Path) -> None:
+    root = tmp_path / "catalog"
+    make_image(root / "one.jpg")
+    make_image(root / "two.jpg", color=(10, 20, 30))
+
+    with Catalog(root) as catalog:
+        catalog.refresh()
+        catalog.define_tags(["Unused", "Keep"])
+        catalog.set_image_tags("one.jpg", ["Assigned", "Keep"], replace=True)
+        catalog.set_image_tags("two.jpg", ["Assigned"], replace=True)
+
+        assert catalog.delete_tag(" unused ")
+        assert catalog.list_tags() == ["Assigned", "Keep"]
+
+        assert catalog.delete_tag(" ASSIGNED ")
+        assert catalog.get_image_tags("one.jpg") == ["Keep"]
+        assert catalog.get_image_tags("two.jpg") == []
+        assert catalog.list_tags() == ["Keep"]
+        assert not catalog.delete_tag("missing")
+
+
+def test_custom_virtual_directory_matches_regex_subtrees_and_all_tags(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "catalog"
+    for index, rel_path in enumerate(
+        (
+            "album/keep-one.jpg",
+            "album/sub/keep-two.jpg",
+            "album/keep-one-tag.jpg",
+            "album/skip.png",
+            "other/keep-outside.jpg",
+        )
+    ):
+        make_image(root / rel_path, color=(index + 1, index + 2, index + 3))
+
+    with Catalog(root) as catalog:
+        catalog.refresh()
+        for rel_path in (
+            "album/keep-one.jpg",
+            "album/sub/keep-two.jpg",
+            "album/skip.png",
+            "other/keep-outside.jpg",
+        ):
+            catalog.set_image_tags(rel_path, ["Family", "Favorite"], replace=True)
+        catalog.set_image_tags("album/keep-one-tag.jpg", ["Family"], replace=True)
+
+        definition = catalog.create_custom_virtual_directory(
+            "Album Picks",
+            r"^keep.*\.jpg$",
+            ["album", "album/sub"],
+            ["favorite", "FAMILY"],
+        )
+
+        assert definition.name == "Album Picks"
+        assert definition.filename_regex == r"^keep.*\.jpg$"
+        assert definition.directories == ("album",)
+        assert definition.tags == ("Family", "Favorite")
+        assert catalog.custom_virtual_directory_image_count(definition.id) == 2
+        assert [
+            record.rel_path
+            for record in catalog.list_images_for_custom_virtual_directory_page(
+                definition.id,
+                SortOrder.NAME_ASC,
+                limit=1,
+                offset=1,
+            )
+        ] == ["album/sub/keep-two.jpg"]
+
+        unfiltered = catalog.create_custom_virtual_directory(
+            "All Album Files",
+            "",
+            ["album"],
+            [],
+        )
+        assert catalog.custom_virtual_directory_image_count(unfiltered.id) == 4
+        assert catalog.delete_custom_virtual_directory(unfiltered.id)
+
+        with pytest.raises(ValueError, match="already exists"):
+            catalog.create_custom_virtual_directory(
+                " album picks ",
+                "",
+                [""],
+                [],
+            )
+        with pytest.raises(ValueError, match="regular expression"):
+            catalog.create_custom_virtual_directory("Broken", "[", [""], [])
+        with pytest.raises(ValueError, match="select at least one"):
+            catalog.create_custom_virtual_directory("Nowhere", "", [], [])
+
+    with Catalog(root) as catalog:
+        definitions = catalog.list_custom_virtual_directories()
+        assert definitions == [definition]
+        assert catalog.delete_custom_virtual_directory(definition.id)
+        assert not catalog.delete_custom_virtual_directory(definition.id)
+        assert catalog.custom_virtual_directory_image_count(definition.id) == 0
+        assert catalog.list_custom_virtual_directories() == []
+
+
+def test_advanced_virtual_directory_evaluates_nested_boolean_tag_logic(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "catalog"
+    assignments = {
+        "album/keep-family.jpg": ["Family", "Edited"],
+        "album/keep-favorite.jpg": ["Favorite", "Original"],
+        "album/keep-both.jpg": ["Family", "Edited", "Original"],
+        "album/keep-private.jpg": ["Family", "Edited", "Private"],
+        "album/no-pattern.jpg": ["Family", "Edited"],
+        "scans/scan-family.jpg": ["Family", "Original"],
+        "other/keep-outside.jpg": ["Family", "Edited"],
+    }
+    for index, rel_path in enumerate(assignments):
+        make_image(root / rel_path, color=(index + 1, index + 2, index + 3))
+
+    tag = lambda name: VirtualDirectoryRule(  # noqa: E731 - compact expression fixture
+        "tag",
+        value=name,
+        display_value=name,
+    )
+    expression = VirtualDirectoryRule(
+        "all",
+        children=(
+            VirtualDirectoryRule(
+                "any",
+                children=(
+                    VirtualDirectoryRule("directory", value="album"),
+                    VirtualDirectoryRule("directory", value="scans"),
+                ),
+            ),
+            VirtualDirectoryRule(
+                "any",
+                children=(tag("Family"), tag("Favorite")),
+            ),
+            VirtualDirectoryRule("not", children=(tag("Private"),)),
+            VirtualDirectoryRule(
+                "tag_xor",
+                children=(tag("Edited"), tag("Original")),
+            ),
+            VirtualDirectoryRule(
+                "any",
+                children=(
+                    VirtualDirectoryRule("regex", value=r"^keep"),
+                    VirtualDirectoryRule("regex", value=r"^scan"),
+                ),
+            ),
+        ),
+    )
+
+    with Catalog(root) as catalog:
+        catalog.refresh()
+        for rel_path, tags in assignments.items():
+            catalog.set_image_tags(rel_path, tags, replace=True)
+
+        definition = catalog.create_advanced_custom_virtual_directory(
+            "Nested Picks",
+            expression,
+        )
+
+        assert definition.advanced
+        assert definition.directories == ()
+        assert definition.tags == ()
+        assert definition.expression is not None
+        assert catalog.custom_virtual_directory_image_count(definition.id) == 3
+        assert [
+            record.rel_path
+            for record in catalog.list_images_for_custom_virtual_directory_page(
+                definition.id,
+                limit=100,
+            )
+        ] == [
+            "album/keep-family.jpg",
+            "album/keep-favorite.jpg",
+            "scans/scan-family.jpg",
+        ]
+
+        with pytest.raises(ValueError, match="exactly two tags"):
+            catalog.create_advanced_custom_virtual_directory(
+                "Broken XOR",
+                VirtualDirectoryRule("tag_xor", children=(tag("Family"),)),
+            )
+        with pytest.raises(ValueError, match="exactly one rule"):
+            catalog.create_advanced_custom_virtual_directory(
+                "Broken NOT",
+                VirtualDirectoryRule(
+                    "not",
+                    children=(tag("Family"), tag("Favorite")),
+                ),
+            )
+
+    with Catalog(root) as catalog:
+        persisted = catalog.get_custom_virtual_directory(definition.id)
+        assert persisted == definition
+        assert catalog.custom_virtual_directory_image_count(definition.id) == 3
 
 
 def test_replacing_image_tags_rolls_back_as_one_transaction(tmp_path: Path) -> None:

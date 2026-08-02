@@ -129,12 +129,30 @@ Deep discovery walks descendants separately from the selected-pane load and comm
 
 Right-click a file tile for rename or deletion; image tiles also offer duplicate matches and metadata. Right-click a folder tile for open, properties, deletion, or trash restore. The folder-tree context menu also provides directory creation and, at a catalog root, catalog preferences, tag definitions, and close.
 
+Right-click **Virtual Directories** and choose **New** to save a named view. In
+**Simple** mode, a saved virtual directory combines selected catalog folder
+subtrees, an optional file-name regular expression, and any number of required
+tags; an image must satisfy every selected tag and the other active filters.
+Switch to **Advanced** mode to build arbitrarily nested **ALL (AND)**,
+**ANY (OR)**, and **NOT** groups from directory, filename-regex, and tag rules.
+An **Exactly one of two tags (XOR)** rule is also available. The dialog validates
+the expression as it is edited and shows a live matching-file count before the
+view is created. Right-click a saved virtual directory and choose **Delete** to
+remove the saved view after confirmation without deleting any files.
+
 While the tag dialog is open, typing filters the existing-tag list to names
 with that prefix. `Tab` completes the matching tag used most recently during
 the current session, and `Enter` applies the dialog from either the entry or a
 tag checkbox. **Repeat (Ctrl-R)** replaces the pending selection with the exact
 tag set from the most recent image tagged in the session, including an empty
-set; it can be reassigned under **Tools > Hotkeys**.
+set; it can be reassigned under **Tools > Hotkeys**. Catalog-tag additions and
+image-tag assignments run as highest-priority protected catalog tasks. If
+SQLite is temporarily busy or locked by in-flight catalog work, the queued tag
+task waits with bounded backoff and retries instead of dropping the update.
+Right-click an existing tag and choose **Delete** to remove it from the
+catalog. Unused tags are removed immediately; a tag assigned to any image
+requires confirmation before its assignments and catalog entry are removed
+together.
 
 Directory tiles remain grouped before file tiles. Directory “size” is the total byte size of currently indexed supported files below that directory, not total filesystem usage. Directory aspect ratio is the mean aspect ratio of indexed descendant thumbnails. Both aggregates are calculated in one batched database query.
 

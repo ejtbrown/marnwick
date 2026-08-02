@@ -32,6 +32,7 @@ def _lexical_task_root(root: Path) -> Path:
 class ActionPriority(IntEnum):
     # Explicit protected mutations must not starve behind a stream of rapid
     # folder selections. They remain serialized by the single action lane.
+    TAG_UPDATE = -1
     FILE_MOVE_CROSS_CATALOG = 0
     FILE_DELETE = 1
     FILE_MOVE_WITHIN_CATALOG = 2
