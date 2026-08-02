@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import socket
 from concurrent.futures import Future
 from dataclasses import replace as dataclass_replace
@@ -32,7 +33,13 @@ from PySide6.QtWidgets import (  # noqa: E402
     QTreeWidgetItem,
 )
 
-from marnwick.catalog import DuplicateMatchGroups, SIMILARITY_FEATURE_VERSION, TRASH_DIR_NAME, Catalog  # noqa: E402
+from marnwick.catalog import (  # noqa: E402
+    DuplicateMatchGroups,
+    SIMILARITY_FEATURE_VERSION,
+    TRASH_DIR_NAME,
+    Catalog,
+    VirtualDirectoryRule,
+)
 from marnwick.config import (  # noqa: E402
     LAMA_RUNTIME_NVIDIA,
     LAMA_RUNTIME_WEBGPU,
@@ -77,6 +84,7 @@ from marnwick.ui import (  # noqa: E402
     MovePayloadResult,
     MovePayloadTask,
     MainWindow,
+    NewVirtualDirectoryDialog,
     TagDialog,
     ThumbnailDelegate,
     ThumbnailModel,
@@ -84,6 +92,7 @@ from marnwick.ui import (  # noqa: E402
     ThumbnailView,
     VirtualViewResult,
     VIRTUAL_KIND_DUPLICATES,
+    VIRTUAL_KIND_CUSTOM,
     VIRTUAL_KIND_PHYSICAL,
     VIRTUAL_KIND_ROLE,
     VIRTUAL_KIND_TAG,
@@ -4791,6 +4800,72 @@ def test_tag_dialog_return_from_checkbox_always_accepts(tmp_path: Path) -> None:
             qt_app.processEvents()
 
 
+def test_tag_dialog_right_click_delete_confirms_only_for_assigned_tags(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    Image.new("RGB", (8, 8), (10, 20, 30)).save(root / "image.jpg")
+    queued: list[str] = []
+    confirmations: list[bool] = []
+    confirmation_answers = iter((False, True))
+
+    def confirm(_parent) -> bool:  # type: ignore[no-untyped-def]
+        confirmations.append(True)
+        return next(confirmation_answers)
+
+    monkeypatch.setattr(ui_module, "ask_remove_tag_from_all_files", confirm)
+    with Catalog(root) as catalog:
+        catalog.refresh()
+        catalog.define_tags(["Unused"])
+        catalog.set_image_tags("image.jpg", ["Assigned"], replace=True)
+        dialog = TagDialog(
+            catalog,
+            "image.jpg",
+            recent_tags=["Assigned", "Unused"],
+            repeat_tags=["Assigned", "Unused"],
+            delete_tag_callback=lambda name: queued.append(name) or object(),  # type: ignore[arg-type,return-value]
+        )
+        menu = QMenu()
+        try:
+            dialog.show()
+            deadline = monotonic() + 2
+            while not dialog._load_finished and monotonic() < deadline:
+                qt_app.processEvents()
+                sleep(0.01)
+
+            actions = dialog._tag_context_menu_actions(menu)
+            assert [action.text() for action in menu.actions()] == ["Delete"]
+            assert set(actions) == {"delete"}
+            by_name = {checkbox.text(): checkbox for checkbox in dialog.checkboxes}
+
+            dialog._request_tag_deletion(by_name["Unused"])
+            assert confirmations == []
+            assert queued == ["Unused"]
+            assert [checkbox.text() for checkbox in dialog.checkboxes] == ["Assigned"]
+
+            dialog._request_tag_deletion(by_name["Assigned"])
+            assert len(confirmations) == 1
+            assert queued == ["Unused"]
+            assert [checkbox.text() for checkbox in dialog.checkboxes] == ["Assigned"]
+
+            dialog._request_tag_deletion(by_name["Assigned"])
+            assert len(confirmations) == 2
+            assert queued == ["Unused", "Assigned"]
+            assert dialog.checkboxes == []
+            assert dialog.selected_tags() == []
+            assert dialog._recent_tags == ()
+            assert dialog._repeat_tags == ()
+        finally:
+            menu.close()
+            menu.deleteLater()
+            dialog.close()
+            dialog.deleteLater()
+            qt_app.processEvents()
+
+
 def test_tag_dialog_constructor_stays_responsive_while_tag_query_blocks(
     tmp_path: Path,
     monkeypatch,
@@ -4807,7 +4882,7 @@ def test_tag_dialog_constructor_stays_responsive_while_tag_query_blocks(
         assert release.wait(timeout=5)
         with Catalog.open_reader(root) as reader:
             identity = reader.file_identity("image.jpg")
-        return ["Family"], [], False, identity
+        return ["Family"], [], {"family": 0}, False, identity
 
     monkeypatch.setattr(TagDialog, "_load_tag_state", staticmethod(blocked_tag_state))
     with Catalog(root) as catalog:
@@ -8655,6 +8730,7 @@ def test_catalog_tag_additions_wait_in_protected_worker_lane(
         window.open_catalog_tags(catalog.root)
         assert monotonic() - started_at < 0.1
         assert catalog.list_tags() == []
+        assert window._move_payload_tasks[-1].task.priority == ActionPriority.TAG_UPDATE
 
         release.set()
         blocker.result(timeout=2)
@@ -8719,6 +8795,7 @@ def test_image_tag_update_waits_in_protected_worker_lane(
         window.open_tag_dialog_for_selection()
         assert monotonic() - started_at < 0.1
         assert catalog.get_image_tags("image.jpg") == []
+        assert window._move_payload_tasks[-1].task.priority == ActionPriority.TAG_UPDATE
         assert window._last_assigned_tags == ("Queued",)
         assert window._recent_assigned_tags[:2] == ("Queued", "Prior")
 
@@ -8894,6 +8971,97 @@ def test_fullscreen_tags_resolve_edits_and_wait_for_async_save(
             viewer.operations.clear()
             viewer.close()
             viewer.deleteLater()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_queued_image_tags_retry_until_catalog_database_is_available(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    Image.new("RGB", (8, 8), (10, 20, 30)).save(root / "image.jpg")
+    window = MainWindow()
+    attempts = 0
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        catalog.refresh()
+        expected_identity = catalog.file_identity("image.jpg")
+        original_open_writer = Catalog.open_writer.__func__
+
+        def intermittently_locked_writer(
+            cls,
+            *args: object,
+            **kwargs: object,
+        ) -> Catalog:
+            nonlocal attempts
+            attempts += 1
+            if attempts <= 2:
+                raise sqlite3.OperationalError("database is locked")
+            return original_open_writer(cls, *args, **kwargs)
+
+        monkeypatch.setattr(
+            Catalog,
+            "open_writer",
+            classmethod(intermittently_locked_writer),
+        )
+        monkeypatch.setattr(ui_module, "TAG_DATABASE_RETRY_INITIAL_SECONDS", 0)
+        monkeypatch.setattr(ui_module, "TAG_DATABASE_RETRY_MAX_SECONDS", 0)
+
+        mutation = window.queue_image_tags(
+            catalog,
+            "image.jpg",
+            ["Eventually"],
+            expected_identity=expected_identity,
+        )
+
+        assert mutation is not None
+        assert mutation.task.priority == ActionPriority.TAG_UPDATE
+        mutation.future.result(timeout=2)
+        assert attempts == 3
+        assert catalog.get_image_tags("image.jpg") == ["Eventually"]
+        window._settle_move_payload_task()
+    finally:
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_catalog_tag_deletion_uses_priority_worker_and_clears_assignments(
+    tmp_path: Path,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    Image.new("RGB", (8, 8), (10, 20, 30)).save(root / "one.jpg")
+    Image.new("RGB", (8, 8), (20, 30, 40)).save(root / "two.jpg")
+    window = MainWindow()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        catalog.refresh()
+        catalog.set_image_tags("one.jpg", ["Remove", "Keep"], replace=True)
+        catalog.set_image_tags("two.jpg", ["Remove"], replace=True)
+        window._remember_image_tag_assignment(["Remove", "Keep"])
+
+        mutation = window.queue_catalog_tag_deletion(catalog, " remove ")
+
+        assert mutation is not None
+        assert mutation.task.priority == ActionPriority.TAG_UPDATE
+        mutation.future.result(timeout=2)
+        assert catalog.list_tags() == ["Keep"]
+        assert catalog.get_image_tags("one.jpg") == ["Keep"]
+        assert catalog.get_image_tags("two.jpg") == []
+        assert window._recent_assigned_tags == ("Keep",)
+        assert window._last_assigned_tags == ("Keep",)
+        window._settle_move_payload_task()
+    finally:
         window.close()
         window.deleteLater()
         qt_app.processEvents()
@@ -9608,6 +9776,351 @@ def test_virtual_directory_tree_rebuild_preserves_virtual_expansion_state(tmp_pa
         window.idle_timer.stop()
         window.indexer.shutdown()
         window.workspace.close()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_new_virtual_directory_dialog_validates_and_collects_filters(
+    tmp_path: Path,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    image_path = root / "album" / "sub" / "image.jpg"
+    image_path.parent.mkdir(parents=True)
+    Image.new("RGB", (8, 8), (10, 20, 30)).save(image_path)
+
+    with Catalog(root) as catalog:
+        catalog.refresh()
+        catalog.define_tags(["Family", "Favorite"])
+        catalog.create_custom_virtual_directory("Existing", "", [""], [])
+        dialog = NewVirtualDirectoryDialog(catalog)
+        try:
+            dialog.show()
+            deadline = monotonic() + 2
+            while not dialog._loaded and monotonic() < deadline:
+                qt_app.processEvents()
+                dialog._poll_load()
+                sleep(0.01)
+
+            assert dialog._loaded
+            assert dialog.name_entry.placeholderText() == "Virtual directory name"
+            assert "regular expression" in dialog.regex_entry.placeholderText()
+            assert set(dialog._directory_items) >= {"", "album", "album/sub"}
+            assert [
+                dialog.tag_list.item(index).text()
+                for index in range(dialog.tag_list.count())
+            ] == ["Family", "Favorite"]
+
+            dialog._directory_items["album"].setCheckState(
+                0,
+                Qt.CheckState.Checked,
+            )
+            dialog._directory_items["album/sub"].setCheckState(
+                0,
+                Qt.CheckState.Checked,
+            )
+            dialog.tag_list.item(0).setCheckState(Qt.CheckState.Checked)
+            dialog.name_entry.setText(" existing ")
+            assert not dialog.create_button.isEnabled()
+
+            dialog.name_entry.setText("Album Picks")
+            dialog.regex_entry.setText("[")
+            assert not dialog.create_button.isEnabled()
+            assert dialog.regex_entry.styleSheet()
+
+            dialog.regex_entry.setText(r"^keep.*\.jpg$")
+            assert dialog.create_button.isEnabled()
+            assert dialog.virtual_directory_name() == "Album Picks"
+            assert dialog.filename_regex() == r"^keep.*\.jpg$"
+            assert dialog.selected_directories() == ("album",)
+            assert dialog.selected_tags() == ("Family",)
+            deadline = monotonic() + 2
+            while (
+                not dialog.match_count_label.text().startswith("Matches")
+                and monotonic() < deadline
+            ):
+                qt_app.processEvents()
+                sleep(0.01)
+            assert dialog.match_count_label.text() == "Matches 0 files"
+        finally:
+            dialog.close()
+            dialog.deleteLater()
+            qt_app.processEvents()
+
+
+def test_advanced_virtual_directory_builder_round_trips_nested_rules(
+    tmp_path: Path,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    image_path = root / "album" / "sub" / "image.jpg"
+    image_path.parent.mkdir(parents=True)
+    Image.new("RGB", (8, 8), (10, 20, 30)).save(image_path)
+
+    def tag(name: str) -> VirtualDirectoryRule:
+        return VirtualDirectoryRule("tag", value=name, display_value=name)
+
+    with Catalog(root) as catalog:
+        catalog.refresh()
+        catalog.define_tags(["Family", "Favorite", "Private"])
+        dialog = NewVirtualDirectoryDialog(catalog)
+        try:
+            dialog.show()
+            deadline = monotonic() + 2
+            while not dialog._loaded and monotonic() < deadline:
+                qt_app.processEvents()
+                dialog._poll_load()
+                sleep(0.01)
+            assert dialog._loaded
+
+            dialog.name_entry.setText("Nested Picks")
+            dialog._directory_items["album"].setCheckState(
+                0,
+                Qt.CheckState.Checked,
+            )
+            dialog.regex_entry.setText(r"^image")
+            dialog.tag_list.item(0).setCheckState(Qt.CheckState.Checked)
+            dialog.mode_combo.setCurrentIndex(
+                dialog.mode_combo.findData("advanced")
+            )
+
+            converted = dialog.advanced_expression()
+            assert converted.kind == "all"
+            assert [child.kind for child in converted.children] == [
+                "directory",
+                "regex",
+                "tag",
+            ]
+
+            expression = VirtualDirectoryRule(
+                "all",
+                children=(
+                    VirtualDirectoryRule(
+                        "any",
+                        children=(
+                            VirtualDirectoryRule("directory", value="album"),
+                            VirtualDirectoryRule("regex", value=r"^scan"),
+                        ),
+                    ),
+                    VirtualDirectoryRule(
+                        "any",
+                        children=(tag("Family"), tag("Favorite")),
+                    ),
+                    VirtualDirectoryRule(
+                        "not",
+                        children=(tag("Private"),),
+                    ),
+                    VirtualDirectoryRule(
+                        "tag_xor",
+                        children=(tag("Family"), tag("Favorite")),
+                    ),
+                ),
+            )
+            dialog.advanced_root_group.set_rule(expression)
+
+            assert dialog.advanced_expression() == catalog.validate_virtual_directory_rule(
+                expression
+            )
+            assert dialog.create_button.isEnabled()
+            assert dialog.advanced_validation_label.text() == ""
+
+            xor_row = dialog.advanced_root_group.children[-1]
+            assert isinstance(xor_row, ui_module.VirtualDirectoryConditionWidget)
+            xor_row.xor_second_combo.setEditText("Family")
+            assert not dialog.create_button.isEnabled()
+            assert "different tags" in dialog.advanced_validation_label.text()
+
+            xor_row.xor_second_combo.setEditText("Favorite")
+            assert dialog.create_button.isEnabled()
+
+            dialog.mode_combo.setCurrentIndex(
+                dialog.mode_combo.findData("simple")
+            )
+            assert dialog.advanced_mode()
+            assert "cannot be represented" in dialog.advanced_validation_label.text()
+
+            dialog.advanced_root_group.set_rule(converted)
+            dialog.mode_combo.setCurrentIndex(
+                dialog.mode_combo.findData("simple")
+            )
+            assert not dialog.advanced_mode()
+            assert dialog.selected_directories() == ("album",)
+            assert dialog.filename_regex() == r"^image"
+            assert dialog.selected_tags() == ("Family",)
+        finally:
+            dialog.close()
+            dialog.deleteLater()
+            qt_app.processEvents()
+
+
+def test_advanced_virtual_directory_creation_uses_priority_worker(
+    tmp_path: Path,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    Image.new("RGB", (8, 8), (10, 20, 30)).save(root / "image.jpg")
+    window = MainWindow()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        catalog.refresh()
+        catalog.set_image_tags("image.jpg", ["Family"], replace=True)
+        expression = VirtualDirectoryRule(
+            "all",
+            children=(
+                VirtualDirectoryRule("directory", value=""),
+                VirtualDirectoryRule(
+                    "tag",
+                    value="Family",
+                    display_value="Family",
+                ),
+            ),
+        )
+
+        mutation = window.queue_advanced_custom_virtual_directory_creation(
+            catalog,
+            "Nested Picks",
+            expression,
+        )
+
+        assert mutation is not None
+        assert mutation.task.priority == ActionPriority.TAG_UPDATE
+        settle_move_payload_task(window, qt_app)
+        definition = catalog.list_custom_virtual_directories()[0]
+        assert definition.advanced
+        assert catalog.custom_virtual_directory_image_count(definition.id) == 1
+    finally:
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_custom_virtual_directory_tree_create_browse_and_confirmed_delete(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    for index, rel_path in enumerate(
+        (
+            "album/keep-one.jpg",
+            "album/sub/keep-two.jpg",
+            "album/keep-one-tag.jpg",
+            "other/keep-outside.jpg",
+        )
+    ):
+        path = root / rel_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        Image.new("RGB", (8, 8), (index + 1, index + 2, index + 3)).save(path)
+
+    window = MainWindow()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        catalog.refresh()
+        for rel_path in (
+            "album/keep-one.jpg",
+            "album/sub/keep-two.jpg",
+            "other/keep-outside.jpg",
+        ):
+            catalog.set_image_tags(rel_path, ["Family", "Favorite"], replace=True)
+        catalog.set_image_tags("album/keep-one-tag.jpg", ["Family"], replace=True)
+        window.current_catalog = catalog
+        window.current_dir_rel = ""
+        window.rebuild_tree()
+        settle_tree_build_tasks(window, qt_app)
+
+        creation = window.queue_custom_virtual_directory_creation(
+            catalog,
+            "Album Picks",
+            r"^keep.*\.jpg$",
+            ["album"],
+            ["Family", "Favorite"],
+        )
+
+        assert creation is not None
+        assert creation.task.priority == ActionPriority.TAG_UPDATE
+        settle_move_payload_task(window, qt_app)
+        settle_tree_build_tasks(window, qt_app)
+        definitions = catalog.list_custom_virtual_directories()
+        assert len(definitions) == 1
+        definition = definitions[0]
+
+        virtual_root = find_virtual_tree_root(window)
+        custom_item = virtual_root.child(3)
+        assert custom_item is not None
+        assert custom_item.text(0) == "Album Picks"
+        assert custom_item.data(0, VIRTUAL_KIND_ROLE) == VIRTUAL_KIND_CUSTOM
+        assert custom_item.data(0, VIRTUAL_VALUE_ROLE) == str(definition.id)
+
+        root_menu = QMenu()
+        custom_menu = QMenu()
+        try:
+            assert [
+                action.text()
+                for action in window.tree._virtual_context_menu_actions(
+                    root_menu,
+                    virtual_root,
+                ).values()
+            ] == ["New"]
+            assert [
+                action.text()
+                for action in window.tree._virtual_context_menu_actions(
+                    custom_menu,
+                    custom_item,
+                ).values()
+            ] == ["Delete"]
+        finally:
+            root_menu.close()
+            root_menu.deleteLater()
+            custom_menu.close()
+            custom_menu.deleteLater()
+
+        window._directory_clicked(custom_item)
+        settle_virtual_view_tasks(window, qt_app)
+        assert window.current_virtual_kind == VIRTUAL_KIND_CUSTOM
+        assert [
+            record.rel_path
+            for record in window.model.images
+            if isinstance(record, ImageRecord)
+        ] == ["album/keep-one.jpg", "album/sub/keep-two.jpg"]
+
+        confirmations: list[str] = []
+        monkeypatch.setattr(
+            ui_module,
+            "ask_delete_virtual_directory",
+            lambda _parent, name: confirmations.append(name) or False,
+        )
+        window.delete_custom_virtual_directory(
+            catalog.root,
+            definition.id,
+            definition.name,
+        )
+        assert confirmations == ["Album Picks"]
+        assert catalog.get_custom_virtual_directory(definition.id) == definition
+
+        monkeypatch.setattr(
+            ui_module,
+            "ask_delete_virtual_directory",
+            lambda _parent, _name: True,
+        )
+        window.delete_custom_virtual_directory(
+            catalog.root,
+            definition.id,
+            definition.name,
+        )
+        assert window.current_virtual_kind is None
+        settle_move_payload_task(window, qt_app)
+        settle_tree_build_tasks(window, qt_app)
+
+        assert catalog.get_custom_virtual_directory(definition.id) is None
+        assert all(path.exists() for path in root.rglob("*.jpg"))
+        assert find_virtual_tree_root(window).childCount() == 3
+    finally:
         window.close()
         window.deleteLater()
         qt_app.processEvents()

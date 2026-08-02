@@ -6,6 +6,7 @@ import io
 import json
 from math import ceil, hypot
 import os
+import re
 import sqlite3
 import stat
 import sys
@@ -21,7 +22,7 @@ from functools import partial
 from pathlib import Path
 from queue import Empty, SimpleQueue
 from threading import Event, Lock
-from time import monotonic
+from time import monotonic, sleep
 
 from PySide6.QtCore import (
     QAbstractListModel,
@@ -36,6 +37,7 @@ from PySide6.QtCore import (
     QRect,
     QSize,
     Signal,
+    QStringListModel,
     Qt,
     QTimer,
     QUrl,
@@ -94,6 +96,7 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QSpinBox,
     QSplitter,
+    QStackedWidget,
     QStyle,
     QStyledItemDelegate,
     QTableWidget,
@@ -127,6 +130,8 @@ from .catalog import (
     Catalog,
     CatalogFileIdentity,
     CatalogStorageIdentity,
+    CustomVirtualDirectory,
+    VirtualDirectoryRule,
     DuplicateMatchGroups,
     DuplicateDeletionResult,
     is_inside_trash_rel_path,
@@ -244,11 +249,14 @@ MAX_INTERACTIVE_PREVIEW_DIMENSION = 4096
 MAX_ANIMATED_IMAGE_BYTES = 128 * 1024 * 1024
 IMAGE_RECONCILE_MAX_ATTEMPTS = 3
 IMAGE_RECONCILE_RETRY_BASE_MS = 250
+TAG_DATABASE_RETRY_INITIAL_SECONDS = 0.05
+TAG_DATABASE_RETRY_MAX_SECONDS = 1.0
 VIRTUAL_KIND_ROOT = "virtual-root"
 VIRTUAL_KIND_TAG_ROOT = "tag-root"
 VIRTUAL_KIND_TAG = "tag"
 VIRTUAL_KIND_DUPLICATES = "duplicates"
 VIRTUAL_KIND_VERY_SIMILAR = "very-similar"
+VIRTUAL_KIND_CUSTOM = "custom"
 VIRTUAL_KIND_PHYSICAL = "physical"
 VIRTUAL_KIND_PHYSICAL_PREVIEW = "physical-preview"
 TreeStateKey = tuple[Path, str, str, str]
@@ -582,6 +590,7 @@ class TreeBuildTask:
     page_future: Future[TreePageResult] | None
     page_cancel_event: Event | None
     tags: tuple[str, ...]
+    custom_virtual_directories: tuple[CustomVirtualDirectory, ...]
 
 
 @dataclass(slots=True)
@@ -591,6 +600,7 @@ class TreePageResult:
     offset: int
     directories: list[str]
     tags: tuple[str, ...] | None
+    custom_virtual_directories: tuple[CustomVirtualDirectory, ...] | None = None
     tags_have_more: bool = False
     directories_with_children: frozenset[str] = field(default_factory=frozenset)
 
@@ -3218,6 +3228,26 @@ class ThumbnailView(QListView):
         )
 
 
+class CheckableListWidget(QListWidget):
+    """Let a click anywhere on a checkable row toggle its check state."""
+
+    def mouseReleaseEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        item = self.itemAt(event.position().toPoint())
+        before = item.checkState() if item is not None else None
+        super().mouseReleaseEvent(event)
+        if (
+            item is not None
+            and event.button() == Qt.MouseButton.LeftButton
+            and item.flags() & Qt.ItemFlag.ItemIsUserCheckable
+            and item.checkState() == before
+        ):
+            item.setCheckState(
+                Qt.CheckState.Unchecked
+                if before == Qt.CheckState.Checked
+                else Qt.CheckState.Checked
+            )
+
+
 class DirectoryTree(QTreeWidget):
     def __init__(self, window: "MainWindow") -> None:
         super().__init__()
@@ -3362,11 +3392,40 @@ class DirectoryTree(QTreeWidget):
             item.setForeground(0, QBrush(QColor("#ffffff")))
             item.setFont(0, hover_font)
 
+    @staticmethod
+    def _virtual_context_menu_actions(
+        menu: QMenu,
+        item: QTreeWidgetItem,
+    ) -> dict[str, QAction]:
+        kind = item.data(0, VIRTUAL_KIND_ROLE)
+        if kind == VIRTUAL_KIND_ROOT:
+            return {"new": menu.addAction("New")}
+        if kind == VIRTUAL_KIND_CUSTOM:
+            return {"delete": menu.addAction("Delete")}
+        return {}
+
     def _open_context_menu(self, pos) -> None:  # type: ignore[no-untyped-def]
         item = self.itemAt(pos)
         if item is None:
             return
         if self.window.is_virtual_tree_item(item):
+            menu = QMenu(self)
+            actions = self._virtual_context_menu_actions(menu, item)
+            if not actions:
+                menu.deleteLater()
+                return
+            selected = menu.exec(self.viewport().mapToGlobal(pos))
+            menu.deleteLater()
+            root = Path(item.data(0, CATALOG_ROOT_ROLE))
+            if selected == actions.get("new"):
+                self.window.open_new_virtual_directory(root)
+            elif selected == actions.get("delete"):
+                with suppress(TypeError, ValueError):
+                    self.window.delete_custom_virtual_directory(
+                        root,
+                        int(item.data(0, VIRTUAL_VALUE_ROLE)),
+                        item.text(0),
+                    )
             return
         root = Path(item.data(0, CATALOG_ROOT_ROLE))
         dir_rel = item.data(0, DIR_REL_ROLE)
@@ -3601,6 +3660,9 @@ class MainWindow(QMainWindow):
         self._tree_tags_tasks: dict[Future[TreeTagsPageResult], TreeTagsTask] = {}
         self._tree_tag_next_offsets: dict[Path, int | None] = {}
         self._tree_tag_cache: dict[Path, tuple[str, ...]] = {}
+        self._tree_custom_virtual_cache: dict[
+            Path, tuple[CustomVirtualDirectory, ...]
+        ] = {}
         self._tree_item_maps: dict[Path, dict[str, QTreeWidgetItem]] = {}
         self._tree_expanded_state: set[TreeStateKey] = set()
         self._tree_known_state: set[TreeStateKey] = set()
@@ -4802,6 +4864,167 @@ class MainWindow(QMainWindow):
         if requested_tags:
             self.queue_catalog_tags(catalog, requested_tags)
 
+    def open_new_virtual_directory(self, root: Path) -> None:
+        catalog = self.workspace.catalog_for_root(root)
+        if catalog is None:
+            return
+        dialog = NewVirtualDirectoryDialog(catalog, self)
+        accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        if accepted:
+            name = dialog.virtual_directory_name()
+            advanced = dialog.advanced_mode()
+            expression = dialog.advanced_expression() if advanced else None
+            filename_regex = "" if advanced else dialog.filename_regex()
+            directories = () if advanced else dialog.selected_directories()
+            tags = () if advanced else dialog.selected_tags()
+        else:
+            name = filename_regex = ""
+            directories = tags = ()
+            expression = None
+        dialog.deleteLater()
+        if accepted and self.workspace.catalog_for_root(catalog.root) is catalog:
+            if expression is not None:
+                self.queue_advanced_custom_virtual_directory_creation(
+                    catalog,
+                    name,
+                    expression,
+                )
+            else:
+                self.queue_custom_virtual_directory_creation(
+                    catalog,
+                    name,
+                    filename_regex,
+                    directories,
+                    tags,
+                )
+
+    def queue_custom_virtual_directory_creation(
+        self,
+        catalog: Catalog,
+        name: str,
+        filename_regex: str,
+        directories: Sequence[str],
+        tags: Sequence[str],
+    ) -> MovePayloadTask | None:
+        if self.workspace.catalog_for_root(catalog.root) is not catalog:
+            return None
+        clean_name = " ".join(name.strip().split())
+        if not clean_name or not directories:
+            return None
+        mutation = self._queue_catalog_mutation(
+            catalog,
+            label="Creating virtual directory",
+            dest_dir_rel="",
+            priority=ActionPriority.TAG_UPDATE,
+            worker=lambda task: self._create_custom_virtual_directory_worker(
+                catalog.root,
+                catalog.root_identity,
+                clean_name,
+                filename_regex,
+                tuple(directories),
+                tuple(tags),
+                None,
+                task,
+            ),
+            completion_verb="Created",
+            error_title="Create Virtual Directory",
+        )
+        mutation.edit_owner = self
+        return mutation
+
+    def queue_advanced_custom_virtual_directory_creation(
+        self,
+        catalog: Catalog,
+        name: str,
+        expression: VirtualDirectoryRule,
+    ) -> MovePayloadTask | None:
+        if self.workspace.catalog_for_root(catalog.root) is not catalog:
+            return None
+        clean_name = " ".join(name.strip().split())
+        if not clean_name:
+            return None
+        try:
+            canonical = catalog.validate_virtual_directory_rule(expression)
+        except ValueError:
+            return None
+        mutation = self._queue_catalog_mutation(
+            catalog,
+            label="Creating advanced virtual directory",
+            dest_dir_rel="",
+            priority=ActionPriority.TAG_UPDATE,
+            worker=lambda task: self._create_custom_virtual_directory_worker(
+                catalog.root,
+                catalog.root_identity,
+                clean_name,
+                "",
+                (),
+                (),
+                canonical,
+                task,
+            ),
+            completion_verb="Created",
+            error_title="Create Virtual Directory",
+        )
+        mutation.edit_owner = self
+        return mutation
+
+    def delete_custom_virtual_directory(
+        self,
+        root: Path,
+        virtual_directory_id: int,
+        name: str,
+    ) -> None:
+        catalog = self.workspace.catalog_for_root(root)
+        if catalog is None or not ask_delete_virtual_directory(self, name):
+            return
+        mutation = self.queue_custom_virtual_directory_deletion(
+            catalog,
+            virtual_directory_id,
+            name,
+        )
+        if (
+            mutation is not None
+            and self.current_catalog is catalog
+            and self.current_virtual_kind == VIRTUAL_KIND_CUSTOM
+            and self.current_virtual_value == str(virtual_directory_id)
+        ):
+            self.current_virtual_kind = None
+            self.current_virtual_value = ""
+            self.current_dir_rel = ""
+            self.load_current_directory()
+
+    def queue_custom_virtual_directory_deletion(
+        self,
+        catalog: Catalog,
+        virtual_directory_id: int,
+        name: str,
+    ) -> MovePayloadTask | None:
+        if self.workspace.catalog_for_root(catalog.root) is not catalog:
+            return None
+        try:
+            saved_id = int(virtual_directory_id)
+        except (TypeError, ValueError):
+            return None
+        if saved_id <= 0:
+            return None
+        mutation = self._queue_catalog_mutation(
+            catalog,
+            label="Deleting virtual directory",
+            dest_dir_rel="",
+            priority=ActionPriority.TAG_UPDATE,
+            worker=lambda task: self._delete_custom_virtual_directory_worker(
+                catalog.root,
+                catalog.root_identity,
+                saved_id,
+                name,
+                task,
+            ),
+            completion_verb="Deleted",
+            error_title="Delete Virtual Directory",
+        )
+        mutation.edit_owner = self
+        return mutation
+
     def queue_catalog_tags(self, catalog: Catalog, names: Sequence[str]) -> MovePayloadTask | None:
         if self.workspace.catalog_for_root(catalog.root) is not catalog:
             return None
@@ -4812,7 +5035,7 @@ class MainWindow(QMainWindow):
             catalog,
             label="Adding catalog tags",
             dest_dir_rel="",
-            priority=ActionPriority.FILE_MOVE_WITHIN_CATALOG,
+            priority=ActionPriority.TAG_UPDATE,
             worker=lambda task: self._define_catalog_tags_worker(
                 catalog.root,
                 catalog.root_identity,
@@ -4822,6 +5045,37 @@ class MainWindow(QMainWindow):
             completion_verb="Added",
             error_title="Catalog Tags",
         )
+
+    def queue_catalog_tag_deletion(
+        self,
+        catalog: Catalog,
+        name: str,
+        *,
+        owner: QWidget | None = None,
+    ) -> MovePayloadTask | None:
+        if self.workspace.catalog_for_root(catalog.root) is not catalog:
+            return None
+        clean_name = " ".join(name.strip().split())
+        if not clean_name:
+            return None
+        mutation = self._queue_catalog_mutation(
+            catalog,
+            label="Deleting catalog tag",
+            dest_dir_rel="",
+            priority=ActionPriority.TAG_UPDATE,
+            worker=lambda task: self._delete_catalog_tag_worker(
+                catalog.root,
+                catalog.root_identity,
+                clean_name,
+                task,
+            ),
+            completion_verb="Deleted",
+            error_title="Delete Tag",
+        )
+        if mutation is not None:
+            mutation.edit_owner = owner
+            self._forget_deleted_tag(clean_name)
+        return mutation
 
     def queue_image_tags(
         self,
@@ -4839,7 +5093,7 @@ class MainWindow(QMainWindow):
             catalog,
             label="Updating image tags",
             dest_dir_rel=rel_path.rpartition("/")[0],
-            priority=ActionPriority.FILE_MOVE_WITHIN_CATALOG,
+            priority=ActionPriority.TAG_UPDATE,
             worker=lambda task: self._set_image_tags_worker(
                 catalog.root,
                 catalog.root_identity,
@@ -4877,6 +5131,20 @@ class MainWindow(QMainWindow):
         )
         self._recent_assigned_tags = tuple(newest_first)
         self._last_assigned_tags = tuple(assigned)
+
+    def _forget_deleted_tag(self, name: str) -> None:
+        deleted_key = normalize_tag(name)
+        self._recent_assigned_tags = tuple(
+            recent_name
+            for recent_name in self._recent_assigned_tags
+            if normalize_tag(recent_name) != deleted_key
+        )
+        if self._last_assigned_tags is not None:
+            self._last_assigned_tags = tuple(
+                assigned_name
+                for assigned_name in self._last_assigned_tags
+                if normalize_tag(assigned_name) != deleted_key
+            )
 
     def rename_image(self, catalog: Catalog, record: ImageRecord) -> None:
         if (
@@ -5663,6 +5931,152 @@ class MainWindow(QMainWindow):
         return mutation
 
     @staticmethod
+    def _is_transient_database_lock(error: sqlite3.OperationalError) -> bool:
+        error_code = getattr(error, "sqlite_errorcode", None)
+        if isinstance(error_code, int) and error_code & 0xFF in {
+            sqlite3.SQLITE_BUSY,
+            sqlite3.SQLITE_LOCKED,
+        }:
+            return True
+        message = str(error).casefold()
+        return "locked" in message or "busy" in message
+
+    @classmethod
+    def _wait_for_tag_database(
+        cls,
+        task: IndexTask,
+        *,
+        processed: int,
+        total: int,
+        current: str,
+        write: Callable[[], int],
+    ) -> int:
+        retry_delay = TAG_DATABASE_RETRY_INITIAL_SECONDS
+        while True:
+            task.check_canceled()
+            try:
+                return write()
+            except sqlite3.OperationalError as error:
+                if not cls._is_transient_database_lock(error):
+                    raise
+                task.update(
+                    processed,
+                    total,
+                    f"Waiting for catalog database ({current})",
+                )
+                sleep(retry_delay)
+                retry_delay = min(
+                    retry_delay * 2,
+                    TAG_DATABASE_RETRY_MAX_SECONDS,
+                )
+
+    @staticmethod
+    def _delete_catalog_tag_worker(
+        root: Path,
+        expected_root_identity: tuple[int, int],
+        name: str,
+        task: IndexTask,
+    ) -> MovePayloadResult:
+        task.update(0, 1, name)
+        task.check_canceled()
+
+        def write() -> int:
+            with Catalog.open_writer(
+                root,
+                expected_root_identity=expected_root_identity,
+                expected_storage_identity=task.expected_storage_identity,
+            ) as catalog:
+                return int(catalog.delete_tag(name))
+
+        deleted = MainWindow._wait_for_tag_database(
+            task,
+            processed=0,
+            total=1,
+            current=name,
+            write=write,
+        )
+        task.update(1, 1, name)
+        task.mark_done()
+        return MovePayloadResult(1, deleted, {root})
+
+    @staticmethod
+    def _create_custom_virtual_directory_worker(
+        root: Path,
+        expected_root_identity: tuple[int, int],
+        name: str,
+        filename_regex: str,
+        directories: Sequence[str],
+        tags: Sequence[str],
+        expression: VirtualDirectoryRule | None,
+        task: IndexTask,
+    ) -> MovePayloadResult:
+        task.update(0, 1, name)
+        task.check_canceled()
+
+        def write() -> int:
+            with Catalog.open_writer(
+                root,
+                expected_root_identity=expected_root_identity,
+                expected_storage_identity=task.expected_storage_identity,
+            ) as catalog:
+                if expression is None:
+                    catalog.create_custom_virtual_directory(
+                        name,
+                        filename_regex,
+                        directories,
+                        tags,
+                    )
+                else:
+                    catalog.create_advanced_custom_virtual_directory(
+                        name,
+                        expression,
+                    )
+                return 1
+
+        created = MainWindow._wait_for_tag_database(
+            task,
+            processed=0,
+            total=1,
+            current=name,
+            write=write,
+        )
+        task.update(1, 1, name)
+        task.mark_done()
+        return MovePayloadResult(1, created, {root})
+
+    @staticmethod
+    def _delete_custom_virtual_directory_worker(
+        root: Path,
+        expected_root_identity: tuple[int, int],
+        virtual_directory_id: int,
+        name: str,
+        task: IndexTask,
+    ) -> MovePayloadResult:
+        task.update(0, 1, name)
+        task.check_canceled()
+
+        def write() -> int:
+            with Catalog.open_writer(
+                root,
+                expected_root_identity=expected_root_identity,
+                expected_storage_identity=task.expected_storage_identity,
+            ) as catalog:
+                return int(
+                    catalog.delete_custom_virtual_directory(virtual_directory_id)
+                )
+
+        deleted = MainWindow._wait_for_tag_database(
+            task,
+            processed=0,
+            total=1,
+            current=name,
+            write=write,
+        )
+        task.update(1, 1, name)
+        task.mark_done()
+        return MovePayloadResult(1, deleted, {root})
+
+    @staticmethod
     def _define_catalog_tags_worker(
         root: Path,
         expected_root_identity: tuple[int, int],
@@ -5671,15 +6085,25 @@ class MainWindow(QMainWindow):
     ) -> MovePayloadResult:
         task.update(0, len(names), "catalog tags")
         task.check_canceled()
-        with Catalog.open_writer(
-            root,
-            expected_root_identity=expected_root_identity,
-            expected_storage_identity=task.expected_storage_identity,
-        ) as catalog:
-            stored = catalog.define_tags(names)
+
+        def write() -> int:
+            with Catalog.open_writer(
+                root,
+                expected_root_identity=expected_root_identity,
+                expected_storage_identity=task.expected_storage_identity,
+            ) as catalog:
+                return len(catalog.define_tags(names))
+
+        stored_count = MainWindow._wait_for_tag_database(
+            task,
+            processed=0,
+            total=len(names),
+            current="catalog tags",
+            write=write,
+        )
         task.update(len(names), len(names), "catalog tags")
         task.mark_done()
-        return MovePayloadResult(len(names), len(stored), {root})
+        return MovePayloadResult(len(names), stored_count, {root})
 
     @staticmethod
     def _set_image_tags_worker(
@@ -5692,17 +6116,28 @@ class MainWindow(QMainWindow):
     ) -> MovePayloadResult:
         task.update(0, 1, rel_path)
         task.check_canceled()
-        with Catalog.open_writer(
-            root,
-            expected_root_identity=expected_root_identity,
-            expected_storage_identity=task.expected_storage_identity,
-        ) as catalog:
-            catalog.set_image_tags(
-                rel_path,
-                names,
-                replace=True,
-                expected_identity=expected_identity,
-            )
+
+        def write() -> int:
+            with Catalog.open_writer(
+                root,
+                expected_root_identity=expected_root_identity,
+                expected_storage_identity=task.expected_storage_identity,
+            ) as catalog:
+                catalog.set_image_tags(
+                    rel_path,
+                    names,
+                    replace=True,
+                    expected_identity=expected_identity,
+                )
+            return 1
+
+        MainWindow._wait_for_tag_database(
+            task,
+            processed=0,
+            total=1,
+            current=rel_path,
+            write=write,
+        )
         task.update(1, 1, rel_path)
         task.mark_done()
         return MovePayloadResult(1, 1, {root})
@@ -6758,6 +7193,7 @@ class MainWindow(QMainWindow):
         self._tree_tag_next_offsets.pop(resolved, None)
         self._tree_item_maps.pop(resolved, None)
         self._tree_tag_cache.pop(resolved, None)
+        self._tree_custom_virtual_cache.pop(resolved, None)
         self._tree_expanded_state = {key for key in self._tree_expanded_state if key[0] != resolved}
         self._tree_known_state = {key for key in self._tree_known_state if key[0] != resolved}
         self._successful_catalog_open_intents.pop(resolved, None)
@@ -7071,6 +7507,10 @@ class MainWindow(QMainWindow):
                 expanded_items,
                 known_items,
                 tags=self._tree_tag_cache.get(catalog.root, ()),
+                custom_virtual_directories=self._tree_custom_virtual_cache.get(
+                    catalog.root,
+                    (),
+                ),
             )
             if virtual_selected_item is not None:
                 selected_item = virtual_selected_item
@@ -7194,6 +7634,10 @@ class MainWindow(QMainWindow):
             page_future=None,
             page_cancel_event=None,
             tags=self._tree_tag_cache.get(catalog.root, ()),
+            custom_virtual_directories=self._tree_custom_virtual_cache.get(
+                catalog.root,
+                (),
+            ),
         )
         self._record_timing_phase(
             catalog.root,
@@ -7265,9 +7709,13 @@ class MainWindow(QMainWindow):
                     tag_page = tuple(str(row["name"]) for row in tag_rows)
                     tags_have_more = len(tag_page) > MAX_TREE_TAG_ITEMS
                     tags = tag_page[:MAX_TREE_TAG_ITEMS]
+                    custom_virtual_directories = tuple(
+                        catalog.list_custom_virtual_directories()
+                    )
                 else:
                     tags = None
                     tags_have_more = False
+                    custom_virtual_directories = None
             finally:
                 with suppress(sqlite3.Error):
                     catalog._conn.execute("ROLLBACK")  # noqa: SLF001
@@ -7279,6 +7727,7 @@ class MainWindow(QMainWindow):
             offset=offset,
             directories=directories,
             tags=tags,
+            custom_virtual_directories=custom_virtual_directories,
             tags_have_more=tags_have_more,
             directories_with_children=frozenset(directories_with_children),
         )
@@ -7382,6 +7831,13 @@ class MainWindow(QMainWindow):
                 self._tree_tag_cache[task.catalog.root] = page_result.tags
                 self._tree_tag_next_offsets[task.catalog.root] = (
                     len(page_result.tags) if page_result.tags_have_more else None
+                )
+            if page_result.custom_virtual_directories is not None:
+                task.custom_virtual_directories = (
+                    page_result.custom_virtual_directories
+                )
+                self._tree_custom_virtual_cache[task.catalog.root] = (
+                    page_result.custom_virtual_directories
                 )
             if len(page) < TREE_BUILD_BATCH_SIZE:
                 task.total = task.processed + len(task.directories)
@@ -7545,6 +8001,7 @@ class MainWindow(QMainWindow):
             task.expanded_items,
             task.known_items,
             tags=task.tags,
+            custom_virtual_directories=task.custom_virtual_directories,
         )
         if self.current_catalog is not None and self.current_catalog.root == task.catalog.root:
             if self.current_virtual_kind is None:
@@ -7634,6 +8091,10 @@ class MainWindow(QMainWindow):
                 self._expanded_tree_items(),
                 self._known_tree_items(),
                 tags=self._tree_tag_cache.get(catalog.root, ()),
+                custom_virtual_directories=self._tree_custom_virtual_cache.get(
+                    catalog.root,
+                    (),
+                ),
             )
         elif item_by_dir is None:
             item_by_dir = {"": root_item}
@@ -7737,6 +8198,7 @@ class MainWindow(QMainWindow):
         known_items: set[TreeStateKey],
         *,
         tags: Sequence[str],
+        custom_virtual_directories: Sequence[CustomVirtualDirectory] = (),
     ) -> QTreeWidgetItem | None:
         selected_item: QTreeWidgetItem | None = None
         tag_names = tuple(dict.fromkeys(tags))
@@ -7793,6 +8255,22 @@ class MainWindow(QMainWindow):
         virtual_root.addChild(very_similar_item)
         if self._is_current_virtual_item(catalog.root, VIRTUAL_KIND_VERY_SIMILAR, ""):
             selected_item = very_similar_item
+        for definition in custom_virtual_directories:
+            value = str(definition.id)
+            item = QTreeWidgetItem([definition.name])
+            self._set_virtual_tree_item_data(
+                item,
+                catalog,
+                VIRTUAL_KIND_CUSTOM,
+                value,
+            )
+            virtual_root.addChild(item)
+            if self._is_current_virtual_item(
+                catalog.root,
+                VIRTUAL_KIND_CUSTOM,
+                value,
+            ):
+                selected_item = item
         self._tree_known_state.update(
             {
                 self._tree_state_key_for_virtual(catalog.root, VIRTUAL_KIND_ROOT, ""),
@@ -7802,6 +8280,14 @@ class MainWindow(QMainWindow):
                 *(
                     self._tree_state_key_for_virtual(catalog.root, VIRTUAL_KIND_TAG, tag)
                     for tag in tag_names
+                ),
+                *(
+                    self._tree_state_key_for_virtual(
+                        catalog.root,
+                        VIRTUAL_KIND_CUSTOM,
+                        str(definition.id),
+                    )
+                    for definition in custom_virtual_directories
                 ),
             }
         )
@@ -8421,6 +8907,8 @@ class MainWindow(QMainWindow):
             item.setToolTip(0, "Images with matching exact content hashes")
         elif kind == VIRTUAL_KIND_VERY_SIMILAR:
             item.setToolTip(0, "Images with close aspect ratios, perceptual hashes, and color distributions")
+        elif kind == VIRTUAL_KIND_CUSTOM:
+            item.setToolTip(0, "Saved virtual directory")
         else:
             item.setToolTip(0, "Virtual directories")
 
@@ -8632,7 +9120,12 @@ class MainWindow(QMainWindow):
         if kind in {VIRTUAL_KIND_ROOT, VIRTUAL_KIND_TAG_ROOT}:
             item.setExpanded(not item.isExpanded())
             return
-        if kind not in {VIRTUAL_KIND_TAG, VIRTUAL_KIND_DUPLICATES, VIRTUAL_KIND_VERY_SIMILAR}:
+        if kind not in {
+            VIRTUAL_KIND_TAG,
+            VIRTUAL_KIND_DUPLICATES,
+            VIRTUAL_KIND_VERY_SIMILAR,
+            VIRTUAL_KIND_CUSTOM,
+        }:
             return
         if self.current_catalog is not None:
             self._cancel_virtual_view_tasks(self.current_catalog.root)
@@ -9923,7 +10416,11 @@ class MainWindow(QMainWindow):
         if preserve_selection and selection_keys is None:
             selection_keys = self._thumbnail_selection_keys()
             current_key = self._current_thumbnail_selection_key()
-        if self.current_virtual_kind in {VIRTUAL_KIND_TAG, VIRTUAL_KIND_DUPLICATES}:
+        if self.current_virtual_kind in {
+            VIRTUAL_KIND_TAG,
+            VIRTUAL_KIND_DUPLICATES,
+            VIRTUAL_KIND_CUSTOM,
+        }:
             self._load_simple_virtual_directory(
                 preserve_selection=preserve_selection,
                 selection_keys=selection_keys or set(),
@@ -9954,7 +10451,11 @@ class MainWindow(QMainWindow):
     ) -> None:
         catalog = self.current_catalog
         kind = self.current_virtual_kind
-        if catalog is None or kind not in {VIRTUAL_KIND_TAG, VIRTUAL_KIND_DUPLICATES}:
+        if catalog is None or kind not in {
+            VIRTUAL_KIND_TAG,
+            VIRTUAL_KIND_DUPLICATES,
+            VIRTUAL_KIND_CUSTOM,
+        }:
             return
         value = self.current_virtual_value
         fingerprint = self._physical_pane_generation
@@ -10070,6 +10571,20 @@ class MainWindow(QMainWindow):
                         include_blobs=False,
                         cancel_check=check_canceled,
                     )
+                elif kind == VIRTUAL_KIND_CUSTOM:
+                    saved_id = int(value)
+                    total_images = catalog.custom_virtual_directory_image_count(
+                        saved_id,
+                        cancel_check=check_canceled,
+                    )
+                    images = catalog.list_images_for_custom_virtual_directory_page(
+                        saved_id,
+                        sort_order,
+                        limit=page_limit,
+                        offset=page_offset,
+                        include_blobs=False,
+                        cancel_check=check_canceled,
+                    )
                 else:
                     total_images = catalog.exact_duplicate_image_count(
                         cancel_check=check_canceled,
@@ -10156,7 +10671,11 @@ class MainWindow(QMainWindow):
                 self.model.page_fetch_failed(page_offset)
                 return
             worker = self._physical_view_worker
-        elif kind in {VIRTUAL_KIND_TAG, VIRTUAL_KIND_DUPLICATES}:
+        elif kind in {
+            VIRTUAL_KIND_TAG,
+            VIRTUAL_KIND_DUPLICATES,
+            VIRTUAL_KIND_CUSTOM,
+        }:
             if self.current_virtual_kind != kind or self.current_virtual_value != value:
                 self.model.page_fetch_failed(page_offset)
                 return
@@ -10230,7 +10749,11 @@ class MainWindow(QMainWindow):
                 page_offset,
                 page_limit,
             )
-        elif kind in {VIRTUAL_KIND_TAG, VIRTUAL_KIND_DUPLICATES}:
+        elif kind in {
+            VIRTUAL_KIND_TAG,
+            VIRTUAL_KIND_DUPLICATES,
+            VIRTUAL_KIND_CUSTOM,
+        }:
             result = self._simple_virtual_view_worker(
                 root,
                 expected_root_identity,
@@ -10922,6 +11445,7 @@ class MainWindow(QMainWindow):
                     VIRTUAL_KIND_PHYSICAL,
                     VIRTUAL_KIND_TAG,
                     VIRTUAL_KIND_DUPLICATES,
+                    VIRTUAL_KIND_CUSTOM,
                 }
             ):
                 total_records = result.total_records
@@ -12633,6 +13157,11 @@ class MainWindow(QMainWindow):
             recent_tags=self._recent_assigned_tags,
             repeat_tags=self._last_assigned_tags,
             repeat_shortcut=self.hotkey_sequence("tags.repeat"),
+            delete_tag_callback=lambda name: self.queue_catalog_tag_deletion(
+                catalog,
+                name,
+                owner=dialog,
+            ),
         )
         accepted = dialog.exec() == QDialog.DialogCode.Accepted
         selected_tags = dialog.selected_tags() if accepted else []
@@ -12701,6 +13230,7 @@ class MainWindow(QMainWindow):
             None,
             VIRTUAL_KIND_TAG,
             VIRTUAL_KIND_DUPLICATES,
+            VIRTUAL_KIND_CUSTOM,
         }:
             initial = (
                 ImageNavigator.random(order, start).order
@@ -14140,6 +14670,7 @@ class TagDialog(QDialog):
         recent_tags: Sequence[str] = (),
         repeat_tags: Sequence[str] | None = None,
         repeat_shortcut: str = "Ctrl+R",
+        delete_tag_callback: Callable[[str], MovePayloadTask | None] | None = None,
     ) -> None:
         super().__init__(parent)
         self.catalog = catalog
@@ -14150,6 +14681,8 @@ class TagDialog(QDialog):
         )
         self._repeat_pending = False
         self._repeat_shortcut_text = repeat_shortcut
+        self._delete_tag_callback = delete_tag_callback
+        self._tag_usage_counts: dict[str, int] = {}
         self._load_closed = False
         self._load_finished = False
         self._accept_pending = False
@@ -14237,11 +14770,11 @@ class TagDialog(QDialog):
         expected_storage_identity: CatalogStorageIdentity,
         rel_path: str,
         cancel_event: Event,
-    ) -> tuple[list[str], list[str], bool, object | None]:
+    ) -> tuple[list[str], list[str], dict[str, int], bool, object | None]:
         """Read a bounded tag editor snapshot without using the UI connection."""
 
         if cancel_event.is_set():
-            return [], [], False, None
+            return [], [], {}, False, None
         with Catalog.open_reader(
             root,
             expected_root_identity=expected_root_identity,
@@ -14249,11 +14782,18 @@ class TagDialog(QDialog):
         ) as reader:
             image_identity = reader.file_identity(rel_path)
             rows = reader._conn.execute(  # noqa: SLF001 - bounded read-only dialog query
-                "SELECT name FROM tags ORDER BY name COLLATE NOCASE ASC LIMIT ?",
+                """
+                SELECT tags.name, COUNT(image_tags.image_id) AS usage_count
+                FROM tags
+                LEFT JOIN image_tags ON image_tags.tag_id = tags.id
+                GROUP BY tags.id, tags.name
+                ORDER BY tags.name COLLATE NOCASE ASC
+                LIMIT ?
+                """,
                 (cls.MAX_VISIBLE_TAGS + 1,),
             ).fetchall()
             if cancel_event.is_set():
-                return [], [], False, None
+                return [], [], {}, False, None
             selected_rows = reader._conn.execute(  # noqa: SLF001 - bounded read-only dialog query
                 """
                 SELECT tags.name
@@ -14271,8 +14811,14 @@ class TagDialog(QDialog):
                 raise OSError(f"image changed while tags were loading: {rel_path}")
         tags = [str(row["name"]) for row in rows[: cls.MAX_VISIBLE_TAGS]]
         selected = [str(row["name"]) for row in selected_rows[: cls.MAX_VISIBLE_TAGS]]
+        usage_counts = {
+            normalize_tag(str(row["name"])): int(row["usage_count"])
+            for row in rows[: cls.MAX_VISIBLE_TAGS]
+        }
+        for name in selected:
+            usage_counts.setdefault(normalize_tag(name), 1)
         selected_overflow = len(selected_rows) > cls.MAX_VISIBLE_TAGS
-        return tags, selected, selected_overflow, image_identity
+        return tags, selected, usage_counts, selected_overflow, image_identity
 
     def _settle_tag_state(self) -> None:
         if not self._load_future.done():
@@ -14281,7 +14827,13 @@ class TagDialog(QDialog):
         if self._load_closed or self._load_future.cancelled():
             return
         try:
-            tags, selected, selected_overflow, image_identity = self._load_future.result()
+            (
+                tags,
+                selected,
+                usage_counts,
+                selected_overflow,
+                image_identity,
+            ) = self._load_future.result()
         except Exception as error:
             self.loading_label.setText(f"Unable to load tags: {error}")
             self._accept_pending = False
@@ -14291,6 +14843,7 @@ class TagDialog(QDialog):
             self._accept_pending = False
             return
         self.loaded_file_identity = image_identity
+        self._tag_usage_counts = usage_counts
         selected_by_key = {normalize_tag(name): name for name in selected}
         visible_by_key = {normalize_tag(name): name for name in tags}
         # Always show selected tags first. This preserves a selection even when
@@ -14312,6 +14865,10 @@ class TagDialog(QDialog):
             checkbox.setStyleSheet("background: transparent; color: #202124;")
             checkbox.setChecked(normalize_tag(tag) in selected_by_key)
             checkbox.installEventFilter(self)
+            checkbox.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            checkbox.customContextMenuRequested.connect(
+                partial(self._open_tag_context_menu, checkbox)
+            )
             self.checkboxes.append(checkbox)
             self.tag_layout.addWidget(checkbox)
         if len(visible_by_key) >= self.MAX_VISIBLE_TAGS:
@@ -14344,6 +14901,59 @@ class TagDialog(QDialog):
         for checkbox in self.checkboxes:
             checkbox.setHidden(
                 bool(prefix) and not checkbox.text().casefold().startswith(prefix)
+            )
+
+    @staticmethod
+    def _tag_context_menu_actions(menu: QMenu) -> dict[str, QAction]:
+        return {"delete": menu.addAction("Delete")}
+
+    def _open_tag_context_menu(self, checkbox: QCheckBox, pos: QPoint) -> None:
+        if checkbox not in self.checkboxes:
+            return
+        menu = QMenu(self)
+        actions = self._tag_context_menu_actions(menu)
+        selected = menu.exec(checkbox.mapToGlobal(pos))
+        menu.deleteLater()
+        if selected == actions["delete"]:
+            self._request_tag_deletion(checkbox)
+
+    def _request_tag_deletion(self, checkbox: QCheckBox) -> None:
+        if checkbox not in self.checkboxes or self._delete_tag_callback is None:
+            return
+        name = checkbox.text()
+        key = normalize_tag(name)
+        if self._tag_usage_counts.get(key, 0) > 0 and not ask_remove_tag_from_all_files(
+            self
+        ):
+            return
+        mutation = self._delete_tag_callback(name)
+        if mutation is None:
+            return
+        self._remove_deleted_tag(checkbox)
+
+    def _remove_deleted_tag(self, checkbox: QCheckBox) -> None:
+        name = checkbox.text()
+        key = normalize_tag(name)
+        self.checkboxes.remove(checkbox)
+        self.tag_layout.removeWidget(checkbox)
+        checkbox.hide()
+        checkbox.deleteLater()
+        self._tag_usage_counts.pop(key, None)
+        self._hidden_selected_tags = [
+            selected_name
+            for selected_name in self._hidden_selected_tags
+            if normalize_tag(selected_name) != key
+        ]
+        self._recent_tags = tuple(
+            recent_name
+            for recent_name in self._recent_tags
+            if normalize_tag(recent_name) != key
+        )
+        if self._repeat_tags is not None:
+            self._repeat_tags = tuple(
+                repeated_name
+                for repeated_name in self._repeat_tags
+                if normalize_tag(repeated_name) != key
             )
 
     def _tab_completion(self) -> None:
@@ -15005,6 +15615,991 @@ class PreferencesDialog(QDialog):
             if catalog.root == root:
                 return catalog
         return self.catalogs[0]
+
+
+class VirtualDirectoryConditionWidget(QFrame):
+    changed = Signal()
+
+    def __init__(
+        self,
+        directory_model: QStringListModel,
+        tag_model: QStringListModel,
+        remove_callback: Callable[[QWidget], None],
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.directory_model = directory_model
+        self.tag_model = tag_model
+        self._remove_callback = remove_callback
+        self.setFrameShape(QFrame.Shape.StyledPanel)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(6, 4, 6, 4)
+
+        self.not_checkbox = QCheckBox("NOT")
+        self.not_checkbox.setToolTip("Negate this condition")
+        layout.addWidget(self.not_checkbox)
+        self.kind_combo = QComboBox()
+        self.kind_combo.addItem("Directory", "directory")
+        self.kind_combo.addItem("Filename regex", "regex")
+        self.kind_combo.addItem("Tag", "tag")
+        self.kind_combo.addItem("Exactly one of two tags (XOR)", "tag_xor")
+        layout.addWidget(self.kind_combo)
+
+        self.value_stack = QStackedWidget()
+        self.directory_combo = self._choice_combo(directory_model)
+        self.value_stack.addWidget(self.directory_combo)
+        self.regex_entry = QLineEdit()
+        self.regex_entry.setPlaceholderText("Regular expression matched against file names")
+        self.value_stack.addWidget(self.regex_entry)
+        self.tag_combo = self._choice_combo(tag_model)
+        self.value_stack.addWidget(self.tag_combo)
+        xor_widget = QWidget()
+        xor_layout = QHBoxLayout(xor_widget)
+        xor_layout.setContentsMargins(0, 0, 0, 0)
+        self.xor_first_combo = self._choice_combo(tag_model)
+        self.xor_second_combo = self._choice_combo(tag_model)
+        xor_layout.addWidget(self.xor_first_combo)
+        xor_layout.addWidget(QLabel("XOR"))
+        xor_layout.addWidget(self.xor_second_combo)
+        self.value_stack.addWidget(xor_widget)
+        layout.addWidget(self.value_stack, 1)
+
+        self.remove_button = QPushButton("Remove")
+        self.remove_button.clicked.connect(lambda: self._remove_callback(self))
+        layout.addWidget(self.remove_button)
+
+        self.kind_combo.currentIndexChanged.connect(self._kind_changed)
+        self.not_checkbox.toggled.connect(lambda _checked: self.changed.emit())
+        self.regex_entry.textChanged.connect(lambda _text: self.changed.emit())
+        for combo in (
+            self.directory_combo,
+            self.tag_combo,
+            self.xor_first_combo,
+            self.xor_second_combo,
+        ):
+            combo.currentTextChanged.connect(lambda _text: self.changed.emit())
+        self._kind_changed(self.kind_combo.currentIndex())
+
+    @staticmethod
+    def _choice_combo(model: QStringListModel) -> QComboBox:
+        combo = QComboBox()
+        combo.setEditable(True)
+        combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        combo.setModel(model)
+        combo.setCurrentIndex(-1)
+        return combo
+
+    def _kind_changed(self, index: int) -> None:
+        self.value_stack.setCurrentIndex(max(0, index))
+        self.changed.emit()
+
+    @staticmethod
+    def _tag_rule(name: str) -> VirtualDirectoryRule:
+        return VirtualDirectoryRule(
+            "tag",
+            value=name,
+            display_value=name,
+        )
+
+    def rule(self) -> VirtualDirectoryRule:
+        kind = str(self.kind_combo.currentData())
+        if kind == "directory":
+            value = self.directory_combo.currentText().strip()
+            condition = VirtualDirectoryRule(
+                "directory",
+                value="" if value == "." else (value or "."),
+            )
+        elif kind == "regex":
+            condition = VirtualDirectoryRule(
+                "regex",
+                value=self.regex_entry.text(),
+            )
+        elif kind == "tag":
+            condition = self._tag_rule(self.tag_combo.currentText())
+        else:
+            condition = VirtualDirectoryRule(
+                "tag_xor",
+                children=(
+                    self._tag_rule(self.xor_first_combo.currentText()),
+                    self._tag_rule(self.xor_second_combo.currentText()),
+                ),
+            )
+        if self.not_checkbox.isChecked():
+            return VirtualDirectoryRule("not", children=(condition,))
+        return condition
+
+    def set_rule(self, rule: VirtualDirectoryRule) -> None:
+        negated = rule.kind == "not" and len(rule.children) == 1
+        condition = rule.children[0] if negated else rule
+        self.not_checkbox.setChecked(negated)
+        index = self.kind_combo.findData(condition.kind)
+        if index < 0:
+            return
+        self.kind_combo.setCurrentIndex(index)
+        if condition.kind == "directory":
+            self.directory_combo.setEditText(condition.value or ".")
+        elif condition.kind == "regex":
+            self.regex_entry.setText(condition.value)
+        elif condition.kind == "tag":
+            self.tag_combo.setEditText(
+                condition.display_value or condition.value
+            )
+        elif condition.kind == "tag_xor" and len(condition.children) == 2:
+            self.xor_first_combo.setEditText(
+                condition.children[0].display_value
+                or condition.children[0].value
+            )
+            self.xor_second_combo.setEditText(
+                condition.children[1].display_value
+                or condition.children[1].value
+            )
+
+
+class VirtualDirectoryRuleGroupWidget(QFrame):
+    changed = Signal()
+
+    def __init__(
+        self,
+        directory_model: QStringListModel,
+        tag_model: QStringListModel,
+        *,
+        remove_callback: Callable[[QWidget], None] | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.directory_model = directory_model
+        self.tag_model = tag_model
+        self._remove_callback = remove_callback
+        self.children: list[
+            VirtualDirectoryConditionWidget | VirtualDirectoryRuleGroupWidget
+        ] = []
+        self.setFrameShape(QFrame.Shape.StyledPanel)
+        self.setStyleSheet(
+            "VirtualDirectoryRuleGroupWidget { background: #eef2f7; }"
+        )
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 6, 8, 6)
+        header = QHBoxLayout()
+        header.addWidget(QLabel("Match"))
+        self.operator_combo = QComboBox()
+        self.operator_combo.addItem("ALL rules (AND)", "all")
+        self.operator_combo.addItem("ANY rule (OR)", "any")
+        self.operator_combo.addItem("the opposite of one rule (NOT)", "not")
+        header.addWidget(self.operator_combo)
+        header.addStretch(1)
+        if remove_callback is not None:
+            remove_button = QPushButton("Remove group")
+            remove_button.clicked.connect(lambda: remove_callback(self))
+            header.addWidget(remove_button)
+        layout.addLayout(header)
+
+        self.child_layout = QVBoxLayout()
+        self.child_layout.setContentsMargins(16, 0, 0, 0)
+        layout.addLayout(self.child_layout)
+        buttons = QHBoxLayout()
+        self.add_condition_button = QPushButton("+ Condition")
+        self.add_group_button = QPushButton("+ Group")
+        self.add_condition_button.clicked.connect(self.add_condition)
+        self.add_group_button.clicked.connect(self.add_group)
+        buttons.addWidget(self.add_condition_button)
+        buttons.addWidget(self.add_group_button)
+        buttons.addStretch(1)
+        layout.addLayout(buttons)
+        self.operator_combo.currentIndexChanged.connect(self._operator_changed)
+        self._operator_changed()
+
+    def _operator_changed(self, _index: int = -1) -> None:
+        is_not = self.operator() == "not"
+        can_add = not is_not or not self.children
+        self.add_condition_button.setEnabled(can_add)
+        self.add_group_button.setEnabled(can_add)
+        self.changed.emit()
+
+    def operator(self) -> str:
+        return str(self.operator_combo.currentData())
+
+    def add_condition(
+        self,
+        rule: VirtualDirectoryRule | None = None,
+    ) -> VirtualDirectoryConditionWidget:
+        child = VirtualDirectoryConditionWidget(
+            self.directory_model,
+            self.tag_model,
+            self._remove_child,
+            self,
+        )
+        child.changed.connect(self.changed.emit)
+        self.children.append(child)
+        self.child_layout.addWidget(child)
+        if rule is not None:
+            child.set_rule(rule)
+        self._operator_changed()
+        return child
+
+    def add_group(
+        self,
+        rule: VirtualDirectoryRule | None = None,
+    ) -> "VirtualDirectoryRuleGroupWidget":
+        child = VirtualDirectoryRuleGroupWidget(
+            self.directory_model,
+            self.tag_model,
+            remove_callback=self._remove_child,
+            parent=self,
+        )
+        child.changed.connect(self.changed.emit)
+        self.children.append(child)
+        self.child_layout.addWidget(child)
+        if rule is not None:
+            child.set_rule(rule)
+        self._operator_changed()
+        return child
+
+    def _remove_child(self, child: QWidget) -> None:
+        if child not in self.children:
+            return
+        self.children.remove(child)  # type: ignore[arg-type]
+        self.child_layout.removeWidget(child)
+        child.hide()
+        child.deleteLater()
+        self._operator_changed()
+
+    def clear_rules(self) -> None:
+        for child in list(self.children):
+            self._remove_child(child)
+
+    def rule(self) -> VirtualDirectoryRule:
+        return VirtualDirectoryRule(
+            self.operator(),
+            children=tuple(child.rule() for child in self.children),
+        )
+
+    def set_rule(self, rule: VirtualDirectoryRule) -> None:
+        self.clear_rules()
+        index = self.operator_combo.findData(rule.kind)
+        if index >= 0:
+            self.operator_combo.setCurrentIndex(index)
+        for child_rule in rule.children:
+            if child_rule.kind in {"all", "any"} or (
+                child_rule.kind == "not"
+                and len(child_rule.children) == 1
+                and child_rule.children[0].kind in {"all", "any", "not"}
+            ):
+                self.add_group(child_rule)
+            else:
+                self.add_condition(child_rule)
+        self._operator_changed()
+
+
+class NewVirtualDirectoryDialog(QDialog):
+    RENDER_BATCH_SIZE = 256
+
+    def __init__(self, catalog: Catalog, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.catalog = catalog
+        self._closed = False
+        self._loaded = False
+        self._rendering = False
+        self._cancel_event = Event()
+        self._read_executor: SharedExecutorLease | None = shared_dialog_executor()
+        self._read_future: Future[
+            tuple[list[str], list[str], set[str]]
+        ] | None = self._read_executor.submit(
+            self._load_catalog_choices,
+            catalog.root,
+            catalog.root_identity,
+            catalog.storage_identity,
+            self._cancel_event,
+        )
+        self._pending_directories: list[str] = []
+        self._pending_tags: list[str] = []
+        self._directory_render_index = 0
+        self._tag_render_index = 0
+        self._directory_items: dict[str, QTreeWidgetItem] = {}
+        self._selected_directory_rels: set[str] = set()
+        self._selected_tag_names: dict[str, str] = {}
+        self._existing_names: set[str] = set()
+        self._available_directory_rels: set[str] = set()
+        self._available_tag_keys: set[str] = set()
+        self._advanced_initialized = False
+        self._advanced_mode_notice: str | None = None
+        self._directory_choice_model = QStringListModel([])
+        self._tag_choice_model = QStringListModel([])
+        self._preview_generation = 0
+        self._preview_expression: VirtualDirectoryRule | None = None
+        self._preview_cancel_event: Event | None = None
+        self._preview_executor: SharedExecutorLease | None = None
+        self._preview_future: Future[tuple[int, int]] | None = None
+
+        self.setWindowTitle("New Virtual Directory")
+        self.setWindowIcon(load_app_icon())
+        self.setStyleSheet(DIALOG_STYLESHEET)
+        layout = QVBoxLayout(self)
+
+        fields = QFormLayout()
+        self.name_entry = QLineEdit()
+        self.name_entry.setPlaceholderText("Virtual directory name")
+        fields.addRow("Name:", self.name_entry)
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItem("Simple", "simple")
+        self.mode_combo.addItem("Advanced", "advanced")
+        self.mode_combo.setEnabled(False)
+        fields.addRow("Creation mode:", self.mode_combo)
+        layout.addLayout(fields)
+
+        self.status_label = QLabel("Loading catalog directories and tags…")
+        layout.addWidget(self.status_label)
+
+        self.content_stack = QStackedWidget()
+        simple_panel = QWidget()
+        simple_layout = QVBoxLayout(simple_panel)
+        simple_fields = QFormLayout()
+        self.regex_entry = QLineEdit()
+        self.regex_entry.setPlaceholderText("Optional file name regular expression")
+        simple_fields.addRow("File name regex:", self.regex_entry)
+        simple_layout.addLayout(simple_fields)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        directory_group = QGroupBox("Catalog directories")
+        directory_layout = QVBoxLayout(directory_group)
+        self.directory_tree = QTreeWidget()
+        self.directory_tree.setHeaderHidden(True)
+        self.directory_tree.setEnabled(False)
+        directory_layout.addWidget(self.directory_tree)
+        splitter.addWidget(directory_group)
+
+        tag_group = QGroupBox("Tags")
+        tag_layout = QVBoxLayout(tag_group)
+        self.tag_list = CheckableListWidget()
+        self.tag_list.setEnabled(False)
+        tag_layout.addWidget(self.tag_list)
+        splitter.addWidget(tag_group)
+        splitter.setSizes([430, 270])
+        simple_layout.addWidget(splitter, 1)
+        self.content_stack.addWidget(simple_panel)
+
+        advanced_panel = QWidget()
+        advanced_layout = QVBoxLayout(advanced_panel)
+        advanced_help = QLabel(
+            "Build nested groups with ALL (AND), ANY (OR), and NOT. "
+            "XOR conditions accept exactly two tags."
+        )
+        advanced_help.setWordWrap(True)
+        advanced_layout.addWidget(advanced_help)
+        advanced_scroll = QScrollArea()
+        advanced_scroll.setWidgetResizable(True)
+        advanced_container = QWidget()
+        advanced_container_layout = QVBoxLayout(advanced_container)
+        self.advanced_root_group = VirtualDirectoryRuleGroupWidget(
+            self._directory_choice_model,
+            self._tag_choice_model,
+            parent=advanced_container,
+        )
+        advanced_container_layout.addWidget(self.advanced_root_group)
+        advanced_container_layout.addStretch(1)
+        advanced_scroll.setWidget(advanced_container)
+        advanced_layout.addWidget(advanced_scroll, 1)
+        self.advanced_validation_label = QLabel()
+        self.advanced_validation_label.setWordWrap(True)
+        advanced_layout.addWidget(self.advanced_validation_label)
+        self.content_stack.addWidget(advanced_panel)
+        layout.addWidget(self.content_stack, 1)
+        self.match_count_label = QLabel()
+        layout.addWidget(self.match_count_label)
+
+        self.buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        self.create_button = self.buttons.button(
+            QDialogButtonBox.StandardButton.Ok
+        )
+        self.create_button.setText("Create")
+        self.create_button.setDefault(True)
+        self.create_button.setEnabled(False)
+        self.buttons.accepted.connect(self._accept_if_valid)
+        self.buttons.rejected.connect(self.reject)
+        layout.addWidget(self.buttons)
+
+        self.name_entry.textChanged.connect(self._validate)
+        self.regex_entry.textChanged.connect(self._validate)
+        self.mode_combo.currentIndexChanged.connect(self._mode_changed)
+        self.advanced_root_group.changed.connect(self._advanced_rule_changed)
+        self.directory_tree.itemChanged.connect(self._directory_check_changed)
+        self.tag_list.itemChanged.connect(self._tag_check_changed)
+        self._load_timer = QTimer(self)
+        self._load_timer.setInterval(25)
+        self._load_timer.timeout.connect(self._poll_load)
+        self._load_timer.start()
+        self._preview_due_timer = QTimer(self)
+        self._preview_due_timer.setSingleShot(True)
+        self._preview_due_timer.setInterval(250)
+        self._preview_due_timer.timeout.connect(self._start_preview)
+        self._preview_poll_timer = QTimer(self)
+        self._preview_poll_timer.setInterval(25)
+        self._preview_poll_timer.timeout.connect(self._settle_preview)
+        self.resize(780, 570)
+
+    @staticmethod
+    def _load_catalog_choices(
+        root: Path,
+        expected_root_identity: tuple[int, int],
+        expected_storage_identity: CatalogStorageIdentity,
+        cancel_event: Event,
+    ) -> tuple[list[str], list[str], set[str]]:
+        if cancel_event.is_set():
+            return [], [], set()
+        with Catalog.open_reader(
+            root,
+            expected_root_identity=expected_root_identity,
+            expected_storage_identity=expected_storage_identity,
+        ) as reader:
+            reader._conn.execute("BEGIN")  # noqa: SLF001 - one dialog snapshot
+            try:
+                directories = reader.list_known_directories()
+                tags = reader.list_tags()
+                existing_names = {
+                    definition.name.casefold()
+                    for definition in reader.list_custom_virtual_directories()
+                }
+            finally:
+                with suppress(sqlite3.Error):
+                    reader._conn.execute("ROLLBACK")  # noqa: SLF001
+            reader._assert_catalog_storage_identity()  # noqa: SLF001
+        if cancel_event.is_set():
+            return [], [], set()
+        return directories, tags, existing_names
+
+    def _poll_load(self) -> None:
+        if self._closed:
+            return
+        future = self._read_future
+        if future is not None:
+            if not future.done():
+                return
+            self._read_future = None
+            if future.cancelled():
+                return
+            try:
+                directories, tags, existing_names = future.result()
+            except Exception as error:
+                self.status_label.setText(f"Unable to load catalog choices: {error}")
+                self._release_read_executor()
+                self._load_timer.stop()
+                return
+            self._release_read_executor()
+            self._pending_directories = sorted(
+                {"", *directories},
+                key=lambda value: (value.casefold(), value),
+            )
+            self._pending_tags = tags
+            self._existing_names = existing_names
+            self._available_directory_rels = {"", *directories}
+            self._available_tag_keys = {normalize_tag(name) for name in tags}
+            self._directory_choice_model.setStringList(
+                [
+                    ".",
+                    *(
+                        dir_rel
+                        for dir_rel in self._pending_directories
+                        if dir_rel
+                    ),
+                ]
+            )
+            self._tag_choice_model.setStringList(tags)
+            self._begin_render()
+        self._render_batch()
+
+    def _begin_render(self) -> None:
+        self._rendering = True
+        self.directory_tree.clear()
+        self.tag_list.clear()
+        root_label = self.catalog.root.name or str(self.catalog.root)
+        root_item = self._new_directory_item(root_label, "")
+        self.directory_tree.addTopLevelItem(root_item)
+        self._directory_items = {"": root_item}
+        self._directory_render_index = 0
+        while (
+            self._directory_render_index < len(self._pending_directories)
+            and not self._pending_directories[self._directory_render_index]
+        ):
+            self._directory_render_index += 1
+        self._tag_render_index = 0
+
+    @staticmethod
+    def _checkable_item_flags(flags: Qt.ItemFlag) -> Qt.ItemFlag:
+        return flags | Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled
+
+    def _new_directory_item(self, label: str, dir_rel: str) -> QTreeWidgetItem:
+        item = QTreeWidgetItem([label])
+        item.setData(0, DIR_REL_ROLE, dir_rel)
+        item.setFlags(self._checkable_item_flags(item.flags()))
+        item.setCheckState(0, Qt.CheckState.Unchecked)
+        item.setToolTip(0, str(self.catalog.root / dir_rel) if dir_rel else str(self.catalog.root))
+        return item
+
+    def _render_batch(self) -> None:
+        if not self._rendering:
+            return
+        directory_end = min(
+            len(self._pending_directories),
+            self._directory_render_index + self.RENDER_BATCH_SIZE,
+        )
+        while self._directory_render_index < directory_end:
+            dir_rel = self._pending_directories[self._directory_render_index]
+            self._directory_render_index += 1
+            if not dir_rel or dir_rel in self._directory_items:
+                continue
+            parent_rel, _, label = dir_rel.rpartition("/")
+            parent_item = self._directory_items.get(parent_rel)
+            if parent_item is None:
+                continue
+            item = self._new_directory_item(label, dir_rel)
+            parent_item.addChild(item)
+            self._directory_items[dir_rel] = item
+
+        tag_end = min(
+            len(self._pending_tags),
+            self._tag_render_index + self.RENDER_BATCH_SIZE,
+        )
+        while self._tag_render_index < tag_end:
+            name = self._pending_tags[self._tag_render_index]
+            self._tag_render_index += 1
+            item = QListWidgetItem(name)
+            item.setData(Qt.ItemDataRole.UserRole, name)
+            item.setFlags(self._checkable_item_flags(item.flags()))
+            item.setCheckState(Qt.CheckState.Unchecked)
+            self.tag_list.addItem(item)
+
+        if (
+            self._directory_render_index < len(self._pending_directories)
+            or self._tag_render_index < len(self._pending_tags)
+        ):
+            rendered = self._directory_render_index + self._tag_render_index
+            total = len(self._pending_directories) + len(self._pending_tags)
+            self.status_label.setText(f"Loading catalog choices… {rendered:,}/{total:,}")
+            return
+        self._rendering = False
+        self._loaded = True
+        self._load_timer.stop()
+        self.status_label.hide()
+        self.directory_tree.setEnabled(True)
+        self.tag_list.setEnabled(True)
+        self.mode_combo.setEnabled(True)
+        root_item = self._directory_items.get("")
+        if root_item is not None:
+            root_item.setExpanded(True)
+        self._validate()
+
+    def _directory_check_changed(
+        self,
+        item: QTreeWidgetItem,
+        _column: int,
+    ) -> None:
+        if not self._loaded:
+            return
+        dir_rel = str(item.data(0, DIR_REL_ROLE) or "")
+        if item.checkState(0) == Qt.CheckState.Checked:
+            self._selected_directory_rels.add(dir_rel)
+        else:
+            self._selected_directory_rels.discard(dir_rel)
+        self._validate()
+
+    def _tag_check_changed(self, item: QListWidgetItem) -> None:
+        if not self._loaded:
+            return
+        name = str(item.data(Qt.ItemDataRole.UserRole) or item.text())
+        key = normalize_tag(name)
+        if item.checkState() == Qt.CheckState.Checked:
+            self._selected_tag_names[key] = name
+        else:
+            self._selected_tag_names.pop(key, None)
+        self._validate()
+
+    def _simple_expression(self) -> VirtualDirectoryRule:
+        directory_rules = tuple(
+            VirtualDirectoryRule("directory", value=dir_rel)
+            for dir_rel in self.selected_directories()
+        )
+        rules: list[VirtualDirectoryRule] = []
+        if directory_rules:
+            rules.append(
+                directory_rules[0]
+                if len(directory_rules) == 1
+                else VirtualDirectoryRule("any", children=directory_rules)
+            )
+        if self.regex_entry.text():
+            rules.append(
+                VirtualDirectoryRule("regex", value=self.regex_entry.text())
+            )
+        rules.extend(
+            VirtualDirectoryRule(
+                "tag",
+                value=name,
+                display_value=name,
+            )
+            for name in self.selected_tags()
+        )
+        return VirtualDirectoryRule("all", children=tuple(rules))
+
+    def _mode_changed(self, _index: int = -1) -> None:
+        advanced = self.advanced_mode()
+        if advanced and self._loaded and not self._advanced_initialized:
+            self._advanced_initialized = True
+            self.advanced_root_group.set_rule(self._simple_expression())
+        elif not advanced and self._loaded and self._advanced_initialized:
+            try:
+                expression = self.advanced_expression()
+            except ValueError:
+                self._restore_advanced_mode()
+                self._validate()
+                return
+            simple_values = self._simple_values_for_expression(expression)
+            if simple_values is None:
+                self._advanced_mode_notice = (
+                    "This expression cannot be represented in Simple mode without "
+                    "changing its meaning. Simplify the rule tree first."
+                )
+                self._restore_advanced_mode()
+                self._validate()
+                return
+            self._apply_simple_values(*simple_values)
+        self._advanced_mode_notice = None
+        self.content_stack.setCurrentIndex(1 if advanced else 0)
+        self._validate()
+
+    def _restore_advanced_mode(self) -> None:
+        previous = self.mode_combo.blockSignals(True)
+        try:
+            self.mode_combo.setCurrentIndex(
+                self.mode_combo.findData("advanced")
+            )
+        finally:
+            self.mode_combo.blockSignals(previous)
+        self.content_stack.setCurrentIndex(1)
+
+    @staticmethod
+    def _simple_values_for_expression(
+        expression: VirtualDirectoryRule,
+    ) -> tuple[tuple[str, ...], str, tuple[str, ...]] | None:
+        if expression.kind != "all":
+            return None
+        directories: list[str] = []
+        pattern: str | None = None
+        tags: list[str] = []
+        for rule in expression.children:
+            if rule.kind == "directory" and not directories:
+                directories.append(rule.value)
+            elif (
+                rule.kind == "any"
+                and not directories
+                and rule.children
+                and all(child.kind == "directory" for child in rule.children)
+            ):
+                directories.extend(child.value for child in rule.children)
+            elif rule.kind == "regex" and pattern is None:
+                pattern = rule.value
+            elif rule.kind == "tag":
+                tags.append(rule.display_value or rule.value)
+            else:
+                return None
+        if not directories:
+            return None
+        return tuple(directories), pattern or "", tuple(tags)
+
+    def _apply_simple_values(
+        self,
+        directories: tuple[str, ...],
+        pattern: str,
+        tags: tuple[str, ...],
+    ) -> None:
+        selected_directories = set(directories)
+        previous = self.directory_tree.blockSignals(True)
+        try:
+            for dir_rel, item in self._directory_items.items():
+                item.setCheckState(
+                    0,
+                    Qt.CheckState.Checked
+                    if dir_rel in selected_directories
+                    else Qt.CheckState.Unchecked,
+                )
+        finally:
+            self.directory_tree.blockSignals(previous)
+        self._selected_directory_rels = selected_directories
+
+        selected_tag_keys = {normalize_tag(name) for name in tags}
+        selected_tag_names: dict[str, str] = {}
+        previous = self.tag_list.blockSignals(True)
+        try:
+            for index in range(self.tag_list.count()):
+                item = self.tag_list.item(index)
+                name = str(item.data(Qt.ItemDataRole.UserRole) or item.text())
+                key = normalize_tag(name)
+                selected = key in selected_tag_keys
+                item.setCheckState(
+                    Qt.CheckState.Checked
+                    if selected
+                    else Qt.CheckState.Unchecked
+                )
+                if selected:
+                    selected_tag_names[key] = name
+        finally:
+            self.tag_list.blockSignals(previous)
+        self._selected_tag_names = selected_tag_names
+
+        previous = self.regex_entry.blockSignals(True)
+        try:
+            self.regex_entry.setText(pattern)
+        finally:
+            self.regex_entry.blockSignals(previous)
+
+    def _advanced_rule_changed(self) -> None:
+        self._advanced_mode_notice = None
+        self._validate()
+
+    def advanced_mode(self) -> bool:
+        return self.mode_combo.currentData() == "advanced"
+
+    def advanced_expression(self) -> VirtualDirectoryRule:
+        return self.catalog.validate_virtual_directory_rule(
+            self.advanced_root_group.rule()
+        )
+
+    def _advanced_expression_error(self) -> str | None:
+        try:
+            expression = self.advanced_expression()
+        except ValueError as error:
+            return str(error)
+
+        def check_choices(rule: VirtualDirectoryRule) -> str | None:
+            if (
+                rule.kind == "directory"
+                and rule.value not in self._available_directory_rels
+            ):
+                return f'Directory "{rule.value or "."}" is not in this catalog.'
+            if rule.kind == "tag" and rule.value not in self._available_tag_keys:
+                return f'Tag "{rule.display_value or rule.value}" is not in this catalog.'
+            for child in rule.children:
+                error = check_choices(child)
+                if error is not None:
+                    return error
+            return None
+
+        return check_choices(expression)
+
+    def _validate(self, _value: object = None) -> None:
+        clean_name = " ".join(self.name_entry.text().strip().split())
+        name_valid = bool(clean_name) and clean_name.casefold() not in self._existing_names
+        self.name_entry.setStyleSheet(
+            "QLineEdit { color: #c62828; }"
+            if self.name_entry.text() and not name_valid
+            else ""
+        )
+        pattern = self.regex_entry.text()
+        try:
+            if pattern:
+                re.compile(pattern)
+        except re.error as error:
+            regex_valid = False
+            self.regex_entry.setToolTip(str(error))
+        else:
+            regex_valid = True
+            self.regex_entry.setToolTip("")
+        self.regex_entry.setStyleSheet(
+            "QLineEdit { color: #c62828; }" if not regex_valid else ""
+        )
+        advanced_error = (
+            self._advanced_expression_error()
+            if self._loaded and self.advanced_mode()
+            else None
+        )
+        self.advanced_validation_label.setText(
+            advanced_error or self._advanced_mode_notice or ""
+        )
+        self.advanced_validation_label.setStyleSheet(
+            "color: #c62828;" if advanced_error else ""
+        )
+        simple_valid = regex_valid and bool(self._selected_directory_rels)
+        expression_valid = advanced_error is None
+        self.create_button.setEnabled(
+            self._loaded
+            and name_valid
+            and (expression_valid if self.advanced_mode() else simple_valid)
+        )
+        criteria_valid = self._loaded and (
+            expression_valid if self.advanced_mode() else simple_valid
+        )
+        if criteria_valid:
+            try:
+                preview_expression = (
+                    self.advanced_expression()
+                    if self.advanced_mode()
+                    else self.catalog.validate_virtual_directory_rule(
+                        self._simple_expression()
+                    )
+                )
+            except ValueError:
+                self._cancel_preview(clear=True)
+            else:
+                self._schedule_preview(preview_expression)
+        else:
+            self._cancel_preview(clear=True)
+
+    def _schedule_preview(self, expression: VirtualDirectoryRule) -> None:
+        if self._preview_expression == expression:
+            return
+        self._cancel_preview(clear=False)
+        self._preview_expression = expression
+        self.match_count_label.setText("Counting matching files…")
+        self._preview_due_timer.start()
+
+    def _cancel_preview(self, *, clear: bool) -> None:
+        self._preview_generation += 1
+        self._preview_due_timer.stop()
+        self._preview_poll_timer.stop()
+        if self._preview_cancel_event is not None:
+            self._preview_cancel_event.set()
+            self._preview_cancel_event = None
+        if self._preview_future is not None:
+            self._preview_future.cancel()
+            self._preview_future = None
+        if self._preview_executor is not None:
+            self._preview_executor.shutdown(wait=False, cancel_futures=True)
+            self._preview_executor = None
+        if clear:
+            self._preview_expression = None
+            self.match_count_label.clear()
+
+    @staticmethod
+    def _preview_count_worker(
+        root: Path,
+        expected_root_identity: tuple[int, int],
+        expected_storage_identity: CatalogStorageIdentity,
+        expression: VirtualDirectoryRule,
+        generation: int,
+        cancel_event: Event,
+    ) -> tuple[int, int]:
+        def check_canceled() -> None:
+            if cancel_event.is_set():
+                raise IndexTaskCancelled()
+
+        check_canceled()
+        with Catalog.open_reader(
+            root,
+            expected_root_identity=expected_root_identity,
+            expected_storage_identity=expected_storage_identity,
+        ) as reader:
+            count = reader.virtual_directory_rule_image_count(
+                expression,
+                cancel_check=check_canceled,
+            )
+            reader._assert_catalog_storage_identity()  # noqa: SLF001
+        check_canceled()
+        return generation, count
+
+    def _start_preview(self) -> None:
+        expression = self._preview_expression
+        if self._closed or expression is None:
+            return
+        self._preview_generation += 1
+        generation = self._preview_generation
+        self._preview_cancel_event = Event()
+        self._preview_executor = shared_dialog_executor()
+        try:
+            self._preview_future = self._preview_executor.submit(
+                self._preview_count_worker,
+                self.catalog.root,
+                self.catalog.root_identity,
+                self.catalog.storage_identity,
+                expression,
+                generation,
+                self._preview_cancel_event,
+            )
+        except RuntimeError:
+            self._preview_executor.shutdown(wait=False, cancel_futures=True)
+            self._preview_executor = None
+            self.match_count_label.setText("Match count is temporarily unavailable")
+            return
+        self._preview_poll_timer.start()
+
+    def _settle_preview(self) -> None:
+        future = self._preview_future
+        if future is None or not future.done():
+            return
+        self._preview_future = None
+        self._preview_poll_timer.stop()
+        if self._preview_executor is not None:
+            self._preview_executor.shutdown(wait=False, cancel_futures=True)
+            self._preview_executor = None
+        self._preview_cancel_event = None
+        if self._closed or future.cancelled():
+            return
+        try:
+            generation, count = future.result()
+        except IndexTaskCancelled:
+            return
+        except Exception as error:
+            self.match_count_label.setText(f"Unable to count matching files: {error}")
+            return
+        if generation != self._preview_generation:
+            return
+        noun = "file" if count == 1 else "files"
+        self.match_count_label.setText(f"Matches {count:,} {noun}")
+
+    def _accept_if_valid(self) -> None:
+        if self.create_button.isEnabled():
+            self.accept()
+
+    def virtual_directory_name(self) -> str:
+        return " ".join(self.name_entry.text().strip().split())
+
+    def filename_regex(self) -> str:
+        return self.regex_entry.text()
+
+    def selected_directories(self) -> tuple[str, ...]:
+        if "" in self._selected_directory_rels:
+            return ("",)
+        selected = set(self._selected_directory_rels)
+        minimal: list[str] = []
+        for dir_rel in sorted(
+            selected,
+            key=lambda value: (value.count("/"), value.casefold(), value),
+        ):
+            parent = dir_rel.rpartition("/")[0]
+            while parent and parent not in selected:
+                parent = parent.rpartition("/")[0]
+            if not parent:
+                minimal.append(dir_rel)
+        return tuple(minimal)
+
+    def selected_tags(self) -> tuple[str, ...]:
+        return tuple(
+            sorted(self._selected_tag_names.values(), key=lambda value: value.casefold())
+        )
+
+    def _release_read_executor(self) -> None:
+        if self._read_executor is not None:
+            self._read_executor.shutdown(wait=False, cancel_futures=True)
+            self._read_executor = None
+
+    def _shutdown_reads(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._cancel_preview(clear=False)
+        self._load_timer.stop()
+        self._cancel_event.set()
+        if self._read_future is not None:
+            self._read_future.cancel()
+            self._read_future = None
+        self._release_read_executor()
+
+    def done(self, result: int) -> None:
+        self._shutdown_reads()
+        super().done(result)
+
+    def closeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        self._shutdown_reads()
+        super().closeEvent(event)
 
 
 class CatalogTagsDialog(QDialog):
@@ -19349,6 +20944,17 @@ class FullscreenViewer(QDialog):
                     if main_window is not None
                     else "Ctrl+R"
                 ),
+                delete_tag_callback=(
+                    (
+                        lambda name: main_window.queue_catalog_tag_deletion(
+                            self.catalog,
+                            name,
+                            owner=dialog,
+                        )
+                    )
+                    if main_window is not None
+                    else None
+                ),
             )
             return int(dialog.exec())
 
@@ -20211,6 +21817,43 @@ def ask_delete_files(parent: QWidget, count: int) -> bool:
     confirmed = box.clickedButton() == delete_button
     box.deleteLater()
     return confirmed
+
+
+def ask_remove_tag_from_all_files(parent: QWidget) -> bool:
+    box = QMessageBox(parent)
+    box.setWindowTitle("Delete Tag")
+    box.setWindowIcon(load_app_icon())
+    box.setIcon(QMessageBox.Icon.Warning)
+    box.setText("Remove this tag from all files?")
+    box.setStyleSheet(DIALOG_STYLESHEET)
+    box.setStandardButtons(
+        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+    )
+    box.setDefaultButton(QMessageBox.StandardButton.No)
+    box.setEscapeButton(QMessageBox.StandardButton.No)
+    style_message_box_buttons(box)
+    response = box.exec()
+    box.deleteLater()
+    return response == int(QMessageBox.StandardButton.Yes)
+
+
+def ask_delete_virtual_directory(parent: QWidget, name: str) -> bool:
+    box = QMessageBox(parent)
+    box.setWindowTitle("Delete Virtual Directory")
+    box.setWindowIcon(load_app_icon())
+    box.setIcon(QMessageBox.Icon.Warning)
+    box.setText(f'Delete the virtual directory "{name}"?')
+    box.setInformativeText("This will not delete any files.")
+    box.setStyleSheet(DIALOG_STYLESHEET)
+    box.setStandardButtons(
+        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+    )
+    box.setDefaultButton(QMessageBox.StandardButton.No)
+    box.setEscapeButton(QMessageBox.StandardButton.No)
+    style_message_box_buttons(box)
+    response = box.exec()
+    box.deleteLater()
+    return response == int(QMessageBox.StandardButton.Yes)
 
 
 def ask_automatically_delete_duplicates(parent: QWidget) -> bool:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from io import BytesIO
+from pathlib import Path
 
 from PIL import Image
 
@@ -14,6 +15,26 @@ def test_app_icon_is_packaged_png_resource() -> None:
     assert DESKTOP_FILE_ID == "marnwick"
     assert icon.startswith(b"\x89PNG\r\n\x1a\n")
     assert len(icon) > 0
+
+    image = Image.open(BytesIO(icon))
+    image.load()
+    assert image.mode == "RGBA"
+    alpha = image.getchannel("A")
+    assert alpha.getextrema() == (0, 255)
+    assert all(
+        alpha.getpixel(corner) == 0
+        for corner in (
+            (0, 0),
+            (image.width - 1, 0),
+            (0, image.height - 1),
+            (image.width - 1, image.height - 1),
+        )
+    )
+    assert alpha.getpixel((image.width // 2, image.height // 2)) == 255
+    assert sum(alpha.histogram()[1:255]) > 0
+
+    repository_icon = Path(__file__).parents[1] / "marnwick-icon.png"
+    assert repository_icon.read_bytes() == icon
 
 
 def test_folder_icon_is_packaged_png_resource() -> None:
