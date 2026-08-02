@@ -14573,6 +14573,81 @@ def test_paged_thumbnail_model_fetches_bounded_pages_and_stops_stale_mutation_cu
         catalog.close()
 
 
+def test_thumbnail_end_paging_continues_until_every_page_is_available(
+    tmp_path: Path,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    window = MainWindow()
+
+    def record(index: int) -> ImageRecord:
+        filename = f"image-{index:03d}.png"
+        return ImageRecord(
+            id=index + 1,
+            catalog_root=root,
+            rel_path=filename,
+            dir_rel="",
+            filename=filename,
+            size_bytes=1,
+            mtime_ns=index,
+            width=1,
+            height=1,
+            aspect_ratio=1.0,
+            thumb_width=1,
+            thumb_height=1,
+        )
+
+    records = [record(index) for index in range(11)]
+    requested_offsets: list[int] = []
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        window.current_catalog = catalog
+        window.current_dir_rel = ""
+
+        def request_page(offset: int) -> None:
+            requested_offsets.append(offset)
+            page = records[offset : offset + 2]
+            assert window.model.append_page(
+                page,
+                expected_offset=offset,
+                next_offset=offset + len(page),
+                has_more=offset + len(page) < len(records),
+                total_records=len(records),
+                total_images=len(records),
+            )
+            window._thumbnail_page_appended()
+
+        window.model.set_paged_images(
+            catalog,
+            records[:2],
+            total_records=len(records),
+            total_images=len(records),
+            next_offset=2,
+            has_more=True,
+            request_page=request_page,
+        )
+        window._thumbnail_follow_paged_end = True
+        window._continue_thumbnail_end_paging()
+
+        deadline = monotonic() + 2
+        while window.model.may_have_more_pages and monotonic() < deadline:
+            qt_app.processEvents()
+            sleep(0.001)
+
+        assert requested_offsets == [2, 4, 6, 8, 10]
+        assert len(window.model.images) == len(records)
+        assert window.model.rowCount() == len(records)
+        assert not window.model.may_have_more_pages
+        assert not window._thumbnail_follow_paged_end
+    finally:
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
 def test_main_go_to_file_keeps_request_across_thumbnail_page_load(
     tmp_path: Path,
 ) -> None:
@@ -15877,6 +15952,138 @@ def test_random_paged_viewer_crosses_page_boundary_without_repeats(tmp_path: Pat
         viewer._shutdown_async_load()
         viewer.deleteLater()
         catalog.close()
+        qt_app.processEvents()
+
+
+def test_paged_random_viewer_prefetches_one_complete_randomized_order(
+    tmp_path: Path,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    order = ["a.png", "b.png", "c.png"]
+    for index, filename in enumerate(order):
+        Image.new("RGB", (2, 2), (index, index, index)).save(root / filename)
+    catalog = Catalog(root)
+    calls: list[tuple[int, int]] = []
+
+    def load_page(offset: int, limit: int, _cancel_event: Event):
+        calls.append((offset, limit))
+        return ui_module.ViewerNavigationPage(
+            rel_paths=["c.png", "a.png", "b.png"],
+            next_offset=3,
+            has_more=False,
+            total_images=3,
+            randomized=True,
+            complete_order=True,
+        )
+
+    navigator = ui_module.PagedImageNavigator(
+        order=["a.png"],
+        index=0,
+        next_offset=0,
+        has_more=True,
+        total_count=3,
+        page_loader=load_page,
+        random_mode=True,
+        prefetch_all=True,
+    )
+    viewer = FullscreenViewer(catalog, navigator, display_order=["a.png"])
+    try:
+        deadline = monotonic() + 2
+        while (
+            (not calls or viewer._navigation_page_future is not None)
+            and monotonic() < deadline
+        ):
+            qt_app.processEvents()
+            viewer._settle_navigation_page()
+            sleep(0.001)
+
+        assert calls == [(0, ui_module.PANE_QUERY_PAGE_SIZE)]
+        assert navigator.order == ["a.png", "c.png", "b.png"]
+        assert viewer._display_order == ["a.png", "c.png", "b.png"]
+        assert navigator.total_count == 3
+        assert not navigator.has_more
+    finally:
+        viewer._shutdown_async_load()
+        viewer.deleteLater()
+        catalog.close()
+        qt_app.processEvents()
+
+
+def test_paged_random_open_uses_every_matching_path_not_loaded_prefix(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    filenames = [f"image-{index:02d}.png" for index in range(12)]
+    for index, filename in enumerate(filenames):
+        Image.new("RGB", (2, 2), (index, index, index)).save(root / filename)
+    window = MainWindow()
+    captured_orders: list[list[str]] = []
+
+    class FakeViewer:
+        def __init__(self, _catalog, navigator, _parent, **kwargs):  # type: ignore[no-untyped-def]
+            assert isinstance(navigator, ui_module.PagedImageNavigator)
+            assert navigator.random_mode
+            assert navigator.prefetch_all
+            assert navigator.order == [filenames[0]]
+            assert kwargs["display_order"] == [filenames[0]]
+            page = navigator.page_loader(0, ui_module.PANE_QUERY_PAGE_SIZE, Event())
+            assert page.randomized
+            assert page.complete_order
+            assert set(page.rel_paths) == set(filenames)
+            navigator.append_page(page)
+            captured_orders.append(list(navigator.order))
+            self.last_viewed_rel_path = navigator.current
+
+        def exec_fullscreen(self) -> None:
+            return None
+
+        def deleteLater(self) -> None:  # noqa: N802 - Qt-compatible fake
+            return None
+
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        catalog.refresh()
+        for filename in filenames:
+            catalog.set_image_tags(filename, ["Shuffle"], replace=True)
+        loaded = catalog.list_images_for_tag_page(
+            "Shuffle",
+            limit=2,
+            include_blobs=False,
+        )
+        window.current_catalog = catalog
+        window.current_virtual_kind = ui_module.VIRTUAL_KIND_TAG
+        window.current_virtual_value = "Shuffle"
+        window.model.set_paged_images(
+            catalog,
+            loaded,
+            total_records=len(filenames),
+            total_images=len(filenames),
+            next_offset=2,
+            has_more=True,
+            request_page=lambda _offset: None,
+        )
+        monkeypatch.setattr(
+            ui_module,
+            "shuffled_items",
+            lambda items: list(reversed(items)),
+        )
+        monkeypatch.setattr(ui_module, "FullscreenViewer", FakeViewer)
+
+        window.open_viewer(window.model.index(0, 0), random_mode=True)
+
+        assert len(captured_orders) == 1
+        assert len(captured_orders[0]) == len(filenames)
+        assert set(captured_orders[0]) == set(filenames)
+    finally:
+        window.close()
+        window.deleteLater()
         qt_app.processEvents()
 
 

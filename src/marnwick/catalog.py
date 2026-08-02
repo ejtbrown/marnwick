@@ -5692,6 +5692,105 @@ class Catalog:
             for row in rows:
                 yield row
 
+    def _slideshow_rel_paths_where(
+        self,
+        filter_sql: str,
+        params: Sequence[object],
+        cancel_check: CancelCallback | None,
+    ) -> list[str]:
+        """Materialize only paths for a whole-set slideshow permutation."""
+
+        if cancel_check is not None:
+            cancel_check()
+        with self._sqlite_cancel_progress(cancel_check):
+            rows = self._iter_cursor_rows(
+                self._conn.execute(
+                    f"""
+                    SELECT rel_path
+                    FROM images
+                    WHERE COALESCE(media_kind, 'image') != 'video'
+                        AND ({filter_sql})
+                    ORDER BY id
+                    """,
+                    tuple(params),
+                ),
+                cancel_check,
+            )
+            return [str(row["rel_path"]) for row in rows]
+
+    def list_slideshow_rel_paths(
+        self,
+        dir_rel: str = "",
+        *,
+        cancel_check: CancelCallback | None = None,
+    ) -> list[str]:
+        """Return all slideshow-eligible paths directly in one directory."""
+
+        return self._slideshow_rel_paths_where(
+            "dir_rel = ?",
+            (dir_rel,),
+            cancel_check,
+        )
+
+    def list_slideshow_rel_paths_for_tag(
+        self,
+        tag_name: str,
+        *,
+        cancel_check: CancelCallback | None = None,
+    ) -> list[str]:
+        """Return all slideshow-eligible paths assigned to one tag."""
+
+        return self._slideshow_rel_paths_where(
+            """
+            id IN (
+                SELECT image_tags.image_id
+                FROM image_tags
+                JOIN tags ON tags.id = image_tags.tag_id
+                WHERE tags.normalized = ?
+            )
+            """,
+            (normalize_tag(tag_name),),
+            cancel_check,
+        )
+
+    def list_exact_duplicate_slideshow_rel_paths(
+        self,
+        *,
+        cancel_check: CancelCallback | None = None,
+    ) -> list[str]:
+        """Return all slideshow-eligible, non-trash exact duplicates."""
+
+        trash_start, trash_end = descendant_range_bounds(TRASH_DIR_NAME)
+        return self._slideshow_rel_paths_where(
+            """
+            image_hash IS NOT NULL
+                AND length(image_hash) = ?
+                AND rel_path != ?
+                AND NOT (rel_path >= ? AND rel_path < ?)
+                AND image_hash IN (
+                    SELECT image_hash
+                    FROM images
+                    WHERE image_hash IS NOT NULL
+                        AND length(image_hash) = ?
+                        AND rel_path != ?
+                        AND NOT (rel_path >= ? AND rel_path < ?)
+                    GROUP BY image_hash
+                    HAVING COUNT(*) > 1
+                )
+            """,
+            (
+                EXACT_IMAGE_HASH_HEX_LENGTH,
+                TRASH_DIR_NAME,
+                trash_start,
+                trash_end,
+                EXACT_IMAGE_HASH_HEX_LENGTH,
+                TRASH_DIR_NAME,
+                trash_start,
+                trash_end,
+            ),
+            cancel_check,
+        )
+
     @contextmanager
     def _sqlite_cancel_progress(
         self,
@@ -7851,6 +7950,23 @@ class Catalog:
                 filter_params,
             ).fetchone()
         return 0 if row is None else int(row["count"])
+
+    def list_slideshow_rel_paths_for_custom_virtual_directory(
+        self,
+        virtual_directory_id: int,
+        *,
+        cancel_check: CancelCallback | None = None,
+    ) -> list[str]:
+        """Return all slideshow paths matching one saved rule expression."""
+
+        filter_sql, filter_params = self._compiled_custom_virtual_directory_filter(
+            int(virtual_directory_id)
+        )
+        return self._slideshow_rel_paths_where(
+            filter_sql,
+            filter_params,
+            cancel_check,
+        )
 
     def list_images_for_custom_virtual_directory_page(
         self,

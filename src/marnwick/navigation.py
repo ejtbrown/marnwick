@@ -5,14 +5,20 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 
+def shuffled_items(items: Sequence[str], seed: int | None = None) -> list[str]:
+    """Return a fresh shuffle, using operating-system entropy by default."""
+
+    shuffled = list(items)
+    rng = random.SystemRandom() if seed is None else random.Random(seed)  # nosec B311
+    rng.shuffle(shuffled)
+    return shuffled
+
+
 def build_random_order(items: Sequence[str], start_item: str, seed: int | None = None) -> list[str]:
     if start_item not in items:
         raise ValueError("start_item must be present in items")
     remaining = [item for item in items if item != start_item]
-    # Deterministic UI shuffle, not security-sensitive randomness.
-    rng = random.Random(seed)  # nosec B311
-    rng.shuffle(remaining)
-    return [start_item, *remaining]
+    return [start_item, *shuffled_items(remaining, seed)]
 
 
 @dataclass(slots=True)

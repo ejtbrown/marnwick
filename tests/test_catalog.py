@@ -2055,6 +2055,48 @@ def test_advanced_virtual_directory_evaluates_nested_boolean_tag_logic(
         assert catalog.custom_virtual_directory_image_count(definition.id) == 3
 
 
+def test_whole_set_slideshow_path_queries_cover_physical_and_virtual_views(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "catalog"
+    for rel_path, color in (
+        ("one.jpg", (10, 20, 30)),
+        ("copy.jpg", (10, 20, 30)),
+        ("album/tagged.jpg", (40, 50, 60)),
+        ("album/other.jpg", (70, 80, 90)),
+    ):
+        make_image(root / rel_path, color=color)
+
+    with Catalog(root) as catalog:
+        catalog.refresh()
+        catalog.set_image_tags("one.jpg", ["Shuffle"], replace=True)
+        catalog.set_image_tags("album/tagged.jpg", ["Shuffle"], replace=True)
+        saved = catalog.create_custom_virtual_directory(
+            "Album",
+            r"\.jpg$",
+            ["album"],
+            [],
+        )
+
+        assert set(catalog.list_slideshow_rel_paths("")) == {
+            "copy.jpg",
+            "one.jpg",
+        }
+        assert set(catalog.list_slideshow_rel_paths_for_tag("shuffle")) == {
+            "album/tagged.jpg",
+            "one.jpg",
+        }
+        assert set(
+            catalog.list_slideshow_rel_paths_for_custom_virtual_directory(
+                saved.id
+            )
+        ) == {"album/other.jpg", "album/tagged.jpg"}
+        assert set(catalog.list_exact_duplicate_slideshow_rel_paths()) == {
+            "copy.jpg",
+            "one.jpg",
+        }
+
+
 def test_replacing_image_tags_rolls_back_as_one_transaction(tmp_path: Path) -> None:
     root = tmp_path / "catalog"
     make_image(root / "image.jpg")
