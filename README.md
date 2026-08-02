@@ -92,7 +92,7 @@ Verify the command-line entry point without opening the GUI:
 1. Choose **File > Open** and select an existing photo directory. Catalog initialization runs in the background, and the status bar reports the open request without freezing the application window.
 2. Marnwick creates `<catalog>/.marnwick` and shows the root and any cached or immediately visible folders.
 3. Select a folder in the left tree. Marnwick gives that folder's work priority over deep discovery and idle maintenance, starts a catalog-page read and a complete direct-child filesystem inventory in parallel, and reports the active phase in the status bar. A nonempty current catalog page can paint immediately. For an unindexed or changed folder, the filesystem worker publishes every recognized direct image and child folder in one stable sorted layout as soon as enumeration finishes; it does not wait for image decoding or recursive descendant discovery.
-4. The thumbnail model exposes that layout to Qt in 400-row batches. Thumbnail files are read away from the UI thread and replace placeholders at their existing rows as they become available. Metadata updates also apply in place. An aspect-ratio or directory-aggregate sort can require one final reconciliation after indexing supplies the previously unknown values, but it does not rebuild the pane for every completed thumbnail. Tag and exact-duplicate panes remain database-paged, while folder-tree database reads are paged and Qt item construction is time-sliced into bounded batches.
+4. The thumbnail model exposes that layout to Qt in 400-row batches. Thumbnail files are read away from the UI thread and replace placeholders at their existing rows as they become available. Metadata updates also apply in place. An aspect-ratio or directory-aggregate sort can require one final reconciliation after indexing supplies the previously unknown values, but it does not rebuild the pane for every completed thumbnail. Tag, exact-duplicate, and custom virtual-directory panes remain database-paged; approaching the loaded end requests another page, and explicitly scrolling to the end continues until the full result is available. Folder-tree database reads are also paged, and Qt item construction is time-sliced into bounded batches.
 5. Deep folder discovery continues independently in the background. The status bar reports folders found, images checked, the current path, and other active phases.
 6. Double-click an image or document for fullscreen viewing, a video to launch the default player, or a folder tile to enter it.
 
@@ -120,6 +120,11 @@ shortcut that opens the dialog is configurable.
 | `Ctrl` while dragging | Copy selected files or folders; the drag cursor shows a `+` badge |
 
 Use the slider to choose the number of thumbnail columns and the sort menu to change ordering. Scroll positions and selections are remembered separately for each physical or virtual directory during the session.
+
+Each use of `S` creates a fresh operating-system-randomized permutation of the
+complete matching physical or virtual-directory set. For a database-paged
+pane, the viewer gathers only compact relative paths on a background reader;
+the loaded, sorted thumbnail prefix does not constrain or bias the shuffle.
 
 Dragging file thumbnails beyond the Marnwick window publishes standard local-file URLs with copy semantics. They can therefore be dropped onto browser upload targets or applications that accept files for opening or importing, while drops onto Marnwick folders retain the internal move/`Ctrl`-copy behavior.
 

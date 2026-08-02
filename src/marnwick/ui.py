@@ -198,7 +198,7 @@ from .lama import (
 )
 from .models import CatalogSettings, DirectoryRecord, FolderPreviewRecord, ImageRecord, PaneRecord, SortOrder
 from .media import is_supported_file_name, media_kind_for_name
-from .navigation import ImageNavigator
+from .navigation import ImageNavigator, shuffled_items
 from .safe_image import MAX_IMAGE_PIXELS, open_catalog_image
 from .workspace import Workspace
 
@@ -484,15 +484,17 @@ class ViewerNavigationPage:
     next_offset: int
     has_more: bool
     total_images: int
+    randomized: bool = False
+    complete_order: bool = False
 
 
 @dataclass(slots=True)
 class PagedImageNavigator:
-    """A loaded-prefix navigator whose later database pages are fetched lazily.
+    """A navigator whose later database-backed paths are fetched lazily.
 
-    Random navigation is progressive: the already loaded prefix is shuffled,
-    then each newly fetched page is shuffled independently without repeats.
-    That keeps memory bounded while still crossing every page boundary.
+    Normal navigation extends the loaded sorted prefix page by page. Random
+    navigation may instead prefetch one whole-set path permutation in the
+    background; only compact relative-path strings are materialized.
     """
 
     order: list[str]
@@ -503,6 +505,7 @@ class PagedImageNavigator:
     page_loader: Callable[[int, int, Event], ViewerNavigationPage]
     random_mode: bool = False
     view_kind: str = VIRTUAL_KIND_PHYSICAL
+    prefetch_all: bool = False
     _seen: set[str] = field(default_factory=set)
 
     def __post_init__(self) -> None:
@@ -526,13 +529,17 @@ class PagedImageNavigator:
 
     def append_page(self, page: ViewerNavigationPage) -> int:
         rel_paths = [rel_path for rel_path in page.rel_paths if rel_path not in self._seen]
-        if self.random_mode and rel_paths:
-            rel_paths = ImageNavigator.random(rel_paths, rel_paths[0]).order
+        if self.random_mode and rel_paths and not page.randomized:
+            rel_paths = shuffled_items(rel_paths)
         self.order.extend(rel_paths)
         self._seen.update(rel_paths)
         self.next_offset = page.next_offset
         self.has_more = page.has_more
-        self.total_count = max(len(self.order), page.total_images)
+        self.total_count = (
+            len(self.order)
+            if page.complete_order
+            else max(len(self.order), page.total_images)
+        )
         return len(rel_paths)
 
 
@@ -2749,9 +2756,18 @@ class ThumbnailView(QListView):
                 scroll_bar.sliderReleased.connect(
                     window._remember_thumbnail_scroll_position
                 )
+                scroll_bar.sliderReleased.connect(
+                    window._thumbnail_scroll_user_action
+                )
                 scroll_bar.actionTriggered.connect(
                     lambda _action: window._thumbnail_scroll_user_action()
                 )
+            self.verticalScrollBar().valueChanged.connect(
+                window._thumbnail_scroll_position_changed
+            )
+            self.verticalScrollBar().rangeChanged.connect(
+                window._thumbnail_scroll_range_changed
+            )
         self.setLayoutMode(QListView.LayoutMode.Batched)
         self.setBatchSize(256)
 
@@ -3676,6 +3692,8 @@ class MainWindow(QMainWindow):
         ] = OrderedDict()
         self._thumbnail_scroll_key: TreeStateKey | None = None
         self._thumbnail_scroll_restore_generation = 0
+        self._thumbnail_page_fetch_scheduled = False
+        self._thumbnail_follow_paged_end = False
         self._pending_move_thumbnail_visibility: (
             tuple[TreeStateKey, tuple[str, str]] | None
         ) = None
@@ -10158,6 +10176,7 @@ class MainWindow(QMainWindow):
             self._thumbnail_selections.popitem(last=False)
 
     def _restore_thumbnail_scroll_position(self, key: TreeStateKey | None) -> None:
+        self._thumbnail_follow_paged_end = False
         self._thumbnail_scroll_key = key
         position = self._thumbnail_scroll_positions.get(key) if key is not None else None
         if position is not None and key is not None:
@@ -10279,17 +10298,110 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(
             0,
             partial(
-                self._remember_thumbnail_scroll_position_if_current,
+                self._settle_thumbnail_scroll_user_action,
                 scroll_key,
             ),
         )
 
-    def _remember_thumbnail_scroll_position_if_current(
+    def _settle_thumbnail_scroll_user_action(
         self,
         scroll_key: TreeStateKey | None,
     ) -> None:
-        if scroll_key == self._thumbnail_scroll_key:
+        if scroll_key != self._thumbnail_scroll_key:
+            return
+        scroll_bar = self.thumbnail_view.verticalScrollBar()
+        self._thumbnail_follow_paged_end = bool(
+            self.model.is_paged
+            and self.model.may_have_more_pages
+            and scroll_bar.value() >= scroll_bar.maximum()
+        )
+        self._remember_thumbnail_scroll_position()
+        self._schedule_thumbnail_page_fetch_if_near_end()
+
+    def _thumbnail_scroll_position_changed(self, _value: int) -> None:
+        self._schedule_thumbnail_page_fetch_if_near_end()
+
+    def _thumbnail_scroll_range_changed(
+        self,
+        _minimum: int,
+        _maximum: int,
+    ) -> None:
+        if self._thumbnail_follow_paged_end:
+            QTimer.singleShot(0, self._continue_thumbnail_end_paging)
+        else:
+            self._schedule_thumbnail_page_fetch_if_near_end()
+
+    def _thumbnail_page_appended(self) -> None:
+        if self._thumbnail_follow_paged_end:
+            QTimer.singleShot(0, self._continue_thumbnail_end_paging)
+        else:
+            self._schedule_thumbnail_page_fetch_if_near_end()
+
+    def _continue_thumbnail_end_paging(self) -> None:
+        if self._closing or not self._thumbnail_follow_paged_end:
+            return
+        if not self.model.may_have_more_pages:
+            self._thumbnail_follow_paged_end = False
             self._remember_thumbnail_scroll_position()
+            return
+        scroll_bar = self.thumbnail_view.verticalScrollBar()
+        scroll_bar.setValue(scroll_bar.maximum())
+        self._schedule_thumbnail_page_fetch_if_near_end(force=True)
+
+    def _schedule_thumbnail_page_fetch_if_near_end(
+        self,
+        *,
+        force: bool = False,
+    ) -> None:
+        if (
+            self._closing
+            or self._thumbnail_page_fetch_scheduled
+            or not self.model.canFetchMore()
+        ):
+            return
+        scroll_bar = self.thumbnail_view.verticalScrollBar()
+        threshold = max(
+            scroll_bar.pageStep(),
+            self.model.card_size(self.thumbnail_view.font()).height() * 2,
+        )
+        if not force and scroll_bar.maximum() - scroll_bar.value() > threshold:
+            return
+        self._thumbnail_page_fetch_scheduled = True
+        pane_key = self._current_thumbnail_scroll_key()
+        pane_generation = self._physical_pane_generation
+        QTimer.singleShot(
+            0,
+            partial(
+                self._fetch_thumbnail_page_if_current,
+                pane_key,
+                pane_generation,
+            ),
+        )
+
+    def _fetch_thumbnail_page_if_current(
+        self,
+        pane_key: TreeStateKey | None,
+        pane_generation: int,
+    ) -> None:
+        self._thumbnail_page_fetch_scheduled = False
+        if (
+            self._closing
+            or pane_key != self._current_thumbnail_scroll_key()
+            or pane_generation != self._physical_pane_generation
+            or not self.model.canFetchMore()
+        ):
+            return
+        scroll_bar = self.thumbnail_view.verticalScrollBar()
+        threshold = max(
+            scroll_bar.pageStep(),
+            self.model.card_size(self.thumbnail_view.font()).height() * 2,
+        )
+        if (
+            not self._thumbnail_follow_paged_end
+            and scroll_bar.maximum() - scroll_bar.value() > threshold
+        ):
+            return
+        self.model.fetchMore()
 
     def _shallow_child_directories(
         self,
@@ -10777,6 +10889,72 @@ class MainWindow(QMainWindow):
             next_offset=result.next_offset,
             has_more=result.has_more,
             total_images=result.total_images or 0,
+        )
+
+    @staticmethod
+    def _viewer_random_order_worker(
+        root: Path,
+        expected_root_identity: tuple[int, int],
+        expected_storage_identity: CatalogStorageIdentity,
+        kind: str,
+        value: str,
+        page_offset: int,
+        _page_limit: int,
+        cancel_event: Event,
+    ) -> ViewerNavigationPage:
+        """Build one fresh whole-result permutation using only path strings."""
+
+        def check_canceled() -> None:
+            if cancel_event.is_set():
+                raise IndexTaskCancelled()
+
+        if page_offset != 0:
+            raise ValueError("whole-set random navigation must start at offset zero")
+        check_canceled()
+        with Catalog.open_reader(
+            root,
+            expected_root_identity=expected_root_identity,
+            expected_storage_identity=expected_storage_identity,
+        ) as catalog:
+            catalog._conn.execute("BEGIN")  # noqa: SLF001 - one membership snapshot
+            try:
+                if kind == VIRTUAL_KIND_PHYSICAL:
+                    rel_paths = catalog.list_slideshow_rel_paths(
+                        value,
+                        cancel_check=check_canceled,
+                    )
+                elif kind == VIRTUAL_KIND_TAG:
+                    rel_paths = catalog.list_slideshow_rel_paths_for_tag(
+                        value,
+                        cancel_check=check_canceled,
+                    )
+                elif kind == VIRTUAL_KIND_DUPLICATES:
+                    rel_paths = catalog.list_exact_duplicate_slideshow_rel_paths(
+                        cancel_check=check_canceled,
+                    )
+                elif kind == VIRTUAL_KIND_CUSTOM:
+                    rel_paths = (
+                        catalog.list_slideshow_rel_paths_for_custom_virtual_directory(
+                            int(value),
+                            cancel_check=check_canceled,
+                        )
+                    )
+                else:
+                    raise ValueError(f"unsupported random viewer kind: {kind}")
+            finally:
+                with suppress(sqlite3.Error):
+                    catalog._conn.execute("ROLLBACK")  # noqa: SLF001
+            catalog._assert_catalog_storage_identity()  # noqa: SLF001
+        check_canceled()
+        rel_paths = shuffled_items(rel_paths)
+        check_canceled()
+        return ViewerNavigationPage(
+            rel_paths=rel_paths,
+            next_offset=len(rel_paths),
+            has_more=False,
+            total_images=len(rel_paths),
+            randomized=True,
+            complete_order=True,
         )
 
     def _thumbnail_record_key(self, record: PaneRecord) -> tuple[str, str]:
@@ -11486,6 +11664,7 @@ class MainWindow(QMainWindow):
                     if not appended:
                         continue
                     self.refresh_thumbnail_layout()
+                    self._thumbnail_page_appended()
                     self.update_selection_status()
                     self._apply_pending_rel_path_selection(result.fingerprint)
                     pending = self._pending_rel_path_selection
@@ -13226,30 +13405,40 @@ class MainWindow(QMainWindow):
         )
         start_index = order.index(start)
         catalog = self.current_catalog
+        viewer_display_order = order
         if self.model.is_paged and self.current_virtual_kind in {
             None,
             VIRTUAL_KIND_TAG,
             VIRTUAL_KIND_DUPLICATES,
             VIRTUAL_KIND_CUSTOM,
         }:
-            initial = (
-                ImageNavigator.random(order, start).order
-                if random_mode
-                else list(order)
-            )
             kind = self.current_virtual_kind or VIRTUAL_KIND_PHYSICAL
             value = (
                 self.current_dir_rel
                 if kind == VIRTUAL_KIND_PHYSICAL
                 else self.current_virtual_value
             )
-            navigator: ImageNavigator | PagedImageNavigator = PagedImageNavigator(
-                order=initial,
-                index=0 if random_mode else initial.index(start),
-                next_offset=self.model.next_page_offset,
-                has_more=self.model.may_have_more_pages,
-                total_count=self.model.image_count,
-                page_loader=partial(
+            if random_mode:
+                # A sorted pane page is not a random sample of the result.
+                # Keep the selected image immediately displayable, then build
+                # one fresh whole-set path permutation on the viewer worker.
+                initial = [start]
+                next_offset = 0
+                has_more = True
+                page_loader = partial(
+                    self._viewer_random_order_worker,
+                    catalog.root,
+                    catalog.root_identity,
+                    catalog.storage_identity,
+                    kind,
+                    value,
+                )
+                viewer_display_order = initial
+            else:
+                initial = list(order)
+                next_offset = self.model.next_page_offset
+                has_more = self.model.may_have_more_pages
+                page_loader = partial(
                     self._viewer_navigation_page_worker,
                     catalog.root,
                     catalog.root_identity,
@@ -13257,9 +13446,17 @@ class MainWindow(QMainWindow):
                     kind,
                     value,
                     self.current_sort,
-                ),
+                )
+            navigator: ImageNavigator | PagedImageNavigator = PagedImageNavigator(
+                order=initial,
+                index=0 if random_mode else initial.index(start),
+                next_offset=next_offset,
+                has_more=has_more,
+                total_count=self.model.image_count,
+                page_loader=page_loader,
                 random_mode=random_mode,
                 view_kind=kind,
+                prefetch_all=random_mode,
             )
         else:
             navigator = ImageNavigator.random(order, start) if random_mode else ImageNavigator(
@@ -13272,7 +13469,7 @@ class MainWindow(QMainWindow):
             navigator,
             self,
             wipe_on_delete=self.wipe_on_delete_enabled(),
-            display_order=order,
+            display_order=viewer_display_order,
             random_mode=random_mode,
         )
         last_viewed: str | None = None
@@ -18586,6 +18783,12 @@ class FullscreenViewer(QDialog):
         layout.addWidget(self.pdf_view, 1)
         self.load_current()
         self.update_cursor_visibility()
+        if (
+            isinstance(self.navigator, PagedImageNavigator)
+            and self.navigator.prefetch_all
+            and self.navigator.has_more
+        ):
+            QTimer.singleShot(0, self._prefetch_complete_navigation_order)
 
     def exec_fullscreen(self) -> int:
         """Enter the modal viewer loop without first exposing a nonmodal window.
@@ -19440,6 +19643,18 @@ class FullscreenViewer(QDialog):
             return
         self.load_current()
 
+    def _prefetch_complete_navigation_order(self) -> None:
+        navigator = self.navigator
+        if (
+            self._load_closed
+            or self._navigation_page_future is not None
+            or not isinstance(navigator, PagedImageNavigator)
+            or not navigator.prefetch_all
+            or not navigator.has_more
+        ):
+            return
+        self._start_navigation_page(0)
+
     def _start_navigation_page(
         self,
         step: int,
@@ -19600,8 +19815,8 @@ class FullscreenViewer(QDialog):
                 self._navigation_rebuild_display_seen.add(rel_path)
                 self._navigation_rebuild_display_order.append(rel_path)
             rel_paths = canonical_rel_paths
-            if navigator.random_mode and rel_paths:
-                rel_paths = ImageNavigator.random(rel_paths, rel_paths[0]).order
+            if navigator.random_mode and rel_paths and not page.randomized:
+                rel_paths = shuffled_items(rel_paths)
             for rel_path in rel_paths:
                 if rel_path in self._navigation_rebuild_seen:
                     continue
