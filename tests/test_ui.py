@@ -9676,6 +9676,15 @@ def test_virtual_directory_tree_loads_tag_and_duplicate_aggregates(tmp_path: Pat
         assert tag_item is not None
         assert tag_item.data(0, VIRTUAL_KIND_ROLE) == VIRTUAL_KIND_TAG
         assert tag_item.data(0, VIRTUAL_VALUE_ROLE) == "Keep"
+        assert tag_item.icon(0).cacheKey() == tags_root.icon(0).cacheKey()
+        assert len(
+            {
+                virtual_root.icon(0).cacheKey(),
+                tags_root.icon(0).cacheKey(),
+                duplicates_item.icon(0).cacheKey(),
+                very_similar_item.icon(0).cacheKey(),
+            }
+        ) == 4
 
         window._directory_clicked(tag_item)
         settle_virtual_view_tasks(window, qt_app)
@@ -10056,6 +10065,15 @@ def test_custom_virtual_directory_tree_create_browse_and_confirmed_delete(
         assert custom_item.text(0) == "Album Picks"
         assert custom_item.data(0, VIRTUAL_KIND_ROLE) == VIRTUAL_KIND_CUSTOM
         assert custom_item.data(0, VIRTUAL_VALUE_ROLE) == str(definition.id)
+        assert custom_item.icon(0).cacheKey() == (
+            window.custom_virtual_folder_icon.cacheKey()
+        )
+        assert custom_item.icon(0).cacheKey() not in {
+            virtual_root.icon(0).cacheKey(),
+            virtual_root.child(0).icon(0).cacheKey(),
+            virtual_root.child(1).icon(0).cacheKey(),
+            virtual_root.child(2).icon(0).cacheKey(),
+        }
 
         root_menu = QMenu()
         custom_menu = QMenu()
