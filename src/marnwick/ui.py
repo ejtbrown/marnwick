@@ -3801,7 +3801,11 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(splitter)
 
         self.folder_icon = self.style().standardIcon(QStyle.StandardPixmap.SP_DirIcon)
-        self.virtual_folder_icon = load_virtual_folder_icon()
+        self.custom_virtual_folder_icon = load_virtual_folder_icon()
+        self.implicit_virtual_folder_icon = load_implicit_virtual_folder_icon()
+        self.tag_virtual_folder_icon = load_tag_virtual_folder_icon()
+        self.duplicate_virtual_folder_icon = load_duplicate_virtual_folder_icon()
+        self.similar_virtual_folder_icon = load_similar_virtual_folder_icon()
 
         self.status_left_label = QLabel("-")
         self.status_left_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
@@ -8914,7 +8918,17 @@ class MainWindow(QMainWindow):
         kind: str,
         value: str,
     ) -> None:
-        item.setIcon(0, self.virtual_folder_icon)
+        item.setIcon(
+            0,
+            {
+                VIRTUAL_KIND_ROOT: self.implicit_virtual_folder_icon,
+                VIRTUAL_KIND_TAG_ROOT: self.tag_virtual_folder_icon,
+                VIRTUAL_KIND_TAG: self.tag_virtual_folder_icon,
+                VIRTUAL_KIND_DUPLICATES: self.duplicate_virtual_folder_icon,
+                VIRTUAL_KIND_VERY_SIMILAR: self.similar_virtual_folder_icon,
+                VIRTUAL_KIND_CUSTOM: self.custom_virtual_folder_icon,
+            }.get(kind, self.implicit_virtual_folder_icon),
+        )
         item.setData(0, CATALOG_ROOT_ROLE, str(catalog.root))
         item.setData(0, DIR_REL_ROLE, "")
         item.setData(0, VIRTUAL_KIND_ROLE, kind)
@@ -21921,6 +21935,101 @@ def load_app_icon() -> QIcon:
 def load_virtual_folder_icon() -> QIcon:
     pixmap = QPixmap()
     pixmap.loadFromData(virtual_folder_icon_bytes(), "PNG")
+    return QIcon(pixmap)
+
+
+def _tree_icon_canvas() -> tuple[QPixmap, QPainter]:
+    pixmap = QPixmap(64, 64)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    return pixmap, painter
+
+
+def load_implicit_virtual_folder_icon() -> QIcon:
+    """Return a folder-with-spark icon for built-in virtual collections."""
+
+    pixmap, painter = _tree_icon_canvas()
+    painter.setPen(QPen(QColor("#155e75"), 3))
+    painter.setBrush(QBrush(QColor("#67e8f9")))
+    folder = QPainterPath()
+    folder.moveTo(5, 17)
+    folder.lineTo(5, 12)
+    folder.lineTo(25, 12)
+    folder.lineTo(31, 18)
+    folder.lineTo(57, 18)
+    folder.lineTo(59, 54)
+    folder.lineTo(5, 54)
+    folder.closeSubpath()
+    painter.drawPath(folder)
+
+    painter.setPen(QPen(QColor("#fef3c7"), 2))
+    painter.setBrush(QBrush(QColor("#f59e0b")))
+    sparkle = QPainterPath()
+    sparkle.moveTo(43, 24)
+    sparkle.lineTo(47, 33)
+    sparkle.lineTo(56, 37)
+    sparkle.lineTo(47, 41)
+    sparkle.lineTo(43, 50)
+    sparkle.lineTo(39, 41)
+    sparkle.lineTo(30, 37)
+    sparkle.lineTo(39, 33)
+    sparkle.closeSubpath()
+    painter.drawPath(sparkle)
+    painter.end()
+    return QIcon(pixmap)
+
+
+def load_tag_virtual_folder_icon() -> QIcon:
+    """Return a tag icon for the implicit tag group and tag views."""
+
+    pixmap, painter = _tree_icon_canvas()
+    painter.setPen(QPen(QColor("#115e59"), 3))
+    painter.setBrush(QBrush(QColor("#5eead4")))
+    tag = QPainterPath()
+    tag.moveTo(7, 17)
+    tag.lineTo(31, 8)
+    tag.lineTo(57, 34)
+    tag.lineTo(34, 57)
+    tag.lineTo(7, 31)
+    tag.closeSubpath()
+    painter.drawPath(tag)
+    painter.setPen(QPen(QColor("#115e59"), 3))
+    painter.setBrush(QBrush(QColor("#f8fafc")))
+    painter.drawEllipse(QRect(17, 17, 11, 11))
+    painter.end()
+    return QIcon(pixmap)
+
+
+def load_duplicate_virtual_folder_icon() -> QIcon:
+    """Return overlapping cards for the implicit exact-duplicate view."""
+
+    pixmap, painter = _tree_icon_canvas()
+    painter.setPen(QPen(QColor("#5b21b6"), 3))
+    painter.setBrush(QBrush(QColor("#c4b5fd")))
+    painter.drawRoundedRect(QRect(7, 9, 39, 39), 5, 5)
+    painter.setBrush(QBrush(QColor("#8b5cf6")))
+    painter.drawRoundedRect(QRect(18, 17, 39, 39), 5, 5)
+    painter.setPen(QPen(QColor("#ede9fe"), 3))
+    painter.drawLine(QPoint(26, 31), QPoint(49, 31))
+    painter.drawLine(QPoint(26, 40), QPoint(49, 40))
+    painter.end()
+    return QIcon(pixmap)
+
+
+def load_similar_virtual_folder_icon() -> QIcon:
+    """Return overlapping shapes for the implicit visual-similarity view."""
+
+    pixmap, painter = _tree_icon_canvas()
+    painter.setPen(QPen(QColor("#9a3412"), 3))
+    painter.setBrush(QBrush(QColor(251, 146, 60, 205)))
+    painter.drawEllipse(QRect(5, 15, 37, 37))
+    painter.setBrush(QBrush(QColor(253, 186, 116, 205)))
+    painter.drawEllipse(QRect(22, 15, 37, 37))
+    painter.setPen(QPen(QColor("#fff7ed"), 3))
+    painter.drawLine(QPoint(25, 29), QPoint(39, 29))
+    painter.drawLine(QPoint(25, 38), QPoint(39, 38))
+    painter.end()
     return QIcon(pixmap)
 
 
