@@ -2097,6 +2097,31 @@ def test_whole_set_slideshow_path_queries_cover_physical_and_virtual_views(
         }
 
 
+def test_virtual_directory_regex_timeout_is_reported_after_sqlite_returns(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "catalog"
+    make_image(root / "image.jpg")
+
+    class TimedOutPattern:
+        def search(self, *_args: object, **_kwargs: object) -> None:
+            raise TimeoutError
+
+    with Catalog(root) as catalog:
+        catalog.refresh()
+        monkeypatch.setattr(
+            catalog_module,
+            "_compile_bounded_regex",
+            lambda _pattern: TimedOutPattern(),
+        )
+
+        with pytest.raises(ValueError, match="matching time limit"):
+            catalog.virtual_directory_rule_image_count(
+                VirtualDirectoryRule("regex", value="image")
+            )
+
+
 def test_replacing_image_tags_rolls_back_as_one_transaction(tmp_path: Path) -> None:
     root = tmp_path / "catalog"
     make_image(root / "image.jpg")

@@ -1110,6 +1110,14 @@ def test_fullscreen_position_labels_are_rotated_and_use_adaptive_contrast(
             assert viewer.label.filename_text_color() == QColor("white")
             assert viewer.label.resolution_text_color() == QColor("white")
 
+            viewer.label.set_filename_text(f"{'x' * 251}.png")
+            viewer.label.set_resolution_text("12000 x 8000")
+            long_filename_rect = viewer.label.filename_overlay_rect()
+            long_resolution_rect = viewer.label.resolution_overlay_rect()
+            assert not long_filename_rect.isEmpty()
+            assert not long_resolution_rect.isEmpty()
+            assert long_filename_rect.intersected(long_resolution_rect).isEmpty()
+
             rendered = viewer.label.grab().toImage()
             bright_points = [
                 (x, y)
@@ -4676,7 +4684,7 @@ def test_tag_dialog_filters_and_completes_with_most_recent_match(
 
     with Catalog(root) as catalog:
         catalog.refresh()
-        catalog.define_tags(["Alpha", "Alpine", "Beta"])
+        catalog.define_tags(["Alpha", "Alpine", "Beta", "Black, White"])
         dialog = TagDialog(
             catalog,
             "image.jpg",
@@ -4710,6 +4718,18 @@ def test_tag_dialog_filters_and_completes_with_most_recent_match(
             assert dialog.entry.text() == "Alpine"
             assert by_name["Alpha"].isHidden()
             assert not by_name["Alpine"].isHidden()
+
+            dialog.entry.setText("Al, Beta")
+            dialog.entry.setCursorPosition(2)
+            dialog._tab_completion()
+
+            assert dialog.entry.text() == "Alpine, Beta"
+
+            dialog.entry.setText('"Black, W", Beta')
+            dialog.entry.setCursorPosition(len('"Black, W'))
+            dialog._tab_completion()
+
+            assert dialog.entry.text() == '"Black, White", Beta'
         finally:
             dialog.close()
             dialog.deleteLater()
@@ -9032,6 +9052,80 @@ def test_queued_image_tags_retry_until_catalog_database_is_available(
         qt_app.processEvents()
 
 
+def test_queued_image_tags_stop_retrying_a_persistent_database_lock(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    Image.new("RGB", (8, 8), (10, 20, 30)).save(root / "image.jpg")
+    window = MainWindow()
+    attempts = 0
+    errors: list[str] = []
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        catalog.refresh()
+        expected_identity = catalog.file_identity("image.jpg")
+        original_open_writer = Catalog.open_writer.__func__
+
+        def always_locked_writer(
+            _cls,
+            *_args: object,
+            **_kwargs: object,
+        ) -> Catalog:
+            nonlocal attempts
+            attempts += 1
+            raise sqlite3.OperationalError("database is locked")
+
+        monkeypatch.setattr(
+            Catalog,
+            "open_writer",
+            classmethod(always_locked_writer),
+        )
+        monkeypatch.setattr(ui_module, "TAG_DATABASE_RETRY_TIMEOUT_SECONDS", 0)
+        monkeypatch.setattr(
+            ui_module,
+            "show_error",
+            lambda _owner, _title, detail: errors.append(detail),
+        )
+
+        failed = window.queue_image_tags(
+            catalog,
+            "image.jpg",
+            ["Blocked"],
+            expected_identity=expected_identity,
+        )
+        assert failed is not None
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            failed.future.result(timeout=2)
+        assert attempts == 1
+
+        monkeypatch.setattr(
+            Catalog,
+            "open_writer",
+            classmethod(original_open_writer),
+        )
+        succeeded = window.queue_image_tags(
+            catalog,
+            "image.jpg",
+            ["Recovered"],
+            expected_identity=expected_identity,
+        )
+        assert succeeded is not None
+        succeeded.future.result(timeout=2)
+        window._settle_move_payload_task()
+
+        assert errors == ["database is locked"]
+        assert catalog.get_image_tags("image.jpg") == ["Recovered"]
+    finally:
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
 def test_catalog_tag_deletion_uses_priority_worker_and_clears_assignments(
     tmp_path: Path,
 ) -> None:
@@ -9049,6 +9143,9 @@ def test_catalog_tag_deletion_uses_priority_worker_and_clears_assignments(
         catalog.set_image_tags("one.jpg", ["Remove", "Keep"], replace=True)
         catalog.set_image_tags("two.jpg", ["Remove"], replace=True)
         window._remember_image_tag_assignment(["Remove", "Keep"])
+        window.current_catalog = catalog
+        window.current_virtual_kind = VIRTUAL_KIND_TAG
+        window.current_virtual_value = "Remove"
 
         mutation = window.queue_catalog_tag_deletion(catalog, " remove ")
 
@@ -9060,7 +9157,11 @@ def test_catalog_tag_deletion_uses_priority_worker_and_clears_assignments(
         assert catalog.get_image_tags("two.jpg") == []
         assert window._recent_assigned_tags == ("Keep",)
         assert window._last_assigned_tags == ("Keep",)
+        assert window.current_virtual_kind == VIRTUAL_KIND_TAG
         window._settle_move_payload_task()
+        assert window.current_virtual_kind is None
+        assert window.current_virtual_value == ""
+        assert window.current_dir_rel == ""
     finally:
         window.close()
         window.deleteLater()
@@ -9852,6 +9953,25 @@ def test_new_virtual_directory_dialog_validates_and_collects_filters(
                 qt_app.processEvents()
                 sleep(0.01)
             assert dialog.match_count_label.text() == "Matches 0 files"
+
+            dialog.tag_list.item(0).setCheckState(Qt.CheckState.Unchecked)
+            dialog.regex_entry.setText("   ")
+            assert dialog.filename_regex() == ""
+            deadline = monotonic() + 2
+            while (
+                dialog.match_count_label.text() != "Matches 1 file"
+                and monotonic() < deadline
+            ):
+                qt_app.processEvents()
+                sleep(0.01)
+            assert dialog.match_count_label.text() == "Matches 1 file"
+            saved = catalog.create_custom_virtual_directory(
+                "Whitespace",
+                dialog.filename_regex(),
+                dialog.selected_directories(),
+                dialog.selected_tags(),
+            )
+            assert catalog.custom_virtual_directory_image_count(saved.id) == 1
         finally:
             dialog.close()
             dialog.deleteLater()
@@ -15973,6 +16093,65 @@ def test_random_paged_viewer_crosses_page_boundary_without_repeats(tmp_path: Pat
         qt_app.processEvents()
 
 
+def test_paged_custom_viewer_total_excludes_video_rows(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    Image.new("RGB", (2, 2), (1, 2, 3)).save(root / "still.png")
+    Image.new("RGB", (2, 2), (4, 5, 6)).save(root / "clip.png")
+    window = MainWindow()
+    captured_totals: list[int] = []
+
+    class FakeViewer:
+        def __init__(self, _catalog, navigator, _parent, **kwargs):  # type: ignore[no-untyped-def]
+            assert isinstance(navigator, ui_module.PagedImageNavigator)
+            captured_totals.append(navigator.total_count)
+            assert navigator.order == ["still.png"]
+            assert kwargs["display_order"] == ["still.png"]
+            self.last_viewed_rel_path = navigator.current
+
+        def exec_fullscreen(self) -> None:
+            return None
+
+        def deleteLater(self) -> None:  # noqa: N802 - Qt-compatible fake
+            return None
+
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        catalog.refresh()
+        catalog._conn.execute(  # noqa: SLF001 - deterministic media fixture
+            "UPDATE images SET media_kind = 'video' WHERE rel_path = 'clip.png'"
+        )
+        saved = catalog.create_custom_virtual_directory("Everything", "", [""], [])
+        window.current_catalog = catalog
+        window.current_virtual_kind = VIRTUAL_KIND_CUSTOM
+        window.current_virtual_value = str(saved.id)
+        window.load_current_directory()
+        settle_virtual_view_tasks(window, qt_app)
+
+        assert window.model.image_count == 2
+        assert window.model.slideshow_image_count == 1
+        still_row = next(
+            row
+            for row, record in enumerate(window.model.images)
+            if isinstance(record, ImageRecord) and record.rel_path == "still.png"
+        )
+        monkeypatch.setattr(ui_module, "FullscreenViewer", FakeViewer)
+
+        window.open_viewer(window.model.index(still_row, 0), random_mode=False)
+
+        assert captured_totals == [1]
+    finally:
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
 def test_paged_random_viewer_prefetches_one_complete_randomized_order(
     tmp_path: Path,
 ) -> None:
@@ -15992,6 +16171,7 @@ def test_paged_random_viewer_prefetches_one_complete_randomized_order(
             next_offset=3,
             has_more=False,
             total_images=3,
+            display_rel_paths=order,
             randomized=True,
             complete_order=True,
         )
@@ -16019,7 +16199,7 @@ def test_paged_random_viewer_prefetches_one_complete_randomized_order(
 
         assert calls == [(0, ui_module.PANE_QUERY_PAGE_SIZE)]
         assert navigator.order == ["a.png", "c.png", "b.png"]
-        assert viewer._display_order == ["a.png", "c.png", "b.png"]
+        assert viewer._display_order == order
         assert navigator.total_count == 3
         assert not navigator.has_more
     finally:
@@ -16053,6 +16233,7 @@ def test_paged_random_open_uses_every_matching_path_not_loaded_prefix(
             assert page.randomized
             assert page.complete_order
             assert set(page.rel_paths) == set(filenames)
+            assert page.display_rel_paths == filenames
             navigator.append_page(page)
             captured_orders.append(list(navigator.order))
             self.last_viewed_rel_path = navigator.current

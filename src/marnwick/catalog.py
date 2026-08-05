@@ -26,9 +26,11 @@ import sys
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
+from functools import lru_cache
 from pathlib import Path
 
 from PIL import Image, ImageOps
+import regex as bounded_regex
 
 from .document_ops import (
     DOCUMENT_RENDER_VERSION,
@@ -81,6 +83,7 @@ SHUTIL_RMTREE_AVOIDS_SYMLINK_ATTACKS = bool(
     getattr(shutil.rmtree, "avoids_symlink_attacks", False)
 )
 FIND_POLL_INTERVAL_SECONDS = 0.02
+REGEXP_MATCH_TIMEOUT_SECONDS = 0.05
 LOG_FILE_NAME = "marnwick.log"
 MAX_LOG_BYTES = 1024 * 1024
 MAX_THUMBNAIL_FILE_BYTES = 32 * 1024 * 1024
@@ -1181,14 +1184,42 @@ def parse_tag_entry(text: str) -> list[str]:
     return names
 
 
+_REGEXP_MATCH_STATE = threading.local()
+
+
+@lru_cache(maxsize=256)
+def _compile_bounded_regex(pattern: str) -> bounded_regex.Pattern[str]:
+    """Compile Python-compatible syntax for timeout-bounded matching."""
+
+    # Keep the accepted syntax aligned with the existing user contract instead
+    # of silently widening it to every extension supported by regex.
+    re.compile(pattern)
+    return bounded_regex.compile(pattern, bounded_regex.VERSION0)
+
+
 def _sqlite_regexp(pattern: object, value: object) -> int:
     """Implement SQLite's REGEXP operator with Python regular expressions."""
 
     if pattern is None or value is None:
         return 0
+    pattern_text = str(pattern)
     try:
-        return int(re.search(str(pattern), str(value)) is not None)
-    except (re.error, RecursionError):
+        return int(
+            _compile_bounded_regex(pattern_text).search(
+                str(value),
+                timeout=REGEXP_MATCH_TIMEOUT_SECONDS,
+                concurrent=True,
+            )
+            is not None
+        )
+    except TimeoutError:
+        # SQLite cannot preserve a Python UDF exception message. Record the
+        # timeout on this query thread, fail this row closed, and let the
+        # surrounding query context raise an actionable error after SQLite
+        # returns control to Python.
+        _REGEXP_MATCH_STATE.timeout_pattern = pattern_text
+        return 0
+    except (re.error, bounded_regex.error, RecursionError):
         # Definitions are validated before storage. A damaged external row
         # should fail closed instead of breaking every view of the catalog.
         return 0
@@ -5697,11 +5728,19 @@ class Catalog:
         filter_sql: str,
         params: Sequence[object],
         cancel_check: CancelCallback | None,
+        *,
+        sort_order: SortOrder | None = None,
+        order_prefix: str = "",
     ) -> list[str]:
         """Materialize only paths for a whole-set slideshow permutation."""
 
         if cancel_check is not None:
             cancel_check()
+        order_clause = (
+            "id"
+            if sort_order is None
+            else self._deterministic_image_order_clause(sort_order)
+        )
         with self._sqlite_cancel_progress(cancel_check):
             rows = self._iter_cursor_rows(
                 self._conn.execute(
@@ -5710,7 +5749,7 @@ class Catalog:
                     FROM images
                     WHERE COALESCE(media_kind, 'image') != 'video'
                         AND ({filter_sql})
-                    ORDER BY id
+                    ORDER BY {order_prefix}{order_clause}
                     """,
                     tuple(params),
                 ),
@@ -5718,15 +5757,63 @@ class Catalog:
             )
             return [str(row["rel_path"]) for row in rows]
 
+    def _image_and_slideshow_count_where(
+        self,
+        filter_sql: str,
+        params: Sequence[object],
+        cancel_check: CancelCallback | None,
+    ) -> tuple[int, int]:
+        """Count all matching rows and the slideshow-eligible subset."""
+
+        if cancel_check is not None:
+            cancel_check()
+        with self._sqlite_cancel_progress(cancel_check):
+            row = self._conn.execute(
+                f"""
+                SELECT
+                    COUNT(*) AS count,
+                    COALESCE(
+                        SUM(
+                            CASE
+                                WHEN COALESCE(media_kind, 'image') != 'video'
+                                THEN 1
+                                ELSE 0
+                            END
+                        ),
+                        0
+                    ) AS slideshow_count
+                FROM images
+                WHERE {filter_sql}
+                """,
+                tuple(params),
+            ).fetchone()
+        if row is None:
+            return 0, 0
+        return int(row["count"]), int(row["slideshow_count"])
+
     def list_slideshow_rel_paths(
         self,
         dir_rel: str = "",
         *,
+        sort_order: SortOrder | None = None,
         cancel_check: CancelCallback | None = None,
     ) -> list[str]:
         """Return all slideshow-eligible paths directly in one directory."""
 
         return self._slideshow_rel_paths_where(
+            "dir_rel = ?",
+            (dir_rel,),
+            cancel_check,
+            sort_order=sort_order,
+        )
+
+    def image_and_slideshow_count(
+        self,
+        dir_rel: str = "",
+        *,
+        cancel_check: CancelCallback | None = None,
+    ) -> tuple[int, int]:
+        return self._image_and_slideshow_count_where(
             "dir_rel = ?",
             (dir_rel,),
             cancel_check,
@@ -5736,6 +5823,7 @@ class Catalog:
         self,
         tag_name: str,
         *,
+        sort_order: SortOrder | None = None,
         cancel_check: CancelCallback | None = None,
     ) -> list[str]:
         """Return all slideshow-eligible paths assigned to one tag."""
@@ -5751,17 +5839,80 @@ class Catalog:
             """,
             (normalize_tag(tag_name),),
             cancel_check,
+            sort_order=sort_order,
+        )
+
+    def tag_image_and_slideshow_count(
+        self,
+        tag_name: str,
+        *,
+        cancel_check: CancelCallback | None = None,
+    ) -> tuple[int, int]:
+        return self._image_and_slideshow_count_where(
+            """
+            id IN (
+                SELECT image_tags.image_id
+                FROM image_tags
+                JOIN tags ON tags.id = image_tags.tag_id
+                WHERE tags.normalized = ?
+            )
+            """,
+            (normalize_tag(tag_name),),
+            cancel_check,
         )
 
     def list_exact_duplicate_slideshow_rel_paths(
         self,
         *,
+        sort_order: SortOrder | None = None,
         cancel_check: CancelCallback | None = None,
     ) -> list[str]:
         """Return all slideshow-eligible, non-trash exact duplicates."""
 
         trash_start, trash_end = descendant_range_bounds(TRASH_DIR_NAME)
         return self._slideshow_rel_paths_where(
+            """
+            image_hash IS NOT NULL
+                AND length(image_hash) = ?
+                AND rel_path != ?
+                AND NOT (rel_path >= ? AND rel_path < ?)
+                AND image_hash IN (
+                    SELECT image_hash
+                    FROM images
+                    WHERE image_hash IS NOT NULL
+                        AND length(image_hash) = ?
+                        AND rel_path != ?
+                        AND NOT (rel_path >= ? AND rel_path < ?)
+                    GROUP BY image_hash
+                    HAVING COUNT(*) > 1
+                )
+            """,
+            (
+                EXACT_IMAGE_HASH_HEX_LENGTH,
+                TRASH_DIR_NAME,
+                trash_start,
+                trash_end,
+                EXACT_IMAGE_HASH_HEX_LENGTH,
+                TRASH_DIR_NAME,
+                trash_start,
+                trash_end,
+            ),
+            cancel_check,
+            sort_order=sort_order,
+            order_prefix=(
+                "image_hash COLLATE NOCASE ASC, "
+                if sort_order is not None
+                else ""
+            ),
+        )
+
+    def exact_duplicate_image_and_slideshow_count(
+        self,
+        *,
+        cancel_check: CancelCallback | None = None,
+    ) -> tuple[int, int]:
+        trash_start, trash_end = descendant_range_bounds(TRASH_DIR_NAME)
+        return self._image_and_slideshow_count_where(
             """
             image_hash IS NOT NULL
                 AND length(image_hash) = ?
@@ -5796,33 +5947,48 @@ class Catalog:
         self,
         cancel_check: CancelCallback | None,
     ) -> Iterator[None]:
-        """Interrupt long SQLite planning/sort/group work when a task is stale."""
-        if cancel_check is None:
-            yield
-            return
-        cancellation: list[BaseException] = []
+        """Bound regex matching and interrupt stale SQLite query work."""
 
-        def check_progress() -> int:
-            try:
-                cancel_check()
-            except BaseException as error:
-                cancellation.append(error)
-                return 1
-            return 0
-
-        # The progress handler belongs to the connection, not a cursor. Hold
-        # the catalog DB lock until it is cleared so concurrent tasks cannot
-        # replace one another's cancellation callback.
-        with self._db_lock:
-            self._conn.set_progress_handler(check_progress, 1000)
-            try:
+        previous_timeout = getattr(_REGEXP_MATCH_STATE, "timeout_pattern", None)
+        _REGEXP_MATCH_STATE.timeout_pattern = None
+        try:
+            if cancel_check is None:
                 yield
-            except sqlite3.OperationalError:
-                if cancellation:
-                    raise cancellation[0] from None
-                raise
-            finally:
-                self._conn.set_progress_handler(None, 0)
+            else:
+                cancellation: list[BaseException] = []
+
+                def check_progress() -> int:
+                    try:
+                        cancel_check()
+                    except BaseException as error:
+                        cancellation.append(error)
+                        return 1
+                    return 0
+
+                # The progress handler belongs to the connection, not a cursor.
+                # Hold the DB lock so concurrent tasks cannot replace callbacks.
+                with self._db_lock:
+                    self._conn.set_progress_handler(check_progress, 1000)
+                    try:
+                        yield
+                    except sqlite3.OperationalError:
+                        if cancellation:
+                            raise cancellation[0] from None
+                        raise
+                    finally:
+                        self._conn.set_progress_handler(None, 0)
+            timed_out_pattern = getattr(
+                _REGEXP_MATCH_STATE,
+                "timeout_pattern",
+                None,
+            )
+            if timed_out_pattern is not None:
+                raise ValueError(
+                    "file name regular expression exceeded the matching time limit: "
+                    f"{timed_out_pattern!r}"
+                )
+        finally:
+            _REGEXP_MATCH_STATE.timeout_pattern = previous_timeout
 
     def directory_pane_record_count(self, dir_rel: str = "") -> int:
         """Return a cheap hint that includes descendant aggregation workload.
@@ -7955,6 +8121,7 @@ class Catalog:
         self,
         virtual_directory_id: int,
         *,
+        sort_order: SortOrder | None = None,
         cancel_check: CancelCallback | None = None,
     ) -> list[str]:
         """Return all slideshow paths matching one saved rule expression."""
@@ -7963,6 +8130,22 @@ class Catalog:
             int(virtual_directory_id)
         )
         return self._slideshow_rel_paths_where(
+            filter_sql,
+            filter_params,
+            cancel_check,
+            sort_order=sort_order,
+        )
+
+    def custom_virtual_directory_image_and_slideshow_count(
+        self,
+        virtual_directory_id: int,
+        *,
+        cancel_check: CancelCallback | None = None,
+    ) -> tuple[int, int]:
+        filter_sql, filter_params = self._compiled_custom_virtual_directory_filter(
+            int(virtual_directory_id)
+        )
+        return self._image_and_slideshow_count_where(
             filter_sql,
             filter_params,
             cancel_check,
