@@ -251,6 +251,7 @@ IMAGE_RECONCILE_MAX_ATTEMPTS = 3
 IMAGE_RECONCILE_RETRY_BASE_MS = 250
 TAG_DATABASE_RETRY_INITIAL_SECONDS = 0.05
 TAG_DATABASE_RETRY_MAX_SECONDS = 1.0
+TAG_DATABASE_RETRY_TIMEOUT_SECONDS = 10.0
 VIRTUAL_KIND_ROOT = "virtual-root"
 VIRTUAL_KIND_TAG_ROOT = "tag-root"
 VIRTUAL_KIND_TAG = "tag"
@@ -484,6 +485,7 @@ class ViewerNavigationPage:
     next_offset: int
     has_more: bool
     total_images: int
+    display_rel_paths: list[str] | None = None
     randomized: bool = False
     complete_order: bool = False
 
@@ -673,6 +675,7 @@ class VirtualViewResult:
     cache_version: int = 0
     total_records: int | None = None
     total_images: int | None = None
+    slideshow_images: int | None = None
     page_offset: int = 0
     next_offset: int = 0
     has_more: bool = False
@@ -774,6 +777,7 @@ class MovePayloadTask:
     edit_operations: tuple[EditOperation, ...] = ()
     edit_owner: QWidget | None = None
     navigation_owner: FullscreenViewer | None = None
+    deleted_tag_name: str | None = None
     hide_sources: bool = True
 
 
@@ -991,6 +995,8 @@ class ThumbnailModel(QAbstractListModel):
         self._directory_rows: list[int] = []
         self._image_count = 0
         self._indexed_image_count = 0
+        self._slideshow_image_count = 0
+        self._indexed_slideshow_image_count = 0
         self._image_ordinal_by_row: dict[int, int] = {}
         self._first_image_row: int | None = None
         self.tile_size = 160
@@ -1105,6 +1111,8 @@ class ThumbnailModel(QAbstractListModel):
         directory_rows: list[int] = []
         self._image_count = 0
         self._indexed_image_count = 0
+        self._slideshow_image_count = 0
+        self._indexed_slideshow_image_count = 0
         self._image_ordinal_by_row = {}
         self._first_image_row = None
         for row, record in enumerate(images[:THUMBNAIL_MODEL_BATCH_SIZE]):
@@ -1115,6 +1123,11 @@ class ThumbnailModel(QAbstractListModel):
             self._first_image_row = (
                 len(images) - self._image_count if self._image_count else None
             )
+        self._slideshow_image_count = (
+            len(complete_image_order)
+            if complete_image_order is not None
+            else self._indexed_slideshow_image_count
+        )
         if preserve_pixmap_cache and complete_row_by_key is not None:
             for rel_path in list(self._pixmap_cache):
                 previous_row = (
@@ -1202,6 +1215,7 @@ class ThumbnailModel(QAbstractListModel):
         *,
         total_records: int,
         total_images: int,
+        total_slideshow_images: int | None = None,
         next_offset: int,
         has_more: bool,
         request_page: Callable[[int], None],
@@ -1215,6 +1229,14 @@ class ThumbnailModel(QAbstractListModel):
         self._total_record_count = max(len(images), int(total_records))
         self._has_more_pages = bool(has_more and self._next_page_offset < self._total_record_count)
         self._image_count = max(self._indexed_image_count, int(total_images))
+        self._slideshow_image_count = max(
+            self._indexed_slideshow_image_count,
+            int(
+                total_images
+                if total_slideshow_images is None
+                else total_slideshow_images
+            ),
+        )
 
     @property
     def is_paged(self) -> bool:
@@ -1296,6 +1318,11 @@ class ThumbnailModel(QAbstractListModel):
             published_images,
             total_records=self._total_record_count + len(extras),
             total_images=self._image_count + sum(isinstance(record, ImageRecord) for record in extras),
+            total_slideshow_images=self._slideshow_image_count
+            + sum(
+                isinstance(record, ImageRecord) and record.slideshow_eligible
+                for record in extras
+            ),
             next_offset=self._next_page_offset,
             has_more=self._has_more_pages,
             request_page=request_page,
@@ -1464,6 +1491,7 @@ class ThumbnailModel(QAbstractListModel):
         has_more: bool,
         total_records: int,
         total_images: int,
+        total_slideshow_images: int | None = None,
     ) -> bool:
         """Append a completed worker page if it still matches the model cursor."""
 
@@ -1492,6 +1520,14 @@ class ThumbnailModel(QAbstractListModel):
         self._total_record_count = max(len(self.images), int(total_records))
         self._has_more_pages = bool(has_more and self._next_page_offset < self._total_record_count)
         self._image_count = max(self._indexed_image_count, int(total_images))
+        self._slideshow_image_count = max(
+            self._indexed_slideshow_image_count,
+            int(
+                total_images
+                if total_slideshow_images is None
+                else total_slideshow_images
+            ),
+        )
         if new_records:
             self.endInsertRows()
         self.indexesReady.emit(self._record_index_generation)
@@ -1517,11 +1553,27 @@ class ThumbnailModel(QAbstractListModel):
         old_loaded_images = sum(isinstance(record, ImageRecord) for record in self.images)
         new_loaded_images = sum(isinstance(record, ImageRecord) for record in images)
         removed_images = max(0, old_loaded_images - new_loaded_images)
+        old_loaded_slideshow_images = sum(
+            isinstance(record, ImageRecord) and record.slideshow_eligible
+            for record in self.images
+        )
+        new_loaded_slideshow_images = sum(
+            isinstance(record, ImageRecord) and record.slideshow_eligible
+            for record in images
+        )
+        removed_slideshow_images = max(
+            0,
+            old_loaded_slideshow_images - new_loaded_slideshow_images,
+        )
         self.set_paged_images(
             self.catalog,
             images,
             total_records=max(0, self._total_record_count - removed_records),
             total_images=max(0, self._image_count - removed_images),
+            total_slideshow_images=max(
+                0,
+                self._slideshow_image_count - removed_slideshow_images,
+            ),
             next_offset=self._next_page_offset,
             # Offset pagination is no longer causal once a loaded row has
             # been removed. Mutation settlement performs a fresh generation
@@ -1549,6 +1601,12 @@ class ThumbnailModel(QAbstractListModel):
         self._row_by_key[("image", record.rel_path)] = row
         self._indexed_image_count += 1
         self._image_count = max(self._image_count, self._indexed_image_count)
+        if record.slideshow_eligible:
+            self._indexed_slideshow_image_count += 1
+            self._slideshow_image_count = max(
+                self._slideshow_image_count,
+                self._indexed_slideshow_image_count,
+            )
         self._image_ordinal_by_row[row] = self._indexed_image_count
         if self._first_image_row is None:
             self._first_image_row = row
@@ -1682,6 +1740,10 @@ class ThumbnailModel(QAbstractListModel):
     @property
     def image_count(self) -> int:
         return self._image_count
+
+    @property
+    def slideshow_image_count(self) -> int:
+        return self._slideshow_image_count
 
     @property
     def first_image_row(self) -> int | None:
@@ -5096,6 +5158,7 @@ class MainWindow(QMainWindow):
         )
         if mutation is not None:
             mutation.edit_owner = owner
+            mutation.deleted_tag_name = clean_name
             self._forget_deleted_tag(clean_name)
         return mutation
 
@@ -5974,6 +6037,7 @@ class MainWindow(QMainWindow):
         write: Callable[[], int],
     ) -> int:
         retry_delay = TAG_DATABASE_RETRY_INITIAL_SECONDS
+        retry_deadline = monotonic() + TAG_DATABASE_RETRY_TIMEOUT_SECONDS
         while True:
             task.check_canceled()
             try:
@@ -5986,7 +6050,10 @@ class MainWindow(QMainWindow):
                     total,
                     f"Waiting for catalog database ({current})",
                 )
-                sleep(retry_delay)
+                remaining = retry_deadline - monotonic()
+                if remaining <= 0:
+                    raise
+                sleep(min(retry_delay, remaining))
                 retry_delay = min(
                     retry_delay * 2,
                     TAG_DATABASE_RETRY_MAX_SECONDS,
@@ -10087,7 +10154,10 @@ class MainWindow(QMainWindow):
                     dir_rel,
                     cancel_check=check_canceled,
                 )
-                image_count = catalog.image_count(dir_rel, cancel_check=check_canceled)
+                image_count, slideshow_images = catalog.image_and_slideshow_count(
+                    dir_rel,
+                    cancel_check=check_canceled,
+                )
                 check_canceled()
                 directory_take = max(
                     0,
@@ -10137,6 +10207,7 @@ class MainWindow(QMainWindow):
             duration_ms=(monotonic() - started_at) * 1000,
             total_records=total_records,
             total_images=image_count,
+            slideshow_images=slideshow_images,
             page_offset=page_offset,
             next_offset=next_offset,
             has_more=next_offset < total_records,
@@ -10685,9 +10756,11 @@ class MainWindow(QMainWindow):
             catalog._conn.execute("BEGIN")  # noqa: SLF001 - one count/page read snapshot
             try:
                 if kind == VIRTUAL_KIND_TAG:
-                    total_images = catalog.tag_image_count(
-                        value,
-                        cancel_check=check_canceled,
+                    total_images, slideshow_images = (
+                        catalog.tag_image_and_slideshow_count(
+                            value,
+                            cancel_check=check_canceled,
+                        )
                     )
                     images = catalog.list_images_for_tag_page(
                         value,
@@ -10699,9 +10772,11 @@ class MainWindow(QMainWindow):
                     )
                 elif kind == VIRTUAL_KIND_CUSTOM:
                     saved_id = int(value)
-                    total_images = catalog.custom_virtual_directory_image_count(
-                        saved_id,
-                        cancel_check=check_canceled,
+                    total_images, slideshow_images = (
+                        catalog.custom_virtual_directory_image_and_slideshow_count(
+                            saved_id,
+                            cancel_check=check_canceled,
+                        )
                     )
                     images = catalog.list_images_for_custom_virtual_directory_page(
                         saved_id,
@@ -10712,8 +10787,10 @@ class MainWindow(QMainWindow):
                         cancel_check=check_canceled,
                     )
                 else:
-                    total_images = catalog.exact_duplicate_image_count(
-                        cancel_check=check_canceled,
+                    total_images, slideshow_images = (
+                        catalog.exact_duplicate_image_and_slideshow_count(
+                            cancel_check=check_canceled,
+                        )
                     )
                     images = catalog.list_exact_duplicate_images_page(
                         sort_order,
@@ -10738,6 +10815,7 @@ class MainWindow(QMainWindow):
             duration_ms=(monotonic() - started_at) * 1000,
             total_records=total_images,
             total_images=total_images,
+            slideshow_images=slideshow_images,
             page_offset=page_offset,
             next_offset=next_offset,
             has_more=next_offset < total_images,
@@ -10902,7 +10980,7 @@ class MainWindow(QMainWindow):
             ],
             next_offset=result.next_offset,
             has_more=result.has_more,
-            total_images=result.total_images or 0,
+            total_images=result.slideshow_images or 0,
         )
 
     @staticmethod
@@ -10912,6 +10990,7 @@ class MainWindow(QMainWindow):
         expected_storage_identity: CatalogStorageIdentity,
         kind: str,
         value: str,
+        sort_order: SortOrder,
         page_offset: int,
         _page_limit: int,
         cancel_event: Event,
@@ -10935,21 +11014,25 @@ class MainWindow(QMainWindow):
                 if kind == VIRTUAL_KIND_PHYSICAL:
                     rel_paths = catalog.list_slideshow_rel_paths(
                         value,
+                        sort_order=sort_order,
                         cancel_check=check_canceled,
                     )
                 elif kind == VIRTUAL_KIND_TAG:
                     rel_paths = catalog.list_slideshow_rel_paths_for_tag(
                         value,
+                        sort_order=sort_order,
                         cancel_check=check_canceled,
                     )
                 elif kind == VIRTUAL_KIND_DUPLICATES:
                     rel_paths = catalog.list_exact_duplicate_slideshow_rel_paths(
+                        sort_order=sort_order,
                         cancel_check=check_canceled,
                     )
                 elif kind == VIRTUAL_KIND_CUSTOM:
                     rel_paths = (
                         catalog.list_slideshow_rel_paths_for_custom_virtual_directory(
                             int(value),
+                            sort_order=sort_order,
                             cancel_check=check_canceled,
                         )
                     )
@@ -10960,13 +11043,15 @@ class MainWindow(QMainWindow):
                     catalog._conn.execute("ROLLBACK")  # noqa: SLF001
             catalog._assert_catalog_storage_identity()  # noqa: SLF001
         check_canceled()
-        rel_paths = shuffled_items(rel_paths)
+        display_rel_paths = rel_paths
+        rel_paths = shuffled_items(display_rel_paths)
         check_canceled()
         return ViewerNavigationPage(
             rel_paths=rel_paths,
             next_offset=len(rel_paths),
             has_more=False,
             total_images=len(rel_paths),
+            display_rel_paths=display_rel_paths,
             randomized=True,
             complete_order=True,
         )
@@ -11674,6 +11759,7 @@ class MainWindow(QMainWindow):
                         has_more=result.has_more,
                         total_records=total_records,
                         total_images=total_images,
+                        total_slideshow_images=result.slideshow_images,
                     )
                     if not appended:
                         continue
@@ -11694,6 +11780,7 @@ class MainWindow(QMainWindow):
                     filtered_records,
                     total_records=total_records,
                     total_images=total_images,
+                    total_slideshow_images=result.slideshow_images,
                     next_offset=result.next_offset,
                     has_more=result.has_more,
                     request_page=self._pane_page_callback(
@@ -12253,6 +12340,17 @@ class MainWindow(QMainWindow):
                     failed_refresh_roots.update(move_task.affected_roots)
                 continue
             last_result = result
+            if (
+                move_task.deleted_tag_name is not None
+                and self.current_catalog is not None
+                and self.current_catalog.root == move_task.dest_root
+                and self.current_virtual_kind == VIRTUAL_KIND_TAG
+                and normalize_tag(self.current_virtual_value)
+                == normalize_tag(move_task.deleted_tag_name)
+            ):
+                self.current_virtual_kind = None
+                self.current_virtual_value = ""
+                self.current_dir_rel = ""
             if move_task.navigation_owner is not None:
                 with suppress(RuntimeError):
                     move_task.navigation_owner.invalidate_paged_navigation()
@@ -13446,6 +13544,7 @@ class MainWindow(QMainWindow):
                     catalog.storage_identity,
                     kind,
                     value,
+                    self.current_sort,
                 )
                 viewer_display_order = initial
             else:
@@ -13466,7 +13565,7 @@ class MainWindow(QMainWindow):
                 index=0 if random_mode else initial.index(start),
                 next_offset=next_offset,
                 has_more=has_more,
-                total_count=self.model.image_count,
+                total_count=self.model.slideshow_image_count,
                 page_loader=page_loader,
                 random_mode=random_mode,
                 view_kind=kind,
@@ -15101,11 +15200,36 @@ class TagDialog(QDialog):
             self.accept()
 
     @staticmethod
-    def _active_entry_prefix(text: str) -> str:
-        fragment = text.rpartition(",")[2].lstrip()
+    def _active_entry_bounds(text: str, cursor: int) -> tuple[int, int]:
+        """Return the CSV-like tag field surrounding the caret."""
+
+        cursor = max(0, min(int(cursor), len(text)))
+        start = 0
+        end = len(text)
+        in_quotes = False
+        index = 0
+        while index < len(text):
+            character = text[index]
+            if character == '"':
+                if in_quotes and index + 1 < len(text) and text[index + 1] == '"':
+                    index += 2
+                    continue
+                in_quotes = not in_quotes
+            elif character == "," and not in_quotes:
+                if index < cursor:
+                    start = index + 1
+                else:
+                    end = index
+                    break
+            index += 1
+        return start, end
+
+    def _active_entry_prefix(self, text: str) -> str:
+        start, _ = self._active_entry_bounds(text, self.entry.cursorPosition())
+        fragment = text[start : self.entry.cursorPosition()].lstrip()
         if fragment.startswith('"'):
             fragment = fragment[1:]
-        return fragment.casefold()
+        return fragment.replace('""', '"').casefold()
 
     def _filter_tag_checkboxes(self, text: str) -> None:
         prefix = self._active_entry_prefix(text)
@@ -15192,10 +15316,7 @@ class TagDialog(QDialog):
     def _replace_active_entry_tag(self, name: str) -> None:
         text = self.entry.text()
         cursor = self.entry.cursorPosition()
-        start = text.rfind(",", 0, cursor) + 1
-        end = text.find(",", cursor)
-        if end < 0:
-            end = len(text)
+        start, end = self._active_entry_bounds(text, cursor)
         fragment = text[start:end]
         leading = fragment[: len(fragment) - len(fragment.lstrip())]
         quoted = fragment.lstrip().startswith('"')
@@ -16426,6 +16547,12 @@ class NewVirtualDirectoryDialog(QDialog):
             self._selected_tag_names.pop(key, None)
         self._validate()
 
+    @staticmethod
+    def _canonical_simple_regex(text: str) -> str:
+        """Discard an empty criterion without trimming meaningful spaces."""
+
+        return text if text.strip() else ""
+
     def _simple_expression(self) -> VirtualDirectoryRule:
         directory_rules = tuple(
             VirtualDirectoryRule("directory", value=dir_rel)
@@ -16438,9 +16565,10 @@ class NewVirtualDirectoryDialog(QDialog):
                 if len(directory_rules) == 1
                 else VirtualDirectoryRule("any", children=directory_rules)
             )
-        if self.regex_entry.text():
+        pattern = self._canonical_simple_regex(self.regex_entry.text())
+        if pattern:
             rules.append(
-                VirtualDirectoryRule("regex", value=self.regex_entry.text())
+                VirtualDirectoryRule("regex", value=pattern)
             )
         rules.extend(
             VirtualDirectoryRule(
@@ -16605,7 +16733,7 @@ class NewVirtualDirectoryDialog(QDialog):
             if self.name_entry.text() and not name_valid
             else ""
         )
-        pattern = self.regex_entry.text()
+        pattern = self._canonical_simple_regex(self.regex_entry.text())
         try:
             if pattern:
                 re.compile(pattern)
@@ -16764,7 +16892,7 @@ class NewVirtualDirectoryDialog(QDialog):
         return " ".join(self.name_entry.text().strip().split())
 
     def filename_regex(self) -> str:
-        return self.regex_entry.text()
+        return self._canonical_simple_regex(self.regex_entry.text())
 
     def selected_directories(self) -> tuple[str, ...]:
         if "" in self._selected_directory_rels:
@@ -18308,6 +18436,7 @@ class ImageDisplayLabel(QLabel):
     ORDINAL_MARGIN = 16
     ORDINAL_PADDING = 2
     ORDINAL_FONT_POINT_SIZE = 12
+    POSITION_LABEL_GAP = 8
     LIGHT_BACKGROUND_LUMINANCE = 140.0
     ORDINAL_SAMPLE_WIDTH = 16
     ORDINAL_SAMPLE_HEIGHT = 64
@@ -18388,7 +18517,17 @@ class ImageDisplayLabel(QLabel):
         return self._vertical_overlay_rect(self._ordinal_text, right_aligned=False)
 
     def filename_overlay_rect(self) -> QRect:
-        return self._vertical_overlay_rect(self._filename_text, right_aligned=True)
+        resolution_rect = self.resolution_overlay_rect()
+        minimum_top = (
+            resolution_rect.bottom() + 1 + self.POSITION_LABEL_GAP
+            if not resolution_rect.isEmpty()
+            else self.ORDINAL_MARGIN
+        )
+        return self._vertical_overlay_rect(
+            self._filename_text,
+            right_aligned=True,
+            minimum_top=minimum_top,
+        )
 
     def resolution_overlay_rect(self) -> QRect:
         return self._vertical_overlay_rect(
@@ -18403,6 +18542,7 @@ class ImageDisplayLabel(QLabel):
         *,
         right_aligned: bool,
         top_aligned: bool = False,
+        minimum_top: int | None = None,
     ) -> QRect:
         if not text:
             return QRect()
@@ -18411,7 +18551,12 @@ class ImageDisplayLabel(QLabel):
         metrics = QFontMetrics(font)
         unrotated_width = metrics.horizontalAdvance(text) + 2 * self.ORDINAL_PADDING
         unrotated_height = metrics.height() + 2 * self.ORDINAL_PADDING
-        available_height = max(0, self.height() - 2 * self.ORDINAL_MARGIN)
+        top_edge = max(
+            self.ORDINAL_MARGIN,
+            self.ORDINAL_MARGIN if minimum_top is None else minimum_top,
+        )
+        bottom_edge = self.height() - self.ORDINAL_MARGIN
+        available_height = max(0, bottom_edge - top_edge)
         rotated_height = min(unrotated_width, available_height)
         if rotated_height <= 0:
             return QRect()
@@ -18425,7 +18570,7 @@ class ImageDisplayLabel(QLabel):
             (
                 self.ORDINAL_MARGIN
                 if top_aligned
-                else self.height() - self.ORDINAL_MARGIN - rotated_height
+                else bottom_edge - rotated_height
             ),
             unrotated_height,
             rotated_height,
@@ -19822,13 +19967,15 @@ class FullscreenViewer(QDialog):
             self.update_info_overlay()
             return
         if replace_all:
-            canonical_rel_paths = list(dict.fromkeys(page.rel_paths))
-            for rel_path in canonical_rel_paths:
+            display_rel_paths = list(
+                dict.fromkeys(page.display_rel_paths or page.rel_paths)
+            )
+            for rel_path in display_rel_paths:
                 if rel_path in self._navigation_rebuild_display_seen:
                     continue
                 self._navigation_rebuild_display_seen.add(rel_path)
                 self._navigation_rebuild_display_order.append(rel_path)
-            rel_paths = canonical_rel_paths
+            rel_paths = list(dict.fromkeys(page.rel_paths))
             if navigator.random_mode and rel_paths and not page.randomized:
                 rel_paths = shuffled_items(rel_paths)
             for rel_path in rel_paths:
@@ -19887,11 +20034,15 @@ class FullscreenViewer(QDialog):
             else:
                 self.accept()
             return
-        for rel_path in page.rel_paths:
-            if rel_path in self._display_seen:
-                continue
-            self._display_seen.add(rel_path)
-            self._display_order.append(rel_path)
+        if page.complete_order and page.display_rel_paths is not None:
+            self._display_order = list(dict.fromkeys(page.display_rel_paths))
+            self._display_seen = set(self._display_order)
+        else:
+            for rel_path in page.display_rel_paths or page.rel_paths:
+                if rel_path in self._display_seen:
+                    continue
+                self._display_seen.add(rel_path)
+                self._display_order.append(rel_path)
         added = navigator.append_page(page)
         self.update_ordinal_overlay()
         self._navigation_page_select_first = False
