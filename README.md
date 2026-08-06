@@ -41,7 +41,7 @@ Marnwick recognizes AVIF, BMP, GIF, HEIC, HEIF, JPEG, PNG, TIFF, and WebP images
 - Optional GNU `find` and `md5sum` for faster catalog discovery and freshness checks
 - Optional GNU `shred` for wipe-on-delete
 
-The runtime dependencies are NumPy, Pillow, PyAV, PySide6, and one ONNX Runtime variant selected for the host. PyAV's binary wheels provide the FFmpeg libraries used to extract video preview frames. Development and CPU runtime dependencies are hash-locked in `requirements-dev.lock`; the setup scripts select the NVIDIA runtime on supported x86-64 Linux systems, DirectML on x86-64 Windows, and the CPU runtime otherwise. Standard setup also installs Microsoft's beta [WebGPU execution-provider plugin](https://pypi.org/project/onnxruntime-ep-webgpu/) on x86-64 Linux and Windows and on Apple-silicon macOS 14 or newer. LaMa's 198 MiB model data is optional and downloaded only after confirmation.
+The runtime dependencies are NumPy, Pillow, PyAV, PySide6, the timeout-capable Regex package, and one ONNX Runtime variant selected for the host. PyAV's binary wheels provide the FFmpeg libraries used to extract video preview frames. Base runtime dependencies are hash-locked in `requirements-runtime.lock`, while development and CPU runtime dependencies are hash-locked in `requirements-dev.lock`; the setup scripts select the NVIDIA runtime on supported x86-64 Linux systems, DirectML on x86-64 Windows, and the CPU runtime otherwise. Standard setup also installs Microsoft's beta [WebGPU execution-provider plugin](https://pypi.org/project/onnxruntime-ep-webgpu/) on x86-64 Linux and Windows and on Apple-silicon macOS 14 or newer. LaMa's 198 MiB model data is optional and downloaded only after confirmation.
 
 ## Quick start
 
@@ -54,7 +54,7 @@ From a fresh clone:
 ./start.sh
 ```
 
-The setup script creates a virtual environment (by default `.venv`), installs the locked dependencies and Marnwick in editable mode, and writes `start.sh`. On x86-64 Linux it selects the NVIDIA ONNX Runtime when `nvidia-smi` reports a GPU, installs the CPU runtime otherwise, and installs the WebGPU plugin alongside either core runtime. On Apple-silicon macOS 14 or newer it installs the CPU/CoreML runtime and WebGPU plugin. Linux setup also installs a per-user desktop entry under `${XDG_DATA_HOME:-$HOME/.local/share}/applications`; macOS launches through `start.sh`.
+The setup script creates a virtual environment (by default `.venv`), installs the locked dependencies and Marnwick in editable mode, and writes `start.sh`. When a repository update changes the base runtime dependency lock, `start.sh` refreshes those dependencies once before launching. On x86-64 Linux setup selects the NVIDIA ONNX Runtime when `nvidia-smi` reports a GPU, installs the CPU runtime otherwise, and installs the WebGPU plugin alongside either core runtime. On Apple-silicon macOS 14 or newer it installs the CPU/CoreML runtime and WebGPU plugin. Linux setup also installs a per-user desktop entry under `${XDG_DATA_HOME:-$HOME/.local/share}/applications`; macOS launches through `start.sh`.
 
 ### Windows PowerShell
 
@@ -348,9 +348,11 @@ The repository currently has no configured formatter, general-purpose linter, st
 .venv/bin/python -m bandit -q -c bandit.yaml -r src tools
 ```
 
-Regenerate the Python 3.12 development lock after changing dependencies:
+Regenerate the Python 3.12 runtime and development locks after changing dependencies:
 
 ```bash
+.venv/bin/pip-compile --generate-hashes \
+  --output-file=requirements-runtime.lock pyproject.toml
 .venv/bin/pip-compile --allow-unsafe --extra=cpu --extra=dev --generate-hashes \
   --output-file=requirements-dev.lock pyproject.toml
 ```
