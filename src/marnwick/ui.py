@@ -18724,6 +18724,7 @@ class ViewerPanEditSnapshot:
 class FullscreenViewer(QDialog):
     ZOOM_STEP = 1.25
     MAX_ZOOM = 16.0
+    CROP_DISPLAY_SCALE = 0.9
     PAN_KEY_STEP = 80
     LAMA_PROGRESS_LABEL_GAP = 16
 
@@ -21508,6 +21509,7 @@ class FullscreenViewer(QDialog):
     def start_region_edit(self, mode: str) -> None:
         if not self.can_edit_current():
             return
+        crop_display_scale_changed = (self.edit_mode == "crop") != (mode == "crop")
         self._clear_pan_chord_state()
         if self.movie is not None:
             self.stop_movie()
@@ -21544,8 +21546,11 @@ class FullscreenViewer(QDialog):
             else:
                 self.red_eye_overlay.update_selection(None)
         self.update_cursor_visibility()
+        if crop_display_scale_changed:
+            self._fit_pixmap()
 
     def exit_region_edit(self) -> None:
+        restore_crop_display_scale = self.edit_mode == "crop"
         self._clear_pan_chord_state()
         self.edit_mode = None
         self.clone_source_center = None
@@ -21566,6 +21571,8 @@ class FullscreenViewer(QDialog):
             self.red_eye_overlay.update_selection(None)
         if hasattr(self, "label"):
             self.update_cursor_visibility()
+            if restore_crop_display_scale:
+                self._fit_pixmap()
         if not self._load_closed and self._lama_future is None:
             self.setWindowTitle("Marnwick")
 
@@ -21781,9 +21788,10 @@ class FullscreenViewer(QDialog):
             Qt.AspectRatioMode.KeepAspectRatio,
         )
         scaled_size = logical_size_for_physical(scaled_size, device_pixel_ratio)
+        edit_scale = self.CROP_DISPLAY_SCALE if self.edit_mode == "crop" else 1.0
         return QSize(
-            max(1, int(round(scaled_size.width() * self.zoom_level))),
-            max(1, int(round(scaled_size.height() * self.zoom_level))),
+            max(1, int(round(scaled_size.width() * self.zoom_level * edit_scale))),
+            max(1, int(round(scaled_size.height() * self.zoom_level * edit_scale))),
         )
 
     def image_device_pixel_ratio(self) -> float:

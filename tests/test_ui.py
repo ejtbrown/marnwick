@@ -1528,6 +1528,42 @@ def test_red_eye_selection_rect_keeps_square_aspect_ratio(tmp_path: Path) -> Non
             qt_app.processEvents()
 
 
+def test_crop_selection_reduces_fitted_display_by_ten_percent(tmp_path: Path) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    Image.new("RGB", (1000, 500), (10, 20, 30)).save(root / "image.jpg")
+
+    with Catalog(root) as catalog:
+        viewer = FullscreenViewer(
+            catalog,
+            ImageNavigator.sequential(["image.jpg"], "image.jpg"),
+        )
+        try:
+            viewer.label.resize(1000, 500)
+            viewer.base_pixmap = QPixmap(1000, 500)
+            viewer._fit_pixmap()
+
+            assert viewer.displayed_image_rect() == QRect(0, 0, 1000, 500)
+
+            viewer.start_region_edit("crop")
+
+            assert viewer.displayed_image_rect() == QRect(50, 25, 900, 450)
+            assert viewer.label._display_target_rect() == QRect(50, 25, 900, 450)
+            assert viewer.image_box_from_label_rect(
+                viewer.displayed_image_rect()
+            ) == (0, 0, 1000, 500)
+
+            viewer.exit_region_edit()
+
+            assert viewer.displayed_image_rect() == QRect(0, 0, 1000, 500)
+            assert viewer.label._display_target_rect() == QRect(0, 0, 1000, 500)
+        finally:
+            viewer.close()
+            viewer.deleteLater()
+            qt_app.processEvents()
+
+
 def test_fullscreen_display_targets_physical_pixels_on_scaled_displays(tmp_path: Path, monkeypatch) -> None:
     qt_app = app()
     root = tmp_path / "catalog"
@@ -1866,7 +1902,9 @@ def test_fullscreen_zoom_and_mouse_chord_pan_work_during_editing(
                 ),
             )
 
-            assert viewer.pan_offset == QPoint(30, 25)
+            assert viewer.pan_offset == (
+                QPoint(19, 19) if mode == "crop" else QPoint(30, 25)
+            )
             assert viewer.edit_mode == mode
             assert viewer.operations == []
             assert viewer.lama_samples == []
