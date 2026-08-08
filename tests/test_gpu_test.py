@@ -1,14 +1,22 @@
 from __future__ import annotations
 
+import io
 import json
 from pathlib import Path
 import sys
 from types import SimpleNamespace
 
 import numpy as np
+from PIL import Image
 import pytest
 
 from marnwick import gpu_test
+from marnwick.config import RemoteLamaConfig
+from marnwick.remote_lama import (
+    REMOTE_LAMA_EXECUTION_PROVIDER,
+    RemoteLamaResponse,
+    encode_trusted_certificate,
+)
 
 
 def test_platform_specific_gpu_methods_explain_unsupported_hosts() -> None:
@@ -87,7 +95,88 @@ def test_run_gpu_tests_reports_invalid_model_for_every_method(
         result.status == gpu_test.GPU_TEST_STATUS_UNAVAILABLE
         for result in results
     )
-    assert all("integrity check failed" in result.explanation for result in results)
+    local_results = [
+        result
+        for result in results
+        if result.provider != REMOTE_LAMA_EXECUTION_PROVIDER
+    ]
+    remote_result = next(
+        result
+        for result in results
+        if result.provider == REMOTE_LAMA_EXECUTION_PROVIDER
+    )
+    assert all("integrity check failed" in result.explanation for result in local_results)
+    assert "Tools > Remote LaMa" in remote_result.explanation
+
+
+def test_remote_gpu_test_measures_two_verified_round_trips(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    class FakeRemoteClient:
+        def __init__(self, config: RemoteLamaConfig, *, timeout: float) -> None:
+            assert config.host == "172.31.254.1"
+            assert timeout == 30
+
+        def __enter__(self) -> "FakeRemoteClient":
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return
+
+        def health(self, **_kwargs: object) -> dict[str, object]:
+            return {
+                "status": "ready",
+                "model": "big-lama",
+                "device": "Test GPU",
+            }
+
+        def inpaint_png(
+            self,
+            image_png: bytes,
+            mask_png: bytes,
+            **_kwargs: object,
+        ) -> RemoteLamaResponse:
+            nonlocal calls
+            calls += 1
+            with Image.open(io.BytesIO(image_png)) as opened_image:
+                image = np.asarray(opened_image.convert("RGB")).copy()
+            with Image.open(io.BytesIO(mask_png)) as opened_mask:
+                mask = np.asarray(opened_mask.convert("L")) > 0
+            image[mask] = 255 - image[mask]
+            output = io.BytesIO()
+            Image.fromarray(image, mode="RGB").save(output, format="PNG")
+            return RemoteLamaResponse(
+                output.getvalue(),
+                {"x-inference-milliseconds": "12.6"},
+            )
+
+    monkeypatch.setattr(gpu_test, "RemoteLamaClient", FakeRemoteClient)
+    config = RemoteLamaConfig(
+        certificate_der=encode_trusted_certificate(b"certificate")
+    )
+    method = next(
+        method
+        for method in gpu_test.GPU_TEST_METHODS
+        if method.provider == REMOTE_LAMA_EXECUTION_PROVIDER
+    )
+
+    result = gpu_test._run_remote_gpu_test(
+        method,
+        config,
+        cancel_event=None,
+        timeout_seconds=30,
+    )
+
+    assert result.status == gpu_test.GPU_TEST_STATUS_WORKS
+    assert result.setup_seconds is not None
+    assert result.cold_inference_seconds is not None
+    assert result.warm_inference_seconds is not None
+    assert "big-lama" in result.explanation
+    assert "Test GPU" in result.explanation
+    assert "13 ms reported by the server" in result.explanation
+    assert calls == 2
 
 
 def test_worker_runs_cold_and_warm_repairs_without_profiling(

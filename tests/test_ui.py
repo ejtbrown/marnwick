@@ -42,6 +42,7 @@ from marnwick.catalog import (  # noqa: E402
 )
 from marnwick.config import (  # noqa: E402
     LAMA_RUNTIME_NVIDIA,
+    LAMA_RUNTIME_REMOTE,
     LAMA_RUNTIME_WEBGPU,
     NORMAL_DELETE,
     WIPE_ON_DELETE,
@@ -2005,6 +2006,68 @@ def test_lama_processing_keeps_the_unmasked_image_visible(
             viewer.close()
             viewer.deleteLater()
             qt_app.processEvents()
+
+
+def test_remote_lama_engine_skips_local_model_and_passes_trusted_endpoint(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    Image.new("RGB", (160, 120), (180, 40, 30)).save(root / "image.png")
+    window = MainWindow()
+    viewer: FullscreenViewer | None = None
+    pending: Future[EditOperation] = Future()
+    observed: dict[str, object] = {}
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        catalog.refresh()
+        window.app_config.lama_runtime = LAMA_RUNTIME_REMOTE
+        window.app_config.remote_lama = ui_module.RemoteLamaConfig(
+            certificate_der="Y2VydA=="
+        )
+        viewer = FullscreenViewer(
+            catalog,
+            ImageNavigator.sequential(["image.png"], "image.png"),
+            window,
+        )
+        settle_viewer_load(viewer, qt_app)
+        monkeypatch.setattr(
+            window,
+            "ensure_lama_model",
+            lambda *_args, **_kwargs: pytest.fail(
+                "Remote LaMa must not request the local model"
+            ),
+        )
+
+        viewer.open_lama_tool()
+        assert viewer.edit_mode == "lama"
+        viewer.lama_samples.append((80, 60, 12))
+
+        def capture_submit(*_args, **kwargs):  # type: ignore[no-untyped-def]
+            observed.update(kwargs)
+            return pending
+
+        monkeypatch.setattr(viewer._lama_executor, "submit", capture_submit)
+        viewer.apply_lama_mask()
+
+        assert observed["runtime"] == LAMA_RUNTIME_REMOTE
+        assert observed["remote_config"] == window.app_config.remote_lama
+        assert not viewer.lama_busy_overlay.isHidden()
+        assert "pinned TLS" in viewer.lama_busy_overlay.detail_label.text()
+    finally:
+        if viewer is not None:
+            viewer._cancel_lama_inference()
+            viewer.close()
+            viewer.deleteLater()
+        window.indexer.shutdown()
+        window.workspace.close()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
 
 
 def test_lama_mask_drag_overlap_keeps_constant_translucency() -> None:
@@ -5505,13 +5568,13 @@ def test_app_preferences_dialog_exposes_config_settings(tmp_path: Path) -> None:
         assert [
             dialog.lama_runtime.itemText(index)
             for index in range(dialog.lama_runtime.count())
-        ] == ["Auto", "CPU", "NVIDIA", "WebGPU"]
+        ] == ["Auto", "CPU", "NVIDIA", "WebGPU", "Remote LaMa"]
         assert dialog.lama_runtime.currentData() == LAMA_RUNTIME_NVIDIA
         dialog.thumbnail_size.setValue(9)
         dialog.sort_order.setCurrentIndex(dialog.sort_order.findData(SortOrder.DATE_ASC.value))
         dialog.delete_behavior.setCurrentIndex(dialog.delete_behavior.findData(WIPE_ON_DELETE))
         dialog.lama_runtime.setCurrentIndex(
-            dialog.lama_runtime.findData(LAMA_RUNTIME_WEBGPU)
+            dialog.lama_runtime.findData(LAMA_RUNTIME_REMOTE)
         )
         dialog.catalog_list.addItem(str(tmp_path / "two"))
 
@@ -5520,7 +5583,7 @@ def test_app_preferences_dialog_exposes_config_settings(tmp_path: Path) -> None:
         assert selected.thumbnail_size == 9
         assert selected.delete_behavior == WIPE_ON_DELETE
         assert selected.sort_order == SortOrder.DATE_ASC.value
-        assert selected.lama_runtime == LAMA_RUNTIME_WEBGPU
+        assert selected.lama_runtime == LAMA_RUNTIME_REMOTE
         assert selected.catalogs == [str(tmp_path / "one"), str(tmp_path / "two")]
     finally:
         dialog.close()
@@ -9352,9 +9415,16 @@ def test_tools_gpu_test_uses_confirmed_lama_model(
     observed: dict[str, object] = {}
 
     class FakeGpuTestDialog:
-        def __init__(self, model: Path, parent: MainWindow) -> None:
+        def __init__(
+            self,
+            model: Path,
+            parent: MainWindow,
+            *,
+            remote_config,
+        ) -> None:
             observed["model"] = model
             observed["parent"] = parent
+            observed["remote_config"] = remote_config
 
         def exec(self) -> None:
             observed["executed"] = True
@@ -9378,6 +9448,7 @@ def test_tools_gpu_test_uses_confirmed_lama_model(
             "owner": window,
             "model": model_path,
             "parent": window,
+            "remote_config": window.app_config.remote_lama,
             "executed": True,
             "deleted": True,
         }
@@ -9398,12 +9469,14 @@ def test_gpu_test_dialog_runs_all_methods_and_copies_explanations(
     def fake_run_gpu_tests(  # type: ignore[no-untyped-def]
         model_path,
         *,
+        remote_config,
         cancel_event,
         result_callback,
         timeout_seconds=300.0,
     ):
         del timeout_seconds
         assert model_path == tmp_path / "model.onnx"
+        assert remote_config == ui_module.RemoteLamaConfig()
         assert not cancel_event.is_set()
         results = []
         for index, method in enumerate(ui_module.GPU_TEST_METHODS):
@@ -9449,7 +9522,7 @@ def test_gpu_test_dialog_runs_all_methods_and_copies_explanations(
         assert dialog.results_tree.topLevelItem(1).text(1) == "Failed"
         assert dialog.results_tree.topLevelItem(2).text(1) == "Not available"
         assert dialog.status_label.text() == (
-            "Testing complete: 1 working, 5 not available, and 1 failed."
+            "Testing complete: 1 working, 6 not available, and 1 failed."
         )
 
         dialog.results_tree.setCurrentItem(dialog.results_tree.topLevelItem(1))

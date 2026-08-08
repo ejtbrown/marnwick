@@ -17,7 +17,13 @@ import urllib.request
 
 from PIL import Image, ImageDraw, ImageFilter, ImageOps
 
-from .config import LAMA_RUNTIME_AUTO, LAMA_RUNTIMES
+from .config import (
+    LAMA_RUNTIME_AUTO,
+    LAMA_RUNTIME_REMOTE,
+    LAMA_RUNTIMES,
+    LOCAL_LAMA_RUNTIMES,
+    RemoteLamaConfig,
+)
 from .image_ops import (
     EditOperation,
     ImageFileIdentity,
@@ -26,6 +32,12 @@ from .image_ops import (
     snapshot_image_file_identity,
 )
 from .safe_image import open_catalog_image, validate_image_pixel_limit
+from .remote_lama import (
+    REMOTE_LAMA_EXECUTION_PROVIDER,
+    RemoteLamaCancelled,
+    RemoteLamaClient,
+    RemoteLamaNotConfiguredError,
+)
 
 
 LAMA_MODEL_REVISION = "0153b00d76c01058d825296ee162b46ff75ce05d"
@@ -53,6 +65,7 @@ LAMA_EXECUTION_PROVIDERS = frozenset(
     (
         LAMA_CPU_EXECUTION_PROVIDER,
         LAMA_WEBGPU_EXECUTION_PROVIDER,
+        REMOTE_LAMA_EXECUTION_PROVIDER,
         *LAMA_GPU_EXECUTION_PROVIDERS,
     )
 )
@@ -91,7 +104,7 @@ class LamaWorkerService:
     ) -> None:
         """Start initialization in the background if no warm-up is pending."""
 
-        if runtime not in LAMA_RUNTIMES:
+        if runtime not in LOCAL_LAMA_RUNTIMES:
             raise ValueError(f"unsupported LaMa runtime preference: {runtime}")
         if self._closed.is_set():
             return
@@ -121,7 +134,7 @@ class LamaWorkerService:
         timeout: float | None,
         provider_callback: LamaProviderCallback | None,
     ) -> str:
-        if runtime not in LAMA_RUNTIMES:
+        if runtime not in LOCAL_LAMA_RUNTIMES:
             raise ValueError(f"unsupported LaMa runtime preference: {runtime}")
         timeout_seconds = _lama_timeout_seconds(timeout)
         deadline = monotonic() + timeout_seconds
@@ -572,12 +585,21 @@ def create_lama_edit_operation(
     worker_timeout: float | None = None,
     provider_callback: LamaProviderCallback | None = None,
     worker_service: LamaWorkerService | None = None,
+    remote_config: RemoteLamaConfig | None = None,
 ) -> EditOperation:
     if not stroke_samples:
         raise ValueError("paint over an area before applying LaMa")
     if runtime not in LAMA_RUNTIMES:
         raise ValueError(f"unsupported LaMa runtime preference: {runtime}")
-    checked_model_path = validate_lama_model(model_path)
+    checked_model_path = (
+        None
+        if runtime == LAMA_RUNTIME_REMOTE
+        else validate_lama_model(model_path)
+    )
+    if runtime == LAMA_RUNTIME_REMOTE and remote_config is None:
+        raise RemoteLamaNotConfiguredError(
+            "Configure and trust Remote LaMa under Tools > Remote LaMa first."
+        )
     _check_canceled(cancel_event)
     if snapshot_image_file_identity(path) != expected_identity:
         raise OSError(f"{path.name} changed before LaMa could read it")
@@ -615,27 +637,52 @@ def create_lama_edit_operation(
         status_path = temp_dir / "status.json"
         image_crop.save(input_path, format="PNG", compress_level=1)
         model_mask.save(mask_path, format="PNG", compress_level=1)
-        run_worker = (
-            worker_service.run
-            if worker_service is not None
-            else _run_lama_worker
-        )
-        execution_provider = run_worker(
-            checked_model_path,
-            input_path,
-            mask_path,
-            output_path,
-            status_path,
-            runtime=runtime,
-            cancel_event=cancel_event,
-            timeout=worker_timeout,
-            provider_callback=provider_callback,
-        )
+        if runtime == LAMA_RUNTIME_REMOTE:
+            if remote_config is None:
+                raise RemoteLamaNotConfiguredError(
+                    "Configure and trust Remote LaMa under Tools > Remote LaMa first."
+                )
+            try:
+                with RemoteLamaClient(
+                    remote_config,
+                    timeout=_lama_timeout_seconds(worker_timeout),
+                ) as remote_client:
+                    remote_response = remote_client.inpaint_png(
+                        input_path.read_bytes(),
+                        mask_path.read_bytes(),
+                        cancel_event=cancel_event,
+                        provider_callback=provider_callback,
+                    )
+            except RemoteLamaCancelled as error:
+                raise LamaInferenceCancelled(str(error)) from error
+            output_path.write_bytes(remote_response.body)
+            execution_provider = REMOTE_LAMA_EXECUTION_PROVIDER
+        else:
+            if checked_model_path is None:
+                raise LamaModelError("The local LaMa model was not validated")
+            run_worker = (
+                worker_service.run
+                if worker_service is not None
+                else _run_lama_worker
+            )
+            execution_provider = run_worker(
+                checked_model_path,
+                input_path,
+                mask_path,
+                output_path,
+                status_path,
+                runtime=runtime,
+                cancel_event=cancel_event,
+                timeout=worker_timeout,
+                provider_callback=provider_callback,
+            )
         _check_canceled(cancel_event)
         with Image.open(output_path) as output:
-            output.load()
             if output.size != (LAMA_INPUT_SIZE, LAMA_INPUT_SIZE):
                 raise LamaModelError("LaMa worker returned an unexpected image size")
+            if output.format != "PNG":
+                raise LamaModelError("LaMa worker returned an unexpected image format")
+            output.load()
             generated = output.convert("RGB")
         alpha = model_mask.filter(ImageFilter.GaussianBlur(1.25))
         patch = generated.convert("RGBA")
@@ -874,6 +921,7 @@ def lama_execution_provider_label(provider: str) -> str:
         "ROCMExecutionProvider": "ROCm",
         "MIGraphXExecutionProvider": "MIGraphX",
         "CoreMLExecutionProvider": "CoreML",
+        REMOTE_LAMA_EXECUTION_PROVIDER: "Remote LaMa",
     }.get(provider, provider)
 
 

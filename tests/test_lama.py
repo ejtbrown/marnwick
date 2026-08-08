@@ -9,8 +9,13 @@ from PIL import Image, ImageDraw
 import pytest
 
 from marnwick import lama
-from marnwick.config import LAMA_RUNTIME_WEBGPU
+from marnwick.config import (
+    LAMA_RUNTIME_REMOTE,
+    LAMA_RUNTIME_WEBGPU,
+    RemoteLamaConfig,
+)
 from marnwick.image_ops import apply_operation_to_image, snapshot_image_file_identity
+from marnwick.remote_lama import REMOTE_LAMA_EXECUTION_PROVIDER, RemoteLamaResponse
 
 
 class FakeResponse(io.BytesIO):
@@ -161,6 +166,63 @@ def test_create_lama_edit_operation_retains_generated_patch(
     assert provider_updates == [lama.LAMA_CPU_EXECUTION_PROVIDER]
     assert edited.getpixel((80, 60))[1] > edited.getpixel((80, 60))[0]
     assert edited.getpixel((0, 119)) == (200, 20, 20)
+
+
+def test_create_lama_edit_operation_uses_remote_without_local_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image_path = tmp_path / "image.png"
+    Image.new("RGB", (160, 120), (200, 20, 20)).save(image_path)
+    output_buffer = io.BytesIO()
+    Image.new("RGB", (512, 512), (20, 200, 20)).save(
+        output_buffer,
+        format="PNG",
+    )
+    observed: dict[str, object] = {}
+
+    class FakeRemoteClient:
+        def __init__(self, config: RemoteLamaConfig, *, timeout: float | None) -> None:
+            observed["config"] = config
+            observed["timeout"] = timeout
+
+        def __enter__(self) -> "FakeRemoteClient":
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return
+
+        def inpaint_png(self, image_png: bytes, mask_png: bytes, **kwargs: object) -> RemoteLamaResponse:
+            assert image_png.startswith(b"\x89PNG")
+            assert mask_png.startswith(b"\x89PNG")
+            callback = kwargs.get("provider_callback")
+            assert callable(callback)
+            callback(REMOTE_LAMA_EXECUTION_PROVIDER)
+            return RemoteLamaResponse(output_buffer.getvalue(), {})
+
+    monkeypatch.setattr(lama, "RemoteLamaClient", FakeRemoteClient)
+    monkeypatch.setattr(
+        lama,
+        "validate_lama_model",
+        lambda *_args: pytest.fail("remote inference must not require a local model"),
+    )
+    config = RemoteLamaConfig(certificate_der="Y2VydA==")
+    providers: list[str] = []
+
+    operation = lama.create_lama_edit_operation(
+        image_path,
+        (),
+        [(80, 60, 18)],
+        expected_identity=snapshot_image_file_identity(image_path),
+        expected_size=(160, 120),
+        runtime=LAMA_RUNTIME_REMOTE,
+        remote_config=config,
+        provider_callback=providers.append,
+    )
+
+    assert observed["config"] == config
+    assert (operation.params or {})["execution_provider"] == REMOTE_LAMA_EXECUTION_PROVIDER
+    assert providers == [REMOTE_LAMA_EXECUTION_PROVIDER]
 
 
 def test_create_lama_edit_operation_rejects_animation(
