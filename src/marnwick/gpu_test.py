@@ -5,6 +5,7 @@ import base64
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
+import io
 import json
 from math import isfinite
 import os
@@ -17,10 +18,22 @@ from threading import Event
 from time import monotonic, sleep
 from typing import Any
 
+from PIL import Image
+
+from .config import RemoteLamaConfig
 from .lama import (
     LAMA_CPU_EXECUTION_PROVIDER,
     LAMA_INPUT_SIZE,
     validate_lama_model,
+)
+from .remote_lama import (
+    REMOTE_LAMA_EXECUTION_PROVIDER,
+    RemoteLamaCancelled,
+    RemoteLamaClient,
+    RemoteLamaError,
+    RemoteLamaNotConfiguredError,
+    remote_lama_endpoint,
+    remote_lama_is_configured,
 )
 
 
@@ -78,10 +91,16 @@ GPU_TEST_METHODS = (
     GpuTestMethod("CoreMLExecutionProvider", "CoreML"),
     GpuTestMethod("ROCMExecutionProvider", "ROCm"),
     GpuTestMethod("MIGraphXExecutionProvider", "MIGraphX"),
+    GpuTestMethod(REMOTE_LAMA_EXECUTION_PROVIDER, "Remote LaMa"),
     GpuTestMethod(LAMA_CPU_EXECUTION_PROVIDER, "CPU (baseline)"),
 )
 _GPU_TEST_METHOD_BY_PROVIDER = {
     method.provider: method for method in GPU_TEST_METHODS
+}
+_LOCAL_GPU_TEST_METHOD_BY_PROVIDER = {
+    provider: method
+    for provider, method in _GPU_TEST_METHOD_BY_PROVIDER.items()
+    if provider != REMOTE_LAMA_EXECUTION_PROVIDER
 }
 _WEBGPU_REGISTRATION_NAME = "marnwick_gpu_test_webgpu"
 
@@ -116,52 +135,233 @@ _GPU_TEST_MODEL_BASE64 = (
 def run_gpu_tests(
     model_path: Path,
     *,
+    remote_config: RemoteLamaConfig | None = None,
     cancel_event: Event | None = None,
     result_callback: Callable[[GpuTestResult], None] | None = None,
     timeout_seconds: float = GPU_TEST_TIMEOUT_SECONDS,
 ) -> tuple[GpuTestResult, ...]:
+    validated_model_path: Path | None = None
+    model_error: Exception | None = None
     try:
         validated_model_path = validate_lama_model(model_path)
     except Exception as error:
-        explanation = f"The LaMa benchmark model is unavailable or invalid: {error}"
-        results = tuple(
-            GpuTestResult(
-                method.provider,
-                method.label,
-                GPU_TEST_STATUS_UNAVAILABLE,
-                explanation,
-            )
-            for method in GPU_TEST_METHODS
-        )
-        if result_callback is not None:
-            for result in results:
-                result_callback(result)
-        return results
+        model_error = error
     results: list[GpuTestResult] = []
     for method in GPU_TEST_METHODS:
         if cancel_event is not None and cancel_event.is_set():
             break
-        platform_reason = gpu_test_platform_unavailability(method.provider)
-        if platform_reason is None:
-            result = _run_gpu_test_worker(
+        if method.provider == REMOTE_LAMA_EXECUTION_PROVIDER:
+            result = _run_remote_gpu_test(
                 method,
-                validated_model_path,
+                remote_config,
                 cancel_event=cancel_event,
                 timeout_seconds=timeout_seconds,
             )
-        else:
+        elif model_error is not None or validated_model_path is None:
             result = GpuTestResult(
                 method.provider,
                 method.label,
                 GPU_TEST_STATUS_UNAVAILABLE,
-                platform_reason,
+                f"The LaMa benchmark model is unavailable or invalid: {model_error}",
             )
+        else:
+            platform_reason = gpu_test_platform_unavailability(method.provider)
+            if platform_reason is None:
+                result = _run_gpu_test_worker(
+                    method,
+                    validated_model_path,
+                    cancel_event=cancel_event,
+                    timeout_seconds=timeout_seconds,
+                )
+            else:
+                result = GpuTestResult(
+                    method.provider,
+                    method.label,
+                    GPU_TEST_STATUS_UNAVAILABLE,
+                    platform_reason,
+                )
         results.append(result)
         if result_callback is not None:
             result_callback(result)
         if result.status == GPU_TEST_STATUS_CANCELED:
             break
     return tuple(results)
+
+
+def _run_remote_gpu_test(
+    method: GpuTestMethod,
+    config: RemoteLamaConfig | None,
+    *,
+    cancel_event: Event | None,
+    timeout_seconds: float,
+) -> GpuTestResult:
+    if config is None or not remote_lama_is_configured(config):
+        return GpuTestResult(
+            method.provider,
+            method.label,
+            GPU_TEST_STATUS_UNAVAILABLE,
+            "Configure and trust an endpoint under Tools > Remote LaMa to test it.",
+        )
+    try:
+        import numpy as np
+    except ImportError as error:
+        return GpuTestResult(
+            method.provider,
+            method.label,
+            GPU_TEST_STATUS_UNAVAILABLE,
+            f"NumPy is unavailable for the generated benchmark: {_bounded_detail(error)}",
+        )
+    try:
+        image_array, mask_array = _lama_benchmark_inputs(np)
+        image_png, mask_png = _remote_benchmark_pngs(np, image_array, mask_array)
+        with RemoteLamaClient(config, timeout=timeout_seconds) as client:
+            setup_started = monotonic()
+            health = client.health(cancel_event=cancel_event)
+            setup_seconds = monotonic() - setup_started
+            if health.get("status") != "ready":
+                raise RemoteLamaError(
+                    f"the endpoint reported status {health.get('status', 'unknown')}"
+                )
+            cold_started = monotonic()
+            cold_response = client.inpaint_png(
+                image_png,
+                mask_png,
+                cancel_event=cancel_event,
+            )
+            cold_inference_seconds = monotonic() - cold_started
+            masked_mean_change = _validate_remote_benchmark_output(
+                np,
+                cold_response.body,
+                image_array,
+                mask_array,
+            )
+            warm_started = monotonic()
+            warm_response = client.inpaint_png(
+                image_png,
+                mask_png,
+                cancel_event=cancel_event,
+            )
+            warm_inference_seconds = monotonic() - warm_started
+            _validate_remote_benchmark_output(
+                np,
+                warm_response.body,
+                image_array,
+                mask_array,
+            )
+    except (RemoteLamaNotConfiguredError, ValueError) as error:
+        return GpuTestResult(
+            method.provider,
+            method.label,
+            GPU_TEST_STATUS_UNAVAILABLE,
+            _bounded_detail(error),
+        )
+    except RemoteLamaCancelled:
+        return GpuTestResult(
+            method.provider,
+            method.label,
+            GPU_TEST_STATUS_CANCELED,
+            "The test was canceled.",
+        )
+    except Exception as error:
+        return GpuTestResult(
+            method.provider,
+            method.label,
+            GPU_TEST_STATUS_FAILED,
+            f"Remote LaMa failed: {_bounded_detail(error)}",
+        )
+
+    model = str(health.get("model", "LaMa"))
+    device = str(health.get("device", "remote device"))
+    cold_server = _remote_timing_display(cold_response.headers)
+    warm_server = _remote_timing_display(warm_response.headers)
+    return GpuTestResult(
+        method.provider,
+        method.label,
+        GPU_TEST_STATUS_WORKS,
+        (
+            f"The pinned endpoint {remote_lama_endpoint(config)} reported {model} "
+            f"on {device}. TLS connection and health setup took "
+            f"{format_gpu_test_duration(setup_seconds)}. The first verified "
+            f"512×512 inpaint round trip took "
+            f"{format_gpu_test_duration(cold_inference_seconds)}{cold_server}; "
+            f"the second took {format_gpu_test_duration(warm_inference_seconds)}"
+            f"{warm_server}. The repaired mask changed by an average of "
+            f"{masked_mean_change:.1f} pixel levels and unmasked decoded pixels "
+            "were preserved exactly."
+        ),
+        setup_seconds,
+        cold_inference_seconds,
+        warm_inference_seconds,
+    )
+
+
+def _remote_benchmark_pngs(
+    np: Any,
+    image_array: Any,
+    mask_array: Any,
+) -> tuple[bytes, bytes]:
+    image_pixels = np.rint(
+        np.clip(image_array[0].transpose(1, 2, 0), 0.0, 1.0) * 255.0
+    ).astype(np.uint8)
+    mask_pixels = np.where(mask_array[0, 0] > 0, 255, 0).astype(np.uint8)
+    image_buffer = io.BytesIO()
+    mask_buffer = io.BytesIO()
+    Image.fromarray(image_pixels, mode="RGB").save(
+        image_buffer,
+        format="PNG",
+        compress_level=1,
+    )
+    Image.fromarray(mask_pixels, mode="L").save(
+        mask_buffer,
+        format="PNG",
+        compress_level=1,
+    )
+    return image_buffer.getvalue(), mask_buffer.getvalue()
+
+
+def _validate_remote_benchmark_output(
+    np: Any,
+    encoded: bytes,
+    image_array: Any,
+    mask_array: Any,
+) -> float:
+    try:
+        with Image.open(io.BytesIO(encoded)) as opened:
+            if opened.size != (LAMA_INPUT_SIZE, LAMA_INPUT_SIZE):
+                raise ValueError("Remote LaMa returned an unexpected image size")
+            if opened.format != "PNG":
+                raise ValueError("Remote LaMa returned an unexpected image format")
+            opened.load()
+            result_pixels = np.asarray(opened.convert("RGB"), dtype=np.uint8)
+    except (OSError, ValueError) as error:
+        raise ValueError(f"Remote LaMa returned an invalid PNG: {error}") from error
+    result_array = result_pixels.transpose(2, 0, 1)[None, ...].astype(np.float32)
+    masked_change = _validate_lama_benchmark_output(
+        np,
+        [result_array],
+        image_array,
+        mask_array,
+    )
+    source_pixels = np.rint(
+        np.clip(image_array[0].transpose(1, 2, 0), 0.0, 1.0) * 255.0
+    ).astype(np.uint8)
+    outside_mask = mask_array[0, 0] <= 0
+    if not bool(np.array_equal(result_pixels[outside_mask], source_pixels[outside_mask])):
+        raise ValueError("Remote LaMa changed pixels outside the requested mask")
+    return masked_change
+
+
+def _remote_timing_display(headers: dict[str, str]) -> str:
+    raw = headers.get("x-inference-milliseconds")
+    if raw is None:
+        return ""
+    try:
+        milliseconds = float(raw)
+    except ValueError:
+        return ""
+    if not isfinite(milliseconds) or milliseconds < 0:
+        return ""
+    return f" ({milliseconds:.0f} ms reported by the server)"
 
 
 def format_gpu_test_duration(seconds: float | None) -> str:
@@ -866,7 +1066,7 @@ def _terminate_worker(process: subprocess.Popen[bytes]) -> None:
 
 
 def _worker_main(provider: str, model_path: Path) -> int:
-    if provider not in _GPU_TEST_METHOD_BY_PROVIDER:
+    if provider not in _LOCAL_GPU_TEST_METHOD_BY_PROVIDER:
         print(
             json.dumps(
                 {
@@ -882,7 +1082,7 @@ def _worker_main(provider: str, model_path: Path) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Marnwick isolated GPU diagnostic worker")
-    parser.add_argument("--worker", choices=tuple(_GPU_TEST_METHOD_BY_PROVIDER))
+    parser.add_argument("--worker", choices=tuple(_LOCAL_GPU_TEST_METHOD_BY_PROVIDER))
     parser.add_argument("--model", required=True, type=Path)
     args = parser.parse_args(argv)
     if args.worker is None:

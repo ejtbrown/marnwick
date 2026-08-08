@@ -17,7 +17,7 @@ from .config import (
     LAMA_RUNTIME_CPU,
     LAMA_RUNTIME_NVIDIA,
     LAMA_RUNTIME_WEBGPU,
-    LAMA_RUNTIMES,
+    LOCAL_LAMA_RUNTIMES,
 )
 from .lama import (
     LAMA_CPU_EXECUTION_PROVIDER,
@@ -71,7 +71,7 @@ def run_inference_with_provider(
     runtime: str = LAMA_RUNTIME_AUTO,
     provider_callback: Callable[[str], None] | None = None,
 ) -> tuple[Image.Image, str]:
-    if runtime not in LAMA_RUNTIMES:
+    if runtime not in LOCAL_LAMA_RUNTIMES:
         raise ValueError(f"unsupported LaMa runtime preference: {runtime}")
     image_array, mask_array = _load_inference_inputs(input_path, mask_path)
     session, provider = _preferred_inference_session(model_path, runtime)
@@ -360,7 +360,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ready-status", type=Path)
     parser.add_argument(
         "--runtime",
-        choices=sorted(LAMA_RUNTIMES),
+        choices=sorted(LOCAL_LAMA_RUNTIMES),
         default=LAMA_RUNTIME_AUTO,
     )
     args = parser.parse_args()

@@ -19,12 +19,18 @@ LAMA_RUNTIME_AUTO = "auto"
 LAMA_RUNTIME_CPU = "cpu"
 LAMA_RUNTIME_NVIDIA = "nvidia"
 LAMA_RUNTIME_WEBGPU = "webgpu"
-LAMA_RUNTIMES = {
+LAMA_RUNTIME_REMOTE = "remote"
+LOCAL_LAMA_RUNTIMES = {
     LAMA_RUNTIME_AUTO,
     LAMA_RUNTIME_CPU,
     LAMA_RUNTIME_NVIDIA,
     LAMA_RUNTIME_WEBGPU,
 }
+LAMA_RUNTIMES = {*LOCAL_LAMA_RUNTIMES, LAMA_RUNTIME_REMOTE}
+DEFAULT_REMOTE_LAMA_HOST = "172.31.254.1"
+DEFAULT_REMOTE_LAMA_PORT = 8443
+MAX_REMOTE_LAMA_HOST_CHARS = 64
+MAX_REMOTE_LAMA_CERTIFICATE_CHARS = 128 * 1024
 DEFAULT_THUMBNAIL_COLUMNS = 5
 MIN_THUMBNAIL_COLUMNS = 1
 MAX_THUMBNAIL_COLUMNS = 20
@@ -46,6 +52,13 @@ class WindowConfig:
 
 
 @dataclass(slots=True)
+class RemoteLamaConfig:
+    host: str = DEFAULT_REMOTE_LAMA_HOST
+    port: int = DEFAULT_REMOTE_LAMA_PORT
+    certificate_der: str = ""
+
+
+@dataclass(slots=True)
 class AppConfig:
     window: WindowConfig = field(default_factory=WindowConfig)
     catalogs: list[str] = field(default_factory=list)
@@ -53,6 +66,7 @@ class AppConfig:
     delete_behavior: str = NORMAL_DELETE
     sort_order: str = "name"
     lama_runtime: str = LAMA_RUNTIME_AUTO
+    remote_lama: RemoteLamaConfig = field(default_factory=RemoteLamaConfig)
     hotkeys: dict[str, str] = field(default_factory=dict)
     # A load-time baseline allows save_config() to merge catalog-list edits
     # made by separate Marnwick processes without resurrecting removals or
@@ -80,6 +94,7 @@ def load_config(path: Path | None = None) -> AppConfig:
     window_raw = raw.get("window", {})
     if not isinstance(window_raw, dict):
         window_raw = {}
+    remote_lama_raw = raw.get("remote_lama", {})
     catalogs_raw = raw.get("catalogs", [])
     catalogs = (
         list(dict.fromkeys(item for item in catalogs_raw if isinstance(item, str)))
@@ -99,6 +114,7 @@ def load_config(path: Path | None = None) -> AppConfig:
         delete_behavior=_delete_behavior_or_default(raw.get("delete_behavior")),
         sort_order=_string_or_default(raw.get("sort_order"), "name"),
         lama_runtime=_lama_runtime_or_default(raw.get("lama_runtime")),
+        remote_lama=_remote_lama_config_or_default(remote_lama_raw),
         hotkeys=_hotkeys_or_default(raw.get("hotkeys")),
         _loaded_catalogs=tuple(catalogs),
     )
@@ -134,6 +150,11 @@ def save_config(
             "delete_behavior": config.delete_behavior,
             "hotkeys": _hotkeys_or_default(config.hotkeys),
             "lama_runtime": config.lama_runtime,
+            "remote_lama": {
+                "host": config.remote_lama.host,
+                "port": config.remote_lama.port,
+                "certificate_der": config.remote_lama.certificate_der,
+            },
             "sort_order": config.sort_order,
             "thumbnail_size": config.thumbnail_size,
         }
@@ -213,6 +234,32 @@ def _lama_runtime_or_default(value: object) -> str:
     if isinstance(value, str) and value in LAMA_RUNTIMES:
         return value
     return LAMA_RUNTIME_AUTO
+
+
+def _remote_lama_config_or_default(value: object) -> RemoteLamaConfig:
+    if not isinstance(value, dict):
+        return RemoteLamaConfig()
+    host = value.get("host")
+    if (
+        not isinstance(host, str)
+        or not host.strip()
+        or len(host) > MAX_REMOTE_LAMA_HOST_CHARS
+    ):
+        host = DEFAULT_REMOTE_LAMA_HOST
+    port = _int_or_default(value.get("port"), DEFAULT_REMOTE_LAMA_PORT)
+    if not 1 <= port <= 65535:
+        port = DEFAULT_REMOTE_LAMA_PORT
+    certificate_der = value.get("certificate_der")
+    if (
+        not isinstance(certificate_der, str)
+        or len(certificate_der) > MAX_REMOTE_LAMA_CERTIFICATE_CHARS
+    ):
+        certificate_der = ""
+    return RemoteLamaConfig(
+        host=host.strip(),
+        port=port,
+        certificate_der=certificate_der,
+    )
 
 
 def _hotkeys_or_default(value: object) -> dict[str, str]:

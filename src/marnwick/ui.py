@@ -147,12 +147,14 @@ from .config import (
     LAMA_RUNTIME_AUTO,
     LAMA_RUNTIME_CPU,
     LAMA_RUNTIME_NVIDIA,
+    LAMA_RUNTIME_REMOTE,
     LAMA_RUNTIME_WEBGPU,
     MAX_THUMBNAIL_COLUMNS,
     MIN_THUMBNAIL_COLUMNS,
     NORMAL_DELETE,
     WIPE_ON_DELETE,
     AppConfig,
+    RemoteLamaConfig,
     WindowConfig,
     config_disabled,
     default_config_path,
@@ -200,6 +202,15 @@ from .models import CatalogSettings, DirectoryRecord, FolderPreviewRecord, Image
 from .media import is_supported_file_name, media_kind_for_name
 from .navigation import ImageNavigator, shuffled_items
 from .safe_image import MAX_IMAGE_PIXELS, open_catalog_image
+from .remote_lama import (
+    certificate_sha1_thumbprint,
+    encode_trusted_certificate,
+    normalize_remote_lama_ip,
+    remote_lama_endpoint,
+    remote_lama_is_configured,
+    retrieve_server_certificate,
+    trusted_certificate_der,
+)
 from .workspace import Workspace
 
 CATALOG_ROOT_ROLE = Qt.ItemDataRole.UserRole
@@ -4241,6 +4252,7 @@ class MainWindow(QMainWindow):
                 loaded.sort_order = current.sort_order
                 loaded.delete_behavior = current.delete_behavior
                 loaded.lama_runtime = current.lama_runtime
+                loaded.remote_lama = replace(current.remote_lama)
                 loaded.hotkeys = dict(current.hotkeys)
             else:
                 self.set_thumbnail_size(
@@ -4411,6 +4423,7 @@ class MainWindow(QMainWindow):
             delete_behavior=self.app_config.delete_behavior,
             sort_order=self.current_sort.value,
             lama_runtime=self.app_config.lama_runtime,
+            remote_lama=replace(self.app_config.remote_lama),
             hotkeys=dict(self.app_config.hotkeys),
             _loaded_catalogs=self.app_config._loaded_catalogs,
         )
@@ -4554,6 +4567,9 @@ class MainWindow(QMainWindow):
         self.prune_thumbnails_action = QAction("Prune Thumbnails", self)
         self.prune_thumbnails_action.triggered.connect(self.prune_current_catalog_thumbnails)
         self.tools_menu.addAction(self.prune_thumbnails_action)
+        self.remote_lama_action = QAction("Remote LaMa", self)
+        self.remote_lama_action.triggered.connect(self.open_remote_lama)
+        self.tools_menu.addAction(self.remote_lama_action)
         self.download_lama_action = QAction("Download LaMa Model…", self)
         self.download_lama_action.triggered.connect(self.download_lama_model_dialog)
         self.tools_menu.addAction(self.download_lama_action)
@@ -4675,6 +4691,22 @@ class MainWindow(QMainWindow):
     def open_gpu_test(self) -> None:
         self.ensure_lama_model(self, self._open_gpu_test_with_model)
 
+    def open_remote_lama(self) -> None:
+        dialog = RemoteLamaDialog(replace(self.app_config.remote_lama), self)
+        accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        selected = dialog.trusted_config if accepted else None
+        dialog.deleteLater()
+        if selected is None:
+            return
+        self._mark_initial_config_controls_interaction()
+        self.app_config.remote_lama = selected
+        if self.config_enabled:
+            self.save_window_config(wait=False)
+        self.statusBar().showMessage(
+            f"Remote LaMa trusted at {remote_lama_endpoint(selected)}",
+            8000,
+        )
+
     def _open_gpu_test_with_model(
         self,
         model_path: Path | None,
@@ -4685,7 +4717,11 @@ class MainWindow(QMainWindow):
             return
         if model_path is None:
             return
-        dialog = GpuTestDialog(model_path, self)
+        dialog = GpuTestDialog(
+            model_path,
+            self,
+            remote_config=replace(self.app_config.remote_lama),
+        )
         dialog.exec()
         dialog.deleteLater()
 
@@ -15762,6 +15798,7 @@ class AppPreferencesDialog(QDialog):
         super().__init__(parent)
         self._loaded_catalogs = config._loaded_catalogs
         self._hotkeys = dict(config.hotkeys)
+        self._remote_lama = replace(config.remote_lama)
         self.setWindowTitle("Preferences")
         self.setWindowIcon(load_app_icon())
         self.setStyleSheet(DIALOG_STYLESHEET)
@@ -15810,6 +15847,7 @@ class AppPreferencesDialog(QDialog):
         self.lama_runtime.addItem("CPU", LAMA_RUNTIME_CPU)
         self.lama_runtime.addItem("NVIDIA", LAMA_RUNTIME_NVIDIA)
         self.lama_runtime.addItem("WebGPU", LAMA_RUNTIME_WEBGPU)
+        self.lama_runtime.addItem("Remote LaMa", LAMA_RUNTIME_REMOTE)
         lama_runtime_index = self.lama_runtime.findData(config.lama_runtime)
         if lama_runtime_index >= 0:
             self.lama_runtime.setCurrentIndex(lama_runtime_index)
@@ -15829,7 +15867,9 @@ class AppPreferencesDialog(QDialog):
         lama_layout.addRow("Processing runtime", self.lama_runtime)
         lama_note = QLabel(
             "Auto prefers available GPU runtimes and falls back to CPU. "
-            "WebGPU uses the native GPU backend on Linux, macOS, and Windows."
+            "WebGPU uses the native GPU backend on Linux, macOS, and Windows. "
+            "Configure and trust the remote endpoint under Tools > Remote LaMa "
+            "before selecting Remote LaMa."
         )
         lama_note.setWordWrap(True)
         lama_layout.addRow(lama_note)
@@ -15883,6 +15923,7 @@ class AppPreferencesDialog(QDialog):
             delete_behavior=str(self.delete_behavior.currentData()),
             sort_order=str(self.sort_order.currentData()),
             lama_runtime=str(self.lama_runtime.currentData()),
+            remote_lama=replace(self._remote_lama),
             hotkeys=dict(self._hotkeys),
             _loaded_catalogs=self._loaded_catalogs,
         )
@@ -17113,14 +17154,212 @@ class CatalogTagsDialog(QDialog):
         super().closeEvent(event)
 
 
+class RemoteLamaDialog(QDialog):
+    def __init__(
+        self,
+        config: RemoteLamaConfig,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._original_config = replace(config)
+        self.trusted_config: RemoteLamaConfig | None = None
+        self._executor = shared_dialog_executor()
+        self._future: Future[bytes] | None = None
+        self._request_endpoint: tuple[str, int] | None = None
+        self._closed = False
+
+        self.setWindowTitle("Remote LaMa")
+        self.setWindowIcon(load_app_icon())
+        self.setStyleSheet(DIALOG_STYLESHEET)
+
+        layout = QVBoxLayout(self)
+        introduction = QLabel(
+            "Configure the HTTPS endpoint used for remote LaMa inference. "
+            "Marnwick will not send image data until you explicitly trust the "
+            "certificate offered by this IP address and port."
+        )
+        introduction.setWordWrap(True)
+        layout.addWidget(introduction)
+
+        form = QFormLayout()
+        self.host = QLineEdit(config.host)
+        self.host.setPlaceholderText("172.31.254.1")
+        self.host.setMaxLength(64)
+        self.port = QSpinBox()
+        self.port.setRange(1, 65535)
+        self.port.setValue(config.port)
+        form.addRow("IP address", self.host)
+        form.addRow("Port", self.port)
+        layout.addLayout(form)
+
+        self.thumbprint_label = QLabel()
+        self.thumbprint_label.setWordWrap(True)
+        self.thumbprint_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        layout.addWidget(self.thumbprint_label)
+
+        self.status_label = QLabel()
+        self.status_label.setWordWrap(True)
+        layout.addWidget(self.status_label)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        self.retrieve_button = buttons.addButton(
+            "Retrieve Certificate",
+            QDialogButtonBox.ButtonRole.ActionRole,
+        )
+        self.retrieve_button.clicked.connect(self.retrieve_certificate)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self.host.textChanged.connect(self._endpoint_changed)
+        self.port.valueChanged.connect(self._endpoint_changed)
+        self._timer = QTimer(self)
+        self._timer.setInterval(25)
+        self._timer.timeout.connect(self._settle_certificate)
+        self._timer.start()
+        self._show_existing_trust()
+        self.resize(620, self.sizeHint().height())
+
+    def _show_existing_trust(self) -> None:
+        try:
+            certificate_der = trusted_certificate_der(self._original_config)
+            thumbprint = certificate_sha1_thumbprint(certificate_der)
+        except Exception:
+            self.thumbprint_label.setText("No certificate is trusted for this endpoint.")
+            return
+        self.thumbprint_label.setText(f"Trusted certificate SHA-1: {thumbprint}")
+
+    def _endpoint_changed(self, *_args: object) -> None:
+        try:
+            unchanged = (
+                normalize_remote_lama_ip(self.host.text())
+                == normalize_remote_lama_ip(self._original_config.host)
+                and self.port.value() == self._original_config.port
+            )
+        except ValueError:
+            unchanged = False
+        if unchanged:
+            self._show_existing_trust()
+        else:
+            self.thumbprint_label.setText(
+                "No certificate has been trusted for the entered endpoint."
+            )
+        self.status_label.clear()
+
+    def retrieve_certificate(self) -> None:
+        if self._future is not None:
+            return
+        try:
+            host = normalize_remote_lama_ip(self.host.text())
+        except ValueError as error:
+            show_error(self, "Remote LaMa", str(error))
+            return
+        port = self.port.value()
+        self.host.setText(host)
+        self._request_endpoint = (host, port)
+        self.retrieve_button.setEnabled(False)
+        self.status_label.setText(
+            f"Retrieving the certificate from {remote_lama_endpoint(RemoteLamaConfig(host, port))}…"
+        )
+        try:
+            self._future = self._executor.submit(
+                retrieve_server_certificate,
+                host,
+                port,
+            )
+        except ExecutorSaturatedError as error:
+            self._request_endpoint = None
+            self.retrieve_button.setEnabled(True)
+            show_error(self, "Remote LaMa", str(error))
+
+    def _settle_certificate(self) -> None:
+        future = self._future
+        if future is None or not future.done():
+            return
+        endpoint = self._request_endpoint
+        self._future = None
+        self._request_endpoint = None
+        self.retrieve_button.setEnabled(True)
+        if future.cancelled() or endpoint is None or self._closed:
+            return
+        try:
+            certificate_der = future.result()
+        except Exception as error:
+            self.status_label.setText("Certificate retrieval failed.")
+            show_error(self, "Remote LaMa", str(error))
+            return
+        host, port = endpoint
+        if (
+            self.host.text().strip() != host
+            or self.port.value() != port
+        ):
+            self.status_label.setText(
+                "The endpoint changed while its certificate was being retrieved; try again."
+            )
+            return
+        thumbprint = certificate_sha1_thumbprint(certificate_der)
+        self.thumbprint_label.setText(f"Offered certificate SHA-1: {thumbprint}")
+        endpoint_display = remote_lama_endpoint(RemoteLamaConfig(host, port))
+        answer = QMessageBox.question(
+            self,
+            "Trust Remote LaMa Certificate?",
+            (
+                f"{endpoint_display} offered this certificate:\n\n"
+                f"SHA-1: {thumbprint}\n\n"
+                "Trust this exact certificate for future Remote LaMa requests? "
+                "Only choose Yes after verifying the thumbprint through a trusted channel."
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            self.status_label.setText("The offered certificate was not trusted.")
+            return
+        self.trusted_config = RemoteLamaConfig(
+            host=host,
+            port=port,
+            certificate_der=encode_trusted_certificate(certificate_der),
+        )
+        self.status_label.setText(
+            f"Trusted {endpoint_display} with SHA-1 {thumbprint}."
+        )
+        self.accept()
+
+    def _shutdown_certificate_read(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._timer.stop()
+        if self._future is not None:
+            self._future.cancel()
+            self._future = None
+        self._executor.shutdown(wait=False, cancel_futures=True)
+
+    def done(self, result: int) -> None:
+        self._shutdown_certificate_read()
+        super().done(result)
+
+    def closeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        self._shutdown_certificate_read()
+        super().closeEvent(event)
+
+
 class GpuTestDialog(QDialog):
     def __init__(
         self,
         model_path: Path,
         parent: QWidget | None = None,
+        *,
+        remote_config: RemoteLamaConfig | None = None,
     ) -> None:
         super().__init__(parent)
         self._model_path = model_path
+        self._remote_config = (
+            replace(remote_config)
+            if remote_config is not None
+            else RemoteLamaConfig()
+        )
         self._closed = False
         self._executor = shared_dialog_executor()
         self._future: Future[tuple[GpuTestResult, ...]] | None = None
@@ -17137,10 +17376,12 @@ class GpuTestDialog(QDialog):
         layout = QVBoxLayout(self)
         introduction = QLabel(
             "Marnwick will repair the same generated 512×512 test image and erase "
-            "mask with LaMa through every available backend, plus a CPU baseline. "
+            "mask with LaMa through every available local backend, the configured "
+            "Remote LaMa endpoint, and a CPU baseline. "
             "Initialization, first-inpaint, and warmed-inpaint times are measured "
-            "separately without profiling overhead. Each backend runs in an isolated "
-            "process so a native runtime failure cannot prevent the remaining tests."
+            "separately without profiling overhead. Each local backend runs in an "
+            "isolated process so a native runtime failure cannot prevent the "
+            "remaining tests."
         )
         introduction.setWordWrap(True)
         layout.addWidget(introduction)
@@ -17249,6 +17490,7 @@ class GpuTestDialog(QDialog):
         self._future = self._executor.submit(
             run_gpu_tests,
             self._model_path,
+            remote_config=replace(self._remote_config),
             cancel_event=self._cancel_event,
             result_callback=result_queue.put,
         )
@@ -18343,10 +18585,19 @@ class LamaBusyOverlay(QFrame):
         )
         self.hide()
 
-    def start(self, *, left_margin: int | None = None) -> None:
+    def start(
+        self,
+        *,
+        left_margin: int | None = None,
+        remote: bool = False,
+    ) -> None:
         self.detail_label.setText(
-            "Selecting the local processing runtime. "
-            "This can take a few moments. Press Esc to cancel."
+            (
+                "Connecting to Remote LaMa over pinned TLS. "
+                if remote
+                else "Selecting the local processing runtime. "
+            )
+            + "This can take a few moments. Press Esc to cancel."
         )
         self.position_over_parent(left_margin=left_margin)
         self.show()
@@ -18369,9 +18620,12 @@ class LamaBusyOverlay(QFrame):
         )
 
     def set_execution_provider(self, provider_label: str) -> None:
+        if provider_label == "Remote LaMa":
+            detail = "Using Remote LaMa over the trusted HTTPS connection. "
+        else:
+            detail = f"Using {provider_label} for local inference. "
         self.detail_label.setText(
-            f"Using {provider_label} for local inference. "
-            "This can take a few moments. Press Esc to cancel."
+            detail + "This can take a few moments. Press Esc to cancel."
         )
 
     def stop(self) -> None:
@@ -19506,6 +19760,11 @@ class FullscreenViewer(QDialog):
             if isinstance(parent, MainWindow)
             else None
         )
+        remote_config = (
+            replace(parent.app_config.remote_lama)
+            if isinstance(parent, MainWindow)
+            else None
+        )
         self._lama_generation += 1
         lama_generation = self._lama_generation
         submitted_samples = tuple(self.lama_samples)
@@ -19520,6 +19779,7 @@ class FullscreenViewer(QDialog):
                 runtime=runtime,
                 cancel_event=cancel_event,
                 worker_service=worker_service,
+                remote_config=remote_config,
                 provider_callback=lambda provider: self._lama_provider_updates.put(
                     (lama_generation, provider)
                 ),
@@ -19545,9 +19805,10 @@ class FullscreenViewer(QDialog):
         )
         self.lama_processing_image.show()
         self.lama_processing_image.raise_()
-        self.setWindowTitle("Marnwick — LaMa is filling the masked area locally…")
+        self.setWindowTitle("Marnwick — LaMa is filling the masked area…")
         self.lama_busy_overlay.start(
-            left_margin=self._lama_progress_left_margin()
+            left_margin=self._lama_progress_left_margin(),
+            remote=runtime == LAMA_RUNTIME_REMOTE,
         )
         self._lama_timer.start()
 
@@ -21414,6 +21675,16 @@ class FullscreenViewer(QDialog):
         target_rel_path = self.navigator.current
         parent = self.parent()
         if isinstance(parent, MainWindow):
+            if parent.app_config.lama_runtime == LAMA_RUNTIME_REMOTE:
+                if not remote_lama_is_configured(parent.app_config.remote_lama):
+                    show_error(
+                        self,
+                        "Remote LaMa",
+                        "Configure and trust Remote LaMa under Tools > Remote LaMa first.",
+                    )
+                    return
+                self.start_region_edit("lama")
+                return
             viewer_ref = weakref.ref(self)
 
             def model_ready(path: Path | None, error: str | None) -> None:
