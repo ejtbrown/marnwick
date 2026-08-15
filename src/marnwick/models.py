@@ -119,6 +119,7 @@ class FolderPreviewRecord:
 class CatalogSettings:
     thumbnail_native_size: int = 512
     prune_parallelism: int = 4
+    faces_enabled: bool = False
 
 
 @dataclass(frozen=True, slots=True)

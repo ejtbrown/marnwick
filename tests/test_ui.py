@@ -22,6 +22,7 @@ import marnwick.ui as ui_module  # noqa: E402
 
 from PySide6.QtCore import QEvent, QItemSelectionModel, QModelIndex, QPoint, QPointF, QRect, Qt, QTimer  # noqa: E402
 from PySide6.QtGui import QColor, QCursor, QFontMetrics, QImage, QKeyEvent, QKeySequence, QMouseEvent, QPainter, QPixmap  # noqa: E402
+from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import (  # noqa: E402
     QAbstractItemView,
     QApplication,
@@ -41,6 +42,8 @@ from marnwick.catalog import (  # noqa: E402
     VirtualDirectoryRule,
 )
 from marnwick.config import (  # noqa: E402
+    FACE_RUNTIME_REMOTE,
+    FACE_RUNTIME_WEBGPU,
     LAMA_RUNTIME_NVIDIA,
     LAMA_RUNTIME_REMOTE,
     LAMA_RUNTIME_WEBGPU,
@@ -86,6 +89,7 @@ from marnwick.ui import (  # noqa: E402
     MovePayloadTask,
     MainWindow,
     NewVirtualDirectoryDialog,
+    PreferencesDialog,
     TagDialog,
     ThumbnailDelegate,
     ThumbnailModel,
@@ -95,6 +99,11 @@ from marnwick.ui import (  # noqa: E402
     VIRTUAL_KIND_DUPLICATES,
     VIRTUAL_KIND_CUSTOM,
     VIRTUAL_KIND_PHYSICAL,
+    VIRTUAL_KIND_PEOPLE_IGNORED,
+    VIRTUAL_KIND_PEOPLE_LOOSE,
+    VIRTUAL_KIND_PEOPLE_REVIEW,
+    VIRTUAL_KIND_PEOPLE_ROOT,
+    VIRTUAL_KIND_PEOPLE_UNNAMED,
     VIRTUAL_KIND_ROLE,
     VIRTUAL_KIND_TAG,
     VIRTUAL_KIND_VERY_SIMILAR,
@@ -4009,6 +4018,12 @@ def test_hotkeys_dialog_displays_bindings_and_rejects_context_conflicts() -> Non
         assert "Open randomized slideshow" in dialog.validation_label.text()
 
         dialog.editors["thumbnail.go_to_file"].setKeySequence(
+            QKeySequence("Tab")
+        )
+        assert not dialog.ok_button.isEnabled()
+        assert "reserved for the press-and-hold hotkey guide" in dialog.validation_label.text()
+
+        dialog.editors["thumbnail.go_to_file"].setKeySequence(
             QKeySequence("J")
         )
         assert dialog.ok_button.isEnabled()
@@ -4023,6 +4038,101 @@ def test_hotkeys_dialog_displays_bindings_and_rejects_context_conflicts() -> Non
     finally:
         dialog.close()
         dialog.deleteLater()
+        qt_app.processEvents()
+
+
+def test_tab_holds_a_global_hotkey_guide_over_the_focused_main_control() -> None:
+    qt_app = app()
+    window = MainWindow()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        window.app_config.hotkeys = {
+            "thumbnail.go_to_file": "J",
+            "thumbnail.tags": "",
+        }
+        window.resize(900, 600)
+        window.show()
+        window.sort_combo.setFocus()
+        qt_app.processEvents()
+        focused = qt_app.focusWidget()
+
+        QTest.keyPress(
+            window.sort_combo,
+            Qt.Key.Key_Tab,
+            Qt.KeyboardModifier.NoModifier,
+        )
+
+        overlay = window._hotkey_guide_overlay
+        assert overlay is not None
+        assert overlay.isVisible()
+        assert overlay.parentWidget() is window
+        assert overlay.geometry() == window.rect()
+        assert overlay.view_title == "Catalog browser"
+        assert ("J", "Go to file number") in {
+            (entry.sequence, entry.action) for entry in overlay.entries
+        }
+        assert "Edit tags" not in {entry.action for entry in overlay.entries}
+        assert all(entry.sequence.casefold() != "tab" for entry in overlay.entries)
+        assert qt_app.focusWidget() is focused
+
+        QTest.keyRelease(
+            window.sort_combo,
+            Qt.Key.Key_Tab,
+            Qt.KeyboardModifier.NoModifier,
+        )
+
+        assert window._hotkey_guide_overlay is None
+        assert qt_app.focusWidget() is focused
+    finally:
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_tab_hotkey_guide_uses_the_active_dialog_context() -> None:
+    qt_app = app()
+    window = MainWindow()
+    dialog = EditCommandDialog(window)
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        window.show()
+        dialog.resize(420, 520)
+        dialog.show()
+        dialog.list_widget.setFocus()
+        qt_app.processEvents()
+
+        QTest.keyPress(
+            dialog.list_widget,
+            Qt.Key.Key_Tab,
+            Qt.KeyboardModifier.NoModifier,
+        )
+
+        overlay = window._hotkey_guide_overlay
+        assert overlay is not None
+        assert overlay.parentWidget() is dialog
+        assert overlay.view_title == "Image edit tools"
+        assert ("M", "LaMa") in {
+            (entry.sequence, entry.action) for entry in overlay.entries
+        }
+        assert "Open catalog" not in {entry.action for entry in overlay.entries}
+
+        dialog.resize(500, 560)
+        qt_app.processEvents()
+        assert overlay.geometry() == dialog.rect()
+
+        QTest.keyRelease(
+            dialog.list_widget,
+            Qt.Key.Key_Tab,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        assert window._hotkey_guide_overlay is None
+    finally:
+        dialog.close()
+        dialog.deleteLater()
+        window.close()
+        window.deleteLater()
         qt_app.processEvents()
 
 
@@ -4810,9 +4920,9 @@ def test_tag_dialog_filters_and_completes_with_most_recent_match(
                 dialog.entry,
                 QKeyEvent(
                     QEvent.Type.KeyPress,
-                    Qt.Key.Key_Tab,
-                    Qt.KeyboardModifier.NoModifier,
-                    "\t",
+                    Qt.Key.Key_Space,
+                    Qt.KeyboardModifier.ControlModifier,
+                    " ",
                 ),
             )
 
@@ -5562,19 +5672,28 @@ def test_app_preferences_dialog_exposes_config_settings(tmp_path: Path) -> None:
             delete_behavior=NORMAL_DELETE,
             sort_order=SortOrder.NAME_ASC.value,
             lama_runtime=LAMA_RUNTIME_NVIDIA,
+            face_runtime=FACE_RUNTIME_WEBGPU,
         )
     )
     try:
         assert [
             dialog.lama_runtime.itemText(index)
             for index in range(dialog.lama_runtime.count())
-        ] == ["Auto", "CPU", "NVIDIA", "WebGPU", "Remote LaMa"]
+        ] == ["Auto", "CPU", "NVIDIA", "WebGPU", "Remote GPU"]
         assert dialog.lama_runtime.currentData() == LAMA_RUNTIME_NVIDIA
+        assert [
+            dialog.face_runtime.itemText(index)
+            for index in range(dialog.face_runtime.count())
+        ] == ["Auto", "CPU", "NVIDIA", "WebGPU", "Remote GPU"]
+        assert dialog.face_runtime.currentData() == FACE_RUNTIME_WEBGPU
         dialog.thumbnail_size.setValue(9)
         dialog.sort_order.setCurrentIndex(dialog.sort_order.findData(SortOrder.DATE_ASC.value))
         dialog.delete_behavior.setCurrentIndex(dialog.delete_behavior.findData(WIPE_ON_DELETE))
         dialog.lama_runtime.setCurrentIndex(
             dialog.lama_runtime.findData(LAMA_RUNTIME_REMOTE)
+        )
+        dialog.face_runtime.setCurrentIndex(
+            dialog.face_runtime.findData(FACE_RUNTIME_REMOTE)
         )
         dialog.catalog_list.addItem(str(tmp_path / "two"))
 
@@ -5584,11 +5703,41 @@ def test_app_preferences_dialog_exposes_config_settings(tmp_path: Path) -> None:
         assert selected.delete_behavior == WIPE_ON_DELETE
         assert selected.sort_order == SortOrder.DATE_ASC.value
         assert selected.lama_runtime == LAMA_RUNTIME_REMOTE
+        assert selected.face_runtime == FACE_RUNTIME_REMOTE
         assert selected.catalogs == [str(tmp_path / "one"), str(tmp_path / "two")]
     finally:
         dialog.close()
         dialog.deleteLater()
         qt_app.processEvents()
+
+
+def test_catalog_preferences_face_opt_in_is_a_clickable_checkbox(tmp_path: Path) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    with Catalog(root) as catalog:
+        dialog = PreferencesDialog([catalog], catalog)
+        try:
+            dialog.show()
+            qt_app.processEvents()
+
+            assert dialog.faces_enabled.text() == "Find and group faces in this catalog"
+            assert not dialog.faces_enabled.isChecked()
+
+            QTest.mouseClick(
+                dialog.faces_enabled,
+                Qt.MouseButton.LeftButton,
+                pos=QPoint(30, dialog.faces_enabled.rect().center().y()),
+            )
+
+            selected_catalog, settings = dialog.selected_settings()
+            assert dialog.faces_enabled.isChecked()
+            assert selected_catalog is catalog
+            assert settings.faces_enabled
+        finally:
+            dialog.close()
+            dialog.deleteLater()
+            qt_app.processEvents()
 
 
 def test_thumbnail_size_button_resets_to_default_columns(tmp_path: Path) -> None:
@@ -9950,6 +10099,124 @@ def test_virtual_directory_tree_loads_tag_and_duplicate_aggregates(tmp_path: Pat
         qt_app.processEvents()
 
 
+def test_people_tree_is_opt_in_and_opens_the_selected_review_queue(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    window = MainWindow()
+    observed: list[str] = []
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        catalog.set_settings(CatalogSettings(faces_enabled=True))
+        window.current_catalog = catalog
+        window.rebuild_tree()
+        settle_tree_build_tasks(window, qt_app)
+
+        virtual_root = find_virtual_tree_root(window)
+        people_root = next(
+            virtual_root.child(index)
+            for index in range(virtual_root.childCount())
+            if virtual_root.child(index).data(0, VIRTUAL_KIND_ROLE) == VIRTUAL_KIND_PEOPLE_ROOT
+        )
+        assert people_root.text(0) == "People"
+        assert [
+            people_root.child(index).data(0, VIRTUAL_KIND_ROLE)
+            for index in range(people_root.childCount())
+        ] == [
+            VIRTUAL_KIND_PEOPLE_REVIEW,
+            VIRTUAL_KIND_PEOPLE_UNNAMED,
+            VIRTUAL_KIND_PEOPLE_LOOSE,
+            VIRTUAL_KIND_PEOPLE_IGNORED,
+        ]
+
+        monkeypatch.setattr(
+            window,
+            "open_face_manager",
+            lambda *, initial_view="review": observed.append(initial_view),
+        )
+        window._directory_clicked(people_root.child(1))
+
+        assert observed == ["unnamed"]
+    finally:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        window.indexer.shutdown()
+        window.workspace.close()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_idle_face_indexing_uses_trusted_remote_gpu_without_local_models(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    window = MainWindow()
+    observed: dict[str, object] = {}
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        catalog.set_settings(CatalogSettings(faces_enabled=True))
+        window.current_catalog = catalog
+        window.app_config.face_runtime = FACE_RUNTIME_REMOTE
+        window.app_config.remote_lama = ui_module.RemoteLamaConfig(
+            host="172.31.254.1",
+            port=8443,
+            certificate_der="Y2VydA==",
+        )
+        window._swept_catalog_roots.add(catalog.root)
+        task = IndexTask(
+            "remote faces",
+            catalog.root,
+            None,
+            interactive=False,
+            idle_sleep_seconds=0.0,
+        )
+        task.mark_done()
+
+        monkeypatch.setattr(window.indexer, "has_active_tasks", lambda: False)
+
+        def capture_refresh(root, model_directory, **kwargs):  # type: ignore[no-untyped-def]
+            observed.update(
+                root=root,
+                model_directory=model_directory,
+                **kwargs,
+            )
+            return task
+
+        monkeypatch.setattr(window.indexer, "refresh_faces", capture_refresh)
+        monkeypatch.setattr(
+            window,
+            "_start_face_model_probe",
+            lambda: pytest.fail("Remote GPU must not probe local face models"),
+        )
+
+        window._schedule_idle_indexing()
+
+        assert observed["root"] == catalog.root
+        assert observed["model_directory"] is None
+        assert observed["runtime"] == FACE_RUNTIME_REMOTE
+        assert observed["remote_config"] == window.app_config.remote_lama
+    finally:
+        window._face_index_tasks.clear()
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        window.indexer.shutdown()
+        window.workspace.close()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
 def test_virtual_directory_tree_rebuild_preserves_virtual_expansion_state(tmp_path: Path) -> None:
     qt_app = app()
     root = tmp_path / "catalog"
@@ -9971,17 +10238,17 @@ def test_virtual_directory_tree_rebuild_preserves_virtual_expansion_state(tmp_pa
         tags_root = virtual_root.child(0)
         assert tags_root is not None
         assert virtual_root.isExpanded()
-        assert tags_root.isExpanded()
+        assert not tags_root.isExpanded()
 
         virtual_root.setExpanded(False)
-        tags_root.setExpanded(False)
+        tags_root.setExpanded(True)
         window.rebuild_tree()
 
         virtual_root = find_virtual_tree_root(window)
         tags_root = virtual_root.child(0)
         assert tags_root is not None
         assert not virtual_root.isExpanded()
-        assert not tags_root.isExpanded()
+        assert tags_root.isExpanded()
 
         virtual_root.setExpanded(True)
         tags_root.setExpanded(False)

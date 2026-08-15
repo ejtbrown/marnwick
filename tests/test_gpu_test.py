@@ -106,7 +106,7 @@ def test_run_gpu_tests_reports_invalid_model_for_every_method(
         if result.provider == REMOTE_LAMA_EXECUTION_PROVIDER
     )
     assert all("integrity check failed" in result.explanation for result in local_results)
-    assert "Tools > Remote LaMa" in remote_result.explanation
+    assert "Tools > Remote GPU" in remote_result.explanation
 
 
 def test_remote_gpu_test_measures_two_verified_round_trips(

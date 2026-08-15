@@ -598,7 +598,7 @@ def create_lama_edit_operation(
     )
     if runtime == LAMA_RUNTIME_REMOTE and remote_config is None:
         raise RemoteLamaNotConfiguredError(
-            "Configure and trust Remote LaMa under Tools > Remote LaMa first."
+            "Configure and trust the service under Tools > Remote GPU first."
         )
     _check_canceled(cancel_event)
     if snapshot_image_file_identity(path) != expected_identity:
@@ -640,7 +640,7 @@ def create_lama_edit_operation(
         if runtime == LAMA_RUNTIME_REMOTE:
             if remote_config is None:
                 raise RemoteLamaNotConfiguredError(
-                    "Configure and trust Remote LaMa under Tools > Remote LaMa first."
+                    "Configure and trust the service under Tools > Remote GPU first."
                 )
             try:
                 with RemoteLamaClient(
@@ -921,7 +921,7 @@ def lama_execution_provider_label(provider: str) -> str:
         "ROCMExecutionProvider": "ROCm",
         "MIGraphXExecutionProvider": "MIGraphX",
         "CoreMLExecutionProvider": "CoreML",
-        REMOTE_LAMA_EXECUTION_PROVIDER: "Remote LaMa",
+        REMOTE_LAMA_EXECUTION_PROVIDER: "Remote GPU",
     }.get(provider, provider)
 
 

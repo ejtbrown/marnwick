@@ -9,11 +9,14 @@ import pytest
 from PIL import Image
 
 from marnwick.catalog import Catalog
+from marnwick.config import FACE_RUNTIME_REMOTE, RemoteLamaConfig
 from marnwick.indexer import (
     ActionPriority,
     BackgroundIndexer,
     IndexTaskCancelled,
 )
+from marnwick.faces import FaceIndexSummary
+from marnwick.models import CatalogSettings
 
 
 def make_image(path: Path, size: tuple[int, int] = (32, 24)) -> None:
@@ -39,6 +42,91 @@ def test_background_indexer_refreshes_directory_and_reports_completion(tmp_path:
         assert snapshot.total == 1
         with Catalog(root) as catalog:
             assert [record.rel_path for record in catalog.list_images("set")] == ["set/one.jpg"]
+    finally:
+        indexer.shutdown()
+
+
+def test_background_indexer_warms_one_face_engine_and_reports_progress(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "catalog"
+    with Catalog(root, CatalogSettings(faces_enabled=True)):
+        pass
+    engines: list[tuple[Path, str]] = []
+
+    class FakeEngine:
+        provider = "test-gpu"
+
+        def __init__(self, directory: Path, *, runtime: str) -> None:
+            engines.append((directory, runtime))
+
+    def fake_index_pending(self, engine, *, progress, cancel_event):  # type: ignore[no-untyped-def]
+        assert engine.provider == "test-gpu"
+        assert not cancel_event.is_set()
+        progress(2, 2, "two.jpg")
+        return FaceIndexSummary(2, 3, engine.provider)
+
+    monkeypatch.setattr("marnwick.indexer.FaceEngine", FakeEngine)
+    monkeypatch.setattr("marnwick.indexer.FaceStore.index_pending", fake_index_pending)
+    indexer = BackgroundIndexer(max_workers=1)
+    model_dir = tmp_path / "models"
+    try:
+        task = indexer.refresh_faces(root, model_dir, runtime="nvidia")
+        task.wait(timeout=5)
+
+        snapshot = task.snapshot()
+        assert engines == [(model_dir, "nvidia")]
+        assert snapshot.done
+        assert snapshot.error is None
+        assert snapshot.processed == 2
+        assert snapshot.total == 2
+        assert snapshot.current == "two.jpg"
+    finally:
+        indexer.shutdown()
+
+
+def test_background_indexer_uses_remote_gpu_face_engine_without_local_models(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "catalog"
+    with Catalog(root, CatalogSettings(faces_enabled=True)):
+        pass
+    remote = RemoteLamaConfig(certificate_der="Y2VydA==")
+    engines: list[RemoteLamaConfig] = []
+    closed: list[bool] = []
+
+    class FakeRemoteEngine:
+        provider = "Remote GPU (CUDAExecutionProvider)"
+
+        def __init__(self, config: RemoteLamaConfig, *, cancel_event: Event) -> None:
+            assert not cancel_event.is_set()
+            engines.append(config)
+
+        def close(self) -> None:
+            closed.append(True)
+
+    def fake_index_pending(self, engine, *, progress, cancel_event):  # type: ignore[no-untyped-def]
+        assert engine.provider.startswith("Remote GPU")
+        progress(1, 1, "portrait.jpg")
+        return FaceIndexSummary(1, 2, engine.provider)
+
+    monkeypatch.setattr("marnwick.indexer.RemoteFaceEngine", FakeRemoteEngine)
+    monkeypatch.setattr("marnwick.indexer.FaceStore.index_pending", fake_index_pending)
+    indexer = BackgroundIndexer(max_workers=1)
+    try:
+        task = indexer.refresh_faces(
+            root,
+            None,
+            runtime=FACE_RUNTIME_REMOTE,
+            remote_config=remote,
+        )
+        task.wait(timeout=5)
+
+        assert engines == [remote]
+        assert closed == [True]
+        assert task.snapshot().error is None
     finally:
         indexer.shutdown()
 

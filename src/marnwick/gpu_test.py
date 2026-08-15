@@ -91,7 +91,7 @@ GPU_TEST_METHODS = (
     GpuTestMethod("CoreMLExecutionProvider", "CoreML"),
     GpuTestMethod("ROCMExecutionProvider", "ROCm"),
     GpuTestMethod("MIGraphXExecutionProvider", "MIGraphX"),
-    GpuTestMethod(REMOTE_LAMA_EXECUTION_PROVIDER, "Remote LaMa"),
+    GpuTestMethod(REMOTE_LAMA_EXECUTION_PROVIDER, "Remote GPU (LaMa)"),
     GpuTestMethod(LAMA_CPU_EXECUTION_PROVIDER, "CPU (baseline)"),
 )
 _GPU_TEST_METHOD_BY_PROVIDER = {
@@ -200,7 +200,7 @@ def _run_remote_gpu_test(
             method.provider,
             method.label,
             GPU_TEST_STATUS_UNAVAILABLE,
-            "Configure and trust an endpoint under Tools > Remote LaMa to test it.",
+            "Configure and trust an endpoint under Tools > Remote GPU to test it.",
         )
     try:
         import numpy as np
@@ -267,7 +267,7 @@ def _run_remote_gpu_test(
             method.provider,
             method.label,
             GPU_TEST_STATUS_FAILED,
-            f"Remote LaMa failed: {_bounded_detail(error)}",
+            f"Remote GPU LaMa failed: {_bounded_detail(error)}",
         )
 
     model = str(health.get("model", "LaMa"))
@@ -328,13 +328,13 @@ def _validate_remote_benchmark_output(
     try:
         with Image.open(io.BytesIO(encoded)) as opened:
             if opened.size != (LAMA_INPUT_SIZE, LAMA_INPUT_SIZE):
-                raise ValueError("Remote LaMa returned an unexpected image size")
+                raise ValueError("Remote GPU returned an unexpected image size")
             if opened.format != "PNG":
-                raise ValueError("Remote LaMa returned an unexpected image format")
+                raise ValueError("Remote GPU returned an unexpected image format")
             opened.load()
             result_pixels = np.asarray(opened.convert("RGB"), dtype=np.uint8)
     except (OSError, ValueError) as error:
-        raise ValueError(f"Remote LaMa returned an invalid PNG: {error}") from error
+        raise ValueError(f"Remote GPU returned an invalid PNG: {error}") from error
     result_array = result_pixels.transpose(2, 0, 1)[None, ...].astype(np.float32)
     masked_change = _validate_lama_benchmark_output(
         np,
@@ -347,7 +347,7 @@ def _validate_remote_benchmark_output(
     ).astype(np.uint8)
     outside_mask = mask_array[0, 0] <= 0
     if not bool(np.array_equal(result_pixels[outside_mask], source_pixels[outside_mask])):
-        raise ValueError("Remote LaMa changed pixels outside the requested mask")
+        raise ValueError("Remote GPU changed pixels outside the requested mask")
     return masked_change
 
 
