@@ -11,6 +11,8 @@ import pytest
 
 import marnwick.config as config_module
 from marnwick.config import (
+    FACE_RUNTIME_AUTO,
+    FACE_RUNTIME_REMOTE,
     LAMA_RUNTIME_AUTO,
     LAMA_RUNTIME_REMOTE,
     LAMA_RUNTIME_WEBGPU,
@@ -74,6 +76,20 @@ def test_lama_runtime_round_trips_and_invalid_values_default_to_auto(
     raw["lama_runtime"] = "not-a-runtime"
     path.write_text(json.dumps(raw), encoding="utf-8")
     assert load_config(path).lama_runtime == LAMA_RUNTIME_AUTO
+
+
+def test_face_runtime_round_trips_and_invalid_values_default_to_auto(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "config.json"
+
+    save_config(AppConfig(face_runtime=FACE_RUNTIME_REMOTE), path)
+
+    assert load_config(path).face_runtime == FACE_RUNTIME_REMOTE
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    raw["face_runtime"] = "not-a-runtime"
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    assert load_config(path).face_runtime == FACE_RUNTIME_AUTO
 
 
 def test_remote_lama_endpoint_and_certificate_round_trip(tmp_path: Path) -> None:

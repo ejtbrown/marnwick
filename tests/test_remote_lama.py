@@ -45,6 +45,8 @@ class FakeResponse:
         self._headers = [
             ("Content-Type", content_type),
             ("Content-Length", str(len(body))),
+            ("Cache-Control", "no-store"),
+            ("X-Content-Type-Options", "nosniff"),
         ]
 
     def getheader(self, name: str) -> str | None:
@@ -170,6 +172,33 @@ def test_client_reads_health_and_builds_multipart_inpaint() -> None:
     assert b"image-png" in body
     assert b"mask-png" in body
     assert headers["Accept"] == "image/png"
+
+
+def test_client_builds_bounded_face_analysis_request() -> None:
+    response_body = json.dumps({"schema_version": 1}).encode()
+    responses = [FakeResponse(response_body)]
+    connections: list[FakeConnection] = []
+
+    def factory(*args: object, **kwargs: object) -> FakeConnection:
+        connection = FakeConnection(*args, **kwargs, responses=responses)  # type: ignore[arg-type]
+        connections.append(connection)
+        return connection
+
+    with remote_lama.RemoteLamaClient(
+        trusted_config(),
+        connection_factory=factory,
+    ) as client:
+        response = client.analyze_faces(b"prepared-png")
+
+    assert response.body == response_body
+    method, path, body, headers = connections[0].requests[0]
+    assert method == "POST"
+    assert path == "/v1/faces/analyze"
+    assert body is not None
+    assert body.count(b'name="image"') == 1
+    assert b'name="mask"' not in body
+    assert b"prepared-png" in body
+    assert headers["Accept"] == "application/json"
 
 
 def test_client_honors_cancellation_before_connecting() -> None:

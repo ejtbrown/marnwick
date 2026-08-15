@@ -61,6 +61,7 @@ from .models import (
     SortOrder,
 )
 from .safe_image import open_catalog_image
+from .face_schema import FACE_THUMBNAIL_DIR_NAME, init_face_schema
 from .video_ops import VIDEO_RENDER_VERSION, render_video_thumbnail
 
 ProgressCallback = Callable[[int, int | None, str], None]
@@ -1450,6 +1451,7 @@ class Catalog:
         self.log_path = self.state_dir / LOG_FILE_NAME
         self.directory_tree_cache_path = self.state_dir / DIRECTORY_TREE_CACHE_FILE_NAME
         self.thumbnail_dir = self.state_dir / THUMBNAIL_DIR_NAME
+        self.face_thumbnail_dir = self.state_dir / FACE_THUMBNAIL_DIR_NAME
         self.catalog_lock_path = self.state_dir / CATALOG_LOCK_FILE_NAME
         self._closed = False
         self._catalog_lock_acquired = False
@@ -1490,6 +1492,7 @@ class Catalog:
             self.log_path,
             self.directory_tree_cache_path,
             self.thumbnail_dir,
+            self.face_thumbnail_dir,
             self.catalog_lock_path,
         ):
             self._assert_safe_state_entry(state_path)
@@ -1553,6 +1556,8 @@ class Catalog:
                 self.set_settings(CatalogSettings())
             elif self._get_setting("prune_parallelism") is None:
                 self._set_setting("prune_parallelism", str(CatalogSettings().prune_parallelism))
+            if self._get_setting("faces_enabled") is None:
+                self._set_setting("faces_enabled", "0")
         except BaseException:
             connection = getattr(self, "_conn", None)
             if connection is not None:
@@ -1595,6 +1600,7 @@ class Catalog:
         reader.log_path = reader.state_dir / LOG_FILE_NAME
         reader.directory_tree_cache_path = reader.state_dir / DIRECTORY_TREE_CACHE_FILE_NAME
         reader.thumbnail_dir = reader.state_dir / THUMBNAIL_DIR_NAME
+        reader.face_thumbnail_dir = reader.state_dir / FACE_THUMBNAIL_DIR_NAME
         reader.catalog_lock_path = reader.state_dir / CATALOG_LOCK_FILE_NAME
         reader._closed = False
         reader._catalog_lock_acquired = False
@@ -1618,6 +1624,7 @@ class Catalog:
             reader.log_path,
             reader.directory_tree_cache_path,
             reader.thumbnail_dir,
+            reader.face_thumbnail_dir,
             reader.catalog_lock_path,
         ):
             reader._assert_safe_state_entry(state_path)
@@ -1700,6 +1707,7 @@ class Catalog:
             writer.state_dir / DIRECTORY_TREE_CACHE_FILE_NAME
         )
         writer.thumbnail_dir = writer.state_dir / THUMBNAIL_DIR_NAME
+        writer.face_thumbnail_dir = writer.state_dir / FACE_THUMBNAIL_DIR_NAME
         writer.catalog_lock_path = writer.state_dir / CATALOG_LOCK_FILE_NAME
         writer._closed = False
         writer._catalog_lock_acquired = False
@@ -1726,6 +1734,7 @@ class Catalog:
             writer.log_path,
             writer.directory_tree_cache_path,
             writer.thumbnail_dir,
+            writer.face_thumbnail_dir,
             writer.catalog_lock_path,
         ):
             writer._assert_safe_state_entry(state_path)
@@ -1837,6 +1846,7 @@ class Catalog:
             handle.state_dir / DIRECTORY_TREE_CACHE_FILE_NAME
         )
         handle.thumbnail_dir = handle.state_dir / THUMBNAIL_DIR_NAME
+        handle.face_thumbnail_dir = handle.state_dir / FACE_THUMBNAIL_DIR_NAME
         handle.catalog_lock_path = handle.state_dir / CATALOG_LOCK_FILE_NAME
         handle._closed = False
         handle._catalog_lock_acquired = False
@@ -2618,7 +2628,7 @@ class Catalog:
             return
         if stat_module.S_ISLNK(entry_stat.st_mode):
             raise ValueError(f"catalog state entry must not be a symbolic link: {path.name}")
-        if path == self.thumbnail_dir:
+        if path in {self.thumbnail_dir, self.face_thumbnail_dir}:
             if not stat_module.S_ISDIR(entry_stat.st_mode):
                 raise ValueError(f"catalog thumbnail state entry must be a directory: {path.name}")
             return
@@ -2660,13 +2670,14 @@ class Catalog:
                         """
                         SELECT key, value
                         FROM settings
-                        WHERE key IN ('thumbnail_native_size', 'prune_parallelism')
+                        WHERE key IN ('thumbnail_native_size', 'prune_parallelism', 'faces_enabled')
                         """
                     )
                 }
                 cached = CatalogSettings(
                     thumbnail_native_size=int(rows.get("thumbnail_native_size", "512")),
                     prune_parallelism=max(1, int(rows.get("prune_parallelism", "4"))),
+                    faces_enabled=rows.get("faces_enabled", "0") == "1",
                 )
                 self._settings_cache = cached
         return cached
@@ -2680,6 +2691,7 @@ class Catalog:
         with self._database_savepoint("set_catalog_settings"):
             self._set_setting("thumbnail_native_size", str(settings.thumbnail_native_size))
             self._set_setting("prune_parallelism", str(settings.prune_parallelism))
+            self._set_setting("faces_enabled", "1" if settings.faces_enabled else "0")
         self._settings_cache = settings
 
     def append_log(self, message: str, *, level: str = "INFO") -> None:
@@ -10114,6 +10126,7 @@ class Catalog:
         self._ensure_directory_schema()
         self._ensure_index_failure_schema()
         self._ensure_virtual_directory_schema()
+        init_face_schema(self._conn)
 
     def _ensure_virtual_directory_schema(self) -> None:
         columns = {

@@ -46,7 +46,7 @@ def test_tools_menu_exposes_lama_model_download(app: QApplication) -> None:
     window = MainWindow()
 
     assert "LaMa Model" in window.download_lama_action.text()
-    assert window.remote_lama_action.text() == "Remote LaMa"
+    assert window.remote_lama_action.text() == "Remote GPU…"
 
     window.close()
     window.deleteLater()
@@ -124,7 +124,7 @@ def test_lama_busy_overlay_describes_remote_transport(app: QApplication) -> None
     overlay.start(remote=True)
     assert "pinned TLS" in overlay.detail_label.text()
 
-    overlay.set_execution_provider("Remote LaMa")
+    overlay.set_execution_provider("Remote GPU")
     assert "trusted HTTPS" in overlay.detail_label.text()
     assert "local inference" not in overlay.detail_label.text()
 

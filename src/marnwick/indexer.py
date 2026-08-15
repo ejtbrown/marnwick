@@ -14,6 +14,10 @@ from time import monotonic, sleep
 from typing import Generic, TypeVar
 
 from .catalog import Catalog, CatalogStorageIdentity
+from .config import FACE_RUNTIME_REMOTE, RemoteLamaConfig
+from .face_engine import FaceEngine, FaceInferenceCancelled
+from .faces import FaceIndexSummary, FaceStore
+from .remote_face_engine import RemoteFaceEngine
 
 
 def _lexical_task_root(root: Path) -> Path:
@@ -39,7 +43,8 @@ class ActionPriority(IntEnum):
     SELECTED_DIRECTORY_INDEX = 3
     DIRECTORY_INVENTORY = 4
     THUMBNAIL_INDEX = 5
-    PRUNE = 6
+    FACE_INDEX = 6
+    PRUNE = 7
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,6 +143,12 @@ class IndexTask:
     def check_canceled(self) -> None:
         if self._cancel_event.is_set():
             raise IndexTaskCancelled()
+
+    @property
+    def cancel_event(self) -> Event:
+        """Read-only access for cancel-aware native/inference helpers."""
+
+        return self._cancel_event
 
     def cooperate(self) -> None:
         self.check_canceled()
@@ -346,6 +357,40 @@ class BackgroundIndexer:
                 expected_storage_identity=expected_storage_identity,
             ),
             self._prune_thumbnails,
+        )
+
+    def refresh_faces(
+        self,
+        root: Path,
+        model_directory: Path | None,
+        *,
+        runtime: str,
+        remote_config: RemoteLamaConfig | None = None,
+        interactive: bool = False,
+        expected_root_identity: tuple[int, int] | None = None,
+        expected_storage_identity: CatalogStorageIdentity | None = None,
+    ) -> IndexTask:
+        """Index stale face data through one warmed, cancelable model pair."""
+
+        root = _lexical_task_root(root)
+        return self._submit_unique(
+            f"faces:{root}:{runtime}",
+            IndexTask(
+                f"Finding faces in {root.name or root}",
+                root,
+                None,
+                interactive=interactive,
+                idle_sleep_seconds=self._idle_sleep_seconds,
+                priority=ActionPriority.FACE_INDEX,
+                expected_root_identity=expected_root_identity,
+                expected_storage_identity=expected_storage_identity,
+            ),
+            lambda task: self._refresh_faces(
+                task,
+                model_directory,
+                runtime,
+                remote_config,
+            ),
         )
 
     def refresh_directory(
@@ -864,6 +909,53 @@ class BackgroundIndexer:
         except Exception as error:
             self._log_task_error(task, error)
             raise
+
+    def _refresh_faces(
+        self,
+        task: IndexTask,
+        model_directory: Path | None,
+        runtime: str,
+        remote_config: RemoteLamaConfig | None,
+    ) -> FaceIndexSummary:
+        engine: FaceEngine | RemoteFaceEngine | None = None
+        try:
+            task.check_canceled()
+            if runtime == FACE_RUNTIME_REMOTE:
+                if remote_config is None:
+                    raise ValueError("Remote GPU is not configured")
+                engine = RemoteFaceEngine(
+                    remote_config,
+                    cancel_event=task.cancel_event,
+                )
+            else:
+                if model_directory is None:
+                    raise ValueError("Local face model directory is unavailable")
+                engine = FaceEngine(model_directory, runtime=runtime)
+            task.check_canceled()
+            with Catalog.open_writer(
+                task.root,
+                expected_root_identity=task.expected_root_identity,
+                expected_storage_identity=task.expected_storage_identity,
+            ) as catalog:
+                if not catalog.settings.faces_enabled:
+                    return FaceIndexSummary(0, 0, engine.provider)
+                return FaceStore(catalog).index_pending(
+                    engine,
+                    progress=self._progress_callback(task),
+                    cancel_event=task.cancel_event,
+                )
+        except FaceInferenceCancelled as error:
+            raise IndexTaskCancelled() from error
+        except IndexTaskCancelled:
+            raise
+        except Exception as error:
+            self._log_task_error(task, error)
+            raise
+        finally:
+            if engine is not None:
+                close = getattr(engine, "close", None)
+                if callable(close):
+                    close()
 
     def _refresh_subtree(self, task: IndexTask) -> None:
         try:

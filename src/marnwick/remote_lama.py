@@ -22,6 +22,8 @@ REMOTE_LAMA_CONNECT_TIMEOUT_SECONDS = 10.0
 MAX_REMOTE_LAMA_CERTIFICATE_BYTES = 64 * 1024
 MAX_REMOTE_LAMA_RESPONSE_BYTES = 8 * 1024 * 1024
 MAX_REMOTE_LAMA_INPUT_BYTES = 8 * 1024 * 1024
+MAX_REMOTE_FACE_RESPONSE_BYTES = 32 * 1024 * 1024
+MAX_REMOTE_FACE_INPUT_BYTES = 8 * 1024 * 1024
 MAX_REMOTE_LAMA_ERROR_BYTES = 64 * 1024
 MAX_REMOTE_LAMA_HEALTH_BYTES = 64 * 1024
 REMOTE_LAMA_EXECUTION_PROVIDER = "RemoteLaMa"
@@ -53,7 +55,7 @@ def normalize_remote_lama_ip(value: str) -> str:
     try:
         return ipaddress.ip_address(value.strip()).compressed
     except ValueError as error:
-        raise ValueError("Remote LaMa requires a valid IPv4 or IPv6 address") from error
+        raise ValueError("Remote GPU service requires a valid IPv4 or IPv6 address") from error
 
 
 def remote_lama_endpoint(config: RemoteLamaConfig) -> str:
@@ -64,13 +66,13 @@ def remote_lama_endpoint(config: RemoteLamaConfig) -> str:
 
 def validated_remote_lama_port(value: object) -> int:
     if isinstance(value, bool):
-        raise ValueError("Remote LaMa requires a port from 1 through 65535")
+        raise ValueError("Remote GPU service requires a port from 1 through 65535")
     try:
         port = int(value)
     except (TypeError, ValueError, OverflowError) as error:
-        raise ValueError("Remote LaMa requires a port from 1 through 65535") from error
+        raise ValueError("Remote GPU service requires a port from 1 through 65535") from error
     if not 1 <= port <= 65535:
-        raise ValueError("Remote LaMa requires a port from 1 through 65535")
+        raise ValueError("Remote GPU service requires a port from 1 through 65535")
     return port
 
 
@@ -91,17 +93,17 @@ def trusted_certificate_der(config: RemoteLamaConfig) -> bytes:
     encoded = config.certificate_der.strip()
     if not encoded:
         raise RemoteLamaNotConfiguredError(
-            "Configure and trust Remote LaMa under Tools > Remote LaMa first."
+            "Configure and trust the service under Tools > Remote GPU first."
         )
     try:
         certificate_der = base64.b64decode(encoded, validate=True)
     except (ValueError, TypeError) as error:
         raise RemoteLamaNotConfiguredError(
-            "The saved Remote LaMa certificate is invalid; retrieve and trust it again."
+            "The saved Remote GPU certificate is invalid; retrieve and trust it again."
         ) from error
     if not certificate_der or len(certificate_der) > MAX_REMOTE_LAMA_CERTIFICATE_BYTES:
         raise RemoteLamaNotConfiguredError(
-            "The saved Remote LaMa certificate is invalid; retrieve and trust it again."
+            "The saved Remote GPU certificate is invalid; retrieve and trust it again."
         )
     return certificate_der
 
@@ -161,7 +163,7 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
         super().connect()
         if self.sock is None:
             raise RemoteLamaCertificateError(
-                "The Remote LaMa TLS connection did not expose its certificate."
+                "The Remote GPU TLS connection did not expose its certificate."
             )
         offered = self.sock.getpeercert(binary_form=True)
         if not isinstance(offered, bytes) or not hmac.compare_digest(
@@ -176,7 +178,7 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
             expected_display = certificate_sha1_thumbprint(self._trusted_certificate)
             self.close()
             raise RemoteLamaCertificateError(
-                "Remote LaMa offered a different certificate. No image data was sent. "
+                "Remote GPU offered a different certificate. No image data was sent. "
                 f"Expected SHA-1 {expected_display}; received {offered_display}. "
                 "Retrieve and trust the new certificate only after verifying it."
             )
@@ -220,9 +222,9 @@ class RemoteLamaClient:
         try:
             payload = json.loads(response.body)
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise RemoteLamaError("Remote LaMa returned invalid health data") from error
+            raise RemoteLamaError("Remote GPU returned invalid health data") from error
         if not isinstance(payload, dict):
-            raise RemoteLamaError("Remote LaMa returned invalid health data")
+            raise RemoteLamaError("Remote GPU returned invalid health data")
         return payload
 
     def inpaint_png(
@@ -234,12 +236,12 @@ class RemoteLamaClient:
         provider_callback: Callable[[str], None] | None = None,
     ) -> RemoteLamaResponse:
         if not image_png or not mask_png:
-            raise ValueError("Remote LaMa requires an image and mask")
+            raise ValueError("Remote GPU LaMa processing requires an image and mask")
         if (
             len(image_png) > MAX_REMOTE_LAMA_INPUT_BYTES
             or len(mask_png) > MAX_REMOTE_LAMA_INPUT_BYTES
         ):
-            raise ValueError("Remote LaMa image or mask exceeds the safe request size")
+            raise ValueError("Remote GPU LaMa image or mask exceeds the safe request size")
         boundary = f"marnwick-{secrets.token_hex(18)}"
         body = _multipart_body(boundary, image_png, mask_png)
         response = self._request(
@@ -262,8 +264,61 @@ class RemoteLamaClient:
         content_type = response.headers.get("content-type", "").split(";", 1)[0].strip()
         if content_type != "image/png":
             raise RemoteLamaError(
-                f"Remote LaMa returned {content_type or 'an unknown content type'} instead of PNG"
+                f"Remote GPU returned {content_type or 'an unknown content type'} instead of PNG"
             )
+        return response
+
+    def analyze_faces(
+        self,
+        image_bytes: bytes,
+        *,
+        cancel_event: Event | None = None,
+        provider_callback: Callable[[str], None] | None = None,
+    ) -> RemoteLamaResponse:
+        """Submit one bounded image to the stateless remote face service."""
+
+        if not image_bytes:
+            raise ValueError("Remote GPU face analysis requires an image")
+        if len(image_bytes) > MAX_REMOTE_FACE_INPUT_BYTES:
+            raise ValueError("Remote GPU face-analysis image exceeds the safe request size")
+        boundary = f"marnwick-{secrets.token_hex(18)}"
+        body = _multipart_files_body(
+            boundary,
+            (("image", "image.png", "image/png", image_bytes),),
+        )
+        response = self._request(
+            "POST",
+            "/v1/faces/analyze",
+            body=body,
+            headers={
+                "Accept": "application/json",
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+                "Content-Length": str(len(body)),
+            },
+            response_limit=MAX_REMOTE_FACE_RESPONSE_BYTES,
+            cancel_event=cancel_event,
+            connected_callback=(
+                None
+                if provider_callback is None
+                else lambda: provider_callback(REMOTE_LAMA_EXECUTION_PROVIDER)
+            ),
+        )
+        content_type = response.headers.get("content-type", "").split(";", 1)[0].strip()
+        if content_type != "application/json":
+            raise RemoteLamaError(
+                "Remote GPU face analysis returned "
+                f"{content_type or 'an unknown content type'} instead of JSON"
+            )
+        if response.headers.get("cache-control", "").strip().lower() != "no-store":
+            raise RemoteLamaError("Remote GPU face response was not marked no-store")
+        if response.headers.get("x-content-type-options", "").strip().lower() != "nosniff":
+            raise RemoteLamaError("Remote GPU face response omitted nosniff protection")
+        try:
+            declared_length = int(response.headers.get("content-length", ""))
+        except ValueError as error:
+            raise RemoteLamaError("Remote GPU face response omitted its exact length") from error
+        if declared_length != len(response.body):
+            raise RemoteLamaError("Remote GPU face response length did not match its body")
         return response
 
     def close(self) -> None:
@@ -336,7 +391,7 @@ class RemoteLamaClient:
                     declared_length = -1
                 if declared_length > response_limit:
                     self.close()
-                    raise RemoteLamaError("Remote LaMa returned an oversized response")
+                    raise RemoteLamaError("Remote GPU returned an oversized response")
             encoded = response.read(response_limit + 1)
             response_headers = {
                 str(name).lower(): str(value)
@@ -347,11 +402,11 @@ class RemoteLamaClient:
             _check_canceled(cancel_event)
             if len(encoded) > response_limit:
                 self.close()
-                raise RemoteLamaError("Remote LaMa returned an oversized response")
+                raise RemoteLamaError("Remote GPU returned an oversized response")
             if not 200 <= response.status < 300:
                 detail = _remote_error_detail(encoded[:MAX_REMOTE_LAMA_ERROR_BYTES])
                 raise RemoteLamaError(
-                    f"Remote LaMa request failed with HTTP {response.status}"
+                    f"Remote GPU request failed with HTTP {response.status}"
                     + (f": {detail}" if detail else "")
                 )
             return RemoteLamaResponse(encoded, response_headers)
@@ -360,8 +415,8 @@ class RemoteLamaClient:
         except (OSError, http.client.HTTPException, TimeoutError) as error:
             self.close()
             if cancel_event is not None and cancel_event.is_set():
-                raise RemoteLamaCancelled("Remote LaMa inference was canceled") from error
-            raise RemoteLamaError(f"Remote LaMa connection failed: {error}") from error
+                raise RemoteLamaCancelled("Remote GPU inference was canceled") from error
+            raise RemoteLamaError(f"Remote GPU connection failed: {error}") from error
         finally:
             stop_watcher.set()
             if watcher is not None:
@@ -392,11 +447,21 @@ def _unverified_tls_context() -> ssl.SSLContext:
 
 
 def _multipart_body(boundary: str, image_png: bytes, mask_png: bytes) -> bytes:
+    return _multipart_files_body(
+        boundary,
+        (
+            ("image", "image.png", "image/png", image_png),
+            ("mask", "mask.png", "image/png", mask_png),
+        ),
+    )
+
+
+def _multipart_files_body(
+    boundary: str,
+    files: tuple[tuple[str, str, str, bytes], ...],
+) -> bytes:
     parts: list[bytes] = []
-    for field_name, filename, encoded in (
-        ("image", "image.png", image_png),
-        ("mask", "mask.png", mask_png),
-    ):
+    for field_name, filename, content_type, encoded in files:
         parts.extend(
             (
                 f"--{boundary}\r\n".encode("ascii"),
@@ -404,7 +469,7 @@ def _multipart_body(boundary: str, image_png: bytes, mask_png: bytes) -> bytes:
                     f'Content-Disposition: form-data; name="{field_name}"; '
                     f'filename="{filename}"\r\n'
                 ).encode("ascii"),
-                b"Content-Type: image/png\r\n\r\n",
+                f"Content-Type: {content_type}\r\n\r\n".encode("ascii"),
                 encoded,
                 b"\r\n",
             )
@@ -428,4 +493,4 @@ def _remote_error_detail(encoded: bytes) -> str:
 
 def _check_canceled(cancel_event: Event | None) -> None:
     if cancel_event is not None and cancel_event.is_set():
-        raise RemoteLamaCancelled("Remote LaMa inference was canceled")
+        raise RemoteLamaCancelled("Remote GPU inference was canceled")

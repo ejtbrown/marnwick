@@ -76,6 +76,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFormLayout,
     QFrame,
+    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QKeySequenceEdit,
@@ -144,6 +145,11 @@ from .catalog import (
 )
 from .config import (
     DEFAULT_THUMBNAIL_COLUMNS,
+    FACE_RUNTIME_AUTO,
+    FACE_RUNTIME_CPU,
+    FACE_RUNTIME_NVIDIA,
+    FACE_RUNTIME_REMOTE,
+    FACE_RUNTIME_WEBGPU,
     LAMA_RUNTIME_AUTO,
     LAMA_RUNTIME_CPU,
     LAMA_RUNTIME_NVIDIA,
@@ -161,6 +167,15 @@ from .config import (
     load_config,
     save_config,
 )
+from .face_models import (
+    FACE_MODELS_SIZE_BYTES,
+    FaceModelDownloadCancelled,
+    default_face_model_directory,
+    download_face_models,
+    face_models_are_valid,
+)
+from .face_ui import FaceManagerDialog
+from .faces import FaceStore
 from .document_ops import MAX_SOURCE_BYTES, load_document_html
 from .folder_icon import render_folder_icon
 from .gpu_test import (
@@ -263,12 +278,18 @@ IMAGE_RECONCILE_RETRY_BASE_MS = 250
 TAG_DATABASE_RETRY_INITIAL_SECONDS = 0.05
 TAG_DATABASE_RETRY_MAX_SECONDS = 1.0
 TAG_DATABASE_RETRY_TIMEOUT_SECONDS = 10.0
+FACE_INDEX_RETRY_SECONDS = 60.0
 VIRTUAL_KIND_ROOT = "virtual-root"
 VIRTUAL_KIND_TAG_ROOT = "tag-root"
 VIRTUAL_KIND_TAG = "tag"
 VIRTUAL_KIND_DUPLICATES = "duplicates"
 VIRTUAL_KIND_VERY_SIMILAR = "very-similar"
 VIRTUAL_KIND_CUSTOM = "custom"
+VIRTUAL_KIND_PEOPLE_ROOT = "people-root"
+VIRTUAL_KIND_PEOPLE_REVIEW = "people-review"
+VIRTUAL_KIND_PEOPLE_UNNAMED = "people-unnamed"
+VIRTUAL_KIND_PEOPLE_LOOSE = "people-loose"
+VIRTUAL_KIND_PEOPLE_IGNORED = "people-ignored"
 VIRTUAL_KIND_PHYSICAL = "physical"
 VIRTUAL_KIND_PHYSICAL_PREVIEW = "physical-preview"
 TreeStateKey = tuple[Path, str, str, str]
@@ -285,6 +306,14 @@ class HotkeyDefinition:
     default_sequence: str
 
 
+@dataclass(frozen=True, slots=True)
+class HotkeyGuideItem:
+    sequence: str
+    action: str
+    location: str
+
+
+HOTKEY_GUIDE_SEQUENCE = "Tab"
 HOTKEY_DEFINITIONS = (
     HotkeyDefinition(
         "main.open_catalog",
@@ -317,6 +346,13 @@ HOTKEY_DEFINITIONS = (
         "S",
     ),
     HotkeyDefinition("thumbnail.tags", "Edit tags", "Thumbnail pane", "main", "T"),
+    HotkeyDefinition(
+        "tags.complete",
+        "Complete the most recently used matching tag",
+        "Tags dialog",
+        "tags",
+        "Ctrl+Space",
+    ),
     HotkeyDefinition(
         "tags.repeat",
         "Repeat last assigned tag set",
@@ -433,6 +469,33 @@ def resolved_hotkey_sequence(
         normalized_hotkey_sequence(configured)
         or normalized_hotkey_sequence(definition.default_sequence)
     )
+
+
+def hotkey_guide_items(
+    overrides: Mapping[str, str],
+    context: str,
+) -> tuple[HotkeyGuideItem, ...]:
+    items: list[HotkeyGuideItem] = []
+    reserved_sequence = normalized_hotkey_sequence(HOTKEY_GUIDE_SEQUENCE).casefold()
+    for definition in HOTKEY_DEFINITIONS:
+        if definition.context != context:
+            continue
+        sequence_text = resolved_hotkey_sequence(overrides, definition.hotkey_id)
+        if not sequence_text or sequence_text.casefold() == reserved_sequence:
+            continue
+        sequence = QKeySequence.fromString(
+            sequence_text,
+            QKeySequence.SequenceFormat.PortableText,
+        )
+        display_text = sequence.toString(QKeySequence.SequenceFormat.NativeText)
+        items.append(
+            HotkeyGuideItem(
+                sequence=display_text or sequence_text,
+                action=definition.action,
+                location=definition.location,
+            )
+        )
+    return tuple(items)
 
 
 def hotkey_event_matches(event: object, sequence_text: str) -> bool:
@@ -982,6 +1045,140 @@ QPushButton:hover {
     background: #eef2ff;
 }
 """
+
+
+class HotkeyGuideOverlay(QWidget):
+    """A focus-neutral, momentary guide layered over the active Marnwick view."""
+
+    def __init__(
+        self,
+        parent: QWidget,
+        view_title: str,
+        entries: Sequence[HotkeyGuideItem],
+    ) -> None:
+        super().__init__(parent)
+        self.view_title = view_title
+        self.entries = tuple(entries)
+        self.setObjectName("hotkeyGuideOverlay")
+        self.setAccessibleName(f"Available hotkeys for {view_title}")
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+
+        overlay_layout = QVBoxLayout(self)
+        overlay_layout.setContentsMargins(24, 24, 24, 24)
+        overlay_layout.addStretch(1)
+
+        panel_row = QHBoxLayout()
+        panel_row.addStretch(1)
+        guide_columns = 2 if len(self.entries) > 8 and parent.width() >= 640 else 1
+        panel = QFrame(self)
+        panel.setObjectName("hotkeyGuidePanel")
+        panel.setMinimumWidth(
+            min(760 if guide_columns == 2 else 460, max(120, parent.width() - 48))
+        )
+        panel.setMaximumWidth(960)
+        panel.setSizePolicy(
+            QSizePolicy.Policy.Preferred,
+            QSizePolicy.Policy.Maximum,
+        )
+        panel.setStyleSheet(
+            """
+            QFrame#hotkeyGuidePanel {
+                background: rgba(24, 29, 38, 245);
+                border: 1px solid rgba(255, 255, 255, 75);
+                border-radius: 12px;
+            }
+            QLabel {
+                background: transparent;
+                color: #f8fafc;
+            }
+            QLabel#hotkeyGuideTitle {
+                font-size: 20px;
+                font-weight: 700;
+            }
+            QLabel#hotkeyGuideContext {
+                color: #cbd5e1;
+            }
+            QLabel#hotkeyGuideKey {
+                background: #e2e8f0;
+                color: #111827;
+                border: 1px solid #ffffff;
+                border-radius: 5px;
+                padding: 3px 7px;
+                font-weight: 700;
+            }
+            QLabel#hotkeyGuideAction {
+                padding-right: 12px;
+            }
+            """
+        )
+        panel_layout = QVBoxLayout(panel)
+        panel_layout.setContentsMargins(22, 18, 22, 18)
+        panel_layout.setSpacing(8)
+
+        title = QLabel("Available hotkeys")
+        title.setObjectName("hotkeyGuideTitle")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        panel_layout.addWidget(title)
+        context = QLabel(f"{view_title} · release Tab to close")
+        context.setObjectName("hotkeyGuideContext")
+        context.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        panel_layout.addWidget(context)
+
+        if self.entries:
+            grid = QGridLayout()
+            grid.setHorizontalSpacing(12)
+            grid.setVerticalSpacing(7)
+            row_count = ceil(len(self.entries) / guide_columns)
+            for index, entry in enumerate(self.entries):
+                group_column = index // row_count
+                row = index % row_count
+                key_label = QLabel(entry.sequence)
+                key_label.setObjectName("hotkeyGuideKey")
+                key_label.setTextFormat(Qt.TextFormat.PlainText)
+                key_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                key_label.setSizePolicy(
+                    QSizePolicy.Policy.Maximum,
+                    QSizePolicy.Policy.Preferred,
+                )
+                action_label = QLabel(entry.action)
+                action_label.setObjectName("hotkeyGuideAction")
+                action_label.setTextFormat(Qt.TextFormat.PlainText)
+                action_label.setWordWrap(True)
+                grid.addWidget(key_label, row, group_column * 2)
+                grid.addWidget(action_label, row, group_column * 2 + 1)
+                grid.setColumnStretch(group_column * 2 + 1, 1)
+            panel_layout.addLayout(grid)
+        else:
+            empty = QLabel("No other keyboard shortcuts are available in this view.")
+            empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            empty.setWordWrap(True)
+            panel_layout.addWidget(empty)
+
+        panel_row.addWidget(panel, 1)
+        panel_row.addStretch(1)
+        overlay_layout.addLayout(panel_row)
+        overlay_layout.addStretch(1)
+
+        parent.installEventFilter(self)
+        self.setGeometry(parent.rect())
+
+    def paintEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor(55, 60, 67, 178))
+        painter.end()
+        super().paintEvent(event)
+
+    def eventFilter(self, watched: object, event: QEvent) -> bool:
+        if watched is self.parentWidget():
+            if event.type() == QEvent.Type.Resize:
+                parent = self.parentWidget()
+                if parent is not None:
+                    self.setGeometry(parent.rect())
+            elif event.type() in {QEvent.Type.Hide, QEvent.Type.Close}:
+                self.hide()
+        return super().eventFilter(watched, event)
 
 
 class ThumbnailModel(QAbstractListModel):
@@ -3648,6 +3845,23 @@ class MainWindow(QMainWindow):
             Callable[[Path | None, str | None], None]
         ] = []
         self._lama_download_report_completion = False
+        self.face_download_executor = AbandonableThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="marnwick-face-download",
+            max_pending=1,
+        )
+        self.face_model_probe_executor = AbandonableThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="marnwick-face-model-probe",
+            max_pending=1,
+        )
+        self._face_download_future: Future[tuple[Path, Path]] | None = None
+        self._face_download_cancel_event: Event | None = None
+        self._face_download_progress_lock = Lock()
+        self._face_download_progress = (0, FACE_MODELS_SIZE_BYTES)
+        self._face_models_available = False
+        self._face_model_probe_started = False
+        self._face_model_probe_future: Future[bool] | None = None
         self._config_save_futures: set[Future[None]] = set()
         self._config_save_contexts: dict[Future[None], tuple[int, tuple[str, ...]]] = {}
         self._config_save_sequence = 0
@@ -3706,6 +3920,9 @@ class MainWindow(QMainWindow):
         self._directory_discovery_retry_at: dict[Path, float] = {}
         self._directory_index_tasks: dict[tuple[Path, str], IndexTask] = {}
         self._thumbnail_prune_tasks: dict[Path, IndexTask] = {}
+        self._face_index_tasks: dict[Path, IndexTask] = {}
+        self._face_indexed_catalog_roots: set[Path] = set()
+        self._face_index_retry_at: dict[Path, float] = {}
         self._resume_idle_refresh_roots: set[Path] = set()
         self._shallow_tree_roots: set[Path] = set()
         self._catalog_open_tasks: dict[Future[CatalogOpenResult], CatalogOpenTask] = {}
@@ -3777,6 +3994,8 @@ class MainWindow(QMainWindow):
         self._successful_catalog_open_intents: dict[Path, int] = {}
         self._failed_catalog_open_intents: set[int] = set()
         self._closing = False
+        self._hotkey_guide_overlay: HotkeyGuideOverlay | None = None
+        self._hotkey_guide_filter_installed = False
         self._unavailable_catalog_paths: list[str] = []
         self._directory_drag_active = False
         self._tree_rebuild_deferred = False
@@ -3908,6 +4127,10 @@ class MainWindow(QMainWindow):
             self.restore_catalogs_from_config()
         else:
             self._settle_initial_config_load(self._initial_config_load_generation)
+        application = QApplication.instance()
+        if application is not None:
+            application.installEventFilter(self)
+            self._hotkey_guide_filter_installed = True
 
     def closeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         initial_config_pending = self._initial_config_load_pending()
@@ -3966,6 +4189,14 @@ class MainWindow(QMainWindow):
             self._lama_download_future.cancel()
         self._lama_download_waiters.clear()
         self.lama_download_executor.shutdown(wait=False, cancel_futures=True)
+        if self._face_download_cancel_event is not None:
+            self._face_download_cancel_event.set()
+        if self._face_download_future is not None:
+            self._face_download_future.cancel()
+        self.face_download_executor.shutdown(wait=False, cancel_futures=True)
+        if self._face_model_probe_future is not None:
+            self._face_model_probe_future.cancel()
+        self.face_model_probe_executor.shutdown(wait=False, cancel_futures=True)
         self.lama_worker_service.close()
         # The executor has only a single pending slot containing the complete
         # newest snapshot.  Preserve it for a final daemon-thread durability
@@ -3996,6 +4227,11 @@ class MainWindow(QMainWindow):
         self.identity_executor.shutdown(wait=False, cancel_futures=True)
         self.indexer.shutdown()
         self.workspace.close()
+        self._hide_hotkey_guide()
+        application = QApplication.instance()
+        if application is not None and self._hotkey_guide_filter_installed:
+            application.removeEventFilter(self)
+            self._hotkey_guide_filter_installed = False
         super().closeEvent(event)
 
     def _shutdown_catalog_open_tasks(self) -> None:
@@ -4244,6 +4480,7 @@ class MainWindow(QMainWindow):
             not in self._initial_config_catalog_exclusions
         )
         prior_sort = self.current_sort
+        prior_face_runtime = self.app_config.face_runtime
         self._applying_initial_config = True
         try:
             self.app_config = loaded
@@ -4252,6 +4489,7 @@ class MainWindow(QMainWindow):
                 loaded.sort_order = current.sort_order
                 loaded.delete_behavior = current.delete_behavior
                 loaded.lama_runtime = current.lama_runtime
+                loaded.face_runtime = current.face_runtime
                 loaded.remote_lama = replace(current.remote_lama)
                 loaded.hotkeys = dict(current.hotkeys)
             else:
@@ -4267,6 +4505,12 @@ class MainWindow(QMainWindow):
         finally:
             self._applying_initial_config = False
         self._apply_hotkey_bindings()
+
+        if loaded.face_runtime != prior_face_runtime:
+            for task in self._face_index_tasks.values():
+                task.cancel()
+            self._face_indexed_catalog_roots.clear()
+            self._face_index_retry_at.clear()
 
         if not controls_changed and prior_sort != self.current_sort and self.current_catalog is not None:
             self._cancel_virtual_view_tasks(self.current_catalog.root)
@@ -4423,6 +4667,7 @@ class MainWindow(QMainWindow):
             delete_behavior=self.app_config.delete_behavior,
             sort_order=self.current_sort.value,
             lama_runtime=self.app_config.lama_runtime,
+            face_runtime=self.app_config.face_runtime,
             remote_lama=replace(self.app_config.remote_lama),
             hotkeys=dict(self.app_config.hotkeys),
             _loaded_catalogs=self.app_config._loaded_catalogs,
@@ -4456,7 +4701,13 @@ class MainWindow(QMainWindow):
         self._mark_initial_config_controls_interaction()
         self._mark_initial_config_geometry_interaction()
         self._mark_initial_config_catalog_interaction(replaced=True)
+        face_runtime_changed = config.face_runtime != self.app_config.face_runtime
         self.app_config = config
+        if face_runtime_changed:
+            for task in self._face_index_tasks.values():
+                task.cancel()
+            self._face_indexed_catalog_roots.clear()
+            self._face_index_retry_at.clear()
         self._apply_hotkey_bindings()
         self.set_thumbnail_size(self.thumbnail_columns_from_config(config.thumbnail_size))
         self.set_sort_order(self.sort_order_from_config(config.sort_order))
@@ -4514,7 +4765,221 @@ class MainWindow(QMainWindow):
             return max(MIN_THUMBNAIL_COLUMNS, min(MAX_THUMBNAIL_COLUMNS, round(960 / integer)))
         return DEFAULT_THUMBNAIL_COLUMNS
 
+    def _owns_hotkey_guide_window(self, window: QWidget) -> bool:
+        current: QWidget | None = window
+        while current is not None:
+            if current is self:
+                return True
+            current = current.parentWidget()
+        return False
+
+    def _hotkey_guide_target(self, watched: object) -> QWidget | None:
+        if isinstance(watched, QWidget):
+            watched_window = watched.window()
+            if (
+                isinstance(watched_window, QWidget)
+                and not isinstance(watched_window, QMenu)
+                and watched_window.windowType()
+                not in {Qt.WindowType.Popup, Qt.WindowType.ToolTip}
+                and self._owns_hotkey_guide_window(watched_window)
+            ):
+                return watched_window
+        application = QApplication.instance()
+        if application is None:
+            return None
+        for candidate in (
+            application.activeModalWidget(),
+            application.activeWindow(),
+        ):
+            if (
+                isinstance(candidate, QWidget)
+                and self._owns_hotkey_guide_window(candidate)
+            ):
+                return candidate
+        return None
+
+    @staticmethod
+    def _fixed_hotkey_guide_item(
+        sequence_text: str,
+        action: str,
+        location: str,
+    ) -> HotkeyGuideItem:
+        sequence = QKeySequence.fromString(
+            sequence_text,
+            QKeySequence.SequenceFormat.PortableText,
+        )
+        display_text = sequence.toString(QKeySequence.SequenceFormat.NativeText)
+        return HotkeyGuideItem(display_text or sequence_text, action, location)
+
+    @staticmethod
+    def _replace_hotkey_guide_action(
+        entries: list[HotkeyGuideItem],
+        replacement: HotkeyGuideItem,
+    ) -> None:
+        sequence_key = replacement.sequence.casefold()
+        for index, entry in enumerate(entries):
+            if entry.sequence.casefold() == sequence_key:
+                entries[index] = replacement
+                return
+        entries.append(replacement)
+
+    def _hotkey_guide_spec(
+        self,
+        window: QWidget,
+    ) -> tuple[str, tuple[HotkeyGuideItem, ...]]:
+        if isinstance(window, FullscreenViewer):
+            title = "Fullscreen viewer"
+            entries = list(hotkey_guide_items(self.app_config.hotkeys, "fullscreen"))
+            if window._lama_future is not None:
+                cancel_sequence = self.hotkey_sequence("fullscreen.cancel")
+                return (
+                    title,
+                    (
+                        self._fixed_hotkey_guide_item(
+                            cancel_sequence,
+                            "Cancel running LaMa operation",
+                            title,
+                        ),
+                    ),
+                )
+            if window.edit_mode is not None or window.operations:
+                self._replace_hotkey_guide_action(
+                    entries,
+                    self._fixed_hotkey_guide_item(
+                        "Z",
+                        "Undo the most recent edit",
+                        title,
+                    ),
+                )
+            if window.edit_mode == "lama":
+                for sequence_text, action in (
+                    ("Return", "Apply LaMa mask"),
+                    ("Delete", "Clear LaMa mask"),
+                    ("Backspace", "Clear LaMa mask"),
+                    ("R", "Repeat the last LaMa mask"),
+                ):
+                    self._replace_hotkey_guide_action(
+                        entries,
+                        self._fixed_hotkey_guide_item(
+                            sequence_text,
+                            action,
+                            title,
+                        ),
+                    )
+            return title, tuple(entries)
+
+        if isinstance(window, TagDialog):
+            title = "Tags dialog"
+            entries = list(hotkey_guide_items(self.app_config.hotkeys, "tags"))
+            entries.extend(
+                (
+                    self._fixed_hotkey_guide_item("Return", "Apply tags", title),
+                    self._fixed_hotkey_guide_item("Esc", "Cancel", title),
+                )
+            )
+            return title, tuple(entries)
+
+        if isinstance(window, EditCommandDialog):
+            title = "Image edit tools"
+            entries = tuple(
+                self._fixed_hotkey_guide_item(shortcut, label, title)
+                for shortcut, label, _command in window.COMMANDS
+            ) + (self._fixed_hotkey_guide_item("Esc", "Cancel", title),)
+            return title, entries
+
+        if isinstance(window, FaceManagerDialog):
+            title = "People"
+            entries = tuple(
+                self._fixed_hotkey_guide_item(sequence, action, title)
+                for sequence, action in (
+                    ("Return", "Confirm or name the current group"),
+                    ("R", "Remove the selected faces from the group"),
+                    ("X", "Mark as a different person"),
+                    ("I", "Ignore the selected faces"),
+                    ("Delete", "Mark the selection as not a face"),
+                    ("Backspace", "Mark the selection as not a face"),
+                    ("?", "Defer the selection"),
+                    ("Space", "Open the source photograph"),
+                    ("Esc", "Close"),
+                )
+            )
+            return title, entries
+
+        if window is self:
+            return "Catalog browser", hotkey_guide_items(self.app_config.hotkeys, "main")
+
+        title = window.windowTitle().strip() or "Current dialog"
+        if isinstance(window, QDialog):
+            return title, (self._fixed_hotkey_guide_item("Esc", "Close or cancel", title),)
+        return title, ()
+
+    def _show_hotkey_guide(self, window: QWidget) -> None:
+        if self._hotkey_guide_overlay is not None:
+            return
+        title, entries = self._hotkey_guide_spec(window)
+        overlay = HotkeyGuideOverlay(window, title, entries)
+        self._hotkey_guide_overlay = overlay
+        overlay.destroyed.connect(
+            lambda _object=None, current=overlay: self._hotkey_guide_destroyed(
+                current
+            )
+        )
+        overlay.show()
+        overlay.raise_()
+
+    def _hotkey_guide_destroyed(self, overlay: HotkeyGuideOverlay) -> None:
+        if self._hotkey_guide_overlay is overlay:
+            self._hotkey_guide_overlay = None
+
+    def _hide_hotkey_guide(self) -> None:
+        overlay = self._hotkey_guide_overlay
+        self._hotkey_guide_overlay = None
+        if overlay is None:
+            return
+        with suppress(RuntimeError):
+            overlay.hide()
+            overlay.deleteLater()
+
+    def _handle_hotkey_guide_event(self, watched: object, event: QEvent) -> bool:
+        event_type = event.type()
+        if event_type in {
+            QEvent.Type.ApplicationDeactivate,
+            QEvent.Type.WindowDeactivate,
+        }:
+            self._hide_hotkey_guide()
+            return False
+        if event_type == QEvent.Type.KeyPress:
+            if (
+                event.key() == Qt.Key.Key_Tab  # type: ignore[attr-defined]
+                and event.modifiers() == Qt.KeyboardModifier.NoModifier  # type: ignore[attr-defined]
+            ):
+                target = self._hotkey_guide_target(watched)
+                if target is None:
+                    return False
+                if self._hotkey_guide_overlay is None:
+                    self._show_hotkey_guide(target)
+                event.accept()
+                return True
+            if self._hotkey_guide_overlay is not None:
+                event.accept()
+                return True
+        if event_type == QEvent.Type.KeyRelease:
+            if (
+                event.key() == Qt.Key.Key_Tab  # type: ignore[attr-defined]
+                and self._hotkey_guide_overlay is not None
+            ):
+                if not event.isAutoRepeat():  # type: ignore[attr-defined]
+                    self._hide_hotkey_guide()
+                event.accept()
+                return True
+            if self._hotkey_guide_overlay is not None:
+                event.accept()
+                return True
+        return False
+
     def eventFilter(self, watched: object, event: QEvent) -> bool:
+        if self._handle_hotkey_guide_event(watched, event):
+            return True
         if watched == self.thumbnail_view and event.type() == QEvent.Type.KeyPress:
             if self.hotkey_matches(event, "thumbnail.copy"):
                 self.copy_selected_files()
@@ -4567,8 +5032,18 @@ class MainWindow(QMainWindow):
         self.prune_thumbnails_action = QAction("Prune Thumbnails", self)
         self.prune_thumbnails_action.triggered.connect(self.prune_current_catalog_thumbnails)
         self.tools_menu.addAction(self.prune_thumbnails_action)
-        self.remote_lama_action = QAction("Remote LaMa", self)
-        self.remote_lama_action.triggered.connect(self.open_remote_lama)
+        self.people_action = QAction("People…", self)
+        self.people_action.triggered.connect(lambda _checked=False: self.open_face_manager())
+        self.tools_menu.addAction(self.people_action)
+        self.download_face_models_action = QAction("Download Face Models…", self)
+        self.download_face_models_action.triggered.connect(self.download_face_models_dialog)
+        self.tools_menu.addAction(self.download_face_models_action)
+        self.purge_face_data_action = QAction("Remove Face Data…", self)
+        self.purge_face_data_action.triggered.connect(self.purge_current_catalog_face_data)
+        self.tools_menu.addAction(self.purge_face_data_action)
+        self.tools_menu.addSeparator()
+        self.remote_lama_action = QAction("Remote GPU…", self)
+        self.remote_lama_action.triggered.connect(self.open_remote_gpu)
         self.tools_menu.addAction(self.remote_lama_action)
         self.download_lama_action = QAction("Download LaMa Model…", self)
         self.download_lama_action.triggered.connect(self.download_lama_model_dialog)
@@ -4631,6 +5106,15 @@ class MainWindow(QMainWindow):
             else "Download LaMa Model…"
         )
         self.download_lama_action.setEnabled(self._lama_download_future is None)
+        self._start_face_model_probe()
+        self.download_face_models_action.setText(
+            "Re-download Face Models…"
+            if self._face_models_available
+            else "Download Face Models…"
+        )
+        self.download_face_models_action.setEnabled(self._face_download_future is None)
+        self.people_action.setEnabled(self.current_catalog is not None)
+        self.purge_face_data_action.setEnabled(self.current_catalog is not None)
 
     def open_catalog_dialog(self) -> None:
         dialog_started_at = monotonic()
@@ -4691,7 +5175,7 @@ class MainWindow(QMainWindow):
     def open_gpu_test(self) -> None:
         self.ensure_lama_model(self, self._open_gpu_test_with_model)
 
-    def open_remote_lama(self) -> None:
+    def open_remote_gpu(self) -> None:
         dialog = RemoteLamaDialog(replace(self.app_config.remote_lama), self)
         accepted = dialog.exec() == QDialog.DialogCode.Accepted
         selected = dialog.trusted_config if accepted else None
@@ -4700,12 +5184,22 @@ class MainWindow(QMainWindow):
             return
         self._mark_initial_config_controls_interaction()
         self.app_config.remote_lama = selected
+        for task in self._face_index_tasks.values():
+            task.cancel()
+        self._face_indexed_catalog_roots.clear()
+        self._face_index_retry_at.clear()
         if self.config_enabled:
             self.save_window_config(wait=False)
         self.statusBar().showMessage(
-            f"Remote LaMa trusted at {remote_lama_endpoint(selected)}",
+            f"Remote GPU service trusted at {remote_lama_endpoint(selected)}",
             8000,
         )
+        self._schedule_idle_indexing()
+
+    def open_remote_lama(self) -> None:
+        """Compatibility entry point retained for callers using the old name."""
+
+        self.open_remote_gpu()
 
     def _open_gpu_test_with_model(
         self,
@@ -4842,6 +5336,303 @@ class MainWindow(QMainWindow):
             f"({format_bytes(downloaded)} / {format_bytes(total)})"
         )
 
+    def download_face_models_dialog(self) -> None:
+        self._request_face_models_download(force=self._face_models_available)
+
+    def _start_face_model_probe(self) -> None:
+        if self._face_model_probe_started or self._closing:
+            return
+        self._face_model_probe_started = True
+        try:
+            self._face_model_probe_future = self.face_model_probe_executor.submit(
+                face_models_are_valid
+            )
+        except ExecutorSaturatedError:
+            self._face_model_probe_future = None
+
+    def _settle_face_model_probe(self) -> None:
+        future = self._face_model_probe_future
+        if future is None or not future.done():
+            return
+        self._face_model_probe_future = None
+        if not future.cancelled():
+            try:
+                self._face_models_available = bool(future.result())
+            except Exception:
+                self._face_models_available = False
+
+    def _request_face_models_download(self, *, force: bool) -> None:
+        if self._face_download_future is not None:
+            return
+        action = "Replace" if force else "Download"
+        answer = QMessageBox.question(
+            self,
+            "Download Face Models",
+            f"{action} the local face detector and embedding models?\n\n"
+            "The pinned OpenCV Zoo models total about 37 MiB. Face crops and "
+            "embeddings remain inside the catalog and are never uploaded.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        probe_future = self._face_model_probe_future
+        self._face_model_probe_future = None
+        if probe_future is not None:
+            probe_future.cancel()
+        cancel_event = Event()
+        with self._face_download_progress_lock:
+            self._face_download_progress = (0, FACE_MODELS_SIZE_BYTES)
+
+        def record_progress(downloaded: int, total: int) -> None:
+            with self._face_download_progress_lock:
+                self._face_download_progress = (downloaded, total)
+
+        try:
+            future = self.face_download_executor.submit(
+                download_face_models,
+                default_face_model_directory(),
+                progress=record_progress,
+                cancel_event=cancel_event,
+            )
+        except ExecutorSaturatedError:
+            show_error(self, "Download Face Models", "The face model downloader is already busy.")
+            return
+        self._face_download_future = future
+        self._face_download_cancel_event = cancel_event
+        self.progress_bar.setRange(0, FACE_MODELS_SIZE_BYTES)
+        self.progress_bar.setValue(0)
+        self.progress_label.setText("Downloading face models: 0%")
+        self._update_tools_menu_actions()
+
+    def _settle_face_model_download(self) -> None:
+        future = self._face_download_future
+        if future is None or not future.done():
+            return
+        self._face_download_future = None
+        self._face_download_cancel_event = None
+        error_message: str | None = None
+        model_directory: Path | None = None
+        if future.cancelled():
+            error_message = "Face model download was canceled."
+        else:
+            try:
+                detector, _embedding = future.result()
+                model_directory = detector.parent
+            except FaceModelDownloadCancelled:
+                error_message = "Face model download was canceled."
+            except Exception as error:
+                error_message = str(error)
+        if not self._closing:
+            if error_message is not None:
+                show_error(self, "Download Face Models", error_message)
+            elif model_directory is not None:
+                self._face_models_available = True
+                self.statusBar().showMessage(
+                    f"Face models are ready at {model_directory}",
+                    8000,
+                )
+                self._schedule_idle_indexing()
+        self._update_tools_menu_actions()
+
+    def _show_face_download_status(self) -> None:
+        with self._face_download_progress_lock:
+            downloaded, total = self._face_download_progress
+        total = max(1, total)
+        self.progress_bar.setRange(0, total)
+        self.progress_bar.setValue(min(downloaded, total))
+        percent = int(downloaded * 100 / total)
+        self.progress_label.setText(
+            f"Downloading face models: {percent}% "
+            f"({format_bytes(downloaded)} / {format_bytes(total)})"
+        )
+
+    def open_face_manager(self, *, initial_view: str = "review") -> None:
+        catalog = self.current_catalog
+        if catalog is None:
+            QMessageBox.information(self, "People", "Open or select a catalog first.")
+            return
+        if not catalog.settings.faces_enabled:
+            QMessageBox.information(
+                self,
+                "People",
+                "Face processing is disabled for this catalog. Enable “Find and group "
+                "faces” in the catalog Preferences first.",
+            )
+            return
+        if self.app_config.face_runtime != FACE_RUNTIME_REMOTE:
+            self._start_face_model_probe()
+            self._settle_face_model_probe()
+            if self._face_model_probe_future is None and not self._face_models_available:
+                self._request_face_models_download(force=False)
+        dialog = FaceManagerDialog(
+            catalog,
+            lambda kind, face_ids, value: self._submit_face_mutation(
+                catalog,
+                kind,
+                face_ids,
+                value,
+            ),
+            self,
+            initial_view=initial_view,
+            open_photo=lambda rel_path: self._open_face_source_photo(catalog, rel_path),
+        )
+        dialog.exec()
+        dialog.deleteLater()
+
+    def _open_face_source_photo(self, catalog: Catalog, rel_path: str) -> None:
+        if self.workspace.catalog_for_root(catalog.root) is not catalog:
+            return
+        viewer = FullscreenViewer(
+            catalog,
+            ImageNavigator(order=[rel_path], index=0),
+            self,
+            wipe_on_delete=self.wipe_on_delete_enabled(),
+            display_order=[rel_path],
+            random_mode=False,
+        )
+        try:
+            viewer.exec_fullscreen()
+        finally:
+            viewer.deleteLater()
+
+    def _submit_face_mutation(
+        self,
+        catalog: Catalog,
+        kind: str,
+        face_ids: tuple[int, ...],
+        value: object | None,
+    ) -> Future[object]:
+        if self.workspace.catalog_for_root(catalog.root) is not catalog:
+            raise OSError("The catalog was closed")
+        task, future = self.indexer.submit_action(
+            "Updating people",
+            catalog.root,
+            None,
+            priority=ActionPriority.TAG_UPDATE,
+            worker=lambda action_task: self._face_mutation_worker(
+                catalog.root,
+                kind,
+                face_ids,
+                value,
+                action_task,
+            ),
+            key=f"face-mutation:{catalog.root}:{monotonic()}",
+            interactive=True,
+            preemptible=False,
+            expected_root_identity=catalog.root_identity,
+            expected_storage_identity=catalog.storage_identity,
+        )
+        QTimer.singleShot(0, self._poll_indexer)
+        return future
+
+    @staticmethod
+    def _face_mutation_worker(
+        root: Path,
+        kind: str,
+        face_ids: tuple[int, ...],
+        value: object | None,
+        task: IndexTask,
+    ) -> object:
+        try:
+            task.check_canceled()
+            with Catalog.open_writer(
+                root,
+                expected_root_identity=task.expected_root_identity,
+                expected_storage_identity=task.expected_storage_identity,
+            ) as catalog:
+                store = FaceStore(catalog)
+                if kind == "name":
+                    if not isinstance(value, dict):
+                        raise ValueError("Missing identity")
+                    result: object = store.name_faces(
+                        face_ids,
+                        str(value.get("name", "")),
+                        person_id=(
+                            int(value["person_id"])
+                            if value.get("person_id") is not None
+                            else None
+                        ),
+                    )
+                elif kind == "different":
+                    result = store.reject_person(face_ids, int(value))
+                elif kind == "separate":
+                    if not isinstance(value, (tuple, list)):
+                        raise ValueError("Missing faces to separate")
+                    result = store.separate_faces(face_ids, tuple(int(item) for item in value))
+                elif kind == "defer":
+                    result = store.defer_faces(face_ids)
+                elif kind == "status":
+                    result = store.set_face_status(face_ids, str(value))
+                elif kind == "undo":
+                    result = store.undo_last_operation()
+                elif kind == "purge":
+                    result = store.purge()
+                else:
+                    raise ValueError(f"Unsupported face operation: {kind}")
+            task.update(1, 1, kind)
+            task.mark_done()
+            return result
+        except IndexTaskCancelled:
+            task.mark_canceled()
+            raise
+        except Exception as error:
+            task.mark_failed(error)
+            raise
+
+    def purge_current_catalog_face_data(self) -> None:
+        catalog = self.current_catalog
+        if catalog is None:
+            QMessageBox.information(self, "Remove Face Data", "Open or select a catalog first.")
+            return
+        answer = QMessageBox.warning(
+            self,
+            "Remove Face Data",
+            "Remove all detected faces, local embeddings, names, review decisions, and "
+            "face crops from this catalog?\n\nFace processing will be disabled. The "
+            "source photographs are not changed.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self._queue_catalog_mutation(
+            catalog,
+            label="Removing face data",
+            dest_dir_rel="",
+            priority=ActionPriority.FILE_MOVE_WITHIN_CATALOG,
+            worker=lambda task: self._purge_face_data_worker(catalog.root, task),
+            completion_verb="Removed",
+            error_title="Remove Face Data",
+        )
+
+    @staticmethod
+    def _purge_face_data_worker(root: Path, task: IndexTask) -> MovePayloadResult:
+        try:
+            task.update(0, 1, "face data")
+            with Catalog.open_writer(
+                root,
+                expected_root_identity=task.expected_root_identity,
+                expected_storage_identity=task.expected_storage_identity,
+            ) as catalog:
+                FaceStore(catalog).purge()
+                updated_settings = replace(catalog.settings, faces_enabled=False)
+                catalog.set_settings(updated_settings)
+            task.update(1, 1, "face data")
+            task.mark_done()
+            return MovePayloadResult(
+                1,
+                1,
+                {root},
+                catalog_settings=updated_settings,
+            )
+        except IndexTaskCancelled:
+            task.mark_canceled()
+            raise
+        except Exception as error:
+            task.mark_failed(error)
+            raise
+
     def prune_current_catalog_thumbnails(self) -> None:
         if self.current_catalog is None:
             QMessageBox.information(self, "Prune Thumbnails", "Open or select a catalog first.")
@@ -4958,6 +5749,7 @@ class MainWindow(QMainWindow):
     def apply_catalog_settings(self, catalog: Catalog, settings: CatalogSettings) -> None:
         if self.workspace.catalog_for_root(catalog.root) is not catalog:
             return
+        enabling_faces = settings.faces_enabled and not catalog.settings.faces_enabled
         self._queue_catalog_mutation(
             catalog,
             label="Updating catalog settings",
@@ -4972,6 +5764,19 @@ class MainWindow(QMainWindow):
             completion_verb="Updated",
             error_title="Catalog Preferences",
         )
+        if self.app_config.face_runtime == FACE_RUNTIME_REMOTE:
+            if enabling_faces and not remote_lama_is_configured(self.app_config.remote_lama):
+                QMessageBox.information(
+                    self,
+                    "Remote GPU",
+                    "Configure and trust the Remote GPU service under Tools > Remote GPU "
+                    "before background face processing can begin.",
+                )
+        else:
+            self._start_face_model_probe()
+            self._settle_face_model_probe()
+            if enabling_faces and not self._face_models_available:
+                self._request_face_models_download(force=False)
 
     def open_catalog_tags(self, root: Path) -> None:
         catalog = self.workspace.catalog_for_root(root)
@@ -7256,6 +8061,9 @@ class MainWindow(QMainWindow):
         for task_root, task in list(self._thumbnail_prune_tasks.items()):
             if task_root == resolved:
                 task.cancel()
+        for task_root, task in list(self._face_index_tasks.items()):
+            if task_root == resolved:
+                task.cancel()
         for (task_root, _), task in list(self._thumbnail_repair_tasks.items()):
             if task_root == resolved:
                 task.cancel()
@@ -7284,6 +8092,9 @@ class MainWindow(QMainWindow):
             if context.root != resolved
         }
         self._thumbnail_prune_tasks.pop(resolved, None)
+        self._face_index_tasks.pop(resolved, None)
+        self._face_indexed_catalog_roots.discard(resolved)
+        self._face_index_retry_at.pop(resolved, None)
         self._thumbnail_repair_tasks = {
             key: task for key, task in self._thumbnail_repair_tasks.items() if key[0] != resolved
         }
@@ -8352,7 +9163,7 @@ class MainWindow(QMainWindow):
                 "",
                 expanded_items,
                 known_items,
-                default=True,
+                default=False,
             )
         )
         for tag in tag_names:
@@ -8380,6 +9191,36 @@ class MainWindow(QMainWindow):
         virtual_root.addChild(very_similar_item)
         if self._is_current_virtual_item(catalog.root, VIRTUAL_KIND_VERY_SIMILAR, ""):
             selected_item = very_similar_item
+        people_kinds: tuple[tuple[str, str], ...] = ()
+        if catalog.settings.faces_enabled:
+            people_root = QTreeWidgetItem(["People"])
+            self._set_virtual_tree_item_data(
+                people_root,
+                catalog,
+                VIRTUAL_KIND_PEOPLE_ROOT,
+                "",
+            )
+            virtual_root.addChild(people_root)
+            people_root.setExpanded(
+                self._virtual_tree_item_should_expand(
+                    catalog.root,
+                    VIRTUAL_KIND_PEOPLE_ROOT,
+                    "",
+                    expanded_items,
+                    known_items,
+                    default=True,
+                )
+            )
+            people_kinds = (
+                ("Review", VIRTUAL_KIND_PEOPLE_REVIEW),
+                ("Unnamed Groups", VIRTUAL_KIND_PEOPLE_UNNAMED),
+                ("Loose Faces", VIRTUAL_KIND_PEOPLE_LOOSE),
+                ("Ignored", VIRTUAL_KIND_PEOPLE_IGNORED),
+            )
+            for label, kind in people_kinds:
+                item = QTreeWidgetItem([label])
+                self._set_virtual_tree_item_data(item, catalog, kind, "")
+                people_root.addChild(item)
         for definition in custom_virtual_directories:
             value = str(definition.id)
             item = QTreeWidgetItem([definition.name])
@@ -8402,6 +9243,21 @@ class MainWindow(QMainWindow):
                 self._tree_state_key_for_virtual(catalog.root, VIRTUAL_KIND_TAG_ROOT, ""),
                 self._tree_state_key_for_virtual(catalog.root, VIRTUAL_KIND_DUPLICATES, ""),
                 self._tree_state_key_for_virtual(catalog.root, VIRTUAL_KIND_VERY_SIMILAR, ""),
+                *(
+                    (
+                        self._tree_state_key_for_virtual(
+                            catalog.root,
+                            VIRTUAL_KIND_PEOPLE_ROOT,
+                            "",
+                        ),
+                        *(
+                            self._tree_state_key_for_virtual(catalog.root, kind, "")
+                            for _label, kind in people_kinds
+                        ),
+                    )
+                    if people_kinds
+                    else ()
+                ),
                 *(
                     self._tree_state_key_for_virtual(catalog.root, VIRTUAL_KIND_TAG, tag)
                     for tag in tag_names
@@ -9030,6 +9886,11 @@ class MainWindow(QMainWindow):
                 VIRTUAL_KIND_DUPLICATES: self.duplicate_virtual_folder_icon,
                 VIRTUAL_KIND_VERY_SIMILAR: self.similar_virtual_folder_icon,
                 VIRTUAL_KIND_CUSTOM: self.custom_virtual_folder_icon,
+                VIRTUAL_KIND_PEOPLE_ROOT: self.implicit_virtual_folder_icon,
+                VIRTUAL_KIND_PEOPLE_REVIEW: self.similar_virtual_folder_icon,
+                VIRTUAL_KIND_PEOPLE_UNNAMED: self.similar_virtual_folder_icon,
+                VIRTUAL_KIND_PEOPLE_LOOSE: self.similar_virtual_folder_icon,
+                VIRTUAL_KIND_PEOPLE_IGNORED: self.implicit_virtual_folder_icon,
             }.get(kind, self.implicit_virtual_folder_icon),
         )
         item.setData(0, CATALOG_ROOT_ROLE, str(catalog.root))
@@ -9044,6 +9905,16 @@ class MainWindow(QMainWindow):
             item.setToolTip(0, "Images with close aspect ratios, perceptual hashes, and color distributions")
         elif kind == VIRTUAL_KIND_CUSTOM:
             item.setToolTip(0, "Saved virtual directory")
+        elif kind == VIRTUAL_KIND_PEOPLE_ROOT:
+            item.setToolTip(0, "Local face suggestions and named people")
+        elif kind == VIRTUAL_KIND_PEOPLE_REVIEW:
+            item.setToolTip(0, "Prioritized face decisions with the highest review payoff")
+        elif kind == VIRTUAL_KIND_PEOPLE_UNNAMED:
+            item.setToolTip(0, "Conservative groups that still need a name")
+        elif kind == VIRTUAL_KIND_PEOPLE_LOOSE:
+            item.setToolTip(0, "Faces without a sufficiently strong similarity group")
+        elif kind == VIRTUAL_KIND_PEOPLE_IGNORED:
+            item.setToolTip(0, "Faces deliberately excluded from review")
         else:
             item.setToolTip(0, "Virtual directories")
 
@@ -9252,8 +10123,22 @@ class MainWindow(QMainWindow):
     def _virtual_directory_clicked(self, catalog: Catalog, item: QTreeWidgetItem) -> None:
         kind = item.data(0, VIRTUAL_KIND_ROLE)
         value = item.data(0, VIRTUAL_VALUE_ROLE) or ""
-        if kind in {VIRTUAL_KIND_ROOT, VIRTUAL_KIND_TAG_ROOT}:
+        if kind in {
+            VIRTUAL_KIND_ROOT,
+            VIRTUAL_KIND_TAG_ROOT,
+            VIRTUAL_KIND_PEOPLE_ROOT,
+        }:
             item.setExpanded(not item.isExpanded())
+            return
+        face_view_by_kind = {
+            VIRTUAL_KIND_PEOPLE_REVIEW: "review",
+            VIRTUAL_KIND_PEOPLE_UNNAMED: "unnamed",
+            VIRTUAL_KIND_PEOPLE_LOOSE: "loose",
+            VIRTUAL_KIND_PEOPLE_IGNORED: "ignored",
+        }
+        if kind in face_view_by_kind:
+            self.current_catalog = catalog
+            self.open_face_manager(initial_view=face_view_by_kind[kind])
             return
         if kind not in {
             VIRTUAL_KIND_TAG,
@@ -12393,10 +13278,17 @@ class MainWindow(QMainWindow):
             if result.catalog_settings is not None:
                 live_catalog = self.workspace.catalog_for_root(move_task.dest_root)
                 if live_catalog is not None:
+                    faces_enabled_changed = (
+                        live_catalog.settings.faces_enabled
+                        != result.catalog_settings.faces_enabled
+                    )
                     # The durable write was performed by the protected worker.
                     # Publishing its committed value only updates the in-memory
                     # cache and avoids a potentially blocking GUI-thread query.
                     live_catalog._settings_cache = result.catalog_settings  # noqa: SLF001
+                    if faces_enabled_changed:
+                        self._face_indexed_catalog_roots.discard(move_task.dest_root)
+                        self._face_index_retry_at.pop(move_task.dest_root, None)
                 if result.force_thumbnail_reindex:
                     thumbnail_reindex_roots.add(move_task.dest_root)
             if result.warning:
@@ -13484,6 +14376,7 @@ class MainWindow(QMainWindow):
             recent_tags=self._recent_assigned_tags,
             repeat_tags=self._last_assigned_tags,
             repeat_shortcut=self.hotkey_sequence("tags.repeat"),
+            completion_shortcut=self.hotkey_sequence("tags.complete"),
             delete_tag_callback=lambda name: self.queue_catalog_tag_deletion(
                 catalog,
                 name,
@@ -14575,6 +15468,7 @@ class MainWindow(QMainWindow):
         self._settle_directory_index_tasks()
         self._settle_post_move_reconcile_tasks()
         self._settle_idle_tasks()
+        self._settle_face_index_tasks()
         self._settle_thumbnail_prune_tasks()
         self._settle_thumbnail_repair_tasks()
         if self._tree_build_task is not None or self._pending_tree_rebuilds:
@@ -14605,6 +15499,37 @@ class MainWindow(QMainWindow):
                     expected_storage_identity=catalog.storage_identity,
                 )
                 return
+        remote_faces = self.app_config.face_runtime == FACE_RUNTIME_REMOTE
+        if remote_faces:
+            face_runtime_available = remote_lama_is_configured(self.app_config.remote_lama)
+        else:
+            self._start_face_model_probe()
+            self._settle_face_model_probe()
+            face_runtime_available = self._face_models_available
+        if face_runtime_available:
+            for catalog in self.workspace.catalogs:
+                if not catalog.settings.faces_enabled:
+                    continue
+                if catalog.root in self._face_index_tasks:
+                    continue
+                if catalog.root in self._face_indexed_catalog_roots:
+                    continue
+                if now < self._face_index_retry_at.get(catalog.root, 0.0):
+                    continue
+                self._face_index_tasks[catalog.root] = self.indexer.refresh_faces(
+                    catalog.root,
+                    None if remote_faces else default_face_model_directory(),
+                    runtime=self.app_config.face_runtime,
+                    remote_config=(
+                        replace(self.app_config.remote_lama)
+                        if remote_faces
+                        else None
+                    ),
+                    interactive=False,
+                    expected_root_identity=catalog.root_identity,
+                    expected_storage_identity=catalog.storage_identity,
+                )
+                return
         for catalog in self.workspace.catalogs:
             if catalog.root not in self._pruned_catalog_roots:
                 self._thumbnail_prune_tasks[catalog.root] = self.indexer.prune_thumbnails(
@@ -14624,6 +15549,8 @@ class MainWindow(QMainWindow):
         self._settle_initial_config_load(self._initial_config_load_generation)
         self._settle_config_saves()
         self._settle_lama_model_download()
+        self._settle_face_model_probe()
+        self._settle_face_model_download()
         if not self._tree_publication_blocked():
             self._settle_tree_children_tasks()
             self._settle_tree_tags_tasks()
@@ -14653,10 +15580,14 @@ class MainWindow(QMainWindow):
         self._settle_directory_discovery_tasks()
         self._settle_directory_index_tasks()
         self._settle_idle_tasks()
+        self._settle_face_index_tasks()
         self._settle_thumbnail_prune_tasks()
         self._settle_thumbnail_repair_tasks()
         if self._lama_download_future is not None:
             self._show_lama_download_status()
+            return
+        if self._face_download_future is not None:
+            self._show_face_download_status()
             return
         active_open_task = self._active_catalog_open_task()
         if active_open_task is not None:
@@ -14849,12 +15780,38 @@ class MainWindow(QMainWindow):
             if snapshot.error is None and not snapshot.canceled:
                 self._drop_very_similar_cache(root)
                 self._swept_catalog_roots.add(root)
+                self._face_indexed_catalog_roots.discard(root)
+                self._face_index_retry_at.pop(root, None)
                 if self.current_catalog is not None and self.current_catalog.root == root:
                     self.load_current_directory(preserve_selection=True)
                 if snapshot.interactive or task.force_refresh:
                     catalog = self.workspace.catalog_for_root(root)
                     if catalog is not None:
                         self._request_incremental_tree_rebuild(catalog, reason="catalog_refresh")
+
+    def _settle_face_index_tasks(self) -> None:
+        for root, task in list(self._face_index_tasks.items()):
+            snapshot = task.snapshot()
+            if not snapshot.done:
+                continue
+            self._face_index_tasks.pop(root, None)
+            if snapshot.canceled:
+                self._face_indexed_catalog_roots.discard(root)
+            elif snapshot.error is not None:
+                # Remote queue pressure and provider restarts are transient,
+                # but an unavailable service must not form a hot idle loop.
+                self._face_indexed_catalog_roots.discard(root)
+                self._face_index_retry_at[root] = monotonic() + FACE_INDEX_RETRY_SECONDS
+            else:
+                self._face_indexed_catalog_roots.add(root)
+                self._face_index_retry_at.pop(root, None)
+            if (
+                snapshot.error is None
+                and not snapshot.canceled
+                and self.current_catalog is not None
+                and self.current_catalog.root == root
+            ):
+                self.statusBar().showMessage("Face review suggestions are up to date", 5000)
 
     def _settle_directory_index_tasks(self) -> None:
         completed_roots: set[Path] = set()
@@ -14885,6 +15842,8 @@ class MainWindow(QMainWindow):
                 self._swept_catalog_roots.discard(root)
         for root in changed_roots:
             self._drop_very_similar_cache(root)
+            self._face_indexed_catalog_roots.discard(root)
+            self._face_index_retry_at.pop(root, None)
         if reload_current and self.current_catalog is not None:
             self.model.refresh_pending_thumbnails()
             self._request_physical_reconcile(
@@ -15016,6 +15975,7 @@ class TagDialog(QDialog):
         recent_tags: Sequence[str] = (),
         repeat_tags: Sequence[str] | None = None,
         repeat_shortcut: str = "Ctrl+R",
+        completion_shortcut: str = "Ctrl+Space",
         delete_tag_callback: Callable[[str], MovePayloadTask | None] | None = None,
     ) -> None:
         super().__init__(parent)
@@ -15027,6 +15987,7 @@ class TagDialog(QDialog):
         )
         self._repeat_pending = False
         self._repeat_shortcut_text = repeat_shortcut
+        self._completion_shortcut_text = completion_shortcut
         self._delete_tag_callback = delete_tag_callback
         self._tag_usage_counts: dict[str, int] = {}
         self._load_closed = False
@@ -15082,6 +16043,14 @@ class TagDialog(QDialog):
             Qt.ShortcutContext.WidgetWithChildrenShortcut
         )
         self._repeat_shortcut.activated.connect(self.repeat_last_tags)
+        self._completion_shortcut = QShortcut(
+            QKeySequence(completion_shortcut),
+            self,
+        )
+        self._completion_shortcut.setContext(
+            Qt.ShortcutContext.WidgetWithChildrenShortcut
+        )
+        self._completion_shortcut.activated.connect(self._tab_completion)
         self._load_future = self._load_executor.submit(
             self._load_tag_state,
             catalog.root,
@@ -15404,10 +16373,9 @@ class TagDialog(QDialog):
             if event.key() in {Qt.Key.Key_Return, Qt.Key.Key_Enter}:  # type: ignore[attr-defined]
                 self._accept_when_ready()
                 return True
-            if (
-                watched is self.entry
-                and event.key() == Qt.Key.Key_Tab  # type: ignore[attr-defined]
-                and event.modifiers() == Qt.KeyboardModifier.NoModifier  # type: ignore[attr-defined]
+            if watched is self.entry and hotkey_event_matches(
+                event,
+                self._completion_shortcut_text,
             ):
                 self._tab_completion()
                 return True
@@ -15419,6 +16387,9 @@ class TagDialog(QDialog):
     def keyPressEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         if event.key() in {Qt.Key.Key_Return, Qt.Key.Key_Enter}:
             self._accept_when_ready()
+            return
+        if hotkey_event_matches(event, self._completion_shortcut_text):
+            self._tab_completion()
             return
         if hotkey_event_matches(event, self._repeat_shortcut_text):
             self.repeat_last_tags()
@@ -15681,7 +16652,8 @@ class HotkeysDialog(QDialog):
         layout = QVBoxLayout(self)
         instructions = QLabel(
             "Select a hotkey field and press a new key combination. "
-            "Clear a field to leave that action unassigned."
+            "Clear a field to leave that action unassigned. Tab is reserved "
+            "for the press-and-hold hotkey guide."
         )
         instructions.setWordWrap(True)
         layout.addWidget(instructions)
@@ -15743,10 +16715,16 @@ class HotkeysDialog(QDialog):
         conflicts: list[tuple[HotkeyDefinition, HotkeyDefinition, str]] = []
         assigned: dict[tuple[str, str], HotkeyDefinition] = {}
         conflicting_ids: set[str] = set()
+        reserved_ids: set[str] = set()
+        reserved_sequence = normalized_hotkey_sequence(
+            HOTKEY_GUIDE_SEQUENCE
+        ).casefold()
         for definition in HOTKEY_DEFINITIONS:
             sequence_text = self._editor_sequence(definition.hotkey_id)
             if not sequence_text:
                 continue
+            if sequence_text.casefold() == reserved_sequence:
+                reserved_ids.add(definition.hotkey_id)
             key = (definition.context, sequence_text.casefold())
             existing = assigned.get(key)
             if existing is None:
@@ -15757,11 +16735,21 @@ class HotkeysDialog(QDialog):
         for hotkey_id, editor in self.editors.items():
             editor.setStyleSheet(
                 "QKeySequenceEdit { color: #c62828; border: 1px solid #c62828; }"
-                if hotkey_id in conflicting_ids
+                if hotkey_id in conflicting_ids or hotkey_id in reserved_ids
                 else ""
             )
-        self.ok_button.setEnabled(not conflicts)
-        if conflicts:
+        self.ok_button.setEnabled(not conflicts and not reserved_ids)
+        if reserved_ids:
+            definition = next(
+                definition
+                for definition in HOTKEY_DEFINITIONS
+                if definition.hotkey_id in reserved_ids
+            )
+            self.validation_label.setText(
+                f"Tab is reserved for the press-and-hold hotkey guide and "
+                f"cannot be assigned to “{definition.action}”."
+            )
+        elif conflicts:
             first, second, sequence_text = conflicts[0]
             self.validation_label.setText(
                 f"{sequence_text} is assigned to both “{first.action}” "
@@ -15847,10 +16835,20 @@ class AppPreferencesDialog(QDialog):
         self.lama_runtime.addItem("CPU", LAMA_RUNTIME_CPU)
         self.lama_runtime.addItem("NVIDIA", LAMA_RUNTIME_NVIDIA)
         self.lama_runtime.addItem("WebGPU", LAMA_RUNTIME_WEBGPU)
-        self.lama_runtime.addItem("Remote LaMa", LAMA_RUNTIME_REMOTE)
+        self.lama_runtime.addItem("Remote GPU", LAMA_RUNTIME_REMOTE)
         lama_runtime_index = self.lama_runtime.findData(config.lama_runtime)
         if lama_runtime_index >= 0:
             self.lama_runtime.setCurrentIndex(lama_runtime_index)
+
+        self.face_runtime = QComboBox()
+        self.face_runtime.addItem("Auto", FACE_RUNTIME_AUTO)
+        self.face_runtime.addItem("CPU", FACE_RUNTIME_CPU)
+        self.face_runtime.addItem("NVIDIA", FACE_RUNTIME_NVIDIA)
+        self.face_runtime.addItem("WebGPU", FACE_RUNTIME_WEBGPU)
+        self.face_runtime.addItem("Remote GPU", FACE_RUNTIME_REMOTE)
+        face_runtime_index = self.face_runtime.findData(config.face_runtime)
+        if face_runtime_index >= 0:
+            self.face_runtime.setCurrentIndex(face_runtime_index)
 
         form.addRow("Window x", self.window_x)
         form.addRow("Window y", self.window_y)
@@ -15868,12 +16866,24 @@ class AppPreferencesDialog(QDialog):
         lama_note = QLabel(
             "Auto prefers available GPU runtimes and falls back to CPU. "
             "WebGPU uses the native GPU backend on Linux, macOS, and Windows. "
-            "Configure and trust the remote endpoint under Tools > Remote LaMa "
-            "before selecting Remote LaMa."
+            "Configure and trust the shared endpoint under Tools > Remote GPU "
+            "before selecting Remote GPU."
         )
         lama_note.setWordWrap(True)
         lama_layout.addRow(lama_note)
         layout.addWidget(lama_group)
+
+        face_group = QGroupBox("Face processing")
+        face_layout = QFormLayout(face_group)
+        face_layout.addRow("Processing runtime", self.face_runtime)
+        face_note = QLabel(
+            "Face processing is enabled separately for each catalog. Auto uses an available "
+            "local accelerator and falls back to CPU. Remote GPU sends a bounded image to the "
+            "trusted service for stateless detection and embedding; identity stays local."
+        )
+        face_note.setWordWrap(True)
+        face_layout.addRow(face_note)
+        layout.addWidget(face_group)
 
         layout.addWidget(QLabel("Catalogs"))
         self.catalog_list = QListWidget()
@@ -15923,6 +16933,7 @@ class AppPreferencesDialog(QDialog):
             delete_behavior=str(self.delete_behavior.currentData()),
             sort_order=str(self.sort_order.currentData()),
             lama_runtime=str(self.lama_runtime.currentData()),
+            face_runtime=str(self.face_runtime.currentData()),
             remote_lama=replace(self._remote_lama),
             hotkeys=dict(self._hotkeys),
             _loaded_catalogs=self._loaded_catalogs,
@@ -15959,11 +16970,18 @@ class PreferencesDialog(QDialog):
         self.prune_parallelism = QSpinBox()
         self.prune_parallelism.setRange(1, 64)
         self.prune_parallelism.setValue(self._selected_catalog().settings.prune_parallelism)
+        self.faces_enabled = QCheckBox("Find and group faces in this catalog")
+        self.faces_enabled.setToolTip(
+            "Opt in to face detection and similarity grouping for this catalog. "
+            "Marnwick keeps identity assignments in the local catalog."
+        )
+        self.faces_enabled.setChecked(self._selected_catalog().settings.faces_enabled)
         self.catalog_combo.currentIndexChanged.connect(self._catalog_changed)
 
         form.addRow("Catalog", self.catalog_combo)
         form.addRow("Saved thumbnail size", self.thumbnail_size)
         form.addRow("Thumbnail prune threads", self.prune_parallelism)
+        form.addRow(self.faces_enabled)
         layout.addLayout(form)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
@@ -15975,12 +16993,14 @@ class PreferencesDialog(QDialog):
         return self._selected_catalog(), CatalogSettings(
             thumbnail_native_size=self.thumbnail_size.value(),
             prune_parallelism=self.prune_parallelism.value(),
+            faces_enabled=self.faces_enabled.isChecked(),
         )
 
     def _catalog_changed(self) -> None:
         settings = self._selected_catalog().settings
         self.thumbnail_size.setValue(settings.thumbnail_native_size)
         self.prune_parallelism.setValue(settings.prune_parallelism)
+        self.faces_enabled.setChecked(settings.faces_enabled)
 
     def _selected_catalog(self) -> Catalog:
         root = Path(str(self.catalog_combo.currentData()))
@@ -17168,13 +18188,13 @@ class RemoteLamaDialog(QDialog):
         self._request_endpoint: tuple[str, int] | None = None
         self._closed = False
 
-        self.setWindowTitle("Remote LaMa")
+        self.setWindowTitle("Remote GPU Service")
         self.setWindowIcon(load_app_icon())
         self.setStyleSheet(DIALOG_STYLESHEET)
 
         layout = QVBoxLayout(self)
         introduction = QLabel(
-            "Configure the HTTPS endpoint used for remote LaMa inference. "
+            "Configure the HTTPS endpoint used for LaMa inpainting and face inference. "
             "Marnwick will not send image data until you explicitly trust the "
             "certificate offered by this IP address and port."
         )
@@ -17253,7 +18273,7 @@ class RemoteLamaDialog(QDialog):
         try:
             host = normalize_remote_lama_ip(self.host.text())
         except ValueError as error:
-            show_error(self, "Remote LaMa", str(error))
+            show_error(self, "Remote GPU", str(error))
             return
         port = self.port.value()
         self.host.setText(host)
@@ -17271,7 +18291,7 @@ class RemoteLamaDialog(QDialog):
         except ExecutorSaturatedError as error:
             self._request_endpoint = None
             self.retrieve_button.setEnabled(True)
-            show_error(self, "Remote LaMa", str(error))
+            show_error(self, "Remote GPU", str(error))
 
     def _settle_certificate(self) -> None:
         future = self._future
@@ -17287,7 +18307,7 @@ class RemoteLamaDialog(QDialog):
             certificate_der = future.result()
         except Exception as error:
             self.status_label.setText("Certificate retrieval failed.")
-            show_error(self, "Remote LaMa", str(error))
+            show_error(self, "Remote GPU", str(error))
             return
         host, port = endpoint
         if (
@@ -17303,11 +18323,11 @@ class RemoteLamaDialog(QDialog):
         endpoint_display = remote_lama_endpoint(RemoteLamaConfig(host, port))
         answer = QMessageBox.question(
             self,
-            "Trust Remote LaMa Certificate?",
+            "Trust Remote GPU Certificate?",
             (
                 f"{endpoint_display} offered this certificate:\n\n"
                 f"SHA-1: {thumbprint}\n\n"
-                "Trust this exact certificate for future Remote LaMa requests? "
+                "Trust this exact certificate for future Remote GPU requests? "
                 "Only choose Yes after verifying the thumbprint through a trusted channel."
             ),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
@@ -17377,7 +18397,7 @@ class GpuTestDialog(QDialog):
         introduction = QLabel(
             "Marnwick will repair the same generated 512×512 test image and erase "
             "mask with LaMa through every available local backend, the configured "
-            "Remote LaMa endpoint, and a CPU baseline. "
+            "Remote GPU LaMa service, and a CPU baseline. "
             "Initialization, first-inpaint, and warmed-inpaint times are measured "
             "separately without profiling overhead. Each local backend runs in an "
             "isolated process so a native runtime failure cannot prevent the "
@@ -18593,7 +19613,7 @@ class LamaBusyOverlay(QFrame):
     ) -> None:
         self.detail_label.setText(
             (
-                "Connecting to Remote LaMa over pinned TLS. "
+                "Connecting to Remote GPU over pinned TLS. "
                 if remote
                 else "Selecting the local processing runtime. "
             )
@@ -18620,8 +19640,8 @@ class LamaBusyOverlay(QFrame):
         )
 
     def set_execution_provider(self, provider_label: str) -> None:
-        if provider_label == "Remote LaMa":
-            detail = "Using Remote LaMa over the trusted HTTPS connection. "
+        if provider_label == "Remote GPU":
+            detail = "Using Remote GPU over the trusted HTTPS connection. "
         else:
             detail = f"Using {provider_label} for local inference. "
         self.detail_label.setText(
@@ -21586,6 +22606,11 @@ class FullscreenViewer(QDialog):
                     if main_window is not None
                     else "Ctrl+R"
                 ),
+                completion_shortcut=(
+                    main_window.hotkey_sequence("tags.complete")
+                    if main_window is not None
+                    else "Ctrl+Space"
+                ),
                 delete_tag_callback=(
                     (
                         lambda name: main_window.queue_catalog_tag_deletion(
@@ -21679,8 +22704,8 @@ class FullscreenViewer(QDialog):
                 if not remote_lama_is_configured(parent.app_config.remote_lama):
                     show_error(
                         self,
-                        "Remote LaMa",
-                        "Configure and trust Remote LaMa under Tools > Remote LaMa first.",
+                        "Remote GPU",
+                        "Configure and trust the service under Tools > Remote GPU first.",
                     )
                     return
                 self.start_region_edit("lama")

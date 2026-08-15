@@ -27,6 +27,21 @@ LOCAL_LAMA_RUNTIMES = {
     LAMA_RUNTIME_WEBGPU,
 }
 LAMA_RUNTIMES = {*LOCAL_LAMA_RUNTIMES, LAMA_RUNTIME_REMOTE}
+FACE_RUNTIME_AUTO = "auto"
+FACE_RUNTIME_CPU = "cpu"
+FACE_RUNTIME_NVIDIA = "nvidia"
+FACE_RUNTIME_WEBGPU = "webgpu"
+FACE_RUNTIME_REMOTE = "remote"
+LOCAL_FACE_RUNTIMES = {
+    FACE_RUNTIME_AUTO,
+    FACE_RUNTIME_CPU,
+    FACE_RUNTIME_NVIDIA,
+    FACE_RUNTIME_WEBGPU,
+}
+FACE_RUNTIMES = {
+    *LOCAL_FACE_RUNTIMES,
+    FACE_RUNTIME_REMOTE,
+}
 DEFAULT_REMOTE_LAMA_HOST = "172.31.254.1"
 DEFAULT_REMOTE_LAMA_PORT = 8443
 MAX_REMOTE_LAMA_HOST_CHARS = 64
@@ -66,6 +81,7 @@ class AppConfig:
     delete_behavior: str = NORMAL_DELETE
     sort_order: str = "name"
     lama_runtime: str = LAMA_RUNTIME_AUTO
+    face_runtime: str = FACE_RUNTIME_AUTO
     remote_lama: RemoteLamaConfig = field(default_factory=RemoteLamaConfig)
     hotkeys: dict[str, str] = field(default_factory=dict)
     # A load-time baseline allows save_config() to merge catalog-list edits
@@ -114,6 +130,7 @@ def load_config(path: Path | None = None) -> AppConfig:
         delete_behavior=_delete_behavior_or_default(raw.get("delete_behavior")),
         sort_order=_string_or_default(raw.get("sort_order"), "name"),
         lama_runtime=_lama_runtime_or_default(raw.get("lama_runtime")),
+        face_runtime=_face_runtime_or_default(raw.get("face_runtime")),
         remote_lama=_remote_lama_config_or_default(remote_lama_raw),
         hotkeys=_hotkeys_or_default(raw.get("hotkeys")),
         _loaded_catalogs=tuple(catalogs),
@@ -150,6 +167,7 @@ def save_config(
             "delete_behavior": config.delete_behavior,
             "hotkeys": _hotkeys_or_default(config.hotkeys),
             "lama_runtime": config.lama_runtime,
+            "face_runtime": config.face_runtime,
             "remote_lama": {
                 "host": config.remote_lama.host,
                 "port": config.remote_lama.port,
@@ -234,6 +252,12 @@ def _lama_runtime_or_default(value: object) -> str:
     if isinstance(value, str) and value in LAMA_RUNTIMES:
         return value
     return LAMA_RUNTIME_AUTO
+
+
+def _face_runtime_or_default(value: object) -> str:
+    if isinstance(value, str) and value in FACE_RUNTIMES:
+        return value
+    return FACE_RUNTIME_AUTO
 
 
 def _remote_lama_config_or_default(value: object) -> RemoteLamaConfig:
