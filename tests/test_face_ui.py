@@ -164,7 +164,9 @@ def test_face_manager_r_removes_only_the_selected_faces_from_a_group(
             Qt.KeyboardModifier.NoModifier,
         )
 
-        assert submitted == [("separate", (11,), (12, 13))]
+        assert submitted == [
+            ("remove", (11,), {"remaining_face_ids": (12, 13)})
+        ]
     finally:
         dialog.close()
         dialog.deleteLater()
