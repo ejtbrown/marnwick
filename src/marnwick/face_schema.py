@@ -80,6 +80,27 @@ def init_face_schema(connection: sqlite3.Connection) -> None:
             CHECK(first_face_id < second_face_id)
         );
 
+        CREATE TABLE IF NOT EXISTS face_crop_person_rejections (
+            crop_hash TEXT NOT NULL,
+            person_id INTEGER NOT NULL,
+            created_at_ns INTEGER NOT NULL,
+            PRIMARY KEY(crop_hash, person_id),
+            FOREIGN KEY(person_id) REFERENCES people(id) ON DELETE CASCADE,
+            CHECK(length(crop_hash) = 64)
+        );
+        CREATE INDEX IF NOT EXISTS idx_face_crop_person_rejections_person
+            ON face_crop_person_rejections(person_id, crop_hash);
+
+        CREATE TABLE IF NOT EXISTS face_crop_pair_rejections (
+            first_crop_hash TEXT NOT NULL,
+            second_crop_hash TEXT NOT NULL,
+            created_at_ns INTEGER NOT NULL,
+            PRIMARY KEY(first_crop_hash, second_crop_hash),
+            CHECK(first_crop_hash <= second_crop_hash),
+            CHECK(length(first_crop_hash) = 64),
+            CHECK(length(second_crop_hash) = 64)
+        );
+
         CREATE TABLE IF NOT EXISTS face_operations (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             kind TEXT NOT NULL,

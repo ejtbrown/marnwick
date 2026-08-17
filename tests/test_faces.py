@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import io
 from pathlib import Path
 
@@ -72,7 +73,142 @@ def test_face_schema_and_setting_are_catalog_local(tmp_path: Path) -> None:
             )
         }
 
-    assert {"people", "faces", "face_image_state", "face_operations"} <= tables
+    assert {
+        "people",
+        "faces",
+        "face_image_state",
+        "face_crop_person_rejections",
+        "face_crop_pair_rejections",
+        "face_operations",
+    } <= tables
+
+
+def test_removed_crop_hash_cannot_rejoin_an_unnamed_group_from_a_duplicate(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "catalog"
+    wrong_crop = (220, 80, 60)
+    right_crop = (60, 120, 220)
+    with Catalog(root, CatalogSettings(faces_enabled=True)) as catalog:
+        store = FaceStore(catalog)
+        for index, crop_color in enumerate((wrong_crop, right_crop, wrong_crop)):
+            image_id, image_hash = add_image(
+                catalog,
+                f"face-{index}.jpg",
+                (20 + index, 40, 60),
+            )
+            assert store.store_analysis(
+                image_id,
+                image_hash,
+                analysis(
+                    (
+                        (0.2, 0.15, 0.3, 0.4),
+                        embedding(0, variation=index * 0.005),
+                        crop_color,
+                    )
+                ),
+            )
+
+        group = store.groups_for_view("unnamed")[0]
+        assert group.count == 3
+        wrong_hash = hashlib.sha256(jpeg_bytes(wrong_crop)).hexdigest()
+        wrong_face_id = int(
+            catalog._conn.execute(
+                "SELECT id FROM faces WHERE thumbnail_rel_path = ? ORDER BY id LIMIT 1",
+                (f"{wrong_hash[:2]}/{wrong_hash}.jpg",),
+            ).fetchone()["id"]
+        )
+        remainder = tuple(value for value in group.face_ids if value != wrong_face_id)
+
+        store.remove_face_crops_from_group((wrong_face_id,), remainder)
+
+        assert store.groups_for_view("unnamed") == []
+        stored = catalog._conn.execute(
+            "SELECT first_crop_hash, second_crop_hash FROM face_crop_pair_rejections"
+        ).fetchall()
+        assert any(
+            wrong_hash in {str(row["first_crop_hash"]), str(row["second_crop_hash"])}
+            for row in stored
+        )
+
+        later_id, later_hash = add_image(catalog, "later-copy.jpg", (80, 90, 100))
+        assert store.store_analysis(
+            later_id,
+            later_hash,
+            analysis(
+                (
+                    (0.2, 0.15, 0.3, 0.4),
+                    embedding(0, variation=0.008),
+                    wrong_crop,
+                )
+            ),
+        )
+        assert store.groups_for_view("unnamed") == []
+
+        assert store.undo_last_operation() == "remove"
+        assert store.groups_for_view("unnamed")[0].count == 4
+
+
+def test_removed_crop_hash_is_rejected_for_a_person_across_duplicate_files(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "catalog"
+    crop_color = (190, 130, 90)
+    with Catalog(root, CatalogSettings(faces_enabled=True)) as catalog:
+        store = FaceStore(catalog)
+        first_id, first_hash = add_image(catalog, "first.jpg", (20, 40, 60))
+        second_id, second_hash = add_image(catalog, "second.jpg", (60, 40, 20))
+        for image_id, image_hash, variation in (
+            (first_id, first_hash, 0.0),
+            (second_id, second_hash, 0.01),
+        ):
+            assert store.store_analysis(
+                image_id,
+                image_hash,
+                analysis(
+                    (
+                        (0.2, 0.15, 0.3, 0.4),
+                        embedding(4, variation=variation),
+                        crop_color,
+                    )
+                ),
+            )
+        group = store.groups_for_view("unnamed")[0]
+        person_id = store.name_faces(group.face_ids, "Taylor")
+
+        store.remove_face_crops_from_person((group.face_ids[0],), person_id)
+
+        assert store.groups_for_view("people") == []
+        crop_hash = hashlib.sha256(jpeg_bytes(crop_color)).hexdigest()
+        rejection = catalog._conn.execute(
+            "SELECT 1 FROM face_crop_person_rejections "
+            "WHERE crop_hash = ? AND person_id = ?",
+            (crop_hash, person_id),
+        ).fetchone()
+        assert rejection is not None
+
+        later_id, later_hash = add_image(catalog, "third.jpg", (40, 60, 20))
+        assert store.store_analysis(
+            later_id,
+            later_hash,
+            analysis(
+                (
+                    (0.2, 0.15, 0.3, 0.4),
+                    embedding(4, variation=0.015),
+                    crop_color,
+                )
+            ),
+        )
+        assert store.groups_for_view("suggestions") == []
+
+        assert store.name_faces((group.face_ids[0],), "Taylor", person_id=person_id) == person_id
+        rejection = catalog._conn.execute(
+            "SELECT 1 FROM face_crop_person_rejections "
+            "WHERE crop_hash = ? AND person_id = ?",
+            (crop_hash, person_id),
+        ).fetchone()
+        assert rejection is None
+        assert store.groups_for_view("suggestions")[0].count == 2
 
 
 def test_face_review_naming_negatives_and_undo(tmp_path: Path) -> None:

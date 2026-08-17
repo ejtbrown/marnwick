@@ -5560,6 +5560,22 @@ class MainWindow(QMainWindow):
                     if not isinstance(value, (tuple, list)):
                         raise ValueError("Missing faces to separate")
                     result = store.separate_faces(face_ids, tuple(int(item) for item in value))
+                elif kind == "remove":
+                    if not isinstance(value, dict):
+                        raise ValueError("Missing face group")
+                    if value.get("person_id") is not None:
+                        result = store.remove_face_crops_from_person(
+                            face_ids,
+                            int(value["person_id"]),
+                        )
+                    else:
+                        remaining = value.get("remaining_face_ids")
+                        if not isinstance(remaining, (tuple, list)):
+                            raise ValueError("Missing remaining group faces")
+                        result = store.remove_face_crops_from_group(
+                            face_ids,
+                            tuple(int(item) for item in remaining),
+                        )
                 elif kind == "defer":
                     result = store.defer_faces(face_ids)
                 elif kind == "status":

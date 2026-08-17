@@ -422,10 +422,14 @@ class FaceManagerDialog(QDialog):
                 face_id for face_id in group.face_ids if face_id not in selected_set
             )
             if remainder:
-                self._mutate("separate", selected, remainder)
+                self._mutate("remove", selected, {"remaining_face_ids": remainder})
             return
         if group.kind in {"proposal", "named"} and group.proposed_person_id is not None:
-            self._mutate("different", selected, group.proposed_person_id)
+            self._mutate(
+                "remove",
+                selected,
+                {"person_id": group.proposed_person_id},
+            )
 
     def _confirm_or_name(self) -> None:
         group = self._current_group

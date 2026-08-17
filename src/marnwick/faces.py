@@ -456,7 +456,7 @@ class FaceStore:
         rows = list(
             self.connection.execute(
                 """
-                SELECT id, quality, embedding
+                SELECT id, quality, embedding, thumbnail_rel_path
                 FROM faces
                 WHERE status = 'active' AND person_id IS NULL
                   AND (? OR deferred_until_ns <= ?)
@@ -476,16 +476,27 @@ class FaceStore:
             return []
         face_ids = np.asarray([int(row["id"]) for row in rows], dtype=np.int64)
         qualities = np.asarray([float(row["quality"]) for row in rows], dtype=np.float32)
+        crop_hashes = np.asarray(
+            [_crop_hash(str(row["thumbnail_rel_path"])) for row in rows],
+            dtype=object,
+        )
         embeddings = _embedding_matrix(rows)
         codes = _lsh_codes(embeddings)
         rejected_by_face: dict[int, set[int]] = defaultdict(set)
         for row in self.connection.execute("SELECT face_id, person_id FROM face_person_rejections"):
             rejected_by_face[int(row["face_id"])].add(int(row["person_id"]))
+        rejected_by_crop: dict[str, set[int]] = defaultdict(set)
+        for row in self.connection.execute(
+            "SELECT crop_hash, person_id FROM face_crop_person_rejections"
+        ):
+            rejected_by_crop[str(row["crop_hash"])].add(int(row["person_id"]))
         proposed, proposal_scores = self._person_proposals(
             face_ids,
+            crop_hashes,
             embeddings,
             codes,
             rejected_by_face,
+            rejected_by_crop,
         )
         groups: list[FaceReviewGroup] = []
         proposed_members: dict[int, list[int]] = defaultdict(list)
@@ -523,6 +534,8 @@ class FaceStore:
                 codes[subset],
                 face_ids[subset],
                 self._pair_rejections(),
+                crop_hashes[subset],
+                self._crop_pair_rejections(),
             ):
                 original = [remaining_indexes[index] for index in indexes]
                 ordered = sorted(original, key=lambda value: (-qualities[value], int(face_ids[value])))
@@ -707,6 +720,7 @@ class FaceStore:
         ids = _unique_ids(face_ids)
         if not ids:
             raise ValueError("Select at least one face")
+        crop_hashes = self._crop_hashes_for_face_ids(ids)
         before = self._face_snapshots(ids)
         created_person_id: int | None = None
         with self.catalog._database_savepoint("name_faces"):
@@ -731,14 +745,45 @@ class FaceStore:
                 if row is None:
                     raise ValueError("The selected person no longer exists")
                 person_id = int(row["id"])
-            removed_rejections = [
-                int(row["face_id"])
-                for row in self.connection.execute(
-                    f"SELECT face_id FROM face_person_rejections "
-                    f"WHERE person_id = ? AND face_id IN ({','.join('?' for _ in ids)})",
-                    (person_id, *ids),
+            rejection_face_ids = set(ids)
+            crop_paths = tuple(
+                f"{crop_hash[:2]}/{crop_hash}.jpg" for crop_hash in crop_hashes
+            )
+            for offset in range(0, len(crop_paths), 400):
+                batch = crop_paths[offset : offset + 400]
+                rejection_face_ids.update(
+                    int(row["id"])
+                    for row in self.connection.execute(
+                        f"SELECT id FROM faces WHERE thumbnail_rel_path IN "
+                        f"({','.join('?' for _ in batch)})",
+                        batch,
+                    )
                 )
-            ]
+            removed_rejections: list[int] = []
+            sorted_rejection_ids = tuple(sorted(rejection_face_ids))
+            for offset in range(0, len(sorted_rejection_ids), 400):
+                batch = sorted_rejection_ids[offset : offset + 400]
+                removed_rejections.extend(
+                    int(row["face_id"])
+                    for row in self.connection.execute(
+                        f"SELECT face_id FROM face_person_rejections "
+                        f"WHERE person_id = ? AND face_id IN "
+                        f"({','.join('?' for _ in batch)})",
+                        (person_id, *batch),
+                    )
+                )
+            removed_crop_rejections: list[str] = []
+            for offset in range(0, len(crop_hashes), 400):
+                batch = crop_hashes[offset : offset + 400]
+                removed_crop_rejections.extend(
+                    str(row["crop_hash"])
+                    for row in self.connection.execute(
+                        f"SELECT crop_hash FROM face_crop_person_rejections "
+                        f"WHERE person_id = ? AND crop_hash IN "
+                        f"({','.join('?' for _ in batch)})",
+                        (person_id, *batch),
+                    )
+                )
             placeholders = ",".join("?" for _ in ids)
             self.connection.execute(
                 f"""
@@ -751,7 +796,11 @@ class FaceStore:
             )
             self.connection.executemany(
                 "DELETE FROM face_person_rejections WHERE face_id = ? AND person_id = ?",
-                ((face_id, person_id) for face_id in ids),
+                ((face_id, person_id) for face_id in removed_rejections),
+            )
+            self.connection.executemany(
+                "DELETE FROM face_crop_person_rejections WHERE crop_hash = ? AND person_id = ?",
+                ((crop_hash, person_id) for crop_hash in crop_hashes),
             )
             self._record_operation(
                 "name",
@@ -760,6 +809,8 @@ class FaceStore:
                     "created_person_id": created_person_id,
                     "removed_rejection_person_id": person_id,
                     "removed_rejections": removed_rejections,
+                    "removed_crop_rejection_person_id": person_id,
+                    "removed_crop_rejections": removed_crop_rejections,
                 },
             )
         return int(person_id)
@@ -846,6 +897,145 @@ class FaceStore:
                 {"new_pairs": [list(pair) for pair in new_pairs]},
             )
 
+    def remove_face_crops_from_group(
+        self,
+        face_ids: Sequence[int],
+        remaining_face_ids: Sequence[int],
+    ) -> None:
+        """Keep these exact face crops out of this unnamed cluster."""
+
+        removed_hashes = self._crop_hashes_for_face_ids(_unique_ids(face_ids))
+        remaining_hashes = self._crop_hashes_for_face_ids(
+            _unique_ids(remaining_face_ids)
+        )
+        pairs = tuple(
+            sorted(
+                {
+                    (min(removed, remaining), max(removed, remaining))
+                    for removed in removed_hashes
+                    for remaining in remaining_hashes
+                }
+            )
+        )
+        if not pairs:
+            return
+        if len(pairs) > FACE_SEPARATION_PAIR_LIMIT:
+            raise ValueError(
+                "That removal would create too many durable crop exclusions; select fewer faces"
+            )
+        existing: set[tuple[str, str]] = set()
+        for offset in range(0, len(pairs), 400):
+            batch = pairs[offset : offset + 400]
+            placeholders = ",".join("(?, ?)" for _ in batch)
+            flat_pairs = tuple(value for pair in batch for value in pair)
+            existing.update(
+                (str(row["first_crop_hash"]), str(row["second_crop_hash"]))
+                for row in self.connection.execute(
+                    f"SELECT first_crop_hash, second_crop_hash "
+                    f"FROM face_crop_pair_rejections "
+                    f"WHERE (first_crop_hash, second_crop_hash) IN ({placeholders})",
+                    flat_pairs,
+                )
+            )
+        new_pairs = tuple(pair for pair in pairs if pair not in existing)
+        if not new_pairs:
+            return
+        with self.catalog._database_savepoint("remove_face_crops_from_group"):
+            now = time.time_ns()
+            self.connection.executemany(
+                "INSERT INTO face_crop_pair_rejections"
+                "(first_crop_hash, second_crop_hash, created_at_ns) VALUES (?, ?, ?)",
+                ((first, second, now) for first, second in new_pairs),
+            )
+            self._record_operation(
+                "remove",
+                {"new_crop_pairs": [list(pair) for pair in new_pairs]},
+            )
+
+    def remove_face_crops_from_person(
+        self,
+        face_ids: Sequence[int],
+        person_id: int,
+    ) -> None:
+        """Reject every present or future copy of these crops for a person."""
+
+        crop_hashes = self._crop_hashes_for_face_ids(_unique_ids(face_ids))
+        if not crop_hashes:
+            return
+        paths = tuple(f"{value[:2]}/{value}.jpg" for value in crop_hashes)
+        affected: set[int] = set()
+        for offset in range(0, len(paths), 400):
+            batch = paths[offset : offset + 400]
+            affected.update(
+                int(row["id"])
+                for row in self.connection.execute(
+                    f"SELECT id FROM faces WHERE thumbnail_rel_path IN "
+                    f"({','.join('?' for _ in batch)}) "
+                    f"AND (person_id IS NULL OR person_id = ?)",
+                    (*batch, person_id),
+                )
+            )
+        affected_ids = tuple(sorted(affected))
+        before = self._face_snapshots(affected_ids) if affected_ids else []
+        existing_faces: set[int] = set()
+        for offset in range(0, len(affected_ids), 400):
+            batch = affected_ids[offset : offset + 400]
+            existing_faces.update(
+                int(row["face_id"])
+                for row in self.connection.execute(
+                    f"SELECT face_id FROM face_person_rejections WHERE person_id = ? "
+                    f"AND face_id IN ({','.join('?' for _ in batch)})",
+                    (person_id, *batch),
+                )
+            )
+        existing_hashes: set[str] = set()
+        for offset in range(0, len(crop_hashes), 400):
+            batch = crop_hashes[offset : offset + 400]
+            existing_hashes.update(
+                str(row["crop_hash"])
+                for row in self.connection.execute(
+                    f"SELECT crop_hash FROM face_crop_person_rejections "
+                    f"WHERE person_id = ? AND crop_hash IN "
+                    f"({','.join('?' for _ in batch)})",
+                    (person_id, *batch),
+                )
+            )
+        new_face_rejections = [
+            face_id for face_id in affected_ids if face_id not in existing_faces
+        ]
+        new_crop_rejections = [
+            value for value in crop_hashes if value not in existing_hashes
+        ]
+        if not new_face_rejections and not new_crop_rejections:
+            return
+        with self.catalog._database_savepoint("remove_face_crops_from_person"):
+            now = time.time_ns()
+            self.connection.executemany(
+                "INSERT OR IGNORE INTO face_person_rejections"
+                "(face_id, person_id, created_at_ns) VALUES (?, ?, ?)",
+                ((face_id, person_id, now) for face_id in affected_ids),
+            )
+            self.connection.executemany(
+                "INSERT OR IGNORE INTO face_crop_person_rejections"
+                "(crop_hash, person_id, created_at_ns) VALUES (?, ?, ?)",
+                ((value, person_id, now) for value in crop_hashes),
+            )
+            if affected_ids:
+                self.connection.execute(
+                    f"UPDATE faces SET person_id = NULL, confirmed = 0, updated_at_ns = ? "
+                    f"WHERE id IN ({','.join('?' for _ in affected_ids)})",
+                    (now, *affected_ids),
+                )
+            self._record_operation(
+                "remove",
+                {
+                    "faces": before,
+                    "person_id": person_id,
+                    "new_rejections": new_face_rejections,
+                    "new_crop_person_rejections": new_crop_rejections,
+                },
+            )
+
     def defer_faces(self, face_ids: Sequence[int]) -> None:
         ids = _unique_ids(face_ids)
         if not ids:
@@ -917,6 +1107,18 @@ class FaceStore:
                     "WHERE first_face_id = ? AND second_face_id = ?",
                     (first_face_id, second_face_id),
                 )
+            for first_crop_hash, second_crop_hash in payload.get("new_crop_pairs", []):
+                self.connection.execute(
+                    "DELETE FROM face_crop_pair_rejections "
+                    "WHERE first_crop_hash = ? AND second_crop_hash = ?",
+                    (first_crop_hash, second_crop_hash),
+                )
+            for crop_hash in payload.get("new_crop_person_rejections", []):
+                self.connection.execute(
+                    "DELETE FROM face_crop_person_rejections "
+                    "WHERE crop_hash = ? AND person_id = ?",
+                    (crop_hash, person_id),
+                )
             removed_person_id = payload.get("removed_rejection_person_id")
             if removed_person_id is not None:
                 now = time.time_ns()
@@ -926,6 +1128,17 @@ class FaceStore:
                     (
                         (int(face_id), int(removed_person_id), now)
                         for face_id in payload.get("removed_rejections", [])
+                    ),
+                )
+            removed_crop_person_id = payload.get("removed_crop_rejection_person_id")
+            if removed_crop_person_id is not None:
+                now = time.time_ns()
+                self.connection.executemany(
+                    "INSERT OR IGNORE INTO face_crop_person_rejections"
+                    "(crop_hash, person_id, created_at_ns) VALUES (?, ?, ?)",
+                    (
+                        (str(crop_hash), int(removed_crop_person_id), now)
+                        for crop_hash in payload.get("removed_crop_rejections", [])
                     ),
                 )
             created_person_id = payload.get("created_person_id")
@@ -943,6 +1156,8 @@ class FaceStore:
     def purge(self) -> None:
         with self.catalog._database_savepoint("purge_face_data"):
             self.connection.execute("DELETE FROM face_operations")
+            self.connection.execute("DELETE FROM face_crop_pair_rejections")
+            self.connection.execute("DELETE FROM face_crop_person_rejections")
             self.connection.execute("DELETE FROM face_pair_rejections")
             self.connection.execute("DELETE FROM face_person_rejections")
             self.connection.execute("DELETE FROM faces")
@@ -1036,9 +1251,11 @@ class FaceStore:
     def _person_proposals(
         self,
         face_ids: np.ndarray,
+        crop_hashes: np.ndarray,
         embeddings: np.ndarray,
         codes: np.ndarray,
         rejected_by_face: dict[int, set[int]],
+        rejected_by_crop: dict[str, set[int]],
     ) -> tuple[list[int | None], list[float]]:
         anchors = list(
             self.connection.execute(
@@ -1081,7 +1298,10 @@ class FaceStore:
             by_person: dict[int, float] = {}
             for anchor_index in candidates:
                 person_id = int(anchor_people[anchor_index])
-                if person_id in rejected_by_face.get(int(face_id_value), set()):
+                if (
+                    person_id in rejected_by_face.get(int(face_id_value), set())
+                    or person_id in rejected_by_crop.get(str(crop_hashes[index]), set())
+                ):
                     continue
                 score = float(np.dot(embeddings[index], anchor_embeddings[anchor_index]))
                 by_person[person_id] = max(score, by_person.get(person_id, -1.0))
@@ -1110,6 +1330,30 @@ class FaceStore:
                 "SELECT first_face_id, second_face_id FROM face_pair_rejections"
             )
         }
+
+    def _crop_pair_rejections(self) -> set[tuple[str, str]]:
+        return {
+            (str(row["first_crop_hash"]), str(row["second_crop_hash"]))
+            for row in self.connection.execute(
+                "SELECT first_crop_hash, second_crop_hash FROM face_crop_pair_rejections"
+            )
+        }
+
+    def _crop_hashes_for_face_ids(self, ids: Sequence[int]) -> tuple[str, ...]:
+        result: set[str] = set()
+        for offset in range(0, len(ids), 400):
+            batch = ids[offset : offset + 400]
+            if not batch:
+                continue
+            result.update(
+                _crop_hash(str(row["thumbnail_rel_path"]))
+                for row in self.connection.execute(
+                    f"SELECT thumbnail_rel_path FROM faces WHERE id IN "
+                    f"({','.join('?' for _ in batch)})",
+                    tuple(batch),
+                )
+            )
+        return tuple(sorted(result))
 
     def _face_snapshots(self, ids: Sequence[int]) -> list[list[Any]]:
         placeholders = ",".join("?" for _ in ids)
@@ -1216,6 +1460,10 @@ def _validated_thumbnail_rel_path(value: str) -> Path:
     return candidate
 
 
+def _crop_hash(thumbnail_rel_path: str) -> str:
+    return _validated_thumbnail_rel_path(thumbnail_rel_path).stem
+
+
 def _safe_existing_thumbnail(path: Path) -> bool:
     try:
         value = path.lstat()
@@ -1271,6 +1519,8 @@ def _conservative_clusters(
     codes: np.ndarray,
     face_ids: np.ndarray,
     rejected_pairs: set[tuple[int, int]],
+    crop_hashes: np.ndarray,
+    rejected_crop_pairs: set[tuple[str, str]],
 ) -> list[list[int]]:
     parent = list(range(len(embeddings)))
     size = [1] * len(embeddings)
@@ -1288,6 +1538,20 @@ def _conservative_clusters(
         for index, face_id in enumerate(face_ids)
         if int(face_id) in rejected_neighbors
     }
+    rejected_crop_neighbors: dict[str, set[str]] = defaultdict(set)
+    for first_crop_hash, second_crop_hash in rejected_crop_pairs:
+        rejected_crop_neighbors[first_crop_hash].add(second_crop_hash)
+        rejected_crop_neighbors[second_crop_hash].add(first_crop_hash)
+    component_crop_restricted: dict[int, set[str]] = {
+        index: {str(crop_hash)}
+        for index, crop_hash in enumerate(crop_hashes)
+        if str(crop_hash) in rejected_crop_neighbors
+    }
+    component_crop_forbidden: dict[int, set[str]] = {
+        index: set(rejected_crop_neighbors[str(crop_hash)])
+        for index, crop_hash in enumerate(crop_hashes)
+        if str(crop_hash) in rejected_crop_neighbors
+    }
 
     def find(value: int) -> int:
         while parent[value] != value:
@@ -1299,12 +1563,17 @@ def _conservative_clusters(
         first_root, second_root = find(first), find(second)
         if first_root == second_root:
             return
-        empty: frozenset[int] = frozenset()
+        empty_ids: frozenset[int] = frozenset()
+        empty_hashes: frozenset[str] = frozenset()
         if (
-            component_forbidden.get(first_root, empty)
-            & component_restricted.get(second_root, empty)
-            or component_forbidden.get(second_root, empty)
-            & component_restricted.get(first_root, empty)
+            component_forbidden.get(first_root, empty_ids)
+            & component_restricted.get(second_root, empty_ids)
+            or component_forbidden.get(second_root, empty_ids)
+            & component_restricted.get(first_root, empty_ids)
+            or component_crop_forbidden.get(first_root, empty_hashes)
+            & component_crop_restricted.get(second_root, empty_hashes)
+            or component_crop_forbidden.get(second_root, empty_hashes)
+            & component_crop_restricted.get(first_root, empty_hashes)
         ):
             return
         if size[first_root] < size[second_root]:
@@ -1317,6 +1586,12 @@ def _conservative_clusters(
         forbidden = component_forbidden.pop(second_root, set())
         if forbidden:
             component_forbidden.setdefault(first_root, set()).update(forbidden)
+        crop_restricted = component_crop_restricted.pop(second_root, set())
+        if crop_restricted:
+            component_crop_restricted.setdefault(first_root, set()).update(crop_restricted)
+        crop_forbidden = component_crop_forbidden.pop(second_root, set())
+        if crop_forbidden:
+            component_crop_forbidden.setdefault(first_root, set()).update(crop_forbidden)
 
     def connect(first_members: Sequence[int], second_members: Sequence[int] | None = None) -> None:
         first_values = np.asarray(first_members, dtype=np.int64)
