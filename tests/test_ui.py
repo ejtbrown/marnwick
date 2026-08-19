@@ -21,7 +21,7 @@ os.environ.setdefault("MARNWICK_DISABLE_CONFIG", "1")
 import marnwick.ui as ui_module  # noqa: E402
 
 from PySide6.QtCore import QEvent, QItemSelectionModel, QModelIndex, QPoint, QPointF, QRect, Qt, QTimer  # noqa: E402
-from PySide6.QtGui import QColor, QCursor, QFontMetrics, QImage, QKeyEvent, QKeySequence, QMouseEvent, QPainter, QPixmap  # noqa: E402
+from PySide6.QtGui import QColor, QCursor, QFontMetrics, QImage, QKeyEvent, QKeySequence, QMouseEvent, QPainter, QPalette, QPixmap  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import (  # noqa: E402
     QAbstractItemView,
@@ -115,6 +115,7 @@ from marnwick.ui import (  # noqa: E402
     metadata_text,
     EditCommandDialog,
     format_bytes,
+    install_system_theme_tracking,
     parse_runtime_args,
     read_debug_token_file,
 )
@@ -3101,6 +3102,57 @@ def test_dialog_stylesheet_explicitly_styles_message_box_buttons() -> None:
     assert "QScrollArea" in DIALOG_STYLESHEET
     assert "QWidget#tagContainer" in DIALOG_STYLESHEET
     assert "QFrame#propertiesFrame" in DIALOG_STYLESHEET
+    assert "palette(window)" in DIALOG_STYLESHEET
+    assert "#f6f7f9" not in DIALOG_STYLESHEET
+    assert "#202124" not in DIALOG_STYLESHEET
+
+
+def test_dialog_styles_follow_runtime_application_palette_changes() -> None:
+    qt_app = app()
+    install_system_theme_tracking(qt_app)
+    original = QPalette(qt_app.palette())
+    dialog = GoToFileDialog(12, 3)
+    dialog.resize(320, 120)
+    dialog.show()
+    try:
+        dialog.entry.setText("13")
+        dark = QPalette(original)
+        dark.setColor(QPalette.ColorRole.Window, QColor("#202124"))
+        dark.setColor(QPalette.ColorRole.WindowText, QColor("#f8f9fa"))
+        dark.setColor(QPalette.ColorRole.Base, QColor("#292a2d"))
+        dark.setColor(QPalette.ColorRole.Text, QColor("#f8f9fa"))
+        dark.setColor(QPalette.ColorRole.Button, QColor("#303134"))
+        dark.setColor(QPalette.ColorRole.ButtonText, QColor("#f8f9fa"))
+        dark.setColor(QPalette.ColorRole.Mid, QColor("#5f6368"))
+        qt_app.setPalette(dark)
+        qt_app.processEvents()
+        qt_app.processEvents()
+
+        assert dialog.grab().toImage().pixelColor(1, 1) == QColor("#202124")
+        assert dialog.entry.palette().color(QPalette.ColorRole.Base) == QColor(
+            "#292a2d"
+        )
+        assert "#ffb4ab" in dialog.entry.styleSheet()
+
+        light = QPalette(original)
+        light.setColor(QPalette.ColorRole.Window, QColor("#f6f7f9"))
+        light.setColor(QPalette.ColorRole.WindowText, QColor("#202124"))
+        light.setColor(QPalette.ColorRole.Base, QColor("#ffffff"))
+        light.setColor(QPalette.ColorRole.Text, QColor("#202124"))
+        qt_app.setPalette(light)
+        qt_app.processEvents()
+        qt_app.processEvents()
+
+        assert dialog.grab().toImage().pixelColor(1, 1) == QColor("#f6f7f9")
+        assert dialog.entry.palette().color(QPalette.ColorRole.Base) == QColor(
+            "#ffffff"
+        )
+        assert "#b3261e" in dialog.entry.styleSheet()
+    finally:
+        dialog.close()
+        dialog.deleteLater()
+        qt_app.setPalette(original)
+        qt_app.processEvents()
 
 
 def test_thumbnail_model_uses_dense_card_size() -> None:
@@ -3264,7 +3316,9 @@ def test_thumbnail_delegate_centers_card_inside_distributed_grid_cell(tmp_path: 
     assert rect.left() == 40
 
 
-def test_thumbnail_delegate_paints_selected_grid_square_vivid_blue(tmp_path: Path) -> None:
+def test_thumbnail_delegate_uses_palette_highlight_for_selected_grid_square(
+    tmp_path: Path,
+) -> None:
     app()
     model = ThumbnailModel()
     model.set_images(
@@ -3289,6 +3343,7 @@ def test_thumbnail_delegate_paints_selected_grid_square_vivid_blue(tmp_path: Pat
     option = QStyleOptionViewItem()
     option.font = QApplication.font()
     option.state = QStyle.StateFlag.State_Selected
+    option.palette.setColor(QPalette.ColorRole.Highlight, QColor("#7048e8"))
     card = model.card_size(option.font)
     option.rect = QRect(0, 0, card.width() + 80, card.height())
     pixmap = QPixmap(option.rect.size())
@@ -3299,7 +3354,7 @@ def test_thumbnail_delegate_paints_selected_grid_square_vivid_blue(tmp_path: Pat
     finally:
         painter.end()
 
-    assert pixmap.toImage().pixelColor(1, 1) == QColor("#0067ff")
+    assert pixmap.toImage().pixelColor(1, 1) == QColor("#7048e8")
 
 
 def test_thumbnail_model_tooltip_describes_image(tmp_path: Path) -> None:
@@ -3951,7 +4006,7 @@ def test_go_to_file_dialog_validates_range_and_selects_default() -> None:
 
         dialog.entry.setText("13")
         assert not dialog.ok_button.isEnabled()
-        assert "#c62828" in dialog.entry.styleSheet()
+        assert dialog.entry.property("marnwickValidationInvalid") is True
 
         dialog.entry.clear()
         dialog.entry.insert("letters")
@@ -4821,7 +4876,10 @@ def test_tag_dialog_uses_readable_container_styles(tmp_path: Path) -> None:
                 qt_app.processEvents()
                 sleep(0.01)
             assert dialog.checkboxes
-            assert "color: #202124" in dialog.checkboxes[0].styleSheet()
+            assert dialog.checkboxes[0].styleSheet() == ""
+            assert dialog.checkboxes[0].palette().color(
+                QPalette.ColorRole.WindowText
+            ) == dialog.palette().color(QPalette.ColorRole.WindowText)
         finally:
             dialog.close()
             dialog.deleteLater()
@@ -10998,8 +11056,12 @@ def test_directory_tree_drag_hover_highlights_destination(tmp_path: Path) -> Non
 
         window.tree.set_drag_hover_item(item)
 
-        assert item.background(0).color().name() == "#1d4ed8"
-        assert item.foreground(0).color().name() == "#ffffff"
+        assert item.background(0).color() == window.tree.palette().color(
+            QPalette.ColorRole.Highlight
+        )
+        assert item.foreground(0).color() == window.tree.palette().color(
+            QPalette.ColorRole.HighlightedText
+        )
         assert item.font(0).bold()
 
         window.tree.set_drag_hover_item(None)

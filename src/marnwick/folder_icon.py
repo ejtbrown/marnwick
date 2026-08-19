@@ -262,4 +262,15 @@ def _edge_connected_background_mask(icon: Image.Image) -> bytearray:
 
 def _is_background_key(pixel: tuple[int, ...]) -> bool:
     red, green, blue = pixel[:3]
-    return red >= 225 and green >= 225 and blue >= 225 and max(red, green, blue) - min(red, green, blue) <= 5
+    darkest = min(red, green, blue)
+    lightest = max(red, green, blue)
+    spread = lightest - darkest
+    # The RGB source has a checkerboard background baked into it. Its
+    # anti-aliased edge and drop shadow are cooler, darker variants of that
+    # background; retaining them as opaque pixels creates a white/gray halo
+    # around the pouch on dark canvases. Preserve the warmer card frames and
+    # the strongly blue pouch while allowing the edge-connected flood fill to
+    # consume the neutral checkerboard and its cool shadow transition.
+    return (darkest >= 225 and spread <= 7) or (
+        darkest >= 45 and spread <= 24 and blue + 2 >= red
+    )

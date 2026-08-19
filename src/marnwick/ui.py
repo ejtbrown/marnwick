@@ -32,6 +32,7 @@ from PySide6.QtCore import (
     QItemSelectionModel,
     QMimeData,
     QModelIndex,
+    QObject,
     QPoint,
     QPointF,
     QRect,
@@ -60,6 +61,7 @@ from PySide6.QtGui import (
     QMovie,
     QPainter,
     QPainterPath,
+    QPalette,
     QPen,
     QPixmap,
     QShortcut,
@@ -966,85 +968,169 @@ class DeleteConfirmationTask:
 DIALOG_STYLESHEET = """
 QDialog,
 QMessageBox {
-    background: #f6f7f9;
-    color: #202124;
+    background: palette(window);
+    color: palette(window-text);
 }
 QLabel,
 QCheckBox {
     background: transparent;
-    color: #202124;
+    color: palette(window-text);
 }
 QScrollArea,
 QScrollArea QWidget,
 QWidget#tagContainer {
-    background: #f6f7f9;
-    color: #202124;
+    background: palette(window);
+    color: palette(window-text);
 }
 QFrame#propertiesFrame {
-    background: #ffffff;
-    color: #202124;
-    border: 1px solid #9aa0a6;
+    background: palette(base);
+    color: palette(text);
+    border: 1px solid palette(mid);
 }
 QFrame#propertiesFrame QLabel {
     background: transparent;
-    color: #202124;
+    color: palette(text);
 }
 QComboBox,
 QLineEdit,
 QSpinBox,
 QPlainTextEdit {
-    background: #ffffff;
-    color: #202124;
-    border: 1px solid #9aa0a6;
+    background: palette(base);
+    color: palette(text);
+    border: 1px solid palette(mid);
     padding: 3px;
 }
 QComboBox QAbstractItemView {
-    background: #ffffff;
-    color: #202124;
-    selection-background-color: #2563eb;
-    selection-color: #ffffff;
+    background: palette(base);
+    color: palette(text);
+    selection-background-color: palette(highlight);
+    selection-color: palette(highlighted-text);
 }
 QPushButton {
-    background: #ffffff;
-    color: #202124;
-    border: 1px solid #9aa0a6;
+    background: palette(button);
+    color: palette(button-text);
+    border: 1px solid palette(mid);
     padding: 5px 10px;
 }
 QPushButton:default {
-    border: 2px solid #2563eb;
+    border: 2px solid palette(highlight);
 }
 QPushButton:hover {
-    background: #eef2ff;
+    background: palette(alternate-base);
 }
 QListWidget,
 QTreeWidget {
-    background: #ffffff;
-    color: #202124;
-    border: 1px solid #9aa0a6;
+    background: palette(base);
+    color: palette(text);
+    border: 1px solid palette(mid);
 }
 QListWidget::item,
 QTreeWidget::item {
-    color: #202124;
+    color: palette(text);
     padding: 8px;
 }
 QListWidget::item:selected,
 QTreeWidget::item:selected {
-    background: #2563eb;
-    color: #ffffff;
+    background: palette(highlight);
+    color: palette(highlighted-text);
 }
 """
 
 MESSAGE_BUTTON_STYLESHEET = """
 QPushButton {
-    background: #ffffff;
-    color: #202124;
-    border: 1px solid #9aa0a6;
+    background: palette(button);
+    color: palette(button-text);
+    border: 1px solid palette(mid);
     padding: 5px 10px;
 }
 QPushButton:hover {
-    background: #eef2ff;
+    background: palette(alternate-base);
 }
 """
+
+
+def _palette_is_dark(palette: QPalette) -> bool:
+    window = palette.color(QPalette.ColorRole.Window)
+    text = palette.color(QPalette.ColorRole.WindowText)
+    return window.lightnessF() < text.lightnessF()
+
+
+def _validation_color(widget: QWidget) -> str:
+    return "#ffb4ab" if _palette_is_dark(widget.palette()) else "#b3261e"
+
+
+def set_validation_style(
+    widget: QWidget,
+    invalid: bool,
+    *,
+    selector: str = "",
+    border: bool = False,
+) -> None:
+    """Apply a readable validation color and retain enough state for theme changes."""
+
+    widget.setProperty("marnwickValidationInvalid", invalid)
+    widget.setProperty("marnwickValidationSelector", selector)
+    widget.setProperty("marnwickValidationBorder", border)
+    if not invalid:
+        widget.setStyleSheet("")
+        return
+    declarations = f"color: {_validation_color(widget)};"
+    if border:
+        declarations += f" border: 1px solid {_validation_color(widget)};"
+    widget.setStyleSheet(
+        f"{selector} {{ {declarations} }}" if selector else declarations
+    )
+
+
+class SystemThemeSynchronizer(QObject):
+    """Re-evaluate palette-based styles when Qt reports a live system theme change."""
+
+    def __init__(self, application: QApplication) -> None:
+        super().__init__(application)
+        self.application = application
+        self._refresh_pending = False
+        application.paletteChanged.connect(self.schedule_refresh)
+        application.styleHints().colorSchemeChanged.connect(self.schedule_refresh)
+
+    def schedule_refresh(self, *_args: object) -> None:
+        if self._refresh_pending:
+            return
+        self._refresh_pending = True
+        QTimer.singleShot(0, self.refresh)
+
+    def refresh(self) -> None:
+        self._refresh_pending = False
+        for top_level in self.application.topLevelWidgets():
+            widgets = (top_level, *top_level.findChildren(QWidget))
+            for widget in widgets:
+                try:
+                    stylesheet = widget.styleSheet()
+                    if stylesheet:
+                        widget.setStyleSheet("")
+                        widget.setStyleSheet(stylesheet)
+                    if bool(widget.property("marnwickValidationInvalid")):
+                        set_validation_style(
+                            widget,
+                            True,
+                            selector=str(
+                                widget.property("marnwickValidationSelector") or ""
+                            ),
+                            border=bool(
+                                widget.property("marnwickValidationBorder")
+                            ),
+                        )
+                    widget.update()
+                except RuntimeError:
+                    continue
+
+
+def install_system_theme_tracking(application: QApplication) -> SystemThemeSynchronizer:
+    existing = getattr(application, "_marnwick_system_theme_synchronizer", None)
+    if isinstance(existing, SystemThemeSynchronizer):
+        return existing
+    synchronizer = SystemThemeSynchronizer(application)
+    application._marnwick_system_theme_synchronizer = synchronizer  # type: ignore[attr-defined]
+    return synchronizer
 
 
 class HotkeyGuideOverlay(QWidget):
@@ -1213,6 +1299,7 @@ class ThumbnailModel(QAbstractListModel):
         self._pixmap_cache_costs: dict[str, int] = {}
         self._pixmap_cache_bytes = 0
         self._image_placeholder: QPixmap | None = None
+        self._image_placeholder_color: int | None = None
         self._folder_placeholder: QPixmap | None = None
         self._pending_thumbnail_rels: OrderedDict[str, None] = OrderedDict()
         self._thumbnail_generation = 0
@@ -2030,6 +2117,7 @@ class ThumbnailModel(QAbstractListModel):
             if self.row_for_key(("image", rel_path)) is None:
                 self._drop_cached_pixmap(rel_path)
         self._image_placeholder = None
+        self._image_placeholder_color = None
         self._folder_placeholder = None
         self._emit_size_changed()
 
@@ -2760,9 +2848,17 @@ class ThumbnailModel(QAbstractListModel):
         return mime
 
     def _placeholder_pixmap(self) -> QPixmap:
-        if self._image_placeholder is None:
+        placeholder_color = QApplication.palette().color(
+            QPalette.ColorRole.AlternateBase
+        )
+        placeholder_rgba = int(placeholder_color.rgba())
+        if (
+            self._image_placeholder is None
+            or self._image_placeholder_color != placeholder_rgba
+        ):
             self._image_placeholder = QPixmap(self.tile_size, self.tile_size)
-            self._image_placeholder.fill(QColor("#d0d5dd"))
+            self._image_placeholder.fill(placeholder_color)
+            self._image_placeholder_color = placeholder_rgba
         return self._image_placeholder
 
     def _folder_placeholder_pixmap(self) -> QPixmap:
@@ -2888,7 +2984,10 @@ class ThumbnailDelegate(QStyledItemDelegate):
         rect = self.card_rect(option, index)
         is_selected = bool(option.state & QStyle.StateFlag.State_Selected)
         if is_selected:
-            painter.fillRect(option.rect, QColor("#0067ff"))
+            painter.fillRect(
+                option.rect,
+                option.palette.color(QPalette.ColorRole.Highlight),
+            )
 
         font_metrics = QFontMetrics(option.font)
         label_height = font_metrics.height()
@@ -2924,7 +3023,13 @@ class ThumbnailDelegate(QStyledItemDelegate):
             painter.drawPixmap(target_rect.topLeft(), scaled_pixmap)
 
         text = str(index.data(Qt.ItemDataRole.DisplayRole) or "")
-        painter.setPen(QColor("#ffffff") if is_selected else QColor("#111827"))
+        painter.setPen(
+            option.palette.color(
+                QPalette.ColorRole.HighlightedText
+                if is_selected
+                else QPalette.ColorRole.Text
+            )
+        )
         painter.drawText(
             label_rect,
             Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
@@ -3674,8 +3779,15 @@ class DirectoryTree(QTreeWidget):
             self._drag_hover_font = item.font(0)
             hover_font = QFont(self._drag_hover_font)
             hover_font.setBold(True)
-            item.setBackground(0, QBrush(QColor("#1d4ed8")))
-            item.setForeground(0, QBrush(QColor("#ffffff")))
+            palette = self.palette()
+            item.setBackground(
+                0,
+                QBrush(palette.color(QPalette.ColorRole.Highlight)),
+            )
+            item.setForeground(
+                0,
+                QBrush(palette.color(QPalette.ColorRole.HighlightedText)),
+            )
             item.setFont(0, hover_font)
 
     @staticmethod
@@ -15963,8 +16075,10 @@ class GoToFileDialog(QDialog):
             file_number = 0
         valid = bool(text) and 1 <= file_number <= self.total_files
         self.ok_button.setEnabled(valid)
-        self.entry.setStyleSheet(
-            "QLineEdit { color: #c62828; }" if text and not valid else ""
+        set_validation_style(
+            self.entry,
+            bool(text) and not valid,
+            selector="QLineEdit",
         )
 
     def _accept_if_valid(self) -> None:
@@ -16022,7 +16136,6 @@ class TagDialog(QDialog):
         scroll.setWidgetResizable(True)
         tag_container = QWidget()
         tag_container.setObjectName("tagContainer")
-        tag_container.setStyleSheet("background: #f6f7f9; color: #202124;")
         self.tag_layout = QVBoxLayout(tag_container)
         self.loading_label = QLabel("Loading tags…")
         self.tag_layout.addWidget(self.loading_label)
@@ -16193,7 +16306,6 @@ class TagDialog(QDialog):
         self.loading_label.deleteLater()
         for tag in visible_names:
             checkbox = QCheckBox(tag)
-            checkbox.setStyleSheet("background: transparent; color: #202124;")
             checkbox.setChecked(normalize_tag(tag) in selected_by_key)
             checkbox.installEventFilter(self)
             checkbox.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -16700,7 +16812,7 @@ class HotkeysDialog(QDialog):
 
         self.validation_label = QLabel()
         self.validation_label.setWordWrap(True)
-        self.validation_label.setStyleSheet("color: #c62828;")
+        set_validation_style(self.validation_label, True)
         self.validation_label.setMinimumHeight(
             self.validation_label.fontMetrics().height()
         )
@@ -16749,10 +16861,11 @@ class HotkeysDialog(QDialog):
             conflicts.append((existing, definition, sequence_text))
             conflicting_ids.update({existing.hotkey_id, definition.hotkey_id})
         for hotkey_id, editor in self.editors.items():
-            editor.setStyleSheet(
-                "QKeySequenceEdit { color: #c62828; border: 1px solid #c62828; }"
-                if hotkey_id in conflicting_ids or hotkey_id in reserved_ids
-                else ""
+            set_validation_style(
+                editor,
+                hotkey_id in conflicting_ids or hotkey_id in reserved_ids,
+                selector="QKeySequenceEdit",
+                border=True,
             )
         self.ok_button.setEnabled(not conflicts and not reserved_ids)
         if reserved_ids:
@@ -17184,7 +17297,7 @@ class VirtualDirectoryRuleGroupWidget(QFrame):
         ] = []
         self.setFrameShape(QFrame.Shape.StyledPanel)
         self.setStyleSheet(
-            "VirtualDirectoryRuleGroupWidget { background: #eef2f7; }"
+            "VirtualDirectoryRuleGroupWidget { background: palette(alternate-base); }"
         )
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 6, 8, 6)
@@ -17805,10 +17918,10 @@ class NewVirtualDirectoryDialog(QDialog):
     def _validate(self, _value: object = None) -> None:
         clean_name = " ".join(self.name_entry.text().strip().split())
         name_valid = bool(clean_name) and clean_name.casefold() not in self._existing_names
-        self.name_entry.setStyleSheet(
-            "QLineEdit { color: #c62828; }"
-            if self.name_entry.text() and not name_valid
-            else ""
+        set_validation_style(
+            self.name_entry,
+            bool(self.name_entry.text()) and not name_valid,
+            selector="QLineEdit",
         )
         pattern = self._canonical_simple_regex(self.regex_entry.text())
         try:
@@ -17820,8 +17933,10 @@ class NewVirtualDirectoryDialog(QDialog):
         else:
             regex_valid = True
             self.regex_entry.setToolTip("")
-        self.regex_entry.setStyleSheet(
-            "QLineEdit { color: #c62828; }" if not regex_valid else ""
+        set_validation_style(
+            self.regex_entry,
+            not regex_valid,
+            selector="QLineEdit",
         )
         advanced_error = (
             self._advanced_expression_error()
@@ -17831,8 +17946,9 @@ class NewVirtualDirectoryDialog(QDialog):
         self.advanced_validation_label.setText(
             advanced_error or self._advanced_mode_notice or ""
         )
-        self.advanced_validation_label.setStyleSheet(
-            "color: #c62828;" if advanced_error else ""
+        set_validation_style(
+            self.advanced_validation_label,
+            advanced_error is not None,
         )
         simple_valid = regex_valid and bool(self._selected_directory_rels)
         expression_valid = advanced_error is None
@@ -18517,7 +18633,7 @@ class GpuTestDialog(QDialog):
             item.setText(4, "—")
             item.setText(5, "Waiting to run…")
             item.setToolTip(5, "Waiting to run…")
-            item.setForeground(1, QBrush(QColor("#202124")))
+            item.setForeground(1, QBrush())
         self.progress.setValue(0)
         self.copy_button.setEnabled(False)
         self.run_again_button.setEnabled(False)
@@ -18584,23 +18700,36 @@ class GpuTestDialog(QDialog):
         item.setText(4, result.warm_inference_display)
         item.setText(5, result.explanation)
         item.setToolTip(5, result.explanation)
-        item.setForeground(
-            1,
-            QBrush(
-                QColor(
-                    {
-                        GPU_TEST_STATUS_WORKS: "#137333",
-                        GPU_TEST_STATUS_UNAVAILABLE: "#5f6368",
-                        GPU_TEST_STATUS_FAILED: "#b3261e",
-                    }.get(result.status, "#202124")
-                )
-            ),
-        )
+        item.setForeground(1, self._result_status_brush(result.status))
         if self.results_tree.currentItem() is item:
             self.details.setPlainText(result.explanation)
         self._completed_count += 1
         self.progress.setValue(self._completed_count)
         self._show_next_active_method()
+
+    def _result_status_brush(self, status: str) -> QBrush:
+        dark = _palette_is_dark(self.palette())
+        status_color = {
+            GPU_TEST_STATUS_WORKS: "#6dd58c" if dark else "#137333",
+            GPU_TEST_STATUS_UNAVAILABLE: "#c4c7c5" if dark else "#5f6368",
+            GPU_TEST_STATUS_FAILED: "#ffb4ab" if dark else "#b3261e",
+        }.get(status)
+        return (
+            QBrush(QColor(status_color))
+            if status_color is not None
+            else QBrush()
+        )
+
+    def changeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        super().changeEvent(event)
+        if event.type() != QEvent.Type.PaletteChange or not hasattr(self, "_items"):
+            return
+        for provider, item in self._items.items():
+            result = self._results.get(provider)
+            item.setForeground(
+                1,
+                self._result_status_brush(result.status) if result else QBrush(),
+            )
 
     def _show_next_active_method(self) -> None:
         if self._completed_count >= len(GPU_TEST_METHODS):
@@ -23937,6 +24066,7 @@ def run(argv: list[str] | None = None) -> int:
     app = QApplication(qt_argv)
     app.setApplicationName("Marnwick")
     app.setApplicationDisplayName("Marnwick")
+    install_system_theme_tracking(app)
     if hasattr(app, "setDesktopFileName"):
         app.setDesktopFileName(DESKTOP_FILE_ID)
     app.setWindowIcon(load_app_icon())
