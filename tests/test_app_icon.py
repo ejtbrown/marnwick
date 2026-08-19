@@ -81,6 +81,35 @@ def test_render_folder_icon_places_previews_in_mapped_regions() -> None:
         assert icon.getpixel((x, y))[:3] == expected
 
 
+def test_render_folder_icon_has_no_light_matte_on_pouch_edges() -> None:
+    icon = render_folder_icon([], 320)
+    pixels = icon.load()
+    width, height = icon.size
+    light_edge_pixels: list[tuple[int, int]] = []
+    for y in range(height):
+        for x in range(width):
+            red, green, blue, alpha = pixels[x, y]
+            if alpha == 0 or min(red, green, blue) < 180:
+                continue
+            touches_transparency = any(
+                0 <= x + dx < width
+                and 0 <= y + dy < height
+                and pixels[x + dx, y + dy][3] == 0
+                for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1))
+            )
+            on_lower_pouch_silhouette = (
+                y >= int(height * 0.85)
+                or (
+                    y >= int(height * 0.65)
+                    and (x <= int(width * 0.1) or x >= int(width * 0.9))
+                )
+            )
+            if touches_transparency and on_lower_pouch_silhouette:
+                light_edge_pixels.append((x, y))
+
+    assert light_edge_pixels == []
+
+
 def _png_blob(color: tuple[int, int, int]) -> bytes:
     image = Image.new("RGB", (120, 80), color)
     out = BytesIO()
