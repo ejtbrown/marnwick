@@ -735,8 +735,10 @@ class FaceStore:
                         "INSERT INTO people(name, normalized, created_at_ns) VALUES (?, ?, ?)",
                         (cleaned, normalized, time.time_ns()),
                     )
-                    person_id = int(cursor.lastrowid)
-                    created_person_id = person_id
+                    resolved_person_id = int(cursor.lastrowid)
+                    created_person_id = resolved_person_id
+                else:
+                    resolved_person_id = int(row["id"])
             else:
                 row = self.connection.execute(
                     "SELECT id FROM people WHERE id = ?",
@@ -744,7 +746,7 @@ class FaceStore:
                 ).fetchone()
                 if row is None:
                     raise ValueError("The selected person no longer exists")
-                person_id = int(row["id"])
+                resolved_person_id = int(row["id"])
             rejection_face_ids = set(ids)
             crop_paths = tuple(
                 f"{crop_hash[:2]}/{crop_hash}.jpg" for crop_hash in crop_hashes
@@ -769,7 +771,7 @@ class FaceStore:
                         f"SELECT face_id FROM face_person_rejections "
                         f"WHERE person_id = ? AND face_id IN "
                         f"({','.join('?' for _ in batch)})",
-                        (person_id, *batch),
+                        (resolved_person_id, *batch),
                     )
                 )
             removed_crop_rejections: list[str] = []
@@ -781,7 +783,7 @@ class FaceStore:
                         f"SELECT crop_hash FROM face_crop_person_rejections "
                         f"WHERE person_id = ? AND crop_hash IN "
                         f"({','.join('?' for _ in batch)})",
-                        (person_id, *batch),
+                        (resolved_person_id, *batch),
                     )
                 )
             placeholders = ",".join("?" for _ in ids)
@@ -792,28 +794,34 @@ class FaceStore:
                     deferred_until_ns = 0, updated_at_ns = ?
                 WHERE id IN ({placeholders})
                 """,
-                (person_id, time.time_ns(), *ids),
+                (resolved_person_id, time.time_ns(), *ids),
             )
             self.connection.executemany(
                 "DELETE FROM face_person_rejections WHERE face_id = ? AND person_id = ?",
-                ((face_id, person_id) for face_id in removed_rejections),
+                (
+                    (face_id, resolved_person_id)
+                    for face_id in removed_rejections
+                ),
             )
             self.connection.executemany(
                 "DELETE FROM face_crop_person_rejections WHERE crop_hash = ? AND person_id = ?",
-                ((crop_hash, person_id) for crop_hash in crop_hashes),
+                (
+                    (crop_hash, resolved_person_id)
+                    for crop_hash in crop_hashes
+                ),
             )
             self._record_operation(
                 "name",
                 {
                     "faces": before,
                     "created_person_id": created_person_id,
-                    "removed_rejection_person_id": person_id,
+                    "removed_rejection_person_id": resolved_person_id,
                     "removed_rejections": removed_rejections,
-                    "removed_crop_rejection_person_id": person_id,
+                    "removed_crop_rejection_person_id": resolved_person_id,
                     "removed_crop_rejections": removed_crop_rejections,
                 },
             )
-        return int(person_id)
+        return resolved_person_id
 
     def reject_person(self, face_ids: Sequence[int], person_id: int) -> None:
         ids = _unique_ids(face_ids)
