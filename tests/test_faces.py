@@ -267,6 +267,41 @@ def test_face_review_naming_negatives_and_undo(tmp_path: Path) -> None:
         assert store.stats()["ignored"] == 1
 
 
+def test_naming_faces_with_an_existing_name_reuses_that_person(tmp_path: Path) -> None:
+    root = tmp_path / "catalog"
+    with Catalog(root, CatalogSettings(faces_enabled=True)) as catalog:
+        store = FaceStore(catalog)
+        first_id, first_hash = add_image(catalog, "first.jpg", (30, 60, 90))
+        second_id, second_hash = add_image(catalog, "second.jpg", (90, 60, 30))
+        assert store.store_analysis(
+            first_id,
+            first_hash,
+            analysis(((0.1, 0.1, 0.25, 0.35), embedding(0), (220, 180, 150))),
+        )
+        first_face_id = store.groups_for_view("loose")[0].face_ids[0]
+        person_id = store.name_faces((first_face_id,), "Alice")
+
+        assert store.store_analysis(
+            second_id,
+            second_hash,
+            analysis(((0.2, 0.15, 0.3, 0.4), embedding(5), (210, 170, 140))),
+        )
+        second_face_id = store.groups_for_view("loose")[0].face_ids[0]
+
+        assert store.name_faces((second_face_id,), "  ALICE  ") == person_id
+        assert store.stats()["people"] == 1
+        assert store.stats()["named"] == 2
+        assert store.groups_for_view("people")[0].face_ids == (
+            first_face_id,
+            second_face_id,
+        )
+
+        assert store.undo_last_operation() == "name"
+        assert store.stats()["people"] == 1
+        assert store.groups_for_view("people")[0].face_ids == (first_face_id,)
+        assert store.groups_for_view("loose")[0].face_ids == (second_face_id,)
+
+
 def test_reanalysis_preserves_identity_by_face_location_and_purge_is_complete(
     tmp_path: Path,
 ) -> None:
