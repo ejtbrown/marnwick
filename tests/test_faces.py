@@ -8,7 +8,7 @@ import numpy as np
 from PIL import Image
 import pytest
 
-from marnwick.catalog import Catalog
+from marnwick.catalog import Catalog, VirtualDirectoryRule
 from marnwick.face_engine import DetectedFace, FaceAnalysis, FaceInferenceError
 from marnwick.face_models import FACE_DETECTOR_VERSION, FACE_EMBEDDING_VERSION
 from marnwick.faces import (
@@ -79,6 +79,9 @@ def test_face_schema_and_setting_are_catalog_local(tmp_path: Path) -> None:
         "face_image_state",
         "face_crop_person_rejections",
         "face_crop_pair_rejections",
+        "face_forced_loose",
+        "face_manual_groups",
+        "face_manual_group_faces",
         "face_operations",
     } <= tables
 
@@ -231,7 +234,9 @@ def test_face_review_naming_negatives_and_undo(tmp_path: Path) -> None:
 
         store.separate_faces(cluster[0].face_ids[:1], cluster[0].face_ids[1:])
         assert store.groups_for_view("unnamed") == []
-        assert len(store.groups_for_view("loose")) == 2
+        loose = store.groups_for_view("loose")
+        assert len(loose) == 1
+        assert loose[0].count == 2
         assert store.undo_last_operation() == "separate"
         cluster = store.groups_for_view("unnamed")
         assert len(cluster) == 1
@@ -300,6 +305,176 @@ def test_naming_faces_with_an_existing_name_reuses_that_person(tmp_path: Path) -
         assert store.stats()["people"] == 1
         assert store.groups_for_view("people")[0].face_ids == (first_face_id,)
         assert store.groups_for_view("loose")[0].face_ids == (second_face_id,)
+
+
+def test_loose_faces_can_be_manually_grouped_and_groups_can_be_forced_loose(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "catalog"
+    with Catalog(root, CatalogSettings(faces_enabled=True)) as catalog:
+        store = FaceStore(catalog)
+        for index in range(3):
+            image_id, image_hash = add_image(
+                catalog,
+                f"loose-{index}.jpg",
+                (20 + index, 40, 60),
+            )
+            assert store.store_analysis(
+                image_id,
+                image_hash,
+                analysis(
+                    (
+                        (0.2, 0.15, 0.3, 0.4),
+                        embedding(index),
+                        (180 + index, 150, 120),
+                    )
+                ),
+            )
+
+        loose_ids = store.groups_for_view("loose")[0].face_ids
+        assert len(loose_ids) == 3
+        group_id = store.group_faces(loose_ids[:2])
+        grouped = store.groups_for_view("unnamed")
+        assert len(grouped) == 1
+        assert grouped[0].key == f"manual:{group_id}"
+        assert set(grouped[0].face_ids) == set(loose_ids[:2])
+        assert store.groups_for_view("loose")[0].face_ids == (loose_ids[2],)
+
+        assert store.undo_last_operation() == "group"
+        assert set(store.groups_for_view("loose")[0].face_ids) == set(loose_ids)
+
+        first_id, first_hash = add_image(catalog, "same-a.jpg", (70, 80, 90))
+        second_id, second_hash = add_image(catalog, "same-b.jpg", (90, 80, 70))
+        for image_id, image_hash, variation in (
+            (first_id, first_hash, 0.0),
+            (second_id, second_hash, 0.01),
+        ):
+            assert store.store_analysis(
+                image_id,
+                image_hash,
+                analysis(
+                    (
+                        (0.2, 0.15, 0.3, 0.4),
+                        embedding(8, variation=variation),
+                        (150, 120, 90),
+                    )
+                ),
+            )
+        automatic_group = store.groups_for_view("unnamed")[0]
+        person_id = store.name_faces(automatic_group.face_ids, "Morgan")
+        assert store.groups_for_view("people")[0].count == 2
+
+        assert store.mark_faces_loose(
+            automatic_group.face_ids,
+            person_id=person_id,
+        ) == tuple(sorted(automatic_group.face_ids))
+        assert store.groups_for_view("people") == []
+        assert set(automatic_group.face_ids) <= set(
+            store.groups_for_view("loose")[0].face_ids
+        )
+
+        assert store.undo_last_operation() == "loose"
+        assert store.groups_for_view("people")[0].face_ids == automatic_group.face_ids
+
+
+def test_verified_people_drive_person_views_and_virtual_directory_rules(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "catalog"
+    special_name = 'Alex "AJ" O\'Brien %_ 佐藤'
+    with Catalog(root, CatalogSettings(faces_enabled=True)) as catalog:
+        store = FaceStore(catalog)
+        first_id, first_hash = add_image(catalog, "alice.jpg", (30, 60, 90))
+        second_id, second_hash = add_image(catalog, "bob.jpg", (90, 60, 30))
+        shared_id, shared_hash = add_image(catalog, "shared.jpg", (60, 90, 30))
+        assert store.store_analysis(
+            first_id,
+            first_hash,
+            analysis(((0.1, 0.1, 0.25, 0.35), embedding(0), (220, 180, 150))),
+        )
+        alice_face = int(
+            catalog._conn.execute(
+                "SELECT id FROM faces WHERE image_id = ?",
+                (first_id,),
+            ).fetchone()["id"]
+        )
+        alice_id = store.name_faces((alice_face,), special_name)
+        assert store.store_analysis(
+            second_id,
+            second_hash,
+            analysis(((0.1, 0.1, 0.25, 0.35), embedding(1), (180, 150, 120))),
+        )
+        bob_face = int(
+            catalog._conn.execute(
+                "SELECT id FROM faces WHERE image_id = ?",
+                (second_id,),
+            ).fetchone()["id"]
+        )
+        bob_id = store.name_faces((bob_face,), "Bob Smith")
+        assert store.store_analysis(
+            shared_id,
+            shared_hash,
+            analysis(
+                ((0.1, 0.1, 0.25, 0.35), embedding(0), (215, 175, 145)),
+                ((0.55, 0.1, 0.25, 0.35), embedding(1), (175, 145, 115)),
+            ),
+        )
+        shared_faces = tuple(
+            int(row["id"])
+            for row in catalog._conn.execute(
+                "SELECT id FROM faces WHERE image_id = ? ORDER BY ordinal",
+                (shared_id,),
+            )
+        )
+        store.name_faces((shared_faces[0],), special_name, person_id=alice_id)
+        store.name_faces((shared_faces[1],), "Bob Smith", person_id=bob_id)
+
+        assert catalog.person_image_and_slideshow_count(alice_id) == (2, 2)
+        assert [
+            record.rel_path
+            for record in catalog.list_images_for_person_page(
+                alice_id,
+                limit=20,
+            )
+        ] == ["alice.jpg", "shared.jpg"]
+
+        saved = catalog.create_custom_virtual_directory(
+            "Both people",
+            "",
+            [""],
+            [],
+            [special_name, "Bob Smith"],
+        )
+        assert saved.people == (special_name, "Bob Smith")
+        assert catalog.custom_virtual_directory_image_count(saved.id) == 1
+        assert [
+            record.rel_path
+            for record in catalog.list_images_for_custom_virtual_directory_page(
+                saved.id,
+                limit=20,
+            )
+        ] == ["shared.jpg"]
+
+        updated = catalog.update_custom_virtual_directory(
+            saved.id,
+            "Only Bob",
+            "",
+            [""],
+            [],
+            ["Bob Smith"],
+        )
+        assert updated.people == ("Bob Smith",)
+        assert catalog.custom_virtual_directory_image_count(saved.id) == 2
+
+        advanced = catalog.create_advanced_custom_virtual_directory(
+            "Special person",
+            VirtualDirectoryRule(
+                "person",
+                value=special_name,
+                display_value=special_name,
+            ),
+        )
+        assert catalog.custom_virtual_directory_image_count(advanced.id) == 2
 
 
 def test_reanalysis_preserves_identity_by_face_location_and_purge_is_complete(

@@ -172,3 +172,148 @@ def test_face_manager_r_removes_only_the_selected_faces_from_a_group(
         dialog.deleteLater()
         catalog.close()
         qt_app.processEvents()
+
+
+def test_face_manager_exclusions_update_the_current_group_without_refreshing(
+    tmp_path: Path,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    catalog = Catalog(root, CatalogSettings(faces_enabled=True))
+    submitted: list[tuple[str, tuple[int, ...], object | None]] = []
+
+    def submit(
+        kind: str,
+        face_ids: tuple[int, ...],
+        value: object | None,
+    ) -> Future[object]:
+        submitted.append((kind, face_ids, value))
+        future: Future[object] = Future()
+        future.set_result(face_ids if kind == "remove" else None)
+        return future
+
+    dialog = FaceManagerDialog(catalog, submit, initial_view="unnamed")
+    try:
+        dialog._poll_timer.stop()
+        if dialog._group_future is not None:
+            dialog._group_future.cancel()
+            dialog._group_future = None
+        group = FaceReviewGroup(
+            key="cluster:11",
+            kind="unnamed",
+            face_ids=(11, 12, 13),
+            representative_ids=(11, 12, 13),
+            title="Unnamed group",
+            count=3,
+        )
+        dialog._groups = (group,)
+        dialog.group_list.clear()
+        dialog.group_list.addItem(dialog._group_list_label(group))
+        dialog._set_busy(False)
+        dialog.group_list.setCurrentRow(0)
+        if dialog._tile_future is not None:
+            dialog._tile_future.cancel()
+            dialog._tile_future = None
+        dialog.face_list.clear()
+        for face_id in group.face_ids:
+            item = QListWidgetItem(f"Face {face_id}")
+            item.setData(Qt.ItemDataRole.UserRole, face_id)
+            dialog.face_list.addItem(item)
+        dialog.face_list.item(0).setSelected(True)
+        refreshes: list[bool] = []
+        dialog.refresh_groups = lambda: refreshes.append(True)  # type: ignore[method-assign]
+
+        dialog._remove_selected_from_group()
+        dialog._settle_work()
+
+        assert submitted == [
+            ("remove", (11,), {"remaining_face_ids": (12, 13)})
+        ]
+        assert refreshes == []
+        assert dialog._current_group is not None
+        assert dialog._current_group.face_ids == (12, 13)
+        assert dialog._current_group.count == 2
+        assert dialog.face_list.count() == 2
+        assert "2" in dialog.group_list.item(0).text()
+    finally:
+        dialog.close()
+        dialog.deleteLater()
+        catalog.close()
+        qt_app.processEvents()
+
+
+def test_loose_face_controls_group_selected_faces_and_mark_groups_loose(
+    tmp_path: Path,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    catalog = Catalog(root, CatalogSettings(faces_enabled=True))
+    submitted: list[tuple[str, tuple[int, ...], object | None]] = []
+
+    def submit(
+        kind: str,
+        face_ids: tuple[int, ...],
+        value: object | None,
+    ) -> Future[object]:
+        submitted.append((kind, face_ids, value))
+        future: Future[object] = Future()
+        future.set_result(None)
+        return future
+
+    dialog = FaceManagerDialog(catalog, submit, initial_view="loose")
+    try:
+        dialog._poll_timer.stop()
+        if dialog._group_future is not None:
+            dialog._group_future.cancel()
+            dialog._group_future = None
+        group = FaceReviewGroup(
+            key="loose:all",
+            kind="loose",
+            face_ids=(21, 22, 23),
+            representative_ids=(21,),
+            title="Loose faces",
+            count=3,
+        )
+        dialog._groups = (group,)
+        dialog.group_list.clear()
+        dialog.group_list.addItem(dialog._group_list_label(group))
+        dialog._set_busy(False)
+        dialog.group_list.setCurrentRow(0)
+        if dialog._tile_future is not None:
+            dialog._tile_future.cancel()
+            dialog._tile_future = None
+        dialog.face_list.clear()
+        for face_id in group.face_ids:
+            item = QListWidgetItem(f"Face {face_id}")
+            item.setData(Qt.ItemDataRole.UserRole, face_id)
+            dialog.face_list.addItem(item)
+        dialog.face_list.item(0).setSelected(True)
+        dialog.face_list.item(1).setSelected(True)
+        dialog.show()
+        qt_app.processEvents()
+
+        loaded: list[tuple[int, ...]] = []
+        dialog._load_tiles = (  # type: ignore[method-assign]
+            lambda _group, face_ids: loaded.append(tuple(face_ids))
+        )
+        assert dialog.review_all_button.isVisible()
+        dialog._load_all_current_faces()
+        assert loaded == [(21, 22, 23)]
+        assert not dialog.review_all_button.isVisible()
+        assert dialog.group_selected_button.isVisible()
+        assert dialog.group_selected_button.isEnabled()
+        dialog._group_selected_loose_faces()
+        assert submitted[-1] == ("group", (21, 22), None)
+
+        dialog._mutation_future = None
+        dialog._pending_mutation = None
+        dialog._set_busy(False)
+        dialog._mark_current_group_loose()
+        assert submitted[-1] == ("loose", (21, 22, 23), None)
+    finally:
+        dialog.close()
+        dialog.deleteLater()
+        catalog.close()
+        qt_app.processEvents()

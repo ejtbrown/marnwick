@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, QSize, QStringListModel, Qt, QTimer
@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QMenu,
     QMessageBox,
     QPushButton,
     QSplitter,
@@ -80,9 +81,15 @@ class FaceManagerDialog(QDialog):
         self._group_future: Future[FaceGroupLoad] | None = None
         self._tile_future: Future[FaceTileLoad] | None = None
         self._mutation_future: Future[object] | None = None
+        self._pending_mutation: tuple[
+            str,
+            tuple[int, ...],
+            object | None,
+        ] | None = None
         self._load_generation = 0
         self._closed = False
         self._busy = False
+        self._showing_all_faces = False
         self._loader = RolloverThreadPoolExecutor(
             max_workers=1,
             thread_name_prefix="marnwick-face-review",
@@ -132,6 +139,12 @@ class FaceManagerDialog(QDialog):
         self.group_list = QListWidget()
         self.group_list.setMinimumWidth(310)
         self.group_list.currentRowChanged.connect(self._group_selected)
+        self.group_list.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.CustomContextMenu
+        )
+        self.group_list.customContextMenuRequested.connect(
+            self._open_group_context_menu
+        )
         splitter.addWidget(self.group_list)
 
         review_panel = QWidget()
@@ -172,7 +185,10 @@ class FaceManagerDialog(QDialog):
         self.name_button = QPushButton("Name group")
         self.name_button.clicked.connect(self._confirm_or_name)
         identity.addWidget(self.name_button)
-        self.review_all_button = QPushButton("Review all")
+        self.review_all_button = QPushButton("Show all faces")
+        self.review_all_button.setToolTip(
+            "Load every face in this group instead of the representative 16"
+        )
         self.review_all_button.clicked.connect(self._load_all_current_faces)
         identity.addWidget(self.review_all_button)
         review_layout.addLayout(identity)
@@ -209,6 +225,13 @@ class FaceManagerDialog(QDialog):
             lambda: self._mutate("status", self._target_ids(), FACE_STATUS_NOT_FACE)
         )
         decisions.addWidget(self.not_face_button)
+        self.group_selected_button = QPushButton("Group selected")
+        self.group_selected_button.setToolTip(
+            "Group the selected loose faces and run identity recognition"
+        )
+        self.group_selected_button.clicked.connect(self._group_selected_loose_faces)
+        self.group_selected_button.setVisible(False)
+        decisions.addWidget(self.group_selected_button)
         review_layout.addLayout(decisions)
         self._remove_shortcut = QShortcut(QKeySequence("R"), self)
         self._remove_shortcut.setContext(
@@ -318,6 +341,7 @@ class FaceManagerDialog(QDialog):
             return
         group = self._groups[row]
         self._current_group = group
+        self._showing_all_faces = False
         self.confirm_button.setText(
             "Restore" if group.kind in {"ignored", "not_faces"} else "Confirm"
         )
@@ -339,7 +363,10 @@ class FaceManagerDialog(QDialog):
         else:
             self.group_detail.setText("Use context or defer this low-payoff decision until later.")
             self.name_entry.clear()
-        self.review_all_button.setVisible(len(group.face_ids) > len(group.representative_ids))
+        self.review_all_button.setVisible(
+            len(group.face_ids) > len(group.representative_ids)
+        )
+        self.group_selected_button.setVisible(group.kind == "loose")
         self._load_tiles(group, group.representative_ids)
         self._update_remove_button()
         QTimer.singleShot(0, self._focus_name_entry)
@@ -352,6 +379,8 @@ class FaceManagerDialog(QDialog):
 
     def _load_all_current_faces(self) -> None:
         if self._current_group is not None:
+            self._showing_all_faces = True
+            self.review_all_button.hide()
             self._load_tiles(self._current_group, self._current_group.face_ids)
 
     def _load_tiles(self, group: FaceReviewGroup, face_ids: Sequence[int]) -> None:
@@ -410,6 +439,48 @@ class FaceManagerDialog(QDialog):
             self.remove_button.setEnabled(
                 not self._busy and self._can_remove_selected_from_group()
             )
+        if hasattr(self, "group_selected_button"):
+            self.group_selected_button.setEnabled(
+                not self._busy
+                and self._current_group is not None
+                and self._current_group.kind == "loose"
+                and len(self._selected_ids()) >= 2
+            )
+
+    def _group_selected_loose_faces(self) -> None:
+        selected = self._selected_ids()
+        if (
+            self._current_group is None
+            or self._current_group.kind != "loose"
+            or len(selected) < 2
+        ):
+            return
+        self._mutate("group", selected, None)
+
+    def _open_group_context_menu(self, pos) -> None:  # type: ignore[no-untyped-def]
+        item = self.group_list.itemAt(pos)
+        if item is None:
+            return
+        row = self.group_list.row(item)
+        if row < 0 or row >= len(self._groups):
+            return
+        self.group_list.setCurrentRow(row)
+        menu = QMenu(self.group_list)
+        loose_action = menu.addAction("Mark all faces as loose")
+        selected = menu.exec(self.group_list.viewport().mapToGlobal(pos))
+        menu.deleteLater()
+        if selected == loose_action:
+            self._mark_current_group_loose()
+
+    def _mark_current_group_loose(self) -> None:
+        group = self._current_group
+        if group is None:
+            return
+        self._mutate(
+            "loose",
+            group.face_ids,
+            group.proposed_person_id,
+        )
 
     def _remove_selected_from_group(self) -> None:
         group = self._current_group
@@ -484,6 +555,7 @@ class FaceManagerDialog(QDialog):
         except Exception as error:
             QMessageBox.critical(self, "People", str(error))
             return
+        self._pending_mutation = (kind, face_ids, value)
         self._set_busy(True)
         self.group_detail.setText("Applying the reversible catalog decision…")
 
@@ -512,8 +584,7 @@ class FaceManagerDialog(QDialog):
                     )
                     self.group_list.clear()
                     for group in self._groups:
-                        suffix = f" · {group.confidence:.3f}" if group.kind == "proposal" else ""
-                        self.group_list.addItem(f"{group.title}    {group.count:,}{suffix}")
+                        self.group_list.addItem(self._group_list_label(group))
                     if self._groups:
                         self.group_list.setCurrentRow(0)
                     else:
@@ -541,19 +612,121 @@ class FaceManagerDialog(QDialog):
                             item.setToolTip(tile.rel_path)
                             self.face_list.addItem(item)
                         self.context_label.setText(
-                            f"Showing {len(result.tiles):,} representative face crops. "
+                            f"Showing {len(result.tiles):,} face crops. "
                             "No selection means the decision applies to the complete group."
                         )
         mutation_future = self._mutation_future
         if mutation_future is not None and mutation_future.done():
             self._mutation_future = None
             try:
-                mutation_future.result()
+                result = mutation_future.result()
             except Exception as error:
+                self._pending_mutation = None
                 QMessageBox.critical(self, "People", str(error))
                 self._set_busy(False)
             else:
-                self.refresh_groups()
+                pending = self._pending_mutation
+                self._pending_mutation = None
+                if pending is None:
+                    self.refresh_groups()
+                    return
+                kind, requested_ids, value = pending
+                local_exclusion = kind in {
+                    "remove",
+                    "defer",
+                    "different",
+                    "separate",
+                } or (
+                    kind == "status" and value != FACE_STATUS_ACTIVE
+                )
+                if local_exclusion:
+                    affected_ids = (
+                        tuple(int(face_id) for face_id in result)
+                        if isinstance(result, (tuple, list))
+                        else requested_ids
+                    )
+                    self._apply_local_exclusion(affected_ids)
+                    self._set_busy(False)
+                elif kind == "group":
+                    review_index = self.view_combo.findData("review")
+                    if review_index >= 0 and self.view_combo.currentIndex() != review_index:
+                        self.view_combo.setCurrentIndex(review_index)
+                    else:
+                        self.refresh_groups()
+                else:
+                    self.refresh_groups()
+
+    @staticmethod
+    def _group_list_label(group: FaceReviewGroup) -> str:
+        suffix = f" · {group.confidence:.3f}" if group.kind == "proposal" else ""
+        return f"{group.title}    {group.count:,}{suffix}"
+
+    def _apply_local_exclusion(self, face_ids: Sequence[int]) -> None:
+        group = self._current_group
+        row = self.group_list.currentRow()
+        if group is None or row < 0 or row >= len(self._groups):
+            return
+        removed = set(int(face_id) for face_id in face_ids)
+        remaining_ids = tuple(
+            face_id for face_id in group.face_ids if face_id not in removed
+        )
+        if len(remaining_ids) == len(group.face_ids):
+            return
+        for item_row in range(self.face_list.count() - 1, -1, -1):
+            item = self.face_list.item(item_row)
+            if int(item.data(Qt.ItemDataRole.UserRole)) in removed:
+                self.face_list.takeItem(item_row)
+        self._current_tiles = tuple(
+            tile for tile in self._current_tiles if tile.id not in removed
+        )
+        groups = list(self._groups)
+        if not remaining_ids:
+            groups.pop(row)
+            self._groups = tuple(groups)
+            self._current_group = None
+            self.group_list.takeItem(row)
+            if groups:
+                self.group_list.setCurrentRow(min(row, len(groups) - 1))
+            else:
+                self.group_title.setText("Nothing remains in this queue")
+                self.group_detail.setText(
+                    "Use Refresh to include decisions added by background indexing."
+                )
+                self.face_list.clear()
+                self.review_all_button.hide()
+                self.group_selected_button.hide()
+            return
+        updated = replace(
+            group,
+            face_ids=remaining_ids,
+            representative_ids=tuple(
+                face_id
+                for face_id in group.representative_ids
+                if face_id not in removed
+            ),
+            count=len(remaining_ids),
+        )
+        groups[row] = updated
+        self._groups = tuple(groups)
+        self._current_group = updated
+        item = self.group_list.item(row)
+        if item is not None:
+            item.setText(self._group_list_label(updated))
+        self.group_title.setText(
+            f"{updated.title} · {updated.count:,} "
+            f"face{'s' if updated.count != 1 else ''}"
+        )
+        self.group_detail.setText(
+            "Excluded faces were removed in place; continue reviewing this group."
+        )
+        self.review_all_button.setVisible(
+            not self._showing_all_faces
+            and len(updated.face_ids) > len(updated.representative_ids)
+        )
+        self.context_label.setText(
+            f"Showing {self.face_list.count():,} face crops. "
+            "Excluded faces were removed without rebuilding the queue."
+        )
 
     def _set_busy(self, busy: bool) -> None:
         self._busy = busy
@@ -570,6 +743,7 @@ class FaceManagerDialog(QDialog):
             self.not_face_button,
             self.undo_button,
             self.review_all_button,
+            self.group_selected_button,
         ):
             widget.setEnabled(not busy)
         self._remove_shortcut.setEnabled(not busy and not self.name_entry.hasFocus())

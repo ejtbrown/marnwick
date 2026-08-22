@@ -56,6 +56,8 @@ def init_face_schema(connection: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_faces_person
             ON faces(person_id, status, quality DESC);
+        CREATE INDEX IF NOT EXISTS idx_faces_person_verified_image
+            ON faces(person_id, status, confirmed, image_id);
         CREATE INDEX IF NOT EXISTS idx_faces_review
             ON faces(status, person_id, deferred_until_ns);
         CREATE INDEX IF NOT EXISTS idx_faces_image
@@ -100,6 +102,27 @@ def init_face_schema(connection: sqlite3.Connection) -> None:
             CHECK(length(first_crop_hash) = 64),
             CHECK(length(second_crop_hash) = 64)
         );
+
+        CREATE TABLE IF NOT EXISTS face_forced_loose (
+            face_id INTEGER PRIMARY KEY,
+            created_at_ns INTEGER NOT NULL,
+            FOREIGN KEY(face_id) REFERENCES faces(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS face_manual_groups (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at_ns INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS face_manual_group_faces (
+            group_id INTEGER NOT NULL,
+            face_id INTEGER NOT NULL UNIQUE,
+            PRIMARY KEY(group_id, face_id),
+            FOREIGN KEY(group_id) REFERENCES face_manual_groups(id) ON DELETE CASCADE,
+            FOREIGN KEY(face_id) REFERENCES faces(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_face_manual_group_faces_group
+            ON face_manual_group_faces(group_id, face_id);
 
         CREATE TABLE IF NOT EXISTS face_operations (
             id INTEGER PRIMARY KEY AUTOINCREMENT,

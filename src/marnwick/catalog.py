@@ -23,6 +23,7 @@ import tempfile
 import threading
 import time
 import sys
+import unicodedata
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
@@ -136,6 +137,7 @@ class CustomVirtualDirectory:
     tags: tuple[str, ...]
     expression: VirtualDirectoryRule | None = None
     advanced: bool = False
+    people: tuple[str, ...] = ()
 
 _NOREPLACE_UNAVAILABLE_ERRNOS = frozenset(
     {
@@ -1168,6 +1170,10 @@ def _unlock_catalog_file(path: Path) -> None:
 
 def normalize_tag(name: str) -> str:
     return " ".join(name.strip().split()).casefold()
+
+
+def normalize_person_name(name: str) -> str:
+    return unicodedata.normalize("NFKC", " ".join(name.strip().split())).casefold()
 
 
 def parse_tag_entry(text: str) -> list[str]:
@@ -7626,6 +7632,44 @@ class Catalog:
                 if children[0].value == children[1].value:
                     raise ValueError("XOR rules require two different tags")
                 return VirtualDirectoryRule("tag_xor", children=children)
+            if kind == "person":
+                if candidate.children:
+                    raise ValueError("person rules cannot contain child rules")
+                normalized_person = normalize_person_name(
+                    candidate.value or candidate.display_value
+                )
+                if not normalized_person:
+                    raise ValueError("person rules require a person")
+                display_value = " ".join(
+                    (candidate.display_value or candidate.value).strip().split()
+                )
+                if verify_tags:
+                    row = self._conn.execute(
+                        "SELECT name FROM people WHERE normalized = ?",
+                        (normalized_person,),
+                    ).fetchone()
+                    if row is None:
+                        raise ValueError(
+                            f'person "{display_value}" no longer exists'
+                        )
+                    display_value = str(row["name"])
+                return VirtualDirectoryRule(
+                    "person",
+                    value=normalized_person,
+                    display_value=display_value,
+                )
+            if kind == "person_xor":
+                if len(candidate.children) != 2 or any(
+                    child.kind != "person" for child in candidate.children
+                ):
+                    raise ValueError("XOR rules require exactly two people")
+                children = tuple(
+                    canonicalize(child, depth + 1)
+                    for child in candidate.children
+                )
+                if children[0].value == children[1].value:
+                    raise ValueError("XOR rules require two different people")
+                return VirtualDirectoryRule("person_xor", children=children)
             if kind == "false":
                 return VirtualDirectoryRule("false")
             raise ValueError(f"unsupported virtual directory rule: {kind}")
@@ -7645,6 +7689,7 @@ class Catalog:
         filename_regex: str,
         directories: Sequence[str],
         tags: Sequence[tuple[str, str]],
+        people: Sequence[tuple[str, str]] = (),
     ) -> VirtualDirectoryRule:
         directory_rules = tuple(
             VirtualDirectoryRule("directory", value=dir_rel)
@@ -7666,6 +7711,14 @@ class Catalog:
                 display_value=tag_name,
             )
             for tag_name, normalized_tag in tags
+        )
+        rules.extend(
+            VirtualDirectoryRule(
+                "person",
+                value=normalized_person,
+                display_value=person_name,
+            )
+            for person_name, normalized_person in people
         )
         return VirtualDirectoryRule("all", children=tuple(rules))
 
@@ -7731,6 +7784,37 @@ class Catalog:
                 """,
                 [*left_params, *right_params],
             )
+        if rule.kind == "person":
+            return (
+                """
+                images.id IN (
+                    SELECT faces.image_id
+                    FROM faces
+                    JOIN people ON people.id = faces.person_id
+                    WHERE faces.status = 'active'
+                        AND faces.confirmed = 1
+                        AND people.normalized = ?
+                )
+                """,
+                [rule.value],
+            )
+        if rule.kind == "person_xor":
+            left_sql, left_params = cls._compile_virtual_directory_rule(
+                rule.children[0]
+            )
+            right_sql, right_params = cls._compile_virtual_directory_rule(
+                rule.children[1]
+            )
+            return (
+                f"""
+                (
+                    (CASE WHEN {left_sql} THEN 1 ELSE 0 END)
+                    + (CASE WHEN {right_sql} THEN 1 ELSE 0 END)
+                    = 1
+                )
+                """,
+                [*left_params, *right_params],
+            )
         raise ValueError(f"unsupported virtual directory rule: {rule.kind}")
 
     @staticmethod
@@ -7780,6 +7864,7 @@ class Catalog:
         filename_regex: str,
         directories: Iterable[str],
         tags: Iterable[str],
+        people: Iterable[str] = (),
     ) -> CustomVirtualDirectory:
         """Persist one saved image query after validating all criteria."""
 
@@ -7803,6 +7888,12 @@ class Catalog:
             normalized_tag = normalize_tag(clean_tag)
             if normalized_tag:
                 requested_tags.setdefault(normalized_tag, clean_tag)
+        requested_people: dict[str, str] = {}
+        for person in people:
+            clean_person = " ".join(str(person).strip().split())
+            normalized_person = normalize_person_name(clean_person)
+            if normalized_person:
+                requested_people.setdefault(normalized_person, clean_person)
 
         with self._database_savepoint("create_virtual_directory"):
             if self._conn.execute(
@@ -7821,10 +7912,22 @@ class Catalog:
                         f'tag "{requested_tags[normalized_tag]}" no longer exists'
                     )
                 stored_tags.append((str(row["name"]), normalized_tag))
+            stored_people: list[tuple[str, str]] = []
+            for normalized_person in requested_people:
+                row = self._conn.execute(
+                    "SELECT name FROM people WHERE normalized = ?",
+                    (normalized_person,),
+                ).fetchone()
+                if row is None:
+                    raise ValueError(
+                        f'person "{requested_people[normalized_person]}" no longer exists'
+                    )
+                stored_people.append((str(row["name"]), normalized_person))
             expression = self._simple_virtual_directory_expression(
                 pattern,
                 selected_directories,
                 stored_tags,
+                stored_people,
             )
             cursor = self._conn.execute(
                 """
@@ -7873,6 +7976,19 @@ class Catalog:
                 (
                     (virtual_directory_id, tag_name, normalized_tag)
                     for tag_name, normalized_tag in stored_tags
+                ),
+            )
+            self._conn.executemany(
+                """
+                INSERT INTO virtual_directory_people(
+                    virtual_directory_id,
+                    person_name,
+                    person_normalized
+                ) VALUES (?, ?, ?)
+                """,
+                (
+                    (virtual_directory_id, person_name, normalized_person)
+                    for person_name, normalized_person in stored_people
                 ),
             )
         definition = self.get_custom_virtual_directory(virtual_directory_id)
@@ -7926,6 +8042,200 @@ class Catalog:
             raise sqlite3.DatabaseError("created virtual directory could not be read back")
         return definition
 
+    def update_custom_virtual_directory(
+        self,
+        virtual_directory_id: int,
+        name: str,
+        filename_regex: str,
+        directories: Iterable[str],
+        tags: Iterable[str],
+        people: Iterable[str] = (),
+    ) -> CustomVirtualDirectory:
+        """Replace one saved query with validated Simple-mode criteria."""
+
+        self._assert_writable()
+        saved_id = int(virtual_directory_id)
+        clean_name = " ".join(name.strip().split())
+        normalized_name = clean_name.casefold()
+        if not normalized_name:
+            raise ValueError("virtual directory name is required")
+        pattern = str(filename_regex) if str(filename_regex).strip() else ""
+        if pattern:
+            try:
+                re.compile(pattern)
+            except re.error as error:
+                raise ValueError(
+                    f"invalid file name regular expression: {error}"
+                ) from error
+        selected_directories = self._normalized_virtual_directory_paths(directories)
+        requested_tags = {
+            normalize_tag(clean): clean
+            for value in tags
+            if (clean := " ".join(str(value).strip().split()))
+            and normalize_tag(clean)
+        }
+        requested_people = {
+            normalize_person_name(clean): clean
+            for value in people
+            if (clean := " ".join(str(value).strip().split()))
+            and normalize_person_name(clean)
+        }
+        with self._database_savepoint("update_virtual_directory"):
+            if self._conn.execute(
+                "SELECT 1 FROM virtual_directories WHERE id = ?",
+                (saved_id,),
+            ).fetchone() is None:
+                raise ValueError("the virtual directory no longer exists")
+            if self._conn.execute(
+                "SELECT 1 FROM virtual_directories "
+                "WHERE normalized = ? AND id <> ?",
+                (normalized_name, saved_id),
+            ).fetchone() is not None:
+                raise ValueError(
+                    f'a virtual directory named "{clean_name}" already exists'
+                )
+            stored_tags: list[tuple[str, str]] = []
+            for normalized_tag, requested_name in requested_tags.items():
+                row = self._conn.execute(
+                    "SELECT name FROM tags WHERE normalized = ?",
+                    (normalized_tag,),
+                ).fetchone()
+                if row is None:
+                    raise ValueError(f'tag "{requested_name}" no longer exists')
+                stored_tags.append((str(row["name"]), normalized_tag))
+            stored_people: list[tuple[str, str]] = []
+            for normalized_person, requested_name in requested_people.items():
+                row = self._conn.execute(
+                    "SELECT name FROM people WHERE normalized = ?",
+                    (normalized_person,),
+                ).fetchone()
+                if row is None:
+                    raise ValueError(f'person "{requested_name}" no longer exists')
+                stored_people.append((str(row["name"]), normalized_person))
+            expression = self._simple_virtual_directory_expression(
+                pattern,
+                selected_directories,
+                stored_tags,
+                stored_people,
+            )
+            self._conn.execute(
+                """
+                UPDATE virtual_directories
+                SET name = ?, normalized = ?, filename_regex = ?,
+                    expression_json = ?, is_advanced = 0
+                WHERE id = ?
+                """,
+                (
+                    clean_name,
+                    normalized_name,
+                    pattern,
+                    self._virtual_directory_rule_json(expression),
+                    saved_id,
+                ),
+            )
+            for table in (
+                "virtual_directory_directories",
+                "virtual_directory_tags",
+                "virtual_directory_people",
+            ):
+                self._conn.execute(
+                    f"DELETE FROM {table} WHERE virtual_directory_id = ?",
+                    (saved_id,),
+                )
+            self._conn.executemany(
+                "INSERT INTO virtual_directory_directories"
+                "(virtual_directory_id, dir_rel, descendant_start, descendant_end) "
+                "VALUES (?, ?, ?, ?)",
+                (
+                    (
+                        saved_id,
+                        dir_rel,
+                        *(descendant_range_bounds(dir_rel) if dir_rel else ("", "")),
+                    )
+                    for dir_rel in selected_directories
+                ),
+            )
+            self._conn.executemany(
+                "INSERT INTO virtual_directory_tags"
+                "(virtual_directory_id, tag_name, tag_normalized) VALUES (?, ?, ?)",
+                (
+                    (saved_id, tag_name, normalized_tag)
+                    for tag_name, normalized_tag in stored_tags
+                ),
+            )
+            self._conn.executemany(
+                "INSERT INTO virtual_directory_people"
+                "(virtual_directory_id, person_name, person_normalized) VALUES (?, ?, ?)",
+                (
+                    (saved_id, person_name, normalized_person)
+                    for person_name, normalized_person in stored_people
+                ),
+            )
+        definition = self.get_custom_virtual_directory(saved_id)
+        if definition is None:  # pragma: no cover - committed row invariant
+            raise sqlite3.DatabaseError("updated virtual directory could not be read back")
+        return definition
+
+    def update_advanced_custom_virtual_directory(
+        self,
+        virtual_directory_id: int,
+        name: str,
+        expression: VirtualDirectoryRule,
+    ) -> CustomVirtualDirectory:
+        """Replace one saved query with a validated Advanced-mode expression."""
+
+        self._assert_writable()
+        saved_id = int(virtual_directory_id)
+        clean_name = " ".join(name.strip().split())
+        normalized_name = clean_name.casefold()
+        if not normalized_name:
+            raise ValueError("virtual directory name is required")
+        with self._database_savepoint("update_advanced_virtual_directory"):
+            if self._conn.execute(
+                "SELECT 1 FROM virtual_directories WHERE id = ?",
+                (saved_id,),
+            ).fetchone() is None:
+                raise ValueError("the virtual directory no longer exists")
+            if self._conn.execute(
+                "SELECT 1 FROM virtual_directories "
+                "WHERE normalized = ? AND id <> ?",
+                (normalized_name, saved_id),
+            ).fetchone() is not None:
+                raise ValueError(
+                    f'a virtual directory named "{clean_name}" already exists'
+                )
+            canonical = self._canonical_virtual_directory_rule(
+                expression,
+                verify_tags=True,
+            )
+            self._conn.execute(
+                """
+                UPDATE virtual_directories
+                SET name = ?, normalized = ?, filename_regex = '',
+                    expression_json = ?, is_advanced = 1
+                WHERE id = ?
+                """,
+                (
+                    clean_name,
+                    normalized_name,
+                    self._virtual_directory_rule_json(canonical),
+                    saved_id,
+                ),
+            )
+            for table in (
+                "virtual_directory_directories",
+                "virtual_directory_tags",
+                "virtual_directory_people",
+            ):
+                self._conn.execute(
+                    f"DELETE FROM {table} WHERE virtual_directory_id = ?",
+                    (saved_id,),
+                )
+        definition = self.get_custom_virtual_directory(saved_id)
+        if definition is None:  # pragma: no cover - committed row invariant
+            raise sqlite3.DatabaseError("updated virtual directory could not be read back")
+        return definition
+
     def list_custom_virtual_directories(self) -> list[CustomVirtualDirectory]:
         rows = self._conn.execute(
             """
@@ -7948,8 +8258,16 @@ class Catalog:
             ORDER BY virtual_directory_id, tag_name COLLATE NOCASE, tag_name
             """
         )
+        people_rows = self._conn.execute(
+            """
+            SELECT virtual_directory_id, person_name, person_normalized
+            FROM virtual_directory_people
+            ORDER BY virtual_directory_id, person_name COLLATE NOCASE, person_name
+            """
+        )
         directories_by_id: dict[int, list[str]] = defaultdict(list)
         tags_by_id: dict[int, list[tuple[str, str]]] = defaultdict(list)
+        people_by_id: dict[int, list[tuple[str, str]]] = defaultdict(list)
         for row in directory_rows:
             directories_by_id[int(row["virtual_directory_id"])].append(
                 str(row["dir_rel"])
@@ -7958,11 +8276,16 @@ class Catalog:
             tags_by_id[int(row["virtual_directory_id"])].append(
                 (str(row["tag_name"]), str(row["tag_normalized"]))
             )
+        for row in people_rows:
+            people_by_id[int(row["virtual_directory_id"])].append(
+                (str(row["person_name"]), str(row["person_normalized"]))
+            )
         definitions: list[CustomVirtualDirectory] = []
         for row in rows:
             saved_id = int(row["id"])
             directories = tuple(directories_by_id[saved_id])
             stored_tags = tuple(tags_by_id[saved_id])
+            stored_people = tuple(people_by_id[saved_id])
             advanced = bool(row["is_advanced"])
             expression = self._stored_virtual_directory_expression(
                 row["expression_json"],
@@ -7970,6 +8293,7 @@ class Catalog:
                 filename_regex=str(row["filename_regex"]),
                 directories=directories,
                 tags=stored_tags,
+                people=stored_people,
             )
             definitions.append(
                 CustomVirtualDirectory(
@@ -7980,6 +8304,7 @@ class Catalog:
                     tags=tuple(name for name, _normalized in stored_tags),
                     expression=expression,
                     advanced=advanced,
+                    people=tuple(name for name, _normalized in stored_people),
                 )
             )
         return definitions
@@ -8022,6 +8347,18 @@ class Catalog:
                 (int(virtual_directory_id),),
             )
         )
+        stored_people = tuple(
+            (str(value["person_name"]), str(value["person_normalized"]))
+            for value in self._conn.execute(
+                """
+                SELECT person_name, person_normalized
+                FROM virtual_directory_people
+                WHERE virtual_directory_id = ?
+                ORDER BY person_name COLLATE NOCASE, person_name
+                """,
+                (int(virtual_directory_id),),
+            )
+        )
         advanced = bool(row["is_advanced"])
         expression = self._stored_virtual_directory_expression(
             row["expression_json"],
@@ -8029,6 +8366,7 @@ class Catalog:
             filename_regex=str(row["filename_regex"]),
             directories=directories,
             tags=stored_tags,
+            people=stored_people,
         )
         return CustomVirtualDirectory(
             id=int(row["id"]),
@@ -8038,6 +8376,7 @@ class Catalog:
             tags=tuple(name for name, _normalized in stored_tags),
             expression=expression,
             advanced=advanced,
+            people=tuple(name for name, _normalized in stored_people),
         )
 
     def _stored_virtual_directory_expression(
@@ -8048,6 +8387,7 @@ class Catalog:
         filename_regex: str,
         directories: Sequence[str],
         tags: Sequence[tuple[str, str]],
+        people: Sequence[tuple[str, str]],
     ) -> VirtualDirectoryRule:
         expression = self._virtual_directory_rule_from_json(expression_json)
         if expression is not None:
@@ -8064,6 +8404,7 @@ class Catalog:
             filename_regex,
             directories,
             tags,
+            people,
         )
 
     def delete_custom_virtual_directory(self, virtual_directory_id: int) -> bool:
@@ -8197,6 +8538,81 @@ class Catalog:
                 self._row_to_record(row, include_blob=include_blobs)
                 for row in rows
             ]
+
+    @staticmethod
+    def _verified_person_image_filter(person_id: int) -> tuple[str, list[object]]:
+        return (
+            """
+            images.id IN (
+                SELECT faces.image_id FROM faces
+                WHERE faces.person_id = ?
+                  AND faces.status = 'active'
+                  AND faces.confirmed = 1
+            )
+            """,
+            [int(person_id)],
+        )
+
+    def person_image_and_slideshow_count(
+        self,
+        person_id: int,
+        *,
+        cancel_check: CancelCallback | None = None,
+    ) -> tuple[int, int]:
+        filter_sql, filter_params = self._verified_person_image_filter(person_id)
+        return self._image_and_slideshow_count_where(
+            filter_sql,
+            filter_params,
+            cancel_check,
+        )
+
+    def list_images_for_person_page(
+        self,
+        person_id: int,
+        sort_order: SortOrder = SortOrder.NAME_ASC,
+        *,
+        limit: int,
+        offset: int = 0,
+        include_blobs: bool = False,
+        cancel_check: CancelCallback | None = None,
+    ) -> list[ImageRecord]:
+        limit, offset = self._validate_query_page(limit, offset)
+        columns = self._image_columns(include_blobs)
+        order_clause = self._deterministic_image_order_clause(sort_order)
+        filter_sql, filter_params = self._verified_person_image_filter(person_id)
+        with self._sqlite_cancel_progress(cancel_check):
+            rows = self._iter_cursor_rows(
+                self._conn.execute(
+                    f"""
+                    SELECT {columns}
+                    FROM images
+                    WHERE {filter_sql}
+                    ORDER BY {order_clause}
+                    LIMIT ? OFFSET ?
+                    """,
+                    (*filter_params, limit, offset),
+                ),
+                cancel_check,
+            )
+            return [
+                self._row_to_record(row, include_blob=include_blobs)
+                for row in rows
+            ]
+
+    def list_slideshow_rel_paths_for_person(
+        self,
+        person_id: int,
+        *,
+        sort_order: SortOrder | None = None,
+        cancel_check: CancelCallback | None = None,
+    ) -> list[str]:
+        filter_sql, filter_params = self._verified_person_image_filter(person_id)
+        return self._slideshow_rel_paths_where(
+            filter_sql,
+            filter_params,
+            cancel_check,
+            sort_order=sort_order,
+        )
 
     def delete_tag(self, name: str) -> bool:
         """Delete one normalized tag and every image assignment that uses it."""
@@ -10095,6 +10511,15 @@ class Catalog:
                 tag_name TEXT NOT NULL,
                 tag_normalized TEXT NOT NULL,
                 PRIMARY KEY(virtual_directory_id, tag_normalized),
+                FOREIGN KEY(virtual_directory_id)
+                    REFERENCES virtual_directories(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS virtual_directory_people (
+                virtual_directory_id INTEGER NOT NULL,
+                person_name TEXT NOT NULL,
+                person_normalized TEXT NOT NULL,
+                PRIMARY KEY(virtual_directory_id, person_normalized),
                 FOREIGN KEY(virtual_directory_id)
                     REFERENCES virtual_directories(id) ON DELETE CASCADE
             );

@@ -1,0 +1,2 @@
+-c requirements-dev.lock
+onnxruntime-gpu==1.27.0
