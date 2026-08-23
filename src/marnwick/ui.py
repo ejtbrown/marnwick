@@ -142,6 +142,7 @@ from .catalog import (
     is_marnwick_internal_artifact_name,
     is_trash_rel_path,
     is_image_name,
+    normalize_person_name,
     normalize_tag,
     parse_tag_entry,
 )
@@ -177,7 +178,7 @@ from .face_models import (
     face_models_are_valid,
 )
 from .face_ui import FaceManagerDialog
-from .faces import FaceStore
+from .faces import FaceStore, PersonRecord
 from .document_ops import MAX_SOURCE_BYTES, load_document_html
 from .folder_icon import render_folder_icon
 from .gpu_test import (
@@ -288,6 +289,9 @@ VIRTUAL_KIND_DUPLICATES = "duplicates"
 VIRTUAL_KIND_VERY_SIMILAR = "very-similar"
 VIRTUAL_KIND_CUSTOM = "custom"
 VIRTUAL_KIND_PEOPLE_ROOT = "people-root"
+VIRTUAL_KIND_PEOPLE_RECOGNIZE_ROOT = "people-recognize-root"
+VIRTUAL_KIND_PEOPLE_CATALOG_ROOT = "people-catalog-root"
+VIRTUAL_KIND_PERSON = "person"
 VIRTUAL_KIND_PEOPLE_REVIEW = "people-review"
 VIRTUAL_KIND_PEOPLE_UNNAMED = "people-unnamed"
 VIRTUAL_KIND_PEOPLE_LOOSE = "people-loose"
@@ -676,6 +680,7 @@ class TreeBuildTask:
     page_cancel_event: Event | None
     tags: tuple[str, ...]
     custom_virtual_directories: tuple[CustomVirtualDirectory, ...]
+    people: tuple[PersonRecord, ...]
 
 
 @dataclass(slots=True)
@@ -686,6 +691,7 @@ class TreePageResult:
     directories: list[str]
     tags: tuple[str, ...] | None
     custom_virtual_directories: tuple[CustomVirtualDirectory, ...] | None = None
+    people: tuple[PersonRecord, ...] | None = None
     tags_have_more: bool = False
     directories_with_children: frozenset[str] = field(default_factory=frozenset)
 
@@ -3799,7 +3805,10 @@ class DirectoryTree(QTreeWidget):
         if kind == VIRTUAL_KIND_ROOT:
             return {"new": menu.addAction("New")}
         if kind == VIRTUAL_KIND_CUSTOM:
-            return {"delete": menu.addAction("Delete")}
+            return {
+                "edit": menu.addAction("Edit"),
+                "delete": menu.addAction("Delete"),
+            }
         return {}
 
     def _open_context_menu(self, pos) -> None:  # type: ignore[no-untyped-def]
@@ -3817,6 +3826,12 @@ class DirectoryTree(QTreeWidget):
             root = Path(item.data(0, CATALOG_ROOT_ROLE))
             if selected == actions.get("new"):
                 self.window.open_new_virtual_directory(root)
+            elif selected == actions.get("edit"):
+                with suppress(TypeError, ValueError):
+                    self.window.open_edit_virtual_directory(
+                        root,
+                        int(item.data(0, VIRTUAL_VALUE_ROLE)),
+                    )
             elif selected == actions.get("delete"):
                 with suppress(TypeError, ValueError):
                     self.window.delete_custom_virtual_directory(
@@ -4081,6 +4096,7 @@ class MainWindow(QMainWindow):
         self._tree_custom_virtual_cache: dict[
             Path, tuple[CustomVirtualDirectory, ...]
         ] = {}
+        self._tree_people_cache: dict[Path, tuple[PersonRecord, ...]] = {}
         self._tree_item_maps: dict[Path, dict[str, QTreeWidgetItem]] = {}
         self._tree_expanded_state: set[TreeStateKey] = set()
         self._tree_known_state: set[TreeStateKey] = set()
@@ -5283,6 +5299,16 @@ class MainWindow(QMainWindow):
         dialog = LogsDialog(self.workspace.catalogs, self)
         dialog.exec()
         dialog.deleteLater()
+        if self.workspace.catalog_for_root(catalog.root) is catalog:
+            self._request_incremental_tree_rebuild(
+                catalog,
+                reason="people_updated",
+            )
+            if (
+                self.current_catalog is catalog
+                and self.current_virtual_kind == VIRTUAL_KIND_PERSON
+            ):
+                self.load_current_directory(preserve_selection=True)
 
     def open_gpu_test(self) -> None:
         self.ensure_lama_model(self, self._open_gpu_test_with_model)
@@ -5672,6 +5698,13 @@ class MainWindow(QMainWindow):
                     if not isinstance(value, (tuple, list)):
                         raise ValueError("Missing faces to separate")
                     result = store.separate_faces(face_ids, tuple(int(item) for item in value))
+                elif kind == "group":
+                    result = store.group_faces(face_ids)
+                elif kind == "loose":
+                    result = store.mark_faces_loose(
+                        face_ids,
+                        person_id=int(value) if value is not None else None,
+                    )
                 elif kind == "remove":
                     if not isinstance(value, dict):
                         raise ValueError("Missing face group")
@@ -5930,9 +5963,10 @@ class MainWindow(QMainWindow):
             filename_regex = "" if advanced else dialog.filename_regex()
             directories = () if advanced else dialog.selected_directories()
             tags = () if advanced else dialog.selected_tags()
+            people = () if advanced else dialog.selected_people()
         else:
             name = filename_regex = ""
-            directories = tags = ()
+            directories = tags = people = ()
             expression = None
         dialog.deleteLater()
         if accepted and self.workspace.catalog_for_root(catalog.root) is catalog:
@@ -5949,7 +5983,55 @@ class MainWindow(QMainWindow):
                     filename_regex,
                     directories,
                     tags,
+                    people,
                 )
+
+    def open_edit_virtual_directory(
+        self,
+        root: Path,
+        virtual_directory_id: int,
+    ) -> None:
+        catalog = self.workspace.catalog_for_root(root)
+        if catalog is None:
+            return
+        definition = catalog.get_custom_virtual_directory(virtual_directory_id)
+        if definition is None:
+            show_error(
+                self,
+                "Edit Virtual Directory",
+                "The selected virtual directory no longer exists.",
+            )
+            return
+        dialog = NewVirtualDirectoryDialog(
+            catalog,
+            self,
+            definition=definition,
+        )
+        accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        if accepted:
+            name = dialog.virtual_directory_name()
+            advanced = dialog.advanced_mode()
+            expression = dialog.advanced_expression() if advanced else None
+            filename_regex = "" if advanced else dialog.filename_regex()
+            directories = () if advanced else dialog.selected_directories()
+            tags = () if advanced else dialog.selected_tags()
+            people = () if advanced else dialog.selected_people()
+        else:
+            name = filename_regex = ""
+            directories = tags = people = ()
+            expression = None
+        dialog.deleteLater()
+        if accepted and self.workspace.catalog_for_root(catalog.root) is catalog:
+            self.queue_custom_virtual_directory_update(
+                catalog,
+                definition.id,
+                name,
+                filename_regex,
+                directories,
+                tags,
+                people,
+                expression,
+            )
 
     def queue_custom_virtual_directory_creation(
         self,
@@ -5958,6 +6040,7 @@ class MainWindow(QMainWindow):
         filename_regex: str,
         directories: Sequence[str],
         tags: Sequence[str],
+        people: Sequence[str] = (),
     ) -> MovePayloadTask | None:
         if self.workspace.catalog_for_root(catalog.root) is not catalog:
             return None
@@ -5976,6 +6059,7 @@ class MainWindow(QMainWindow):
                 filename_regex,
                 tuple(directories),
                 tuple(tags),
+                tuple(people),
                 None,
                 task,
             ),
@@ -6012,11 +6096,57 @@ class MainWindow(QMainWindow):
                 "",
                 (),
                 (),
+                (),
                 canonical,
                 task,
             ),
             completion_verb="Created",
             error_title="Create Virtual Directory",
+        )
+        mutation.edit_owner = self
+        return mutation
+
+    def queue_custom_virtual_directory_update(
+        self,
+        catalog: Catalog,
+        virtual_directory_id: int,
+        name: str,
+        filename_regex: str,
+        directories: Sequence[str],
+        tags: Sequence[str],
+        people: Sequence[str],
+        expression: VirtualDirectoryRule | None,
+    ) -> MovePayloadTask | None:
+        if self.workspace.catalog_for_root(catalog.root) is not catalog:
+            return None
+        clean_name = " ".join(name.strip().split())
+        if not clean_name or (expression is None and not directories):
+            return None
+        if expression is not None:
+            try:
+                expression = catalog.validate_virtual_directory_rule(expression)
+            except ValueError:
+                return None
+        saved_id = int(virtual_directory_id)
+        mutation = self._queue_catalog_mutation(
+            catalog,
+            label="Updating virtual directory",
+            dest_dir_rel="",
+            priority=ActionPriority.TAG_UPDATE,
+            worker=lambda task: self._update_custom_virtual_directory_worker(
+                catalog.root,
+                catalog.root_identity,
+                saved_id,
+                clean_name,
+                filename_regex,
+                tuple(directories),
+                tuple(tags),
+                tuple(people),
+                expression,
+                task,
+            ),
+            completion_verb="Updated",
+            error_title="Edit Virtual Directory",
         )
         mutation.edit_owner = self
         return mutation
@@ -7065,6 +7195,7 @@ class MainWindow(QMainWindow):
         filename_regex: str,
         directories: Sequence[str],
         tags: Sequence[str],
+        people: Sequence[str],
         expression: VirtualDirectoryRule | None,
         task: IndexTask,
     ) -> MovePayloadResult:
@@ -7083,6 +7214,7 @@ class MainWindow(QMainWindow):
                         filename_regex,
                         directories,
                         tags,
+                        people,
                     )
                 else:
                     catalog.create_advanced_custom_virtual_directory(
@@ -7101,6 +7233,56 @@ class MainWindow(QMainWindow):
         task.update(1, 1, name)
         task.mark_done()
         return MovePayloadResult(1, created, {root})
+
+    @staticmethod
+    def _update_custom_virtual_directory_worker(
+        root: Path,
+        expected_root_identity: tuple[int, int],
+        virtual_directory_id: int,
+        name: str,
+        filename_regex: str,
+        directories: Sequence[str],
+        tags: Sequence[str],
+        people: Sequence[str],
+        expression: VirtualDirectoryRule | None,
+        task: IndexTask,
+    ) -> MovePayloadResult:
+        task.update(0, 1, name)
+        task.check_canceled()
+
+        def write() -> int:
+            with Catalog.open_writer(
+                root,
+                expected_root_identity=expected_root_identity,
+                expected_storage_identity=task.expected_storage_identity,
+            ) as catalog:
+                if expression is None:
+                    catalog.update_custom_virtual_directory(
+                        virtual_directory_id,
+                        name,
+                        filename_regex,
+                        directories,
+                        tags,
+                        people,
+                    )
+                else:
+                    catalog.update_advanced_custom_virtual_directory(
+                        virtual_directory_id,
+                        name,
+                        expression,
+                    )
+                return 1
+
+        updated = MainWindow._wait_for_tag_database(
+            task,
+            processed=0,
+            total=1,
+            current=name,
+            write=write,
+        )
+        task.update(1, 1, name)
+        task.mark_done()
+        return MovePayloadResult(1, updated, {root})
 
     @staticmethod
     def _delete_custom_virtual_directory_worker(
@@ -8258,6 +8440,7 @@ class MainWindow(QMainWindow):
         self._tree_item_maps.pop(resolved, None)
         self._tree_tag_cache.pop(resolved, None)
         self._tree_custom_virtual_cache.pop(resolved, None)
+        self._tree_people_cache.pop(resolved, None)
         self._tree_expanded_state = {key for key in self._tree_expanded_state if key[0] != resolved}
         self._tree_known_state = {key for key in self._tree_known_state if key[0] != resolved}
         self._successful_catalog_open_intents.pop(resolved, None)
@@ -8575,6 +8758,7 @@ class MainWindow(QMainWindow):
                     catalog.root,
                     (),
                 ),
+                people=self._tree_people_cache.get(catalog.root, ()),
             )
             if virtual_selected_item is not None:
                 selected_item = virtual_selected_item
@@ -8702,6 +8886,7 @@ class MainWindow(QMainWindow):
                 catalog.root,
                 (),
             ),
+            people=self._tree_people_cache.get(catalog.root, ()),
         )
         self._record_timing_phase(
             catalog.root,
@@ -8776,10 +8961,12 @@ class MainWindow(QMainWindow):
                     custom_virtual_directories = tuple(
                         catalog.list_custom_virtual_directories()
                     )
+                    people = tuple(FaceStore(catalog).people())
                 else:
                     tags = None
                     tags_have_more = False
                     custom_virtual_directories = None
+                    people = None
             finally:
                 with suppress(sqlite3.Error):
                     catalog._conn.execute("ROLLBACK")  # noqa: SLF001
@@ -8792,6 +8979,7 @@ class MainWindow(QMainWindow):
             directories=directories,
             tags=tags,
             custom_virtual_directories=custom_virtual_directories,
+            people=people,
             tags_have_more=tags_have_more,
             directories_with_children=frozenset(directories_with_children),
         )
@@ -8903,6 +9091,9 @@ class MainWindow(QMainWindow):
                 self._tree_custom_virtual_cache[task.catalog.root] = (
                     page_result.custom_virtual_directories
                 )
+            if page_result.people is not None:
+                task.people = page_result.people
+                self._tree_people_cache[task.catalog.root] = page_result.people
             if len(page) < TREE_BUILD_BATCH_SIZE:
                 task.total = task.processed + len(task.directories)
             if not page:
@@ -9066,6 +9257,7 @@ class MainWindow(QMainWindow):
             task.known_items,
             tags=task.tags,
             custom_virtual_directories=task.custom_virtual_directories,
+            people=task.people,
         )
         if self.current_catalog is not None and self.current_catalog.root == task.catalog.root:
             if self.current_virtual_kind is None:
@@ -9159,6 +9351,7 @@ class MainWindow(QMainWindow):
                     catalog.root,
                     (),
                 ),
+                people=self._tree_people_cache.get(catalog.root, ()),
             )
         elif item_by_dir is None:
             item_by_dir = {"": root_item}
@@ -9263,6 +9456,7 @@ class MainWindow(QMainWindow):
         *,
         tags: Sequence[str],
         custom_virtual_directories: Sequence[CustomVirtualDirectory] = (),
+        people: Sequence[PersonRecord] = (),
     ) -> QTreeWidgetItem | None:
         selected_item: QTreeWidgetItem | None = None
         tag_names = tuple(dict.fromkeys(tags))
@@ -9339,6 +9533,24 @@ class MainWindow(QMainWindow):
                     default=True,
                 )
             )
+            recognize_root = QTreeWidgetItem(["Recognize"])
+            self._set_virtual_tree_item_data(
+                recognize_root,
+                catalog,
+                VIRTUAL_KIND_PEOPLE_RECOGNIZE_ROOT,
+                "",
+            )
+            people_root.addChild(recognize_root)
+            recognize_root.setExpanded(
+                self._virtual_tree_item_should_expand(
+                    catalog.root,
+                    VIRTUAL_KIND_PEOPLE_RECOGNIZE_ROOT,
+                    "",
+                    expanded_items,
+                    known_items,
+                    default=True,
+                )
+            )
             people_kinds = (
                 ("Review", VIRTUAL_KIND_PEOPLE_REVIEW),
                 ("Unnamed Groups", VIRTUAL_KIND_PEOPLE_UNNAMED),
@@ -9348,7 +9560,41 @@ class MainWindow(QMainWindow):
             for label, kind in people_kinds:
                 item = QTreeWidgetItem([label])
                 self._set_virtual_tree_item_data(item, catalog, kind, "")
-                people_root.addChild(item)
+                recognize_root.addChild(item)
+            people_catalog_root = QTreeWidgetItem(["Catalog"])
+            self._set_virtual_tree_item_data(
+                people_catalog_root,
+                catalog,
+                VIRTUAL_KIND_PEOPLE_CATALOG_ROOT,
+                "",
+            )
+            people_root.addChild(people_catalog_root)
+            people_catalog_root.setExpanded(
+                self._virtual_tree_item_should_expand(
+                    catalog.root,
+                    VIRTUAL_KIND_PEOPLE_CATALOG_ROOT,
+                    "",
+                    expanded_items,
+                    known_items,
+                    default=False,
+                )
+            )
+            for person in people:
+                value = str(person.id)
+                item = QTreeWidgetItem([person.name])
+                self._set_virtual_tree_item_data(
+                    item,
+                    catalog,
+                    VIRTUAL_KIND_PERSON,
+                    value,
+                )
+                people_catalog_root.addChild(item)
+                if self._is_current_virtual_item(
+                    catalog.root,
+                    VIRTUAL_KIND_PERSON,
+                    value,
+                ):
+                    selected_item = item
         for definition in custom_virtual_directories:
             value = str(definition.id)
             item = QTreeWidgetItem([definition.name])
@@ -9378,9 +9624,27 @@ class MainWindow(QMainWindow):
                             VIRTUAL_KIND_PEOPLE_ROOT,
                             "",
                         ),
+                        self._tree_state_key_for_virtual(
+                            catalog.root,
+                            VIRTUAL_KIND_PEOPLE_RECOGNIZE_ROOT,
+                            "",
+                        ),
+                        self._tree_state_key_for_virtual(
+                            catalog.root,
+                            VIRTUAL_KIND_PEOPLE_CATALOG_ROOT,
+                            "",
+                        ),
                         *(
                             self._tree_state_key_for_virtual(catalog.root, kind, "")
                             for _label, kind in people_kinds
+                        ),
+                        *(
+                            self._tree_state_key_for_virtual(
+                                catalog.root,
+                                VIRTUAL_KIND_PERSON,
+                                str(person.id),
+                            )
+                            for person in people
                         ),
                     )
                     if people_kinds
@@ -10015,6 +10279,9 @@ class MainWindow(QMainWindow):
                 VIRTUAL_KIND_VERY_SIMILAR: self.similar_virtual_folder_icon,
                 VIRTUAL_KIND_CUSTOM: self.custom_virtual_folder_icon,
                 VIRTUAL_KIND_PEOPLE_ROOT: self.implicit_virtual_folder_icon,
+                VIRTUAL_KIND_PEOPLE_RECOGNIZE_ROOT: self.similar_virtual_folder_icon,
+                VIRTUAL_KIND_PEOPLE_CATALOG_ROOT: self.implicit_virtual_folder_icon,
+                VIRTUAL_KIND_PERSON: self.implicit_virtual_folder_icon,
                 VIRTUAL_KIND_PEOPLE_REVIEW: self.similar_virtual_folder_icon,
                 VIRTUAL_KIND_PEOPLE_UNNAMED: self.similar_virtual_folder_icon,
                 VIRTUAL_KIND_PEOPLE_LOOSE: self.similar_virtual_folder_icon,
@@ -10035,6 +10302,12 @@ class MainWindow(QMainWindow):
             item.setToolTip(0, "Saved virtual directory")
         elif kind == VIRTUAL_KIND_PEOPLE_ROOT:
             item.setToolTip(0, "Local face suggestions and named people")
+        elif kind == VIRTUAL_KIND_PEOPLE_RECOGNIZE_ROOT:
+            item.setToolTip(0, "Face grouping and recognition review queues")
+        elif kind == VIRTUAL_KIND_PEOPLE_CATALOG_ROOT:
+            item.setToolTip(0, "People who have been named in this catalog")
+        elif kind == VIRTUAL_KIND_PERSON:
+            item.setToolTip(0, f"Images with verified faces for {item.text(0)}")
         elif kind == VIRTUAL_KIND_PEOPLE_REVIEW:
             item.setToolTip(0, "Prioritized face decisions with the highest review payoff")
         elif kind == VIRTUAL_KIND_PEOPLE_UNNAMED:
@@ -10255,6 +10528,8 @@ class MainWindow(QMainWindow):
             VIRTUAL_KIND_ROOT,
             VIRTUAL_KIND_TAG_ROOT,
             VIRTUAL_KIND_PEOPLE_ROOT,
+            VIRTUAL_KIND_PEOPLE_RECOGNIZE_ROOT,
+            VIRTUAL_KIND_PEOPLE_CATALOG_ROOT,
         }:
             item.setExpanded(not item.isExpanded())
             return
@@ -10273,6 +10548,7 @@ class MainWindow(QMainWindow):
             VIRTUAL_KIND_DUPLICATES,
             VIRTUAL_KIND_VERY_SIMILAR,
             VIRTUAL_KIND_CUSTOM,
+            VIRTUAL_KIND_PERSON,
         }:
             return
         if self.current_catalog is not None:
@@ -11666,6 +11942,7 @@ class MainWindow(QMainWindow):
             VIRTUAL_KIND_TAG,
             VIRTUAL_KIND_DUPLICATES,
             VIRTUAL_KIND_CUSTOM,
+            VIRTUAL_KIND_PERSON,
         }:
             self._load_simple_virtual_directory(
                 preserve_selection=preserve_selection,
@@ -11701,6 +11978,7 @@ class MainWindow(QMainWindow):
             VIRTUAL_KIND_TAG,
             VIRTUAL_KIND_DUPLICATES,
             VIRTUAL_KIND_CUSTOM,
+            VIRTUAL_KIND_PERSON,
         }:
             return
         value = self.current_virtual_value
@@ -11835,6 +12113,22 @@ class MainWindow(QMainWindow):
                         include_blobs=False,
                         cancel_check=check_canceled,
                     )
+                elif kind == VIRTUAL_KIND_PERSON:
+                    person_id = int(value)
+                    total_images, slideshow_images = (
+                        catalog.person_image_and_slideshow_count(
+                            person_id,
+                            cancel_check=check_canceled,
+                        )
+                    )
+                    images = catalog.list_images_for_person_page(
+                        person_id,
+                        sort_order,
+                        limit=page_limit,
+                        offset=page_offset,
+                        include_blobs=False,
+                        cancel_check=check_canceled,
+                    )
                 else:
                     total_images, slideshow_images = (
                         catalog.exact_duplicate_image_and_slideshow_count(
@@ -11928,6 +12222,7 @@ class MainWindow(QMainWindow):
             VIRTUAL_KIND_TAG,
             VIRTUAL_KIND_DUPLICATES,
             VIRTUAL_KIND_CUSTOM,
+            VIRTUAL_KIND_PERSON,
         }:
             if self.current_virtual_kind != kind or self.current_virtual_value != value:
                 self.model.page_fetch_failed(page_offset)
@@ -12006,6 +12301,7 @@ class MainWindow(QMainWindow):
             VIRTUAL_KIND_TAG,
             VIRTUAL_KIND_DUPLICATES,
             VIRTUAL_KIND_CUSTOM,
+            VIRTUAL_KIND_PERSON,
         }:
             result = self._simple_virtual_view_worker(
                 root,
@@ -12084,6 +12380,12 @@ class MainWindow(QMainWindow):
                             sort_order=sort_order,
                             cancel_check=check_canceled,
                         )
+                    )
+                elif kind == VIRTUAL_KIND_PERSON:
+                    rel_paths = catalog.list_slideshow_rel_paths_for_person(
+                        int(value),
+                        sort_order=sort_order,
+                        cancel_check=check_canceled,
                     )
                 else:
                     raise ValueError(f"unsupported random viewer kind: {kind}")
@@ -12772,6 +13074,7 @@ class MainWindow(QMainWindow):
                     VIRTUAL_KIND_TAG,
                     VIRTUAL_KIND_DUPLICATES,
                     VIRTUAL_KIND_CUSTOM,
+                    VIRTUAL_KIND_PERSON,
                 }
             ):
                 total_records = result.total_records
@@ -14580,6 +14883,7 @@ class MainWindow(QMainWindow):
             VIRTUAL_KIND_TAG,
             VIRTUAL_KIND_DUPLICATES,
             VIRTUAL_KIND_CUSTOM,
+            VIRTUAL_KIND_PERSON,
         }:
             kind = self.current_virtual_kind or VIRTUAL_KIND_PHYSICAL
             value = (
@@ -17146,12 +17450,14 @@ class VirtualDirectoryConditionWidget(QFrame):
         self,
         directory_model: QStringListModel,
         tag_model: QStringListModel,
+        person_model: QStringListModel,
         remove_callback: Callable[[QWidget], None],
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self.directory_model = directory_model
         self.tag_model = tag_model
+        self.person_model = person_model
         self._remove_callback = remove_callback
         self.setFrameShape(QFrame.Shape.StyledPanel)
         layout = QHBoxLayout(self)
@@ -17165,6 +17471,8 @@ class VirtualDirectoryConditionWidget(QFrame):
         self.kind_combo.addItem("Filename regex", "regex")
         self.kind_combo.addItem("Tag", "tag")
         self.kind_combo.addItem("Exactly one of two tags (XOR)", "tag_xor")
+        self.kind_combo.addItem("Verified person", "person")
+        self.kind_combo.addItem("Exactly one of two people (XOR)", "person_xor")
         layout.addWidget(self.kind_combo)
 
         self.value_stack = QStackedWidget()
@@ -17184,6 +17492,17 @@ class VirtualDirectoryConditionWidget(QFrame):
         xor_layout.addWidget(QLabel("XOR"))
         xor_layout.addWidget(self.xor_second_combo)
         self.value_stack.addWidget(xor_widget)
+        self.person_combo = self._choice_combo(person_model)
+        self.value_stack.addWidget(self.person_combo)
+        person_xor_widget = QWidget()
+        person_xor_layout = QHBoxLayout(person_xor_widget)
+        person_xor_layout.setContentsMargins(0, 0, 0, 0)
+        self.person_xor_first_combo = self._choice_combo(person_model)
+        self.person_xor_second_combo = self._choice_combo(person_model)
+        person_xor_layout.addWidget(self.person_xor_first_combo)
+        person_xor_layout.addWidget(QLabel("XOR"))
+        person_xor_layout.addWidget(self.person_xor_second_combo)
+        self.value_stack.addWidget(person_xor_widget)
         layout.addWidget(self.value_stack, 1)
 
         self.remove_button = QPushButton("Remove")
@@ -17198,6 +17517,9 @@ class VirtualDirectoryConditionWidget(QFrame):
             self.tag_combo,
             self.xor_first_combo,
             self.xor_second_combo,
+            self.person_combo,
+            self.person_xor_first_combo,
+            self.person_xor_second_combo,
         ):
             combo.currentTextChanged.connect(lambda _text: self.changed.emit())
         self._kind_changed(self.kind_combo.currentIndex())
@@ -17223,6 +17545,14 @@ class VirtualDirectoryConditionWidget(QFrame):
             display_value=name,
         )
 
+    @staticmethod
+    def _person_rule(name: str) -> VirtualDirectoryRule:
+        return VirtualDirectoryRule(
+            "person",
+            value=name,
+            display_value=name,
+        )
+
     def rule(self) -> VirtualDirectoryRule:
         kind = str(self.kind_combo.currentData())
         if kind == "directory":
@@ -17238,12 +17568,22 @@ class VirtualDirectoryConditionWidget(QFrame):
             )
         elif kind == "tag":
             condition = self._tag_rule(self.tag_combo.currentText())
-        else:
+        elif kind == "tag_xor":
             condition = VirtualDirectoryRule(
                 "tag_xor",
                 children=(
                     self._tag_rule(self.xor_first_combo.currentText()),
                     self._tag_rule(self.xor_second_combo.currentText()),
+                ),
+            )
+        elif kind == "person":
+            condition = self._person_rule(self.person_combo.currentText())
+        else:
+            condition = VirtualDirectoryRule(
+                "person_xor",
+                children=(
+                    self._person_rule(self.person_xor_first_combo.currentText()),
+                    self._person_rule(self.person_xor_second_combo.currentText()),
                 ),
             )
         if self.not_checkbox.isChecked():
@@ -17275,6 +17615,19 @@ class VirtualDirectoryConditionWidget(QFrame):
                 condition.children[1].display_value
                 or condition.children[1].value
             )
+        elif condition.kind == "person":
+            self.person_combo.setEditText(
+                condition.display_value or condition.value
+            )
+        elif condition.kind == "person_xor" and len(condition.children) == 2:
+            self.person_xor_first_combo.setEditText(
+                condition.children[0].display_value
+                or condition.children[0].value
+            )
+            self.person_xor_second_combo.setEditText(
+                condition.children[1].display_value
+                or condition.children[1].value
+            )
 
 
 class VirtualDirectoryRuleGroupWidget(QFrame):
@@ -17284,6 +17637,7 @@ class VirtualDirectoryRuleGroupWidget(QFrame):
         self,
         directory_model: QStringListModel,
         tag_model: QStringListModel,
+        person_model: QStringListModel,
         *,
         remove_callback: Callable[[QWidget], None] | None = None,
         parent: QWidget | None = None,
@@ -17291,6 +17645,7 @@ class VirtualDirectoryRuleGroupWidget(QFrame):
         super().__init__(parent)
         self.directory_model = directory_model
         self.tag_model = tag_model
+        self.person_model = person_model
         self._remove_callback = remove_callback
         self.children: list[
             VirtualDirectoryConditionWidget | VirtualDirectoryRuleGroupWidget
@@ -17347,6 +17702,7 @@ class VirtualDirectoryRuleGroupWidget(QFrame):
         child = VirtualDirectoryConditionWidget(
             self.directory_model,
             self.tag_model,
+            self.person_model,
             self._remove_child,
             self,
         )
@@ -17365,6 +17721,7 @@ class VirtualDirectoryRuleGroupWidget(QFrame):
         child = VirtualDirectoryRuleGroupWidget(
             self.directory_model,
             self.tag_model,
+            self.person_model,
             remove_callback=self._remove_child,
             parent=self,
         )
@@ -17415,16 +17772,23 @@ class VirtualDirectoryRuleGroupWidget(QFrame):
 class NewVirtualDirectoryDialog(QDialog):
     RENDER_BATCH_SIZE = 256
 
-    def __init__(self, catalog: Catalog, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        catalog: Catalog,
+        parent: QWidget | None = None,
+        *,
+        definition: CustomVirtualDirectory | None = None,
+    ) -> None:
         super().__init__(parent)
         self.catalog = catalog
+        self.definition = definition
         self._closed = False
         self._loaded = False
         self._rendering = False
         self._cancel_event = Event()
         self._read_executor: SharedExecutorLease | None = shared_dialog_executor()
         self._read_future: Future[
-            tuple[list[str], list[str], set[str]]
+            tuple[list[str], list[str], list[str], set[str]]
         ] | None = self._read_executor.submit(
             self._load_catalog_choices,
             catalog.root,
@@ -17434,25 +17798,32 @@ class NewVirtualDirectoryDialog(QDialog):
         )
         self._pending_directories: list[str] = []
         self._pending_tags: list[str] = []
+        self._pending_people: list[str] = []
         self._directory_render_index = 0
         self._tag_render_index = 0
+        self._person_render_index = 0
         self._directory_items: dict[str, QTreeWidgetItem] = {}
         self._selected_directory_rels: set[str] = set()
         self._selected_tag_names: dict[str, str] = {}
+        self._selected_person_names: dict[str, str] = {}
         self._existing_names: set[str] = set()
         self._available_directory_rels: set[str] = set()
         self._available_tag_keys: set[str] = set()
+        self._available_person_keys: set[str] = set()
         self._advanced_initialized = False
         self._advanced_mode_notice: str | None = None
         self._directory_choice_model = QStringListModel([])
         self._tag_choice_model = QStringListModel([])
+        self._person_choice_model = QStringListModel([])
         self._preview_generation = 0
         self._preview_expression: VirtualDirectoryRule | None = None
         self._preview_cancel_event: Event | None = None
         self._preview_executor: SharedExecutorLease | None = None
         self._preview_future: Future[tuple[int, int]] | None = None
 
-        self.setWindowTitle("New Virtual Directory")
+        self.setWindowTitle(
+            "Edit Virtual Directory" if definition is not None else "New Virtual Directory"
+        )
         self.setWindowIcon(load_app_icon())
         self.setStyleSheet(DIALOG_STYLESHEET)
         layout = QVBoxLayout(self)
@@ -17460,6 +17831,8 @@ class NewVirtualDirectoryDialog(QDialog):
         fields = QFormLayout()
         self.name_entry = QLineEdit()
         self.name_entry.setPlaceholderText("Virtual directory name")
+        if definition is not None:
+            self.name_entry.setText(definition.name)
         fields.addRow("Name:", self.name_entry)
         self.mode_combo = QComboBox()
         self.mode_combo.addItem("Simple", "simple")
@@ -17468,7 +17841,7 @@ class NewVirtualDirectoryDialog(QDialog):
         fields.addRow("Creation mode:", self.mode_combo)
         layout.addLayout(fields)
 
-        self.status_label = QLabel("Loading catalog directories and tags…")
+        self.status_label = QLabel("Loading catalog directories, tags, and people…")
         layout.addWidget(self.status_label)
 
         self.content_stack = QStackedWidget()
@@ -17495,7 +17868,13 @@ class NewVirtualDirectoryDialog(QDialog):
         self.tag_list.setEnabled(False)
         tag_layout.addWidget(self.tag_list)
         splitter.addWidget(tag_group)
-        splitter.setSizes([430, 270])
+        people_group = QGroupBox("Verified people")
+        people_layout = QVBoxLayout(people_group)
+        self.people_list = CheckableListWidget()
+        self.people_list.setEnabled(False)
+        people_layout.addWidget(self.people_list)
+        splitter.addWidget(people_group)
+        splitter.setSizes([380, 220, 220])
         simple_layout.addWidget(splitter, 1)
         self.content_stack.addWidget(simple_panel)
 
@@ -17503,7 +17882,7 @@ class NewVirtualDirectoryDialog(QDialog):
         advanced_layout = QVBoxLayout(advanced_panel)
         advanced_help = QLabel(
             "Build nested groups with ALL (AND), ANY (OR), and NOT. "
-            "XOR conditions accept exactly two tags."
+            "XOR conditions accept exactly two tags or two verified people."
         )
         advanced_help.setWordWrap(True)
         advanced_layout.addWidget(advanced_help)
@@ -17514,6 +17893,7 @@ class NewVirtualDirectoryDialog(QDialog):
         self.advanced_root_group = VirtualDirectoryRuleGroupWidget(
             self._directory_choice_model,
             self._tag_choice_model,
+            self._person_choice_model,
             parent=advanced_container,
         )
         advanced_container_layout.addWidget(self.advanced_root_group)
@@ -17536,6 +17916,8 @@ class NewVirtualDirectoryDialog(QDialog):
             QDialogButtonBox.StandardButton.Ok
         )
         self.create_button.setText("Create")
+        if definition is not None:
+            self.create_button.setText("Save")
         self.create_button.setDefault(True)
         self.create_button.setEnabled(False)
         self.buttons.accepted.connect(self._accept_if_valid)
@@ -17548,6 +17930,7 @@ class NewVirtualDirectoryDialog(QDialog):
         self.advanced_root_group.changed.connect(self._advanced_rule_changed)
         self.directory_tree.itemChanged.connect(self._directory_check_changed)
         self.tag_list.itemChanged.connect(self._tag_check_changed)
+        self.people_list.itemChanged.connect(self._person_check_changed)
         self._load_timer = QTimer(self)
         self._load_timer.setInterval(25)
         self._load_timer.timeout.connect(self._poll_load)
@@ -17567,9 +17950,9 @@ class NewVirtualDirectoryDialog(QDialog):
         expected_root_identity: tuple[int, int],
         expected_storage_identity: CatalogStorageIdentity,
         cancel_event: Event,
-    ) -> tuple[list[str], list[str], set[str]]:
+    ) -> tuple[list[str], list[str], list[str], set[str]]:
         if cancel_event.is_set():
-            return [], [], set()
+            return [], [], [], set()
         with Catalog.open_reader(
             root,
             expected_root_identity=expected_root_identity,
@@ -17579,6 +17962,7 @@ class NewVirtualDirectoryDialog(QDialog):
             try:
                 directories = reader.list_known_directories()
                 tags = reader.list_tags()
+                people = [person.name for person in FaceStore(reader).people()]
                 existing_names = {
                     definition.name.casefold()
                     for definition in reader.list_custom_virtual_directories()
@@ -17588,8 +17972,8 @@ class NewVirtualDirectoryDialog(QDialog):
                     reader._conn.execute("ROLLBACK")  # noqa: SLF001
             reader._assert_catalog_storage_identity()  # noqa: SLF001
         if cancel_event.is_set():
-            return [], [], set()
-        return directories, tags, existing_names
+            return [], [], [], set()
+        return directories, tags, people, existing_names
 
     def _poll_load(self) -> None:
         if self._closed:
@@ -17602,7 +17986,7 @@ class NewVirtualDirectoryDialog(QDialog):
             if future.cancelled():
                 return
             try:
-                directories, tags, existing_names = future.result()
+                directories, tags, people, existing_names = future.result()
             except Exception as error:
                 self.status_label.setText(f"Unable to load catalog choices: {error}")
                 self._release_read_executor()
@@ -17614,9 +17998,15 @@ class NewVirtualDirectoryDialog(QDialog):
                 key=lambda value: (value.casefold(), value),
             )
             self._pending_tags = tags
+            self._pending_people = people
             self._existing_names = existing_names
+            if self.definition is not None:
+                self._existing_names.discard(self.definition.name.casefold())
             self._available_directory_rels = {"", *directories}
             self._available_tag_keys = {normalize_tag(name) for name in tags}
+            self._available_person_keys = {
+                normalize_person_name(name) for name in people
+            }
             self._directory_choice_model.setStringList(
                 [
                     ".",
@@ -17628,6 +18018,7 @@ class NewVirtualDirectoryDialog(QDialog):
                 ]
             )
             self._tag_choice_model.setStringList(tags)
+            self._person_choice_model.setStringList(people)
             self._begin_render()
         self._render_batch()
 
@@ -17635,6 +18026,7 @@ class NewVirtualDirectoryDialog(QDialog):
         self._rendering = True
         self.directory_tree.clear()
         self.tag_list.clear()
+        self.people_list.clear()
         root_label = self.catalog.root.name or str(self.catalog.root)
         root_item = self._new_directory_item(root_label, "")
         self.directory_tree.addTopLevelItem(root_item)
@@ -17646,6 +18038,7 @@ class NewVirtualDirectoryDialog(QDialog):
         ):
             self._directory_render_index += 1
         self._tag_render_index = 0
+        self._person_render_index = 0
 
     @staticmethod
     def _checkable_item_flags(flags: Qt.ItemFlag) -> Qt.ItemFlag:
@@ -17692,12 +18085,34 @@ class NewVirtualDirectoryDialog(QDialog):
             item.setCheckState(Qt.CheckState.Unchecked)
             self.tag_list.addItem(item)
 
+        person_end = min(
+            len(self._pending_people),
+            self._person_render_index + self.RENDER_BATCH_SIZE,
+        )
+        while self._person_render_index < person_end:
+            name = self._pending_people[self._person_render_index]
+            self._person_render_index += 1
+            item = QListWidgetItem(name)
+            item.setData(Qt.ItemDataRole.UserRole, name)
+            item.setFlags(self._checkable_item_flags(item.flags()))
+            item.setCheckState(Qt.CheckState.Unchecked)
+            self.people_list.addItem(item)
+
         if (
             self._directory_render_index < len(self._pending_directories)
             or self._tag_render_index < len(self._pending_tags)
+            or self._person_render_index < len(self._pending_people)
         ):
-            rendered = self._directory_render_index + self._tag_render_index
-            total = len(self._pending_directories) + len(self._pending_tags)
+            rendered = (
+                self._directory_render_index
+                + self._tag_render_index
+                + self._person_render_index
+            )
+            total = (
+                len(self._pending_directories)
+                + len(self._pending_tags)
+                + len(self._pending_people)
+            )
             self.status_label.setText(f"Loading catalog choices… {rendered:,}/{total:,}")
             return
         self._rendering = False
@@ -17706,11 +18121,31 @@ class NewVirtualDirectoryDialog(QDialog):
         self.status_label.hide()
         self.directory_tree.setEnabled(True)
         self.tag_list.setEnabled(True)
+        self.people_list.setEnabled(True)
         self.mode_combo.setEnabled(True)
         root_item = self._directory_items.get("")
         if root_item is not None:
             root_item.setExpanded(True)
+        self._apply_initial_definition()
         self._validate()
+
+    def _apply_initial_definition(self) -> None:
+        definition = self.definition
+        if definition is None:
+            return
+        if definition.advanced and definition.expression is not None:
+            self._advanced_initialized = True
+            self.advanced_root_group.set_rule(definition.expression)
+            advanced_index = self.mode_combo.findData("advanced")
+            if advanced_index >= 0:
+                self.mode_combo.setCurrentIndex(advanced_index)
+            return
+        self._apply_simple_values(
+            definition.directories,
+            definition.filename_regex,
+            definition.tags,
+            definition.people,
+        )
 
     def _directory_check_changed(
         self,
@@ -17735,6 +18170,17 @@ class NewVirtualDirectoryDialog(QDialog):
             self._selected_tag_names[key] = name
         else:
             self._selected_tag_names.pop(key, None)
+        self._validate()
+
+    def _person_check_changed(self, item: QListWidgetItem) -> None:
+        if not self._loaded:
+            return
+        name = str(item.data(Qt.ItemDataRole.UserRole) or item.text())
+        key = normalize_person_name(name)
+        if item.checkState() == Qt.CheckState.Checked:
+            self._selected_person_names[key] = name
+        else:
+            self._selected_person_names.pop(key, None)
         self._validate()
 
     @staticmethod
@@ -17767,6 +18213,14 @@ class NewVirtualDirectoryDialog(QDialog):
                 display_value=name,
             )
             for name in self.selected_tags()
+        )
+        rules.extend(
+            VirtualDirectoryRule(
+                "person",
+                value=name,
+                display_value=name,
+            )
+            for name in self.selected_people()
         )
         return VirtualDirectoryRule("all", children=tuple(rules))
 
@@ -17809,12 +18263,18 @@ class NewVirtualDirectoryDialog(QDialog):
     @staticmethod
     def _simple_values_for_expression(
         expression: VirtualDirectoryRule,
-    ) -> tuple[tuple[str, ...], str, tuple[str, ...]] | None:
+    ) -> tuple[
+        tuple[str, ...],
+        str,
+        tuple[str, ...],
+        tuple[str, ...],
+    ] | None:
         if expression.kind != "all":
             return None
         directories: list[str] = []
         pattern: str | None = None
         tags: list[str] = []
+        people: list[str] = []
         for rule in expression.children:
             if rule.kind == "directory" and not directories:
                 directories.append(rule.value)
@@ -17829,17 +18289,20 @@ class NewVirtualDirectoryDialog(QDialog):
                 pattern = rule.value
             elif rule.kind == "tag":
                 tags.append(rule.display_value or rule.value)
+            elif rule.kind == "person":
+                people.append(rule.display_value or rule.value)
             else:
                 return None
         if not directories:
             return None
-        return tuple(directories), pattern or "", tuple(tags)
+        return tuple(directories), pattern or "", tuple(tags), tuple(people)
 
     def _apply_simple_values(
         self,
         directories: tuple[str, ...],
         pattern: str,
         tags: tuple[str, ...],
+        people: tuple[str, ...],
     ) -> None:
         selected_directories = set(directories)
         previous = self.directory_tree.blockSignals(True)
@@ -17875,6 +18338,26 @@ class NewVirtualDirectoryDialog(QDialog):
             self.tag_list.blockSignals(previous)
         self._selected_tag_names = selected_tag_names
 
+        selected_person_keys = {normalize_person_name(name) for name in people}
+        selected_person_names: dict[str, str] = {}
+        previous = self.people_list.blockSignals(True)
+        try:
+            for index in range(self.people_list.count()):
+                item = self.people_list.item(index)
+                name = str(item.data(Qt.ItemDataRole.UserRole) or item.text())
+                key = normalize_person_name(name)
+                selected = key in selected_person_keys
+                item.setCheckState(
+                    Qt.CheckState.Checked
+                    if selected
+                    else Qt.CheckState.Unchecked
+                )
+                if selected:
+                    selected_person_names[key] = name
+        finally:
+            self.people_list.blockSignals(previous)
+        self._selected_person_names = selected_person_names
+
         previous = self.regex_entry.blockSignals(True)
         try:
             self.regex_entry.setText(pattern)
@@ -17907,6 +18390,14 @@ class NewVirtualDirectoryDialog(QDialog):
                 return f'Directory "{rule.value or "."}" is not in this catalog.'
             if rule.kind == "tag" and rule.value not in self._available_tag_keys:
                 return f'Tag "{rule.display_value or rule.value}" is not in this catalog.'
+            if (
+                rule.kind == "person"
+                and rule.value not in self._available_person_keys
+            ):
+                return (
+                    f'Person "{rule.display_value or rule.value}" '
+                    "is not in this catalog."
+                )
             for child in rule.children:
                 error = check_choices(child)
                 if error is not None:
@@ -18106,6 +18597,14 @@ class NewVirtualDirectoryDialog(QDialog):
     def selected_tags(self) -> tuple[str, ...]:
         return tuple(
             sorted(self._selected_tag_names.values(), key=lambda value: value.casefold())
+        )
+
+    def selected_people(self) -> tuple[str, ...]:
+        return tuple(
+            sorted(
+                self._selected_person_names.values(),
+                key=lambda value: (value.casefold(), value),
+            )
         )
 
     def _release_read_executor(self) -> None:

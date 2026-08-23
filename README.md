@@ -36,13 +36,13 @@ Marnwick recognizes AVIF, BMP, GIF, HEIC, HEIF, JPEG, PNG, TIFF, and WebP images
 
 ## Requirements
 
-- Python 3.11 or newer
-- Linux, macOS, or Windows for the supplied launcher setup
+- 64-bit CPython 3.12, 3.13, or 3.14; Intel macOS requires 3.12 or 3.13
+- Linux, macOS 14 or newer, or Windows 10 version 1809 or newer for the supplied launcher setup
 - A graphical desktop and a working Qt platform plugin for normal use
 - Optional GNU `find` and `md5sum` for faster catalog discovery and freshness checks
 - Optional GNU `shred` for wipe-on-delete
 
-The runtime dependencies are NumPy, Pillow, PyAV, PySide6, the timeout-capable Regex package, and one ONNX Runtime variant selected for the host. PyAV's binary wheels provide the FFmpeg libraries used to extract video preview frames. Base runtime dependencies are hash-locked in `requirements-runtime.lock`, while development and CPU runtime dependencies are hash-locked in `requirements-dev.lock`; the setup scripts select the NVIDIA runtime on supported x86-64 Linux systems, DirectML on x86-64 Windows, and the CPU runtime otherwise. Standard setup also installs Microsoft's beta [WebGPU execution-provider plugin](https://pypi.org/project/onnxruntime-ep-webgpu/) on x86-64 Linux and Windows and on Apple-silicon macOS 14 or newer. LaMa's 198 MiB model data is optional and downloaded only after confirmation.
+The runtime dependencies are NumPy, Pillow, PyAV, PySide6, the timeout-capable Regex package, and one ONNX Runtime variant selected for the host. PyAV's binary wheels provide the FFmpeg libraries used to extract video preview frames. Base and development dependencies are hash-locked separately from the mutually exclusive ONNX Runtime distributions. The setup scripts select the NVIDIA runtime on supported x86-64 Linux systems, DirectML on x86-64 Windows, and the CPU runtime otherwise. Intel macOS uses ONNX Runtime 1.23.2, the final release that publishes Intel Mac wheels; other CPU hosts use the current CPU lock. Standard setup also installs Microsoft's beta [WebGPU execution-provider plugin](https://pypi.org/project/onnxruntime-ep-webgpu/) on x86-64 Linux and Windows and on Apple-silicon macOS 14 or newer. LaMa's 198 MiB model data is optional and downloaded only after confirmation.
 
 ## Quick start
 
@@ -55,7 +55,7 @@ From a fresh clone:
 ./start.sh
 ```
 
-The setup script creates a virtual environment (by default `.venv`), installs the locked dependencies and Marnwick in editable mode, and writes `start.sh`. When a repository update changes the base runtime dependency lock, `start.sh` refreshes those dependencies once before launching. On x86-64 Linux setup selects the NVIDIA ONNX Runtime when `nvidia-smi` reports a GPU, installs the CPU runtime otherwise, and installs the WebGPU plugin alongside either core runtime. On Apple-silicon macOS 14 or newer it installs the CPU/CoreML runtime and WebGPU plugin. Linux setup also installs a per-user desktop entry under `${XDG_DATA_HOME:-$HOME/.local/share}/applications`; macOS launches through `start.sh`.
+The setup script locates a compatible interpreter, creates a virtual environment (by default `.venv`), installs the locked dependencies and Marnwick in editable mode, and writes `start.sh`. Set `PYTHON` to select a particular interpreter. An incompatible selection is rejected before the virtual environment or dependencies are changed. When a repository update changes the base runtime dependency lock, `start.sh` refreshes those dependencies once before launching. On x86-64 Linux setup selects the NVIDIA ONNX Runtime when `nvidia-smi` reports a GPU, installs the CPU runtime otherwise, and installs the WebGPU plugin alongside either core runtime. On Apple-silicon macOS 14 or newer it installs the CPU/CoreML runtime and WebGPU plugin. Intel macOS uses CPU inference and requires Python 3.12 or 3.13 because its final compatible ONNX Runtime has no Python 3.14 wheel. Linux setup also installs a per-user desktop entry under `${XDG_DATA_HOME:-$HOME/.local/share}/applications`; macOS launches through `start.sh`.
 
 ### Windows PowerShell
 
@@ -64,7 +64,7 @@ The setup script creates a virtual environment (by default `.venv`), installs th
 .\start.cmd
 ```
 
-The setup script creates a virtual environment (by default `.venv`), installs Marnwick, writes `start.ps1` and `start.cmd`, generates a Windows icon, and creates a Start Menu shortcut. On x86-64 Windows it installs both the DirectML ONNX Runtime and WebGPU plugin; either can use compatible GPUs and failures fall back to CPU. `start.cmd` works without changing PowerShell's script policy; `start.ps1` is also available when local scripts are allowed. If PowerShell blocks `setup.ps1`, run:
+The setup script locates a compatible 64-bit interpreter through the Python launcher or common executable names, creates a virtual environment (by default `.venv`), installs Marnwick, writes `start.ps1` and `start.cmd`, generates a Windows icon, and creates a Start Menu shortcut. Runtime selection follows the selected Python architecture rather than the PowerShell process architecture, which also handles 32-bit PowerShell on 64-bit Windows correctly. On x86-64 Windows it installs both the DirectML ONNX Runtime and WebGPU plugin; either can use compatible GPUs and failures fall back to CPU. Windows on ARM uses CPU inference. `start.cmd` works without changing PowerShell's script policy; `start.ps1` is also available when local scripts are allowed. If PowerShell blocks `setup.ps1`, run:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\setup.ps1
@@ -79,6 +79,7 @@ python3 -m venv .venv
 ```
 
 On Windows, replace `.venv/bin/python` with `.venv\Scripts\python.exe`.
+On Intel macOS, use `.[dev,macos-intel]` instead of `.[cpu,dev,webgpu]`.
 
 After installation, the console entry point is available as `.venv/bin/marnwick` on Linux and macOS or `.venv\Scripts\marnwick.exe` on Windows. Activate the virtual environment first if you want to invoke it as bare `marnwick`.
 
@@ -305,7 +306,7 @@ Work that feeds the interface has explicit bounds:
 - LaMa generates a plausible replacement from surrounding pixels; it does not recover the actual hidden scene and can produce incorrect structure or artifacts. It supports static images only and is limited by its fixed 512-pixel inference crop.
 - Remote GPU intentionally sends either the prepared 512×512 LaMa crop and mask or the bounded face-analysis image to the configured endpoint. Certificate pinning authenticates the endpoint after the user verifies its thumbprint, but it does not make an untrusted remote service private; select a remote engine only when its operator and data-handling policy are acceptable.
 - Face similarity is probabilistic. Pose, age, lighting, occlusion, look-alike relatives, and biased or incomplete training data can cause missed groups or incorrect suggestions, so Marnwick never turns a similarity score into identity without user confirmation. Embeddings are biometric-derived data even though they are not photographs; protect and back up the portable `.marnwick` state accordingly, and use **Tools > Remove Face Data** before sharing a catalog when those records should not travel with it.
-- The native WebGPU execution-provider plugin is beta. Marnwick's supplied setup supports x86-64 Linux and Windows and Apple-silicon macOS 14 or newer; upstream ONNX Runtime currently prevents a supported Intel-macOS configuration. Auto mode accepts known physical GPU vendor IDs and skips virtual or software adapters; choosing WebGPU explicitly permits those adapters for diagnostics, although they can be slower than the CPU provider.
+- The native WebGPU execution-provider plugin is beta. Marnwick's supplied setup supports x86-64 Linux and Windows and Apple-silicon macOS 14 or newer; upstream does not publish the plugin for Intel macOS, so Intel Macs use CPU inference. Auto mode accepts known physical GPU vendor IDs and skips virtual or software adapters; choosing WebGPU explicitly permits those adapters for diagnostics, although they can be slower than the CPU provider.
 - Filesystem operations and one or two independent SQLite databases cannot form a single crash-atomic transaction. Runtime failures are compensated, but abrupt process or power loss can require **Tools > Refresh Catalog** to reconcile filesystem and catalog state. Keep independent backups of irreplaceable images.
 - Cross-filesystem directory moves revalidate the published destination immediately before recursively removing the isolated source, but no portable filesystem operation makes those steps atomic across mounts. An external program that replaces or removes the destination during that cleanup window can defeat compensation; do not externally mutate paths participating in a move. Marnwick's catalog lock does not control unrelated filesystem tools.
 - Moving a directory across filesystems recreates regular files, directories, and symlinks. It does not preserve hard-link relationships or guarantee filesystem-specific metadata beyond supported creation dates and modification dates; unsupported special-file entries cause the move to fail with the source retained.
@@ -375,11 +376,17 @@ Regenerate the Python 3.12 runtime and development locks after changing dependen
 ```bash
 .venv/bin/pip-compile --generate-hashes \
   --output-file=requirements-runtime.lock pyproject.toml
-.venv/bin/pip-compile --allow-unsafe --extra=cpu --extra=dev --generate-hashes \
+.venv/bin/pip-compile --allow-unsafe --extra=dev --generate-hashes \
   --output-file=requirements-dev.lock pyproject.toml
+.venv/bin/pip-compile --generate-hashes \
+  --output-file=requirements-lama-cpu.lock requirements-lama-cpu.in
+.venv/bin/pip-compile --generate-hashes \
+  --output-file=requirements-lama-macos-intel.lock requirements-lama-macos-intel.in
+.venv/bin/pip-compile --generate-hashes \
+  --output-file=requirements-lama-nvidia.lock requirements-lama-nvidia.in
 ```
 
-The platform-specific GPU runtime locks are intentionally separate because ONNX Runtime distributions replace one another and WebGPU is registered as a plugin. Update `requirements-lama-nvidia.lock`, `requirements-lama-directml.lock`, and `requirements-lama-webgpu.lock` from the corresponding published wheels when changing their pinned versions.
+The platform-specific runtime locks are intentionally separate because ONNX Runtime distributions replace one another and WebGPU is registered as a plugin. Regenerate `requirements-lama-directml.lock` from `requirements-lama-directml.in` on 64-bit Windows; update `requirements-lama-webgpu.lock` from the published platform wheels when changing its pinned version.
 
 ## Performance tooling
 

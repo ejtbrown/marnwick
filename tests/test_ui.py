@@ -100,10 +100,13 @@ from marnwick.ui import (  # noqa: E402
     VIRTUAL_KIND_CUSTOM,
     VIRTUAL_KIND_PHYSICAL,
     VIRTUAL_KIND_PEOPLE_IGNORED,
+    VIRTUAL_KIND_PEOPLE_CATALOG_ROOT,
     VIRTUAL_KIND_PEOPLE_LOOSE,
+    VIRTUAL_KIND_PEOPLE_RECOGNIZE_ROOT,
     VIRTUAL_KIND_PEOPLE_REVIEW,
     VIRTUAL_KIND_PEOPLE_ROOT,
     VIRTUAL_KIND_PEOPLE_UNNAMED,
+    VIRTUAL_KIND_PERSON,
     VIRTUAL_KIND_ROLE,
     VIRTUAL_KIND_TAG,
     VIRTUAL_KIND_VERY_SIMILAR,
@@ -10164,6 +10167,7 @@ def test_people_tree_is_opt_in_and_opens_the_selected_review_queue(
     qt_app = app()
     root = tmp_path / "catalog"
     root.mkdir()
+    Image.new("RGB", (8, 8), (10, 20, 30)).save(root / "portrait.jpg")
     window = MainWindow()
     observed: list[str] = []
     try:
@@ -10171,6 +10175,35 @@ def test_people_tree_is_opt_in_and_opens_the_selected_review_queue(
         window.idle_timer.stop()
         catalog = window.workspace.open_catalog(root)
         catalog.set_settings(CatalogSettings(faces_enabled=True))
+        catalog.refresh()
+        person_cursor = catalog._conn.execute(
+            "INSERT INTO people(name, normalized, created_at_ns) VALUES (?, ?, ?)",
+            ("A/B % O'Neil 佐藤", "a/b % o'neil 佐藤", 1),
+        )
+        image_id = int(
+            catalog._conn.execute(
+                "SELECT id FROM images WHERE rel_path = 'portrait.jpg'"
+            ).fetchone()["id"]
+        )
+        catalog._conn.execute(
+            """
+            INSERT INTO faces(
+                image_id, ordinal, x, y, width, height, landmarks,
+                detection_score, quality, embedding, embedding_version,
+                thumbnail_rel_path, person_id, confirmed, status,
+                deferred_until_ns, created_at_ns, updated_at_ns
+            ) VALUES (?, 0, 0.1, 0.1, 0.3, 0.4, ?, 0.99, 0.9, ?, ?, ?, ?, 1,
+                      'active', 0, 1, 1)
+            """,
+            (
+                image_id,
+                bytes(40),
+                bytes(128 * 4),
+                "test-embedding",
+                "00/" + "0" * 64 + ".jpg",
+                int(person_cursor.lastrowid),
+            ),
+        )
         window.current_catalog = catalog
         window.rebuild_tree()
         settle_tree_build_tasks(window, qt_app)
@@ -10186,20 +10219,44 @@ def test_people_tree_is_opt_in_and_opens_the_selected_review_queue(
             people_root.child(index).data(0, VIRTUAL_KIND_ROLE)
             for index in range(people_root.childCount())
         ] == [
+            VIRTUAL_KIND_PEOPLE_RECOGNIZE_ROOT,
+            VIRTUAL_KIND_PEOPLE_CATALOG_ROOT,
+        ]
+        recognize_root = people_root.child(0)
+        people_catalog_root = people_root.child(1)
+        assert [
+            recognize_root.child(index).data(0, VIRTUAL_KIND_ROLE)
+            for index in range(recognize_root.childCount())
+        ] == [
             VIRTUAL_KIND_PEOPLE_REVIEW,
             VIRTUAL_KIND_PEOPLE_UNNAMED,
             VIRTUAL_KIND_PEOPLE_LOOSE,
             VIRTUAL_KIND_PEOPLE_IGNORED,
         ]
+        person_item = people_catalog_root.child(0)
+        assert person_item.text(0) == "A/B % O'Neil 佐藤"
+        assert person_item.data(0, VIRTUAL_KIND_ROLE) == VIRTUAL_KIND_PERSON
 
         monkeypatch.setattr(
             window,
             "open_face_manager",
             lambda *, initial_view="review": observed.append(initial_view),
         )
-        window._directory_clicked(people_root.child(1))
+        window._directory_clicked(recognize_root.child(1))
 
         assert observed == ["unnamed"]
+        window._directory_clicked(person_item)
+        settle_virtual_view_tasks(window, qt_app)
+        assert window.current_virtual_kind == VIRTUAL_KIND_PERSON
+        assert window.current_virtual_value == person_item.data(
+            0,
+            VIRTUAL_VALUE_ROLE,
+        )
+        assert [
+            record.rel_path
+            for record in window.model.images
+            if isinstance(record, ImageRecord)
+        ] == ["portrait.jpg"]
     finally:
         window.progress_timer.stop()
         window.idle_timer.stop()
@@ -10339,6 +10396,15 @@ def test_new_virtual_directory_dialog_validates_and_collects_filters(
     with Catalog(root) as catalog:
         catalog.refresh()
         catalog.define_tags(["Family", "Favorite"])
+        special_person = 'A/B "Quoted" O\'Neil %_ 佐藤'
+        catalog._conn.execute(
+            "INSERT INTO people(name, normalized, created_at_ns) VALUES (?, ?, ?)",
+            (
+                special_person,
+                ui_module.normalize_person_name(special_person),
+                1,
+            ),
+        )
         catalog.create_custom_virtual_directory("Existing", "", [""], [])
         dialog = NewVirtualDirectoryDialog(catalog)
         try:
@@ -10357,6 +10423,10 @@ def test_new_virtual_directory_dialog_validates_and_collects_filters(
                 dialog.tag_list.item(index).text()
                 for index in range(dialog.tag_list.count())
             ] == ["Family", "Favorite"]
+            assert [
+                dialog.people_list.item(index).text()
+                for index in range(dialog.people_list.count())
+            ] == [special_person]
 
             dialog._directory_items["album"].setCheckState(
                 0,
@@ -10367,6 +10437,7 @@ def test_new_virtual_directory_dialog_validates_and_collects_filters(
                 Qt.CheckState.Checked,
             )
             dialog.tag_list.item(0).setCheckState(Qt.CheckState.Checked)
+            dialog.people_list.item(0).setCheckState(Qt.CheckState.Checked)
             dialog.name_entry.setText(" existing ")
             assert not dialog.create_button.isEnabled()
 
@@ -10381,6 +10452,7 @@ def test_new_virtual_directory_dialog_validates_and_collects_filters(
             assert dialog.filename_regex() == r"^keep.*\.jpg$"
             assert dialog.selected_directories() == ("album",)
             assert dialog.selected_tags() == ("Family",)
+            assert dialog.selected_people() == (special_person,)
             deadline = monotonic() + 2
             while (
                 not dialog.match_count_label.text().startswith("Matches")
@@ -10391,6 +10463,7 @@ def test_new_virtual_directory_dialog_validates_and_collects_filters(
             assert dialog.match_count_label.text() == "Matches 0 files"
 
             dialog.tag_list.item(0).setCheckState(Qt.CheckState.Unchecked)
+            dialog.people_list.item(0).setCheckState(Qt.CheckState.Unchecked)
             dialog.regex_entry.setText("   ")
             assert dialog.filename_regex() == ""
             deadline = monotonic() + 2
@@ -10406,6 +10479,7 @@ def test_new_virtual_directory_dialog_validates_and_collects_filters(
                 dialog.filename_regex(),
                 dialog.selected_directories(),
                 dialog.selected_tags(),
+                dialog.selected_people(),
             )
             assert catalog.custom_virtual_directory_image_count(saved.id) == 1
         finally:
@@ -10513,6 +10587,71 @@ def test_advanced_virtual_directory_builder_round_trips_nested_rules(
             assert dialog.selected_directories() == ("album",)
             assert dialog.filename_regex() == r"^image"
             assert dialog.selected_tags() == ("Family",)
+        finally:
+            dialog.close()
+            dialog.deleteLater()
+            qt_app.processEvents()
+
+
+def test_edit_virtual_directory_dialog_loads_existing_configuration(
+    tmp_path: Path,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    image_path = root / "album" / "image.jpg"
+    image_path.parent.mkdir(parents=True)
+    Image.new("RGB", (8, 8), (10, 20, 30)).save(image_path)
+
+    with Catalog(root) as catalog:
+        catalog.refresh()
+        catalog.define_tags(["Family"])
+        person_name = "Mary Jane + O'Neil 佐藤"
+        catalog._conn.execute(
+            "INSERT INTO people(name, normalized, created_at_ns) VALUES (?, ?, ?)",
+            (person_name, ui_module.normalize_person_name(person_name), 1),
+        )
+        definition = catalog.create_custom_virtual_directory(
+            "Existing view",
+            r"^image",
+            ["album"],
+            ["Family"],
+            [person_name],
+        )
+        dialog = NewVirtualDirectoryDialog(
+            catalog,
+            definition=definition,
+        )
+        try:
+            dialog.show()
+            deadline = monotonic() + 2
+            while not dialog._loaded and monotonic() < deadline:
+                qt_app.processEvents()
+                dialog._poll_load()
+                sleep(0.01)
+
+            assert dialog._loaded
+            assert dialog.windowTitle() == "Edit Virtual Directory"
+            assert dialog.create_button.text() == "Save"
+            assert dialog.virtual_directory_name() == "Existing view"
+            assert dialog.filename_regex() == r"^image"
+            assert dialog.selected_directories() == ("album",)
+            assert dialog.selected_tags() == ("Family",)
+            assert dialog.selected_people() == (person_name,)
+            assert dialog.create_button.isEnabled()
+
+            dialog.name_entry.setText("Renamed view")
+            dialog.regex_entry.setText("")
+            assert dialog.create_button.isEnabled()
+            updated = catalog.update_custom_virtual_directory(
+                definition.id,
+                dialog.virtual_directory_name(),
+                dialog.filename_regex(),
+                dialog.selected_directories(),
+                dialog.selected_tags(),
+                dialog.selected_people(),
+            )
+            assert updated.name == "Renamed view"
+            assert updated.people == (person_name,)
         finally:
             dialog.close()
             dialog.deleteLater()
@@ -10647,7 +10786,7 @@ def test_custom_virtual_directory_tree_create_browse_and_confirmed_delete(
                     custom_menu,
                     custom_item,
                 ).values()
-            ] == ["Delete"]
+            ] == ["Edit", "Delete"]
         finally:
             root_menu.close()
             root_menu.deleteLater()
@@ -10663,6 +10802,26 @@ def test_custom_virtual_directory_tree_create_browse_and_confirmed_delete(
             if isinstance(record, ImageRecord)
         ] == ["album/keep-one.jpg", "album/sub/keep-two.jpg"]
 
+        update = window.queue_custom_virtual_directory_update(
+            catalog,
+            definition.id,
+            "Album Picks Edited",
+            r"^keep.*\.jpg$",
+            ["album"],
+            ["Family"],
+            [],
+            None,
+        )
+        assert update is not None
+        settle_move_payload_task(window, qt_app)
+        settle_tree_build_tasks(window, qt_app)
+        settle_virtual_view_tasks(window, qt_app)
+        updated_definition = catalog.get_custom_virtual_directory(definition.id)
+        assert updated_definition is not None
+        definition = updated_definition
+        assert definition.name == "Album Picks Edited"
+        assert catalog.custom_virtual_directory_image_count(definition.id) == 3
+
         confirmations: list[str] = []
         monkeypatch.setattr(
             ui_module,
@@ -10674,7 +10833,7 @@ def test_custom_virtual_directory_tree_create_browse_and_confirmed_delete(
             definition.id,
             definition.name,
         )
-        assert confirmations == ["Album Picks"]
+        assert confirmations == ["Album Picks Edited"]
         assert catalog.get_custom_virtual_directory(definition.id) == definition
 
         monkeypatch.setattr(

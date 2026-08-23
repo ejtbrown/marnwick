@@ -3,15 +3,116 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV_DIR="${MARNWICK_VENV:-$ROOT_DIR/.venv}"
-PYTHON_BIN="${PYTHON:-python3}"
 LAMA_RUNTIME_REQUEST="${MARNWICK_LAMA_RUNTIME:-auto}"
 INSTALL_WEBGPU=0
+INSTALL_INTEL_MAC_CPU=0
 SYSTEM_NAME="$(uname -s)"
 MACHINE_ARCH="$(uname -m)"
+MIN_PYTHON_MINOR=12
+MAX_PYTHON_MINOR_EXCLUSIVE=15
 
-if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
-  echo "Could not find Python executable: $PYTHON_BIN" >&2
+if [[ "$SYSTEM_NAME" == Darwin* && "$MACHINE_ARCH" == "x86_64" ]]; then
+  # ONNX Runtime 1.23.2 is the final release with Intel-macOS wheels, and
+  # those wheels stop at CPython 3.13.
+  MAX_PYTHON_MINOR_EXCLUSIVE=14
+fi
+
+python_is_supported() {
+  local candidate="$1"
+  "$candidate" -c '
+import platform
+import sys
+minimum = (3, int(sys.argv[1]))
+maximum = (3, int(sys.argv[2]))
+if sys.argv[3].startswith("Darwin") and platform.machine().lower() in ("amd64", "x86_64"):
+    maximum = min(maximum, (3, 14))
+supported = (
+    sys.implementation.name == "cpython"
+    and minimum <= sys.version_info[:2] < maximum
+)
+raise SystemExit(0 if supported else 1)
+' "$MIN_PYTHON_MINOR" "$MAX_PYTHON_MINOR_EXCLUSIVE" "$SYSTEM_NAME" >/dev/null 2>&1
+}
+
+python_description() {
+  "$1" -c '
+import platform
+import struct
+import sys
+architecture = platform.machine() or "unknown architecture"
+print(
+    f"{platform.python_implementation()} {platform.python_version()} "
+    f"({architecture}, {struct.calcsize(chr(80)) * 8}-bit)"
+)
+' 2>/dev/null || printf 'an unusable Python executable'
+}
+
+python_requirement() {
+  if (( MAX_PYTHON_MINOR_EXCLUSIVE == 14 )); then
+    printf '64-bit CPython 3.12 or 3.13'
+  else
+    printf '64-bit CPython 3.12, 3.13, or 3.14'
+  fi
+}
+
+select_python() {
+  local candidate
+  if [[ -n "${PYTHON:-}" ]]; then
+    if ! command -v "$PYTHON" >/dev/null 2>&1; then
+      echo "Could not find Python executable: $PYTHON" >&2
+      exit 1
+    fi
+    if ! python_is_supported "$PYTHON"; then
+      echo "Marnwick requires $(python_requirement)." >&2
+      echo "PYTHON points to $(python_description "$PYTHON")." >&2
+      exit 1
+    fi
+    PYTHON_BIN="$PYTHON"
+    return
+  fi
+
+  for candidate in python3 python3.14 python3.13 python3.12; do
+    if command -v "$candidate" >/dev/null 2>&1 \
+      && python_is_supported "$candidate"; then
+      PYTHON_BIN="$candidate"
+      return
+    fi
+  done
+
+  echo "Could not find $(python_requirement)." >&2
+  if [[ "$SYSTEM_NAME" == Darwin* ]]; then
+    echo "Install a compatible Python from python.org or Homebrew, then rerun ./setup.sh." >&2
+  else
+    echo "Install a compatible Python or set PYTHON to its executable path." >&2
+  fi
   exit 1
+}
+
+select_python
+
+PYTHON_ARCH="$("$PYTHON_BIN" -c 'import platform; print(platform.machine().lower())')"
+PYTHON_BITS="$("$PYTHON_BIN" -c 'import struct; print(struct.calcsize(chr(80)) * 8)')"
+case "$PYTHON_ARCH" in
+  amd64)
+    PYTHON_ARCH="x86_64"
+    ;;
+  aarch64)
+    PYTHON_ARCH="arm64"
+    ;;
+esac
+if [[ "$PYTHON_BITS" != "64" ]]; then
+  echo "Marnwick requires a 64-bit Python; selected $(python_description "$PYTHON_BIN")." >&2
+  exit 1
+fi
+if [[ "$SYSTEM_NAME" == Darwin* \
+  && "$PYTHON_ARCH" != "x86_64" \
+  && "$PYTHON_ARCH" != "arm64" ]]; then
+  echo "Marnwick supports x86-64 and Apple-silicon Python on macOS; selected $(python_description "$PYTHON_BIN")." >&2
+  exit 1
+fi
+if [[ "$SYSTEM_NAME" == Darwin* && "$PYTHON_ARCH" == "x86_64" ]]; then
+  INSTALL_INTEL_MAC_CPU=1
+  MAX_PYTHON_MINOR_EXCLUSIVE=14
 fi
 
 if [[ ! -f "$ROOT_DIR/marnwick-icon.png" ]]; then
@@ -20,10 +121,10 @@ if [[ ! -f "$ROOT_DIR/marnwick-icon.png" ]]; then
 fi
 
 webgpu_supported() {
-  if [[ "$SYSTEM_NAME" == Linux* && "$MACHINE_ARCH" == "x86_64" ]]; then
+  if [[ "$SYSTEM_NAME" == Linux* && "$PYTHON_ARCH" == "x86_64" ]]; then
     return 0
   fi
-  if [[ "$SYSTEM_NAME" == Darwin* && "$MACHINE_ARCH" == "arm64" ]]; then
+  if [[ "$SYSTEM_NAME" == Darwin* && "$PYTHON_ARCH" == "arm64" ]]; then
     local macos_major
     macos_major="$(sw_vers -productVersion 2>/dev/null | cut -d. -f1)"
     [[ "$macos_major" =~ ^[0-9]+$ ]] && (( macos_major >= 14 ))
@@ -37,7 +138,7 @@ select_automatic_runtimes() {
     INSTALL_WEBGPU=1
   fi
   if [[ "$SYSTEM_NAME" == Linux* ]] \
-    && [[ "$MACHINE_ARCH" == "x86_64" ]] \
+    && [[ "$PYTHON_ARCH" == "x86_64" ]] \
     && command -v nvidia-smi >/dev/null 2>&1 \
     && nvidia-smi -L >/dev/null 2>&1; then
     LAMA_RUNTIME="nvidia"
@@ -61,7 +162,7 @@ case "$LAMA_RUNTIME_REQUEST" in
     select_automatic_runtimes
     ;;
   nvidia)
-    if [[ "$SYSTEM_NAME" != Linux* || "$MACHINE_ARCH" != "x86_64" ]]; then
+    if [[ "$SYSTEM_NAME" != Linux* || "$PYTHON_ARCH" != "x86_64" ]]; then
       echo "NVIDIA LaMa runtime requires x86-64 Linux." >&2
       exit 1
     fi
@@ -76,7 +177,7 @@ case "$LAMA_RUNTIME_REQUEST" in
     INSTALL_WEBGPU=1
     ;;
   vulkan)
-    if [[ "$SYSTEM_NAME" != Linux* || "$MACHINE_ARCH" != "x86_64" ]]; then
+    if [[ "$SYSTEM_NAME" != Linux* || "$PYTHON_ARCH" != "x86_64" ]]; then
       echo "WebGPU over Vulkan requires x86-64 Linux." >&2
       exit 1
     fi
@@ -106,6 +207,10 @@ else
 fi
 
 "$PYTHON_BIN" -m venv "$VENV_DIR"
+if ! python_is_supported "$VENV_DIR/bin/python"; then
+  echo "The virtual environment does not contain $(python_requirement). Remove it and rerun ./setup.sh." >&2
+  exit 1
+fi
 "$VENV_DIR/bin/python" -m pip install --upgrade pip setuptools wheel
 if [[ -f "$ROOT_DIR/requirements-dev.lock" ]]; then
   if [[ "$INSTALL_WEBGPU" == "0" ]]; then
@@ -124,6 +229,18 @@ if [[ -f "$ROOT_DIR/requirements-dev.lock" ]]; then
       --no-deps \
       --require-hashes \
       -r "$ROOT_DIR/requirements-lama-nvidia.lock"
+  elif [[ "$INSTALL_INTEL_MAC_CPU" == "1" ]]; then
+    "$VENV_DIR/bin/python" -m pip uninstall -y \
+      onnxruntime onnxruntime-gpu onnxruntime-directml >/dev/null
+    "$VENV_DIR/bin/python" -m pip install \
+      --no-deps \
+      --require-hashes \
+      -r "$ROOT_DIR/requirements-lama-macos-intel.lock"
+  else
+    "$VENV_DIR/bin/python" -m pip install \
+      --no-deps \
+      --require-hashes \
+      -r "$ROOT_DIR/requirements-lama-cpu.lock"
   fi
   if [[ "$INSTALL_WEBGPU" == "1" ]]; then
     "$VENV_DIR/bin/python" -m pip install \
@@ -133,7 +250,9 @@ if [[ -f "$ROOT_DIR/requirements-dev.lock" ]]; then
   fi
   "$VENV_DIR/bin/python" -m pip install --no-deps -e "$ROOT_DIR"
 else
-  if [[ "$LAMA_RUNTIME" == "nvidia" ]]; then
+  if [[ "$INSTALL_INTEL_MAC_CPU" == "1" ]]; then
+    "$VENV_DIR/bin/python" -m pip install -e "$ROOT_DIR[dev,macos-intel]"
+  elif [[ "$LAMA_RUNTIME" == "nvidia" ]]; then
     if [[ "$INSTALL_WEBGPU" == "1" ]]; then
       "$VENV_DIR/bin/python" -m pip install -e "$ROOT_DIR[dev,nvidia,webgpu]"
     else
@@ -166,6 +285,17 @@ DEPENDENCY_STAMP="$VENV_DIR/.marnwick-runtime.cksum"
 
 if [[ ! -x "$VENV_DIR/bin/python" ]]; then
   echo "Marnwick virtual environment is missing. Run ./setup.sh first." >&2
+  exit 1
+fi
+
+MAX_PYTHON_MINOR_EXCLUSIVE=15
+VENV_PYTHON_ARCH="$("$VENV_DIR/bin/python" -c 'import platform; print(platform.machine().lower())' 2>/dev/null || true)"
+if [[ "$(uname -s)" == Darwin* \
+  && ( "$VENV_PYTHON_ARCH" == "x86_64" || "$VENV_PYTHON_ARCH" == "amd64" ) ]]; then
+  MAX_PYTHON_MINOR_EXCLUSIVE=14
+fi
+if ! "$VENV_DIR/bin/python" -c 'import sys; raise SystemExit(0 if sys.implementation.name == "cpython" and (3, 12) <= sys.version_info[:2] < (3, int(sys.argv[1])) else 1)' "$MAX_PYTHON_MINOR_EXCLUSIVE" >/dev/null 2>&1; then
+  echo "Marnwick's Python is no longer compatible. Run ./setup.sh again." >&2
   exit 1
 fi
 

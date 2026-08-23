@@ -1,0 +1,2 @@
+-c requirements-dev.lock
+onnxruntime==1.23.2

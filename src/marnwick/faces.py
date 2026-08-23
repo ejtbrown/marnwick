@@ -456,12 +456,19 @@ class FaceStore:
         rows = list(
             self.connection.execute(
                 """
-                SELECT id, quality, embedding, thumbnail_rel_path
-                FROM faces
-                WHERE status = 'active' AND person_id IS NULL
-                  AND (? OR deferred_until_ns <= ?)
-                  AND embedding_version = ?
-                ORDER BY quality DESC, id
+                SELECT face.id, face.quality, face.embedding,
+                       face.thumbnail_rel_path,
+                       forced.face_id AS forced_loose,
+                       manual.group_id AS manual_group_id
+                FROM faces AS face
+                LEFT JOIN face_forced_loose AS forced
+                  ON forced.face_id = face.id
+                LEFT JOIN face_manual_group_faces AS manual
+                  ON manual.face_id = face.id
+                WHERE face.status = 'active' AND face.person_id IS NULL
+                  AND (? OR face.deferred_until_ns <= ?)
+                  AND face.embedding_version = ?
+                ORDER BY face.quality DESC, face.id
                 LIMIT ?
                 """,
                 (
@@ -498,11 +505,28 @@ class FaceStore:
             rejected_by_face,
             rejected_by_crop,
         )
+        forced_indexes = {
+            index
+            for index, row in enumerate(rows)
+            if row["forced_loose"] is not None
+        }
+        manual_indexes_by_group: dict[int, list[int]] = defaultdict(list)
+        for index, row in enumerate(rows):
+            if index not in forced_indexes and row["manual_group_id"] is not None:
+                manual_indexes_by_group[int(row["manual_group_id"])].append(index)
+        manual_indexes = {
+            index
+            for indexes in manual_indexes_by_group.values()
+            for index in indexes
+        }
+        reserved_indexes = forced_indexes | manual_indexes
         groups: list[FaceReviewGroup] = []
         proposed_members: dict[int, list[int]] = defaultdict(list)
         proposed_values: dict[int, list[float]] = defaultdict(list)
         remaining_indexes: list[int] = []
         for index, person_id in enumerate(proposed):
+            if index in reserved_indexes:
+                continue
             if person_id is None:
                 remaining_indexes.append(index)
             else:
@@ -525,6 +549,84 @@ class FaceStore:
                     proposed_person_id=person_id,
                     proposed_person_name=name,
                     confidence=confidence,
+                )
+            )
+        for group_id, indexes in manual_indexes_by_group.items():
+            ordered = sorted(
+                indexes,
+                key=lambda value: (-qualities[value], int(face_ids[value])),
+            )
+            ids = tuple(int(face_ids[index]) for index in ordered)
+            if not ids:
+                continue
+            proposed_person_id, confidence = self._manual_group_proposal(
+                face_ids[np.asarray(indexes, dtype=np.int64)],
+                crop_hashes[np.asarray(indexes, dtype=np.int64)],
+                embeddings[np.asarray(indexes, dtype=np.int64)],
+                rejected_by_face,
+                rejected_by_crop,
+            )
+            if proposed_person_id is not None:
+                name = person_names.get(
+                    proposed_person_id,
+                    f"Person {proposed_person_id}",
+                )
+                groups.append(
+                    FaceReviewGroup(
+                        key=f"manual:{group_id}",
+                        kind="proposal",
+                        face_ids=ids,
+                        representative_ids=_diverse_representatives(
+                            ids,
+                            embeddings,
+                            face_ids,
+                        ),
+                        title=f"Likely {name}",
+                        count=len(ids),
+                        proposed_person_id=proposed_person_id,
+                        proposed_person_name=name,
+                        confidence=confidence,
+                    )
+                )
+            elif len(ids) == 1:
+                groups.append(
+                    FaceReviewGroup(
+                        key=f"manual:{group_id}",
+                        kind="loose",
+                        face_ids=ids,
+                        representative_ids=ids,
+                        title="Loose face",
+                        count=1,
+                    )
+                )
+            else:
+                groups.append(
+                    FaceReviewGroup(
+                        key=f"manual:{group_id}",
+                        kind="unnamed",
+                        face_ids=ids,
+                        representative_ids=_diverse_representatives(
+                            ids,
+                            embeddings,
+                            face_ids,
+                        ),
+                        title="Manually grouped faces",
+                        count=len(ids),
+                    )
+                )
+        for index in sorted(
+            forced_indexes,
+            key=lambda value: (-qualities[value], int(face_ids[value])),
+        ):
+            face_id = int(face_ids[index])
+            groups.append(
+                FaceReviewGroup(
+                    key=f"loose:{face_id}",
+                    kind="loose",
+                    face_ids=(face_id,),
+                    representative_ids=(face_id,),
+                    title="Loose face",
+                    count=1,
                 )
             )
         if remaining_indexes:
@@ -582,7 +684,24 @@ class FaceStore:
             if view == "unnamed":
                 return [group for group in groups if group.kind == "unnamed"]
             if view == "loose":
-                return [group for group in groups if group.kind == "loose"]
+                loose_ids = tuple(
+                    face_id
+                    for group in groups
+                    if group.kind == "loose"
+                    for face_id in group.face_ids
+                )
+                if not loose_ids:
+                    return []
+                return [
+                    FaceReviewGroup(
+                        key="loose:all",
+                        kind="loose",
+                        face_ids=loose_ids,
+                        representative_ids=loose_ids[:FACE_REPRESENTATIVE_LIMIT],
+                        title="Loose faces",
+                        count=len(loose_ids),
+                    )
+                ]
             return groups
         if view == "people":
             groups: list[FaceReviewGroup] = []
@@ -905,14 +1024,179 @@ class FaceStore:
                 {"new_pairs": [list(pair) for pair in new_pairs]},
             )
 
+    def group_faces(self, face_ids: Sequence[int]) -> int:
+        """Persist a user-selected positive group for subsequent recognition."""
+
+        ids = _unique_ids(face_ids)
+        if len(ids) < 2:
+            raise ValueError("Select at least two loose faces to group")
+        placeholders = ",".join("?" for _ in ids)
+        available = {
+            int(row["id"])
+            for row in self.connection.execute(
+                f"SELECT id FROM faces WHERE id IN ({placeholders}) "
+                "AND status = 'active' AND person_id IS NULL",
+                ids,
+            )
+        }
+        if available != set(ids):
+            raise ValueError("One or more selected faces are no longer loose")
+        removed_memberships = [
+            [int(row["group_id"]), int(row["face_id"])]
+            for row in self.connection.execute(
+                f"SELECT group_id, face_id FROM face_manual_group_faces "
+                f"WHERE face_id IN ({placeholders})",
+                ids,
+            )
+        ]
+        removed_forced = [
+            int(row["face_id"])
+            for row in self.connection.execute(
+                f"SELECT face_id FROM face_forced_loose "
+                f"WHERE face_id IN ({placeholders})",
+                ids,
+            )
+        ]
+        with self.catalog._database_savepoint("group_faces"):
+            cursor = self.connection.execute(
+                "INSERT INTO face_manual_groups(created_at_ns) VALUES (?)",
+                (time.time_ns(),),
+            )
+            group_id = int(cursor.lastrowid)
+            self.connection.execute(
+                f"DELETE FROM face_manual_group_faces "
+                f"WHERE face_id IN ({placeholders})",
+                ids,
+            )
+            self.connection.executemany(
+                "INSERT INTO face_manual_group_faces(group_id, face_id) VALUES (?, ?)",
+                ((group_id, face_id) for face_id in ids),
+            )
+            self.connection.execute(
+                f"DELETE FROM face_forced_loose WHERE face_id IN ({placeholders})",
+                ids,
+            )
+            self._record_operation(
+                "group",
+                {
+                    "manual_group_id": group_id,
+                    "removed_forced_loose": removed_forced,
+                    "removed_manual_memberships": removed_memberships,
+                },
+            )
+        return group_id
+
+    def mark_faces_loose(
+        self,
+        face_ids: Sequence[int],
+        *,
+        person_id: int | None = None,
+    ) -> tuple[int, ...]:
+        """Keep every selected face out of automatic and manual grouping."""
+
+        ids = _unique_ids(face_ids)
+        if not ids:
+            return ()
+        placeholders = ",".join("?" for _ in ids)
+        existing_rows = list(
+            self.connection.execute(
+                f"SELECT id, person_id FROM faces WHERE id IN ({placeholders}) "
+                "AND status = 'active' ORDER BY id",
+                ids,
+            )
+        )
+        existing_ids = tuple(int(row["id"]) for row in existing_rows)
+        if not existing_ids:
+            return ()
+        if any(
+            row["person_id"] is not None
+            and (
+                person_id is None
+                or int(row["person_id"]) != int(person_id)
+            )
+            for row in existing_rows
+        ):
+            raise ValueError("The selected faces no longer belong to this group")
+        existing_placeholders = ",".join("?" for _ in existing_ids)
+        before = self._face_snapshots(existing_ids)
+        already_forced = {
+            int(row["face_id"])
+            for row in self.connection.execute(
+                f"SELECT face_id FROM face_forced_loose "
+                f"WHERE face_id IN ({existing_placeholders})",
+                existing_ids,
+            )
+        }
+        removed_memberships = [
+            [int(row["group_id"]), int(row["face_id"])]
+            for row in self.connection.execute(
+                f"SELECT group_id, face_id FROM face_manual_group_faces "
+                f"WHERE face_id IN ({existing_placeholders})",
+                existing_ids,
+            )
+        ]
+        existing_rejections: set[int] = set()
+        if person_id is not None:
+            existing_rejections = {
+                int(row["face_id"])
+                for row in self.connection.execute(
+                    f"SELECT face_id FROM face_person_rejections "
+                    f"WHERE person_id = ? AND face_id IN ({existing_placeholders})",
+                    (int(person_id), *existing_ids),
+                )
+            }
+        with self.catalog._database_savepoint("mark_faces_loose"):
+            now = time.time_ns()
+            self.connection.execute(
+                f"DELETE FROM face_manual_group_faces "
+                f"WHERE face_id IN ({existing_placeholders})",
+                existing_ids,
+            )
+            self.connection.executemany(
+                "INSERT OR IGNORE INTO face_forced_loose(face_id, created_at_ns) "
+                "VALUES (?, ?)",
+                ((face_id, now) for face_id in existing_ids),
+            )
+            if person_id is not None:
+                self.connection.executemany(
+                    "INSERT OR IGNORE INTO face_person_rejections"
+                    "(face_id, person_id, created_at_ns) VALUES (?, ?, ?)",
+                    ((face_id, int(person_id), now) for face_id in existing_ids),
+                )
+                self.connection.execute(
+                    f"UPDATE faces SET person_id = NULL, confirmed = 0, "
+                    f"updated_at_ns = ? WHERE id IN ({existing_placeholders})",
+                    (now, *existing_ids),
+                )
+            self._record_operation(
+                "loose",
+                {
+                    "faces": before,
+                    "person_id": int(person_id) if person_id is not None else None,
+                    "new_rejections": [
+                        face_id
+                        for face_id in existing_ids
+                        if face_id not in existing_rejections
+                    ],
+                    "new_forced_loose": [
+                        face_id
+                        for face_id in existing_ids
+                        if face_id not in already_forced
+                    ],
+                    "removed_manual_memberships": removed_memberships,
+                },
+            )
+        return existing_ids
+
     def remove_face_crops_from_group(
         self,
         face_ids: Sequence[int],
         remaining_face_ids: Sequence[int],
-    ) -> None:
+    ) -> tuple[int, ...]:
         """Keep these exact face crops out of this unnamed cluster."""
 
         removed_hashes = self._crop_hashes_for_face_ids(_unique_ids(face_ids))
+        affected_ids = self._face_ids_for_crop_hashes(removed_hashes)
         remaining_hashes = self._crop_hashes_for_face_ids(
             _unique_ids(remaining_face_ids)
         )
@@ -926,7 +1210,7 @@ class FaceStore:
             )
         )
         if not pairs:
-            return
+            return affected_ids
         if len(pairs) > FACE_SEPARATION_PAIR_LIMIT:
             raise ValueError(
                 "That removal would create too many durable crop exclusions; select fewer faces"
@@ -947,7 +1231,7 @@ class FaceStore:
             )
         new_pairs = tuple(pair for pair in pairs if pair not in existing)
         if not new_pairs:
-            return
+            return affected_ids
         with self.catalog._database_savepoint("remove_face_crops_from_group"):
             now = time.time_ns()
             self.connection.executemany(
@@ -959,17 +1243,18 @@ class FaceStore:
                 "remove",
                 {"new_crop_pairs": [list(pair) for pair in new_pairs]},
             )
+        return affected_ids
 
     def remove_face_crops_from_person(
         self,
         face_ids: Sequence[int],
         person_id: int,
-    ) -> None:
+    ) -> tuple[int, ...]:
         """Reject every present or future copy of these crops for a person."""
 
         crop_hashes = self._crop_hashes_for_face_ids(_unique_ids(face_ids))
         if not crop_hashes:
-            return
+            return ()
         paths = tuple(f"{value[:2]}/{value}.jpg" for value in crop_hashes)
         affected: set[int] = set()
         for offset in range(0, len(paths), 400):
@@ -1015,7 +1300,7 @@ class FaceStore:
             value for value in crop_hashes if value not in existing_hashes
         ]
         if not new_face_rejections and not new_crop_rejections:
-            return
+            return affected_ids
         with self.catalog._database_savepoint("remove_face_crops_from_person"):
             now = time.time_ns()
             self.connection.executemany(
@@ -1043,6 +1328,7 @@ class FaceStore:
                     "new_crop_person_rejections": new_crop_rejections,
                 },
             )
+        return affected_ids
 
     def defer_faces(self, face_ids: Sequence[int]) -> None:
         ids = _unique_ids(face_ids)
@@ -1127,9 +1413,39 @@ class FaceStore:
                     "WHERE crop_hash = ? AND person_id = ?",
                     (crop_hash, person_id),
                 )
+            for face_id in payload.get("new_forced_loose", []):
+                self.connection.execute(
+                    "DELETE FROM face_forced_loose WHERE face_id = ?",
+                    (int(face_id),),
+                )
+            manual_group_id = payload.get("manual_group_id")
+            if manual_group_id is not None:
+                self.connection.execute(
+                    "DELETE FROM face_manual_groups WHERE id = ?",
+                    (int(manual_group_id),),
+                )
+            now = time.time_ns()
+            self.connection.executemany(
+                "INSERT OR IGNORE INTO face_forced_loose(face_id, created_at_ns) "
+                "VALUES (?, ?)",
+                (
+                    (int(face_id), now)
+                    for face_id in payload.get("removed_forced_loose", [])
+                ),
+            )
+            self.connection.executemany(
+                "INSERT OR IGNORE INTO face_manual_group_faces(group_id, face_id) "
+                "VALUES (?, ?)",
+                (
+                    (int(group_id), int(face_id))
+                    for group_id, face_id in payload.get(
+                        "removed_manual_memberships",
+                        [],
+                    )
+                ),
+            )
             removed_person_id = payload.get("removed_rejection_person_id")
             if removed_person_id is not None:
-                now = time.time_ns()
                 self.connection.executemany(
                     "INSERT OR IGNORE INTO face_person_rejections"
                     "(face_id, person_id, created_at_ns) VALUES (?, ?, ?)",
@@ -1140,7 +1456,6 @@ class FaceStore:
                 )
             removed_crop_person_id = payload.get("removed_crop_rejection_person_id")
             if removed_crop_person_id is not None:
-                now = time.time_ns()
                 self.connection.executemany(
                     "INSERT OR IGNORE INTO face_crop_person_rejections"
                     "(crop_hash, person_id, created_at_ns) VALUES (?, ?, ?)",
@@ -1164,6 +1479,9 @@ class FaceStore:
     def purge(self) -> None:
         with self.catalog._database_savepoint("purge_face_data"):
             self.connection.execute("DELETE FROM face_operations")
+            self.connection.execute("DELETE FROM face_manual_group_faces")
+            self.connection.execute("DELETE FROM face_manual_groups")
+            self.connection.execute("DELETE FROM face_forced_loose")
             self.connection.execute("DELETE FROM face_crop_pair_rejections")
             self.connection.execute("DELETE FROM face_crop_person_rejections")
             self.connection.execute("DELETE FROM face_pair_rejections")
@@ -1331,6 +1649,73 @@ class FaceStore:
                 scores.append(best_score)
         return proposed, scores
 
+    def _manual_group_proposal(
+        self,
+        face_ids: np.ndarray,
+        crop_hashes: np.ndarray,
+        embeddings: np.ndarray,
+        rejected_by_face: dict[int, set[int]],
+        rejected_by_crop: dict[str, set[int]],
+    ) -> tuple[int | None, float]:
+        """Recognize a user-assembled group using its normalized mean embedding."""
+
+        anchors = list(
+            self.connection.execute(
+                """
+                SELECT id, person_id, embedding, quality
+                FROM (
+                    SELECT id, person_id, embedding, quality,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY person_id ORDER BY quality DESC, id
+                           ) AS anchor_rank
+                    FROM faces
+                    WHERE status = 'active' AND person_id IS NOT NULL AND confirmed = 1
+                      AND embedding_version = ?
+                )
+                WHERE anchor_rank <= ?
+                ORDER BY person_id, quality DESC, id
+                """,
+                (FACE_EMBEDDING_VERSION, FACE_MAX_PERSON_ANCHORS),
+            )
+        )
+        if not anchors or not len(embeddings):
+            return None, 0.0
+        centroid = np.mean(embeddings, axis=0)
+        norm = float(np.linalg.norm(centroid))
+        if norm <= 1e-12:
+            return None, 0.0
+        centroid /= norm
+        anchor_embeddings = _embedding_matrix(anchors)
+        similarities = anchor_embeddings @ centroid
+        blocked_people = {
+            person_id
+            for face_id, crop_hash in zip(face_ids, crop_hashes, strict=True)
+            for person_id in (
+                rejected_by_face.get(int(face_id), set())
+                | rejected_by_crop.get(str(crop_hash), set())
+            )
+        }
+        by_person: dict[int, float] = {}
+        for anchor, score in zip(anchors, similarities, strict=True):
+            person_id = int(anchor["person_id"])
+            if person_id in blocked_people:
+                continue
+            by_person[person_id] = max(
+                float(score),
+                by_person.get(person_id, -1.0),
+            )
+        ordered = sorted(by_person.items(), key=lambda item: (-item[1], item[0]))
+        if not ordered:
+            return None, 0.0
+        best_person, best_score = ordered[0]
+        second_score = ordered[1][1] if len(ordered) > 1 else -1.0
+        if (
+            best_score >= FACE_PERSON_SUGGESTION_SIMILARITY
+            and best_score - second_score >= FACE_PERSON_SUGGESTION_MARGIN
+        ):
+            return best_person, best_score
+        return None, best_score
+
     def _pair_rejections(self) -> set[tuple[int, int]]:
         return {
             (int(row["first_face_id"]), int(row["second_face_id"]))
@@ -1359,6 +1744,26 @@ class FaceStore:
                     f"SELECT thumbnail_rel_path FROM faces WHERE id IN "
                     f"({','.join('?' for _ in batch)})",
                     tuple(batch),
+                )
+            )
+        return tuple(sorted(result))
+
+    def _face_ids_for_crop_hashes(
+        self,
+        crop_hashes: Sequence[str],
+    ) -> tuple[int, ...]:
+        result: set[int] = set()
+        paths = tuple(f"{value[:2]}/{value}.jpg" for value in crop_hashes)
+        for offset in range(0, len(paths), 400):
+            batch = paths[offset : offset + 400]
+            if not batch:
+                continue
+            result.update(
+                int(row["id"])
+                for row in self.connection.execute(
+                    f"SELECT id FROM faces WHERE thumbnail_rel_path IN "
+                    f"({','.join('?' for _ in batch)})",
+                    batch,
                 )
             )
         return tuple(sorted(result))

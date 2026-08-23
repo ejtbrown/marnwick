@@ -1,5 +1,8 @@
 # DirectML-enabled ONNX Runtime selected by setup.ps1 after the base dependencies.
-# Install with --no-deps because requirements-dev.lock supplies shared dependencies.
+# Install with --no-deps because requirements-dev.lock supplies NumPy and packaging.
+flatbuffers==25.12.19 \
+    --hash=sha256:7634f50c427838bb021c2d66a3d1168e9d199b0607e6329399f04846d42e20b4
+    # via onnxruntime-directml
 mpmath==1.3.0 \
     --hash=sha256:7a28eb2a9774d00c7bc92411c19a89209d5da7c4c9a9e227be8330a23a25b91f \
     --hash=sha256:a0b2b9fe80bbcd81a6647ff13108738cfb482d481d826cc0e02f5b35e5c88d2c
@@ -9,6 +12,16 @@ onnxruntime-directml==1.24.4 \
     --hash=sha256:f2ecb68b7b7b259d2ef3112ae760149f9b5a1e7c0fbb73d539da6250a648a614 \
     --hash=sha256:2f1031cb2281e5b27cca9efe0b9399317c7286e4d226f7a79d4ab79bbd94d19e \
     --hash=sha256:51d86bb949488e572b00422f344990a4a81d982416d73b6c0e4ced2bcd423d19
+protobuf==7.36.0 \
+    --hash=sha256:1781cc1de61249b750848029bca452c0a8b7e990080316b9bbc2518b2117b488 \
+    --hash=sha256:3297e60abdff301e5f74393d87f6cc59dacab5f024a89548a6e8de1d26576b16 \
+    --hash=sha256:53374d53fc29a67f7dbbf0ade47d7526a0f0137bf0f9c90e48d8a60790ef748c \
+    --hash=sha256:70f5ec8eb0da81a44360c0dc0beac99a0d78071d21956a7076bae8bd2051841b \
+    --hash=sha256:7326fd717bdc419162a735938d89d4032332bcc3408804012b24ff3a37086071 \
+    --hash=sha256:9103532dffd80c6fab7e50c65a31007680a06eb57537d437bb1b35812c138a37 \
+    --hash=sha256:bf94a5917c71058262de683669bc0a797a7669d3de71f0b36d058e3194f47b44 \
+    --hash=sha256:e8e09cb0d794c6687926fa558a8a6e72aa10edb997d5ca61da0765f12a3e00ea
+    # via onnxruntime-directml
 sympy==1.14.0 \
     --hash=sha256:d3d3fe8df1e5a0b42f0e7bdf50541697dbe7d23746e894990c030e2b05e72517 \
     --hash=sha256:e091cc3e99d2141a0ba2847328f5479b05d94a6635cb96148ccb3f34671bd8f5

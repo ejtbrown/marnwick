@@ -7,7 +7,7 @@ name = "marnwick"
 version = "0.1.0"
 description = "A fast, portable photo viewer and organizer for catalog-based workflows."
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12,<3.15"
 dependencies = [
   "av>=14",
   "numpy>=1.26",
@@ -18,7 +18,7 @@ dependencies = [
 
 [project.optional-dependencies]
 cpu = [
-  "onnxruntime>=1.24.4",
+  "onnxruntime>=1.24.4; platform_system != 'Darwin' or platform_machine != 'x86_64'",
 ]
 directml = [
   "onnxruntime-directml>=1.20; platform_system == 'Windows' and platform_machine == 'AMD64'",
@@ -29,6 +29,9 @@ dev = [
 ]
 nvidia = [
   "onnxruntime-gpu>=1.24.4; platform_system == 'Linux' and platform_machine == 'x86_64'",
+]
+macos-intel = [
+  "onnxruntime==1.23.2",
 ]
 webgpu = [
   "onnxruntime-ep-webgpu>=0.1.0; (platform_system == 'Linux' and platform_machine == 'x86_64') or (platform_system == 'Darwin' and platform_machine == 'arm64') or (platform_system == 'Windows' and platform_machine == 'AMD64')",
