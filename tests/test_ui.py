@@ -3161,6 +3161,9 @@ def test_dialog_styles_follow_runtime_application_palette_changes() -> None:
     qt_app = app()
     install_system_theme_tracking(qt_app)
     original = QPalette(qt_app.palette())
+    qt_app.setPalette(QPalette())
+    qt_app.processEvents()
+    system_light = QPalette(qt_app.palette())
     dialog = GoToFileDialog(12, 3)
     dialog.resize(320, 120)
     dialog.show()
@@ -3190,19 +3193,19 @@ def test_dialog_styles_follow_runtime_application_palette_changes() -> None:
         assert "#ffb4ab" in dialog.entry.styleSheet()
         menu.deleteLater()
 
-        light = QPalette(original)
-        light.setColor(QPalette.ColorRole.Window, QColor("#f6f7f9"))
-        light.setColor(QPalette.ColorRole.WindowText, QColor("#202124"))
-        light.setColor(QPalette.ColorRole.Base, QColor("#ffffff"))
-        light.setColor(QPalette.ColorRole.Text, QColor("#202124"))
-        qt_app.setPalette(light)
+        qt_app.styleHints().colorSchemeChanged.emit(Qt.ColorScheme.Light)
         qt_app.processEvents()
         qt_app.processEvents()
 
-        assert dialog.grab().toImage().pixelColor(1, 1) == QColor("#f6f7f9")
-        assert dialog.entry.palette().color(QPalette.ColorRole.Base) == QColor(
-            "#ffffff"
+        assert dialog.grab().toImage().pixelColor(1, 1) == system_light.color(
+            QPalette.ColorRole.Window
         )
+        assert dialog.entry.palette().color(
+            QPalette.ColorRole.Base
+        ) == system_light.color(
+            QPalette.ColorRole.Base
+        )
+        assert qt_app.palette().resolveMask() == 0
         assert "#b3261e" in dialog.entry.styleSheet()
     finally:
         dialog.close()

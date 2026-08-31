@@ -1163,8 +1163,19 @@ class SystemThemeSynchronizer(QObject):
         self.schedule_refresh()
 
     def _color_scheme_changed(self, *_args: object) -> None:
-        # Fetch a fresh native palette when the OS switches appearance.
-        self._system_palette = QPalette(self.application.style().standardPalette())
+        # Qt emits colorSchemeChanged while the old palette is still active and
+        # preserves roles explicitly set by the application. Clear Marnwick's
+        # derived palette now, then capture Qt's newly resolved system palette
+        # after the native theme change has finished propagating.
+        self._applying_palette = True
+        try:
+            self.application.setPalette(QPalette())
+        finally:
+            self._applying_palette = False
+        QTimer.singleShot(0, self._capture_system_palette)
+
+    def _capture_system_palette(self) -> None:
+        self._system_palette = QPalette(self.application.palette())
         self.schedule_refresh()
 
     def schedule_refresh(self, *_args: object) -> None:
