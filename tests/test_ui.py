@@ -114,6 +114,7 @@ from marnwick.ui import (  # noqa: E402
     copy_files_to_clipboard,
     create_delete_message_box,
     create_save_edits_message_box,
+    darker_system_palette,
     load_oriented_pixmap,
     metadata_text,
     EditCommandDialog,
@@ -3110,10 +3111,59 @@ def test_dialog_stylesheet_explicitly_styles_message_box_buttons() -> None:
     assert "#202124" not in DIALOG_STYLESHEET
 
 
+def test_darker_system_palette_darkens_surfaces_and_preserves_accent() -> None:
+    dark = QPalette()
+    for group in (
+        QPalette.ColorGroup.Active,
+        QPalette.ColorGroup.Inactive,
+        QPalette.ColorGroup.Disabled,
+    ):
+        dark.setColor(group, QPalette.ColorRole.Window, QColor("#303236"))
+        dark.setColor(group, QPalette.ColorRole.WindowText, QColor("#f8f9fa"))
+        dark.setColor(group, QPalette.ColorRole.Base, QColor("#37393d"))
+        dark.setColor(group, QPalette.ColorRole.Button, QColor("#404246"))
+        dark.setColor(group, QPalette.ColorRole.Highlight, QColor("#7c4dff"))
+        dark.setColor(
+            group, QPalette.ColorRole.HighlightedText, QColor("#fff4dd")
+        )
+
+    result = darker_system_palette(dark)
+
+    assert (
+        result.color(QPalette.ColorGroup.Active, QPalette.ColorRole.Window)
+        == QColor("#16181c")
+    )
+    assert (
+        result.color(QPalette.ColorGroup.Inactive, QPalette.ColorRole.Base)
+        == QColor("#0f1114")
+    )
+    assert (
+        result.color(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Button)
+        == QColor("#1b1e23")
+    )
+    for group in (
+        QPalette.ColorGroup.Active,
+        QPalette.ColorGroup.Inactive,
+        QPalette.ColorGroup.Disabled,
+    ):
+        assert result.color(group, QPalette.ColorRole.Highlight) == QColor("#7c4dff")
+        assert result.color(group, QPalette.ColorRole.HighlightedText) == QColor(
+            "#fff4dd"
+        )
+
+    light = QPalette(dark)
+    light.setColor(QPalette.ColorRole.Window, QColor("#f6f7f9"))
+    light.setColor(QPalette.ColorRole.WindowText, QColor("#202124"))
+    assert darker_system_palette(light) == light
+
+
 def test_dialog_styles_follow_runtime_application_palette_changes() -> None:
     qt_app = app()
     install_system_theme_tracking(qt_app)
     original = QPalette(qt_app.palette())
+    qt_app.setPalette(QPalette())
+    qt_app.processEvents()
+    system_light = QPalette(qt_app.palette())
     dialog = GoToFileDialog(12, 3)
     dialog.resize(320, 120)
     dialog.show()
@@ -3131,25 +3181,31 @@ def test_dialog_styles_follow_runtime_application_palette_changes() -> None:
         qt_app.processEvents()
         qt_app.processEvents()
 
-        assert dialog.grab().toImage().pixelColor(1, 1) == QColor("#202124")
+        menu = QMenu(dialog)
+
+        assert dialog.grab().toImage().pixelColor(1, 1) == QColor("#16181c")
         assert dialog.entry.palette().color(QPalette.ColorRole.Base) == QColor(
-            "#292a2d"
+            "#0f1114"
         )
+        assert qt_app.palette().color(QPalette.ColorRole.Button) == QColor("#20242a")
+        assert menu.palette().color(QPalette.ColorRole.Window) == QColor("#16181c")
+        assert menu.palette().color(QPalette.ColorRole.Base) == QColor("#0f1114")
         assert "#ffb4ab" in dialog.entry.styleSheet()
+        menu.deleteLater()
 
-        light = QPalette(original)
-        light.setColor(QPalette.ColorRole.Window, QColor("#f6f7f9"))
-        light.setColor(QPalette.ColorRole.WindowText, QColor("#202124"))
-        light.setColor(QPalette.ColorRole.Base, QColor("#ffffff"))
-        light.setColor(QPalette.ColorRole.Text, QColor("#202124"))
-        qt_app.setPalette(light)
+        qt_app.styleHints().colorSchemeChanged.emit(Qt.ColorScheme.Light)
         qt_app.processEvents()
         qt_app.processEvents()
 
-        assert dialog.grab().toImage().pixelColor(1, 1) == QColor("#f6f7f9")
-        assert dialog.entry.palette().color(QPalette.ColorRole.Base) == QColor(
-            "#ffffff"
+        assert dialog.grab().toImage().pixelColor(1, 1) == system_light.color(
+            QPalette.ColorRole.Window
         )
+        assert dialog.entry.palette().color(
+            QPalette.ColorRole.Base
+        ) == system_light.color(
+            QPalette.ColorRole.Base
+        )
+        assert qt_app.palette().resolveMask() == 0
         assert "#b3261e" in dialog.entry.styleSheet()
     finally:
         dialog.close()

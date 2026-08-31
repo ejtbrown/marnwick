@@ -1055,10 +1055,63 @@ QPushButton:hover {
 """
 
 
+DARK_THEME_COLORS: Mapping[QPalette.ColorRole, str] = {
+    QPalette.ColorRole.Window: "#16181c",
+    QPalette.ColorRole.WindowText: "#e8eaed",
+    QPalette.ColorRole.Base: "#0f1114",
+    QPalette.ColorRole.AlternateBase: "#1b1e23",
+    QPalette.ColorRole.ToolTipBase: "#22262c",
+    QPalette.ColorRole.ToolTipText: "#f1f3f4",
+    QPalette.ColorRole.Text: "#e8eaed",
+    QPalette.ColorRole.Button: "#20242a",
+    QPalette.ColorRole.ButtonText: "#e8eaed",
+    QPalette.ColorRole.BrightText: "#ffffff",
+    QPalette.ColorRole.Light: "#4b535e",
+    QPalette.ColorRole.Midlight: "#414852",
+    QPalette.ColorRole.Mid: "#343a42",
+    QPalette.ColorRole.Dark: "#090b0e",
+    QPalette.ColorRole.Shadow: "#000000",
+    QPalette.ColorRole.PlaceholderText: "#89919c",
+}
+
+DARK_THEME_DISABLED_COLORS: Mapping[QPalette.ColorRole, str] = {
+    QPalette.ColorRole.Window: "#16181c",
+    QPalette.ColorRole.WindowText: "#777f8a",
+    QPalette.ColorRole.Base: "#111317",
+    QPalette.ColorRole.AlternateBase: "#191c20",
+    QPalette.ColorRole.ToolTipBase: "#20242a",
+    QPalette.ColorRole.ToolTipText: "#89919c",
+    QPalette.ColorRole.Text: "#777f8a",
+    QPalette.ColorRole.Button: "#1b1e23",
+    QPalette.ColorRole.ButtonText: "#777f8a",
+    QPalette.ColorRole.BrightText: "#9aa1ab",
+    QPalette.ColorRole.Light: "#343a42",
+    QPalette.ColorRole.Midlight: "#30363d",
+    QPalette.ColorRole.Mid: "#292e35",
+    QPalette.ColorRole.Dark: "#090b0e",
+    QPalette.ColorRole.Shadow: "#000000",
+    QPalette.ColorRole.PlaceholderText: "#59616c",
+}
+
+
 def _palette_is_dark(palette: QPalette) -> bool:
     window = palette.color(QPalette.ColorRole.Window)
     text = palette.color(QPalette.ColorRole.WindowText)
     return window.lightnessF() < text.lightnessF()
+
+
+def darker_system_palette(palette: QPalette) -> QPalette:
+    """Use deeper dark-mode surfaces while preserving the system accent colors."""
+
+    if not _palette_is_dark(palette):
+        return QPalette(palette)
+    darkened = QPalette(palette)
+    for group in (QPalette.ColorGroup.Active, QPalette.ColorGroup.Inactive):
+        for role, color in DARK_THEME_COLORS.items():
+            darkened.setColor(group, role, QColor(color))
+    for role, color in DARK_THEME_DISABLED_COLORS.items():
+        darkened.setColor(QPalette.ColorGroup.Disabled, role, QColor(color))
+    return darkened
 
 
 def _validation_color(widget: QWidget) -> str:
@@ -1095,8 +1148,35 @@ class SystemThemeSynchronizer(QObject):
         super().__init__(application)
         self.application = application
         self._refresh_pending = False
-        application.paletteChanged.connect(self.schedule_refresh)
-        application.styleHints().colorSchemeChanged.connect(self.schedule_refresh)
+        self._applying_palette = False
+        self._system_palette = QPalette(application.palette())
+        application.paletteChanged.connect(self._palette_changed)
+        application.styleHints().colorSchemeChanged.connect(
+            self._color_scheme_changed
+        )
+        self._apply_application_palette()
+
+    def _palette_changed(self, palette: QPalette) -> None:
+        if self._applying_palette:
+            return
+        self._system_palette = QPalette(palette)
+        self.schedule_refresh()
+
+    def _color_scheme_changed(self, *_args: object) -> None:
+        # Qt emits colorSchemeChanged while the old palette is still active and
+        # preserves roles explicitly set by the application. Clear Marnwick's
+        # derived palette now, then capture Qt's newly resolved system palette
+        # after the native theme change has finished propagating.
+        self._applying_palette = True
+        try:
+            self.application.setPalette(QPalette())
+        finally:
+            self._applying_palette = False
+        QTimer.singleShot(0, self._capture_system_palette)
+
+    def _capture_system_palette(self) -> None:
+        self._system_palette = QPalette(self.application.palette())
+        self.schedule_refresh()
 
     def schedule_refresh(self, *_args: object) -> None:
         if self._refresh_pending:
@@ -1106,6 +1186,7 @@ class SystemThemeSynchronizer(QObject):
 
     def refresh(self) -> None:
         self._refresh_pending = False
+        self._apply_application_palette()
         for top_level in self.application.topLevelWidgets():
             widgets = (top_level, *top_level.findChildren(QWidget))
             for widget in widgets:
@@ -1128,6 +1209,16 @@ class SystemThemeSynchronizer(QObject):
                     widget.update()
                 except RuntimeError:
                     continue
+
+    def _apply_application_palette(self) -> None:
+        desired = darker_system_palette(self._system_palette)
+        if desired == self.application.palette():
+            return
+        self._applying_palette = True
+        try:
+            self.application.setPalette(desired)
+        finally:
+            self._applying_palette = False
 
 
 def install_system_theme_tracking(application: QApplication) -> SystemThemeSynchronizer:
