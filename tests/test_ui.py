@@ -55,6 +55,7 @@ from marnwick.config import (  # noqa: E402
     save_config,
 )
 from marnwick.debug import DebugCommandServer  # noqa: E402
+from marnwick.faces import FaceReevaluationSummary, FaceStore  # noqa: E402
 from marnwick.image_ops import (  # noqa: E402
     CommittedImageProof,
     EditOperation,
@@ -89,6 +90,7 @@ from marnwick.ui import (  # noqa: E402
     MovePayloadTask,
     MainWindow,
     NewVirtualDirectoryDialog,
+    PersonRenameDialog,
     PreferencesDialog,
     TagDialog,
     ThumbnailDelegate,
@@ -4047,6 +4049,26 @@ def test_image_rename_dialog_selects_stem_and_keeps_extension() -> None:
         dialog.entry.insert("renamed")
 
         assert dialog.file_name() == "renamed.jpeg"
+    finally:
+        dialog.close()
+        dialog.deleteLater()
+        qt_app.processEvents()
+
+
+def test_person_rename_dialog_selects_name_and_rejects_blank_input() -> None:
+    qt_app = app()
+    dialog = PersonRenameDialog("Mary Jane")
+    try:
+        assert dialog.windowTitle() == "Rename Person"
+        assert dialog.entry.selectedText() == "Mary Jane"
+        assert dialog.ok_button.isEnabled()
+
+        dialog.entry.setText("   ")
+        assert not dialog.ok_button.isEnabled()
+
+        dialog.entry.setText("  Mary   Jane O'Neil  ")
+        assert dialog.ok_button.isEnabled()
+        assert dialog.person_name() == "Mary Jane O'Neil"
     finally:
         dialog.close()
         dialog.deleteLater()
@@ -10292,6 +10314,17 @@ def test_people_tree_is_opt_in_and_opens_the_selected_review_queue(
         person_item = people_catalog_root.child(0)
         assert person_item.text(0) == "A/B % O'Neil 佐藤"
         assert person_item.data(0, VIRTUAL_KIND_ROLE) == VIRTUAL_KIND_PERSON
+        person_menu = QMenu()
+        try:
+            actions = window.tree._virtual_context_menu_actions(
+                person_menu,
+                person_item,
+            )
+            assert list(actions) == ["rename"]
+            assert [action.text() for action in actions.values()] == ["Rename"]
+        finally:
+            person_menu.close()
+            person_menu.deleteLater()
 
         monkeypatch.setattr(
             window,
@@ -10321,6 +10354,115 @@ def test_people_tree_is_opt_in_and_opens_the_selected_review_queue(
         window.close()
         window.deleteLater()
         qt_app.processEvents()
+
+
+def test_people_catalog_rename_updates_tree_through_priority_worker(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+
+    class FakePersonRenameDialog:
+        def __init__(self, name: str, _parent=None) -> None:  # type: ignore[no-untyped-def]
+            assert name == "Old Name"
+
+        def exec(self) -> QDialog.DialogCode:
+            return QDialog.DialogCode.Accepted
+
+        def person_name(self) -> str:
+            return "Mary Jane + O'Neil 佐藤"
+
+        def deleteLater(self) -> None:
+            pass
+
+    window = MainWindow()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        catalog.set_settings(CatalogSettings(faces_enabled=True))
+        cursor = catalog._conn.execute(
+            "INSERT INTO people(name, normalized, created_at_ns) VALUES (?, ?, ?)",
+            ("Old Name", "old name", 1),
+        )
+        person_id = int(cursor.lastrowid)
+        window.current_catalog = catalog
+        window.rebuild_tree()
+        settle_tree_build_tasks(window, qt_app)
+        monkeypatch.setattr(
+            ui_module,
+            "PersonRenameDialog",
+            FakePersonRenameDialog,
+        )
+
+        window.open_rename_person(root, person_id, "Old Name")
+
+        assert window._move_payload_task is not None
+        assert window._move_payload_task.task.priority == ActionPriority.TAG_UPDATE
+        settle_move_payload_task(window, qt_app)
+        settle_tree_build_tasks(window, qt_app)
+        settle_virtual_view_tasks(window, qt_app)
+
+        people = FaceStore(catalog).people()
+        assert [(person.id, person.name) for person in people] == [
+            (person_id, "Mary Jane + O'Neil 佐藤")
+        ]
+        virtual_root = find_virtual_tree_root(window)
+        people_root = next(
+            virtual_root.child(index)
+            for index in range(virtual_root.childCount())
+            if virtual_root.child(index).data(0, VIRTUAL_KIND_ROLE)
+            == VIRTUAL_KIND_PEOPLE_ROOT
+        )
+        people_catalog_root = next(
+            people_root.child(index)
+            for index in range(people_root.childCount())
+            if people_root.child(index).data(0, VIRTUAL_KIND_ROLE)
+            == VIRTUAL_KIND_PEOPLE_CATALOG_ROOT
+        )
+        renamed_item = people_catalog_root.child(0)
+        assert renamed_item.text(0) == "Mary Jane + O'Neil 佐藤"
+        assert renamed_item.data(0, VIRTUAL_VALUE_ROLE) == str(person_id)
+    finally:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        window.indexer.shutdown()
+        window.workspace.close()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_face_mutation_worker_runs_full_reevaluation(tmp_path: Path) -> None:
+    root = tmp_path / "catalog"
+    root.mkdir()
+    with Catalog(root, CatalogSettings(faces_enabled=True)) as catalog:
+        task = IndexTask(
+            "Re-evaluating unnamed faces",
+            catalog.root,
+            None,
+            interactive=True,
+            idle_sleep_seconds=0.0,
+            expected_root_identity=catalog.root_identity,
+            expected_storage_identity=catalog.storage_identity,
+        )
+
+        result = MainWindow._face_mutation_worker(
+            catalog.root,
+            "reevaluate",
+            (),
+            None,
+            task,
+        )
+
+        assert result == FaceReevaluationSummary(0, 0, 0)
+        snapshot = task.snapshot()
+        assert snapshot.done
+        assert snapshot.processed == 0
+        assert snapshot.total == 0
+        assert snapshot.current == "No eligible comparisons"
 
 
 def test_idle_face_indexing_uses_trusted_remote_gpu_without_local_models(

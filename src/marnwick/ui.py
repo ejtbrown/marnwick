@@ -3900,6 +3900,8 @@ class DirectoryTree(QTreeWidget):
                 "edit": menu.addAction("Edit"),
                 "delete": menu.addAction("Delete"),
             }
+        if kind == VIRTUAL_KIND_PERSON:
+            return {"rename": menu.addAction("Rename")}
         return {}
 
     def _open_context_menu(self, pos) -> None:  # type: ignore[no-untyped-def]
@@ -3926,6 +3928,13 @@ class DirectoryTree(QTreeWidget):
             elif selected == actions.get("delete"):
                 with suppress(TypeError, ValueError):
                     self.window.delete_custom_virtual_directory(
+                        root,
+                        int(item.data(0, VIRTUAL_VALUE_ROLE)),
+                        item.text(0),
+                    )
+            elif selected == actions.get("rename"):
+                with suppress(TypeError, ValueError):
+                    self.window.open_rename_person(
                         root,
                         int(item.data(0, VIRTUAL_VALUE_ROLE)),
                         item.text(0),
@@ -5709,6 +5718,23 @@ class MainWindow(QMainWindow):
         dialog.exec()
         dialog.deleteLater()
 
+    def open_rename_person(
+        self,
+        root: Path,
+        person_id: int,
+        current_name: str,
+    ) -> None:
+        catalog = self.workspace.catalog_for_root(root)
+        if catalog is None:
+            return
+        dialog = PersonRenameDialog(current_name, self)
+        accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        new_name = dialog.person_name() if accepted else ""
+        dialog.deleteLater()
+        if not accepted or new_name == " ".join(current_name.strip().split()):
+            return
+        self.queue_person_rename(catalog, person_id, new_name)
+
     def _open_face_source_photo(self, catalog: Catalog, rel_path: str) -> None:
         if self.workspace.catalog_for_root(catalog.root) is not catalog:
             return
@@ -5734,8 +5760,13 @@ class MainWindow(QMainWindow):
     ) -> Future[object]:
         if self.workspace.catalog_for_root(catalog.root) is not catalog:
             raise OSError("The catalog was closed")
+        label = (
+            "Re-evaluating unnamed faces"
+            if kind == "reevaluate"
+            else "Updating people"
+        )
         task, future = self.indexer.submit_action(
-            "Updating people",
+            label,
             catalog.root,
             None,
             priority=ActionPriority.TAG_UPDATE,
@@ -5771,7 +5802,16 @@ class MainWindow(QMainWindow):
                 expected_storage_identity=task.expected_storage_identity,
             ) as catalog:
                 store = FaceStore(catalog)
-                if kind == "name":
+                if kind == "reevaluate":
+                    result = store.reevaluate_unnamed_faces(
+                        cancel_check=task.check_canceled,
+                        progress=lambda processed, total, current: task.update(
+                            processed,
+                            total,
+                            current,
+                        ),
+                    )
+                elif kind == "name":
                     if not isinstance(value, dict):
                         raise ValueError("Missing identity")
                     result: object = store.name_faces(
@@ -5822,7 +5862,8 @@ class MainWindow(QMainWindow):
                     result = store.purge()
                 else:
                     raise ValueError(f"Unsupported face operation: {kind}")
-            task.update(1, 1, kind)
+            if kind != "reevaluate":
+                task.update(1, 1, kind)
             task.mark_done()
             return result
         except IndexTaskCancelled:
@@ -6350,6 +6391,35 @@ class MainWindow(QMainWindow):
             mutation.edit_owner = owner
             mutation.deleted_tag_name = clean_name
             self._forget_deleted_tag(clean_name)
+        return mutation
+
+    def queue_person_rename(
+        self,
+        catalog: Catalog,
+        person_id: int,
+        name: str,
+    ) -> MovePayloadTask | None:
+        if self.workspace.catalog_for_root(catalog.root) is not catalog:
+            return None
+        clean_name = " ".join(name.strip().split())
+        if not clean_name or len(clean_name) > 200 or int(person_id) <= 0:
+            return None
+        mutation = self._queue_catalog_mutation(
+            catalog,
+            label="Renaming person",
+            dest_dir_rel="",
+            priority=ActionPriority.TAG_UPDATE,
+            worker=lambda task: self._rename_person_worker(
+                catalog.root,
+                catalog.root_identity,
+                int(person_id),
+                clean_name,
+                task,
+            ),
+            completion_verb="Renamed",
+            error_title="Rename Person",
+        )
+        mutation.edit_owner = self
         return mutation
 
     def queue_image_tags(
@@ -7277,6 +7347,37 @@ class MainWindow(QMainWindow):
         task.update(1, 1, name)
         task.mark_done()
         return MovePayloadResult(1, deleted, {root})
+
+    @staticmethod
+    def _rename_person_worker(
+        root: Path,
+        expected_root_identity: tuple[int, int],
+        person_id: int,
+        name: str,
+        task: IndexTask,
+    ) -> MovePayloadResult:
+        task.update(0, 1, name)
+        task.check_canceled()
+
+        def write() -> int:
+            with Catalog.open_writer(
+                root,
+                expected_root_identity=expected_root_identity,
+                expected_storage_identity=task.expected_storage_identity,
+            ) as catalog:
+                catalog.rename_person(person_id, name)
+                return 1
+
+        renamed = MainWindow._wait_for_tag_database(
+            task,
+            processed=0,
+            total=1,
+            current=name,
+            write=write,
+        )
+        task.update(1, 1, name)
+        task.mark_done()
+        return MovePayloadResult(1, renamed, {root})
 
     @staticmethod
     def _create_custom_virtual_directory_worker(
@@ -19596,6 +19697,46 @@ class ImageRenameDialog(QDialog):
 
     def file_name(self) -> str:
         return self.entry.text()
+
+
+class PersonRenameDialog(QDialog):
+    def __init__(self, name: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Rename Person")
+        self.setWindowIcon(load_app_icon())
+        self.setStyleSheet(DIALOG_STYLESHEET)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("Person name:"))
+        self.entry = QLineEdit(name)
+        self.entry.setMaxLength(200)
+        layout.addWidget(self.entry)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        self.ok_button = buttons.button(QDialogButtonBox.StandardButton.Ok)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self.entry.textChanged.connect(self._update_ok_button)
+        self.entry.returnPressed.connect(self._accept_if_valid)
+        self.entry.setFocus()
+        self.entry.selectAll()
+        self._update_ok_button()
+        self.resize(460, 130)
+
+    def _update_ok_button(self) -> None:
+        self.ok_button.setEnabled(bool(self.person_name()))
+
+    def _accept_if_valid(self) -> None:
+        if self.ok_button.isEnabled():
+            self.accept()
+
+    def person_name(self) -> str:
+        return " ".join(self.entry.text().strip().split())
 
 
 class DirectoryPropertiesDialog(QDialog):

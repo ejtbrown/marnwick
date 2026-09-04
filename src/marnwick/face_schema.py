@@ -103,6 +103,19 @@ def init_face_schema(connection: sqlite3.Connection) -> None:
             CHECK(length(second_crop_hash) = 64)
         );
 
+        CREATE TABLE IF NOT EXISTS face_person_proposals (
+            face_id INTEGER PRIMARY KEY,
+            person_id INTEGER NOT NULL,
+            confidence REAL NOT NULL,
+            face_updated_at_ns INTEGER NOT NULL,
+            evaluated_at_ns INTEGER NOT NULL,
+            FOREIGN KEY(face_id) REFERENCES faces(id) ON DELETE CASCADE,
+            FOREIGN KEY(person_id) REFERENCES people(id) ON DELETE CASCADE,
+            CHECK(confidence >= -1.0 AND confidence <= 1.0)
+        );
+        CREATE INDEX IF NOT EXISTS idx_face_person_proposals_person
+            ON face_person_proposals(person_id, confidence DESC, face_id);
+
         CREATE TABLE IF NOT EXISTS face_forced_loose (
             face_id INTEGER PRIMARY KEY,
             created_at_ns INTEGER NOT NULL,

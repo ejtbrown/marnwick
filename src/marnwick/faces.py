@@ -46,6 +46,9 @@ FACE_SEPARATION_PAIR_LIMIT = 100_000
 FACE_REVIEW_GROUP_LIMIT = 500
 FACE_REPRESENTATIVE_LIMIT = 16
 FACE_DEFER_DAYS = 7
+FACE_REEVALUATION_ANCHOR_CANDIDATES = 128
+FACE_REEVALUATION_MAX_PERSON_ANCHORS = 32
+FACE_REEVALUATION_MATRIX_ELEMENTS = 8_000_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,6 +90,13 @@ class FaceIndexSummary:
     images_processed: int
     faces_found: int
     provider: str
+
+
+@dataclass(frozen=True, slots=True)
+class FaceReevaluationSummary:
+    faces_examined: int
+    proposals_found: int
+    people_matched: int
 
 
 class FaceStore:
@@ -451,6 +461,250 @@ class FaceStore:
         )
         return [PersonRecord(int(row["id"]), str(row["name"]), int(row["face_count"])) for row in rows]
 
+    def reevaluate_unnamed_faces(
+        self,
+        *,
+        cancel_check: Callable[[], None] | None = None,
+        progress: Callable[[int, int, str], None] | None = None,
+    ) -> FaceReevaluationSummary:
+        """Exhaustively compare every eligible unnamed face with confirmed people.
+
+        The resulting rows are review proposals only.  They never assign a person,
+        and a face edit or fresh embedding invalidates its cached proposal through
+        the stored ``updated_at_ns`` identity.
+        """
+
+        self.catalog._assert_writable()
+
+        def check_canceled() -> None:
+            if cancel_check is not None:
+                cancel_check()
+
+        total_row = self.connection.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM faces AS face
+            LEFT JOIN face_forced_loose AS forced ON forced.face_id = face.id
+            WHERE face.status = 'active'
+              AND face.person_id IS NULL
+              AND face.embedding_version = ?
+              AND forced.face_id IS NULL
+            """,
+            (FACE_EMBEDDING_VERSION,),
+        ).fetchone()
+        total = int(total_row["count"] or 0)
+        anchor_rows = list(
+            self.connection.execute(
+                """
+                SELECT id, person_id, embedding, quality
+                FROM (
+                    SELECT id, person_id, embedding, quality,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY person_id ORDER BY quality DESC, id
+                           ) AS anchor_rank
+                    FROM faces
+                    WHERE status = 'active'
+                      AND person_id IS NOT NULL
+                      AND confirmed = 1
+                      AND embedding_version = ?
+                )
+                WHERE anchor_rank <= ?
+                ORDER BY person_id, quality DESC, id
+                """,
+                (
+                    FACE_EMBEDDING_VERSION,
+                    FACE_REEVALUATION_ANCHOR_CANDIDATES,
+                ),
+            )
+        )
+        check_canceled()
+        anchor_vectors: list[np.ndarray] = []
+        anchor_people: list[int] = []
+        rows_by_person: dict[int, list[sqlite3.Row]] = defaultdict(list)
+        for row in anchor_rows:
+            rows_by_person[int(row["person_id"])].append(row)
+        for person_id, person_rows in rows_by_person.items():
+            candidates = _embedding_matrix(person_rows)
+            selected = _diverse_anchor_indexes(
+                candidates,
+                FACE_REEVALUATION_MAX_PERSON_ANCHORS,
+            )
+            chosen = candidates[selected]
+            anchor_vectors.extend(chosen)
+            anchor_people.extend([person_id] * len(chosen))
+            if len(chosen) > 1:
+                centroid = np.mean(chosen, axis=0)
+                norm = float(np.linalg.norm(centroid))
+                if norm > 1e-12:
+                    anchor_vectors.append((centroid / norm).astype(np.float32))
+                    anchor_people.append(person_id)
+
+        if not anchor_vectors or total == 0:
+            with self.catalog._database_savepoint("clear_face_reevaluation"):
+                self.connection.execute("DELETE FROM face_person_proposals")
+            if progress is not None:
+                progress(total, total, "No eligible comparisons")
+            return FaceReevaluationSummary(total, 0, 0)
+
+        anchors = np.asarray(anchor_vectors, dtype=np.float32)
+        anchor_person_ids = np.asarray(anchor_people, dtype=np.int64)
+        person_ids = np.asarray(sorted(rows_by_person), dtype=np.int64)
+        person_columns = {
+            int(person_id): index for index, person_id in enumerate(person_ids)
+        }
+        anchor_indexes_by_person = tuple(
+            np.flatnonzero(anchor_person_ids == person_id)
+            for person_id in person_ids
+        )
+        rejected_by_face: dict[int, set[int]] = defaultdict(set)
+        for row in self.connection.execute(
+            "SELECT face_id, person_id FROM face_person_rejections"
+        ):
+            rejected_by_face[int(row["face_id"])].add(int(row["person_id"]))
+        rejected_by_crop: dict[str, set[int]] = defaultdict(set)
+        for row in self.connection.execute(
+            "SELECT crop_hash, person_id FROM face_crop_person_rejections"
+        ):
+            rejected_by_crop[str(row["crop_hash"])].add(int(row["person_id"]))
+
+        matrix_width = len(anchors) + len(person_ids)
+        batch_size = max(
+            1,
+            min(
+                4096,
+                FACE_REEVALUATION_MATRIX_ELEMENTS // max(matrix_width, 1),
+            ),
+        )
+        evaluated_at_ns = time.time_ns()
+        self.connection.execute(
+            "DROP TABLE IF EXISTS temp.face_person_reevaluation_work"
+        )
+        self.connection.execute(
+            """
+            CREATE TEMP TABLE face_person_reevaluation_work (
+                face_id INTEGER PRIMARY KEY,
+                person_id INTEGER NOT NULL,
+                confidence REAL NOT NULL,
+                face_updated_at_ns INTEGER NOT NULL,
+                evaluated_at_ns INTEGER NOT NULL
+            )
+            """
+        )
+        processed = 0
+        try:
+            cursor = self.connection.execute(
+                """
+                SELECT face.id, face.embedding, face.thumbnail_rel_path,
+                       face.updated_at_ns
+                FROM faces AS face
+                LEFT JOIN face_forced_loose AS forced ON forced.face_id = face.id
+                WHERE face.status = 'active'
+                  AND face.person_id IS NULL
+                  AND face.embedding_version = ?
+                  AND forced.face_id IS NULL
+                ORDER BY face.id
+                """,
+                (FACE_EMBEDDING_VERSION,),
+            )
+            while True:
+                check_canceled()
+                rows = cursor.fetchmany(batch_size)
+                if not rows:
+                    break
+                face_ids = np.asarray(
+                    [int(row["id"]) for row in rows],
+                    dtype=np.int64,
+                )
+                crop_hashes = np.asarray(
+                    [_crop_hash(str(row["thumbnail_rel_path"])) for row in rows],
+                    dtype=object,
+                )
+                proposals, scores = _exhaustive_person_proposals(
+                    face_ids,
+                    crop_hashes,
+                    _embedding_matrix(rows),
+                    anchors,
+                    person_ids,
+                    anchor_indexes_by_person,
+                    person_columns,
+                    rejected_by_face,
+                    rejected_by_crop,
+                )
+                self.connection.executemany(
+                    """
+                    INSERT INTO face_person_reevaluation_work(
+                        face_id,
+                        person_id,
+                        confidence,
+                        face_updated_at_ns,
+                        evaluated_at_ns
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        (
+                            int(row["id"]),
+                            int(person_id),
+                            float(score),
+                            int(row["updated_at_ns"]),
+                            evaluated_at_ns,
+                        )
+                        for row, person_id, score in zip(
+                            rows,
+                            proposals,
+                            scores,
+                            strict=True,
+                        )
+                        if person_id is not None
+                    ),
+                )
+                processed += len(rows)
+                if progress is not None:
+                    progress(
+                        processed,
+                        total,
+                        "Comparing unnamed faces with confirmed people",
+                    )
+            check_canceled()
+            proposal_row = self.connection.execute(
+                """
+                SELECT COUNT(*) AS proposals,
+                       COUNT(DISTINCT person_id) AS people
+                FROM face_person_reevaluation_work
+                """
+            ).fetchone()
+            proposals_found = int(proposal_row["proposals"] or 0)
+            people_matched = int(proposal_row["people"] or 0)
+            with self.catalog._database_savepoint("save_face_reevaluation"):
+                self.connection.execute("DELETE FROM face_person_proposals")
+                self.connection.execute(
+                    """
+                    INSERT INTO face_person_proposals(
+                        face_id,
+                        person_id,
+                        confidence,
+                        face_updated_at_ns,
+                        evaluated_at_ns
+                    )
+                    SELECT face_id,
+                           person_id,
+                           confidence,
+                           face_updated_at_ns,
+                           evaluated_at_ns
+                    FROM face_person_reevaluation_work
+                    """
+                )
+        finally:
+            self.connection.execute(
+                "DROP TABLE IF EXISTS temp.face_person_reevaluation_work"
+            )
+        if progress is not None:
+            progress(total, total, "Updated face review proposals")
+        return FaceReevaluationSummary(
+            processed,
+            proposals_found,
+            people_matched,
+        )
+
     def review_groups(self, *, include_deferred: bool = False) -> list[FaceReviewGroup]:
         now = time.time_ns()
         rows = list(
@@ -459,12 +713,17 @@ class FaceStore:
                 SELECT face.id, face.quality, face.embedding,
                        face.thumbnail_rel_path,
                        forced.face_id AS forced_loose,
-                       manual.group_id AS manual_group_id
+                       manual.group_id AS manual_group_id,
+                       reevaluated.person_id AS reevaluated_person_id,
+                       reevaluated.confidence AS reevaluated_confidence
                 FROM faces AS face
                 LEFT JOIN face_forced_loose AS forced
                   ON forced.face_id = face.id
                 LEFT JOIN face_manual_group_faces AS manual
                   ON manual.face_id = face.id
+                LEFT JOIN face_person_proposals AS reevaluated
+                  ON reevaluated.face_id = face.id
+                 AND reevaluated.face_updated_at_ns = face.updated_at_ns
                 WHERE face.status = 'active' AND face.person_id IS NULL
                   AND (? OR face.deferred_until_ns <= ?)
                   AND face.embedding_version = ?
@@ -505,6 +764,17 @@ class FaceStore:
             rejected_by_face,
             rejected_by_crop,
         )
+        for index, row in enumerate(rows):
+            if row["reevaluated_person_id"] is None:
+                continue
+            person_id = int(row["reevaluated_person_id"])
+            if (
+                person_id in rejected_by_face.get(int(face_ids[index]), set())
+                or person_id in rejected_by_crop.get(str(crop_hashes[index]), set())
+            ):
+                continue
+            proposed[index] = person_id
+            proposal_scores[index] = float(row["reevaluated_confidence"])
         forced_indexes = {
             index
             for index, row in enumerate(rows)
@@ -1911,6 +2181,101 @@ def _lsh_projection() -> np.ndarray:
 
 
 _FACE_LSH_PROJECTION = _lsh_projection()
+
+
+def _diverse_anchor_indexes(
+    embeddings: np.ndarray,
+    limit: int,
+) -> np.ndarray:
+    """Choose high-quality-first anchors that span a person's appearance."""
+
+    count = len(embeddings)
+    if count <= limit:
+        return np.arange(count, dtype=np.int64)
+    selected = [0]
+    available = np.ones(count, dtype=np.bool_)
+    available[0] = False
+    nearest_similarity = embeddings @ embeddings[0]
+    while len(selected) < limit:
+        candidates = np.flatnonzero(available)
+        next_index = int(candidates[np.argmin(nearest_similarity[candidates])])
+        selected.append(next_index)
+        available[next_index] = False
+        nearest_similarity = np.maximum(
+            nearest_similarity,
+            embeddings @ embeddings[next_index],
+        )
+    return np.asarray(selected, dtype=np.int64)
+
+
+def _exhaustive_person_proposals(
+    face_ids: np.ndarray,
+    crop_hashes: np.ndarray,
+    embeddings: np.ndarray,
+    anchors: np.ndarray,
+    person_ids: np.ndarray,
+    anchor_indexes_by_person: Sequence[np.ndarray],
+    person_columns: dict[int, int],
+    rejected_by_face: dict[int, set[int]],
+    rejected_by_crop: dict[str, set[int]],
+) -> tuple[list[int | None], list[float]]:
+    """Score every face against every confirmed identity without LSH pruning."""
+
+    if not len(embeddings) or not len(anchors) or not len(person_ids):
+        return [None] * len(embeddings), [0.0] * len(embeddings)
+    anchor_scores = embeddings @ anchors.T
+    person_scores = np.full(
+        (len(embeddings), len(person_ids)),
+        -1.0,
+        dtype=np.float32,
+    )
+    for person_column, anchor_indexes in enumerate(anchor_indexes_by_person):
+        person_scores[:, person_column] = np.max(
+            anchor_scores[:, anchor_indexes],
+            axis=1,
+        )
+    for row_index, (face_id, crop_hash) in enumerate(
+        zip(face_ids, crop_hashes, strict=True)
+    ):
+        blocked_people = (
+            rejected_by_face.get(int(face_id), set())
+            | rejected_by_crop.get(str(crop_hash), set())
+        )
+        for person_id in blocked_people:
+            person_column = person_columns.get(person_id)
+            if person_column is not None:
+                person_scores[row_index, person_column] = -1.0
+    rows = np.arange(len(embeddings), dtype=np.int64)
+    best_columns = np.argmax(person_scores, axis=1)
+    best_scores = person_scores[rows, best_columns].copy()
+    person_scores[rows, best_columns] = -1.0
+    second_scores = (
+        np.max(person_scores, axis=1)
+        if len(person_ids) > 1
+        else np.full(
+            len(embeddings),
+            -1.0,
+            dtype=np.float32,
+        )
+    )
+    proposals: list[int | None] = []
+    scores: list[float] = []
+    for best_column, best_score, second_score in zip(
+        best_columns,
+        best_scores,
+        second_scores,
+        strict=True,
+    ):
+        raw_score = float(best_score)
+        if (
+            raw_score >= FACE_PERSON_SUGGESTION_SIMILARITY
+            and raw_score - float(second_score) >= FACE_PERSON_SUGGESTION_MARGIN
+        ):
+            proposals.append(int(person_ids[int(best_column)]))
+        else:
+            proposals.append(None)
+        scores.append(max(-1.0, min(1.0, raw_score)))
+    return proposals, scores
 
 
 def _lsh_codes(embeddings: np.ndarray) -> np.ndarray:
