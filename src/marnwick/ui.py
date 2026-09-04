@@ -1100,10 +1100,24 @@ def _palette_is_dark(palette: QPalette) -> bool:
     return window.lightnessF() < text.lightnessF()
 
 
-def darker_system_palette(palette: QPalette) -> QPalette:
+def _color_scheme_is_dark(
+    palette: QPalette,
+    color_scheme: Qt.ColorScheme,
+) -> bool:
+    if color_scheme == Qt.ColorScheme.Dark:
+        return True
+    if color_scheme == Qt.ColorScheme.Light:
+        return False
+    return _palette_is_dark(palette)
+
+
+def darker_system_palette(
+    palette: QPalette,
+    color_scheme: Qt.ColorScheme = Qt.ColorScheme.Unknown,
+) -> QPalette:
     """Use deeper dark-mode surfaces while preserving the system accent colors."""
 
-    if not _palette_is_dark(palette):
+    if not _color_scheme_is_dark(palette, color_scheme):
         return QPalette(palette)
     darkened = QPalette(palette)
     for group in (QPalette.ColorGroup.Active, QPalette.ColorGroup.Inactive):
@@ -1141,8 +1155,34 @@ def set_validation_style(
     )
 
 
+def _qt_color_scheme(value: object) -> Qt.ColorScheme:
+    try:
+        return Qt.ColorScheme(value)
+    except (TypeError, ValueError):
+        return Qt.ColorScheme.Unknown
+
+
+def _portal_color_scheme(value: object) -> Qt.ColorScheme:
+    for _depth in range(4):
+        variant = getattr(value, "variant", None)
+        if not callable(variant):
+            break
+        unwrapped = variant()
+        if unwrapped is value:
+            break
+        value = unwrapped
+    try:
+        preference = int(value)
+    except (TypeError, ValueError):
+        return Qt.ColorScheme.Unknown
+    return {
+        1: Qt.ColorScheme.Dark,
+        2: Qt.ColorScheme.Light,
+    }.get(preference, Qt.ColorScheme.Unknown)
+
+
 class SystemThemeSynchronizer(QObject):
-    """Re-evaluate palette-based styles when Qt reports a live system theme change."""
+    """Follow Qt and Linux-portal theme changes and repolish palette-based styles."""
 
     def __init__(self, application: QApplication) -> None:
         super().__init__(application)
@@ -1150,23 +1190,33 @@ class SystemThemeSynchronizer(QObject):
         self._refresh_pending = False
         self._applying_palette = False
         self._system_palette = QPalette(application.palette())
+        self._qt_scheme = _qt_color_scheme(
+            application.styleHints().colorScheme()
+        )
+        self._portal_scheme = Qt.ColorScheme.Unknown
+        self._portal_interface: QObject | None = None
         application.paletteChanged.connect(self._palette_changed)
         application.styleHints().colorSchemeChanged.connect(
             self._color_scheme_changed
         )
+        self._install_linux_portal_tracking()
         self._apply_application_palette()
 
     def _palette_changed(self, palette: QPalette) -> None:
         if self._applying_palette:
             return
         self._system_palette = QPalette(palette)
+        self._qt_scheme = _qt_color_scheme(
+            self.application.styleHints().colorScheme()
+        )
         self.schedule_refresh()
 
-    def _color_scheme_changed(self, *_args: object) -> None:
+    def _color_scheme_changed(self, color_scheme: object) -> None:
         # Qt emits colorSchemeChanged while the old palette is still active and
         # preserves roles explicitly set by the application. Clear Marnwick's
         # derived palette now, then capture Qt's newly resolved system palette
         # after the native theme change has finished propagating.
+        self._qt_scheme = _qt_color_scheme(color_scheme)
         self._applying_palette = True
         try:
             self.application.setPalette(QPalette())
@@ -1176,7 +1226,70 @@ class SystemThemeSynchronizer(QObject):
 
     def _capture_system_palette(self) -> None:
         self._system_palette = QPalette(self.application.palette())
+        reported_scheme = _qt_color_scheme(
+            self.application.styleHints().colorScheme()
+        )
+        if reported_scheme != Qt.ColorScheme.Unknown:
+            self._qt_scheme = reported_scheme
         self.schedule_refresh()
+
+    def _install_linux_portal_tracking(self) -> None:
+        if not sys.platform.startswith("linux"):
+            return
+        try:
+            from PySide6.QtDBus import QDBusConnection, QDBusInterface
+        except ImportError:
+            return
+        connection = QDBusConnection.sessionBus()
+        if not connection.isConnected():
+            return
+        interface = QDBusInterface(
+            "org.freedesktop.portal.Desktop",
+            "/org/freedesktop/portal/desktop",
+            "org.freedesktop.portal.Settings",
+            connection,
+            self,
+        )
+        if not interface.isValid():
+            interface.deleteLater()
+            return
+        interface.setTimeout(250)
+        interface.SettingChanged.connect(self._portal_setting_changed)
+        reply = interface.call(
+            "ReadOne",
+            "org.freedesktop.appearance",
+            "color-scheme",
+        )
+        arguments = reply.arguments()
+        if not arguments:
+            reply = interface.call(
+                "Read",
+                "org.freedesktop.appearance",
+                "color-scheme",
+            )
+            arguments = reply.arguments()
+        if arguments:
+            self._portal_scheme = _portal_color_scheme(arguments[0])
+        self._portal_interface = interface
+
+    def _portal_setting_changed(
+        self,
+        namespace: str,
+        key: str,
+        value: object,
+    ) -> None:
+        if namespace != "org.freedesktop.appearance" or key != "color-scheme":
+            return
+        scheme = _portal_color_scheme(value)
+        if scheme == self._portal_scheme:
+            return
+        self._portal_scheme = scheme
+        self.schedule_refresh()
+
+    def _effective_color_scheme(self) -> Qt.ColorScheme:
+        if self._portal_scheme != Qt.ColorScheme.Unknown:
+            return self._portal_scheme
+        return self._qt_scheme
 
     def schedule_refresh(self, *_args: object) -> None:
         if self._refresh_pending:
@@ -1211,7 +1324,10 @@ class SystemThemeSynchronizer(QObject):
                     continue
 
     def _apply_application_palette(self) -> None:
-        desired = darker_system_palette(self._system_palette)
+        desired = darker_system_palette(
+            self._system_palette,
+            self._effective_color_scheme(),
+        )
         if desired == self.application.palette():
             return
         self._applying_palette = True

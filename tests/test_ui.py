@@ -117,6 +117,7 @@ from marnwick.ui import (  # noqa: E402
     create_delete_message_box,
     create_save_edits_message_box,
     darker_system_palette,
+    _portal_color_scheme,
     load_oriented_pixmap,
     metadata_text,
     EditCommandDialog,
@@ -3157,6 +3158,99 @@ def test_darker_system_palette_darkens_surfaces_and_preserves_accent() -> None:
     light.setColor(QPalette.ColorRole.Window, QColor("#f6f7f9"))
     light.setColor(QPalette.ColorRole.WindowText, QColor("#202124"))
     assert darker_system_palette(light) == light
+
+
+def test_explicit_dark_scheme_overrides_a_light_qt_palette() -> None:
+    light = QPalette()
+    light.setColor(QPalette.ColorRole.Window, QColor("#f6f7f9"))
+    light.setColor(QPalette.ColorRole.WindowText, QColor("#202124"))
+    light.setColor(QPalette.ColorRole.Base, QColor("#ffffff"))
+
+    result = darker_system_palette(light, Qt.ColorScheme.Dark)
+
+    assert result.color(QPalette.ColorRole.Window) == QColor("#16181c")
+    assert result.color(QPalette.ColorRole.Base) == QColor("#0f1114")
+
+
+def test_linux_portal_color_scheme_values_follow_the_portal_contract() -> None:
+    class Variant:
+        def __init__(self, value: object) -> None:
+            self.value = value
+
+        def variant(self) -> object:
+            return self.value
+
+    assert _portal_color_scheme(Variant(Variant(1))) == Qt.ColorScheme.Dark
+    assert _portal_color_scheme(Variant(2)) == Qt.ColorScheme.Light
+    assert _portal_color_scheme(0) == Qt.ColorScheme.Unknown
+    assert _portal_color_scheme(99) == Qt.ColorScheme.Unknown
+
+
+def test_linux_portal_dark_preference_updates_a_light_application_palette() -> None:
+    qt_app = app()
+    synchronizer = install_system_theme_tracking(qt_app)
+    original = QPalette(qt_app.palette())
+    qt_app.setPalette(QPalette())
+    qt_app.processEvents()
+    system_light = QPalette(qt_app.palette())
+    synchronizer._portal_scheme = Qt.ColorScheme.Unknown
+    synchronizer._system_palette = QPalette(system_light)
+    try:
+        synchronizer._portal_setting_changed(
+            "org.freedesktop.appearance",
+            "color-scheme",
+            1,
+        )
+        qt_app.processEvents()
+
+        assert qt_app.palette().color(QPalette.ColorRole.Window) == QColor(
+            "#16181c"
+        )
+
+        synchronizer._portal_setting_changed(
+            "org.freedesktop.appearance",
+            "color-scheme",
+            2,
+        )
+        qt_app.processEvents()
+
+        assert qt_app.palette().color(
+            QPalette.ColorRole.Window
+        ) == system_light.color(QPalette.ColorRole.Window)
+    finally:
+        synchronizer._portal_scheme = Qt.ColorScheme.Unknown
+        qt_app.setPalette(original)
+        qt_app.processEvents()
+
+
+def test_qt_dark_scheme_signal_updates_a_light_application_palette() -> None:
+    qt_app = app()
+    synchronizer = install_system_theme_tracking(qt_app)
+    original = QPalette(qt_app.palette())
+    qt_app.setPalette(QPalette())
+    qt_app.processEvents()
+    system_light = QPalette(qt_app.palette())
+    synchronizer._portal_scheme = Qt.ColorScheme.Unknown
+    synchronizer._system_palette = QPalette(system_light)
+    try:
+        synchronizer._color_scheme_changed(Qt.ColorScheme.Dark)
+        qt_app.processEvents()
+        qt_app.processEvents()
+
+        assert qt_app.palette().color(QPalette.ColorRole.Window) == QColor(
+            "#16181c"
+        )
+
+        synchronizer._color_scheme_changed(Qt.ColorScheme.Light)
+        qt_app.processEvents()
+        qt_app.processEvents()
+
+        assert qt_app.palette().color(
+            QPalette.ColorRole.Window
+        ) == system_light.color(QPalette.ColorRole.Window)
+    finally:
+        qt_app.setPalette(original)
+        qt_app.processEvents()
 
 
 def test_dialog_styles_follow_runtime_application_palette_changes() -> None:
