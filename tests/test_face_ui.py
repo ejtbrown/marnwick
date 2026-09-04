@@ -19,7 +19,11 @@ from marnwick.catalog import Catalog  # noqa: E402
 from marnwick.face_engine import DetectedFace, FaceAnalysis  # noqa: E402
 from marnwick.face_models import FACE_DETECTOR_VERSION, FACE_EMBEDDING_VERSION  # noqa: E402
 from marnwick.face_ui import FaceManagerDialog  # noqa: E402
-from marnwick.faces import FaceReviewGroup, FaceStore  # noqa: E402
+from marnwick.faces import (  # noqa: E402
+    FaceReevaluationSummary,
+    FaceReviewGroup,
+    FaceStore,
+)
 from marnwick.models import CatalogSettings  # noqa: E402
 
 
@@ -236,6 +240,54 @@ def test_face_manager_exclusions_update_the_current_group_without_refreshing(
         assert dialog._current_group.count == 2
         assert dialog.face_list.count() == 2
         assert "2" in dialog.group_list.item(0).text()
+    finally:
+        dialog.close()
+        dialog.deleteLater()
+        catalog.close()
+        qt_app.processEvents()
+
+
+def test_face_manager_can_start_a_full_unnamed_face_reevaluation(
+    tmp_path: Path,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    catalog = Catalog(root, CatalogSettings(faces_enabled=True))
+    submitted: list[tuple[str, tuple[int, ...], object | None]] = []
+    summary = FaceReevaluationSummary(42_318, 6_204, 37)
+
+    def submit(
+        kind: str,
+        face_ids: tuple[int, ...],
+        value: object | None,
+    ) -> Future[object]:
+        submitted.append((kind, face_ids, value))
+        future: Future[object] = Future()
+        future.set_result(summary)
+        return future
+
+    dialog = FaceManagerDialog(catalog, submit)
+    try:
+        dialog._poll_timer.stop()
+        if dialog._group_future is not None:
+            dialog._group_future.cancel()
+            dialog._group_future = None
+        dialog._set_busy(False)
+        refreshes: list[bool] = []
+        dialog.refresh_groups = lambda: refreshes.append(True)  # type: ignore[method-assign]
+
+        assert dialog.reevaluate_button.text() == "Re-evaluate unnamed faces"
+        dialog.reevaluate_button.click()
+
+        assert submitted == [("reevaluate", (), None)]
+        assert "full unnamed corpus" in dialog.group_detail.text()
+        assert not dialog.reevaluate_button.isEnabled()
+
+        dialog._settle_work()
+
+        assert dialog._reevaluation_summary == summary
+        assert refreshes == [True]
     finally:
         dialog.close()
         dialog.deleteLater()

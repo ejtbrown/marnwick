@@ -8,6 +8,7 @@ import numpy as np
 from PIL import Image
 import pytest
 
+import marnwick.faces as faces_module
 from marnwick.catalog import Catalog, VirtualDirectoryRule
 from marnwick.face_engine import DetectedFace, FaceAnalysis, FaceInferenceError
 from marnwick.face_models import FACE_DETECTOR_VERSION, FACE_EMBEDDING_VERSION
@@ -79,6 +80,7 @@ def test_face_schema_and_setting_are_catalog_local(tmp_path: Path) -> None:
         "face_image_state",
         "face_crop_person_rejections",
         "face_crop_pair_rejections",
+        "face_person_proposals",
         "face_forced_loose",
         "face_manual_groups",
         "face_manual_group_faces",
@@ -305,6 +307,266 @@ def test_naming_faces_with_an_existing_name_reuses_that_person(tmp_path: Path) -
         assert store.stats()["people"] == 1
         assert store.groups_for_view("people")[0].face_ids == (first_face_id,)
         assert store.groups_for_view("loose")[0].face_ids == (second_face_id,)
+
+
+def test_full_reevaluation_recovers_approximate_lookup_misses_and_honors_rejections(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "catalog"
+    with Catalog(root, CatalogSettings(faces_enabled=True)) as catalog:
+        store = FaceStore(catalog)
+        anchor_image_id, anchor_image_hash = add_image(
+            catalog,
+            "anchor.jpg",
+            (30, 60, 90),
+        )
+        assert store.store_analysis(
+            anchor_image_id,
+            anchor_image_hash,
+            analysis(
+                ((0.1, 0.1, 0.25, 0.35), embedding(0), (220, 180, 150))
+            ),
+        )
+        anchor_face_id = store.groups_for_view("loose")[0].face_ids[0]
+        person_id = store.name_faces((anchor_face_id,), "Alice")
+
+        candidate_image_id, candidate_image_hash = add_image(
+            catalog,
+            "candidate.jpg",
+            (90, 60, 30),
+        )
+        assert store.store_analysis(
+            candidate_image_id,
+            candidate_image_hash,
+            analysis(
+                (
+                    (0.2, 0.15, 0.3, 0.4),
+                    embedding(0, variation=0.75),
+                    (210, 170, 140),
+                )
+            ),
+        )
+        candidate_face_id = store.groups_for_view("loose")[0].face_ids[0]
+
+        def disjoint_lsh_codes(values: np.ndarray) -> np.ndarray:
+            code = 1 if float(values[0, 1]) > 0.1 else 0
+            return np.full(
+                (len(values), faces_module.FACE_LSH_TABLES),
+                code,
+                dtype=np.uint16,
+            )
+
+        monkeypatch.setattr(faces_module, "_lsh_codes", disjoint_lsh_codes)
+        assert store.groups_for_view("suggestions") == []
+
+        progress: list[tuple[int, int, str]] = []
+        summary = store.reevaluate_unnamed_faces(
+            progress=lambda processed, total, current: progress.append(
+                (processed, total, current)
+            )
+        )
+
+        assert summary.faces_examined == 1
+        assert summary.proposals_found == 1
+        assert summary.people_matched == 1
+        assert progress[-1] == (1, 1, "Updated face review proposals")
+        proposal = store.groups_for_view("suggestions")[0]
+        assert proposal.face_ids == (candidate_face_id,)
+        assert proposal.proposed_person_id == person_id
+        candidate_row = catalog._conn.execute(
+            "SELECT person_id, confirmed FROM faces WHERE id = ?",
+            (candidate_face_id,),
+        ).fetchone()
+        assert candidate_row["person_id"] is None
+        assert int(candidate_row["confirmed"]) == 0
+
+        store.reject_person((candidate_face_id,), person_id)
+        assert store.groups_for_view("suggestions") == []
+
+
+def test_full_reevaluation_splits_a_mixed_unnamed_group_by_confirmed_identity(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "catalog"
+
+    def mixed_embedding(first: float, second: float) -> bytes:
+        value = np.zeros(128, dtype="<f4")
+        value[0] = first
+        value[1] = second
+        value /= np.linalg.norm(value)
+        return value.tobytes()
+
+    with Catalog(root, CatalogSettings(faces_enabled=True)) as catalog:
+        store = FaceStore(catalog)
+        for index, (name, vector) in enumerate(
+            (("Alice", embedding(0)), ("Bob", embedding(1)))
+        ):
+            image_id, image_hash = add_image(
+                catalog,
+                f"anchor-{index}.jpg",
+                (30 + index, 60, 90),
+            )
+            assert store.store_analysis(
+                image_id,
+                image_hash,
+                analysis(
+                    (
+                        (0.1, 0.1, 0.25, 0.35),
+                        vector,
+                        (220 - index * 10, 180, 150),
+                    )
+                ),
+            )
+            anchor_id = store.groups_for_view("loose")[0].face_ids[0]
+            store.name_faces((anchor_id,), name)
+
+        for index, vector in enumerate(
+            (mixed_embedding(0.8, 0.6), mixed_embedding(0.6, 0.8))
+        ):
+            image_id, image_hash = add_image(
+                catalog,
+                f"candidate-{index}.jpg",
+                (90, 60, 30 + index),
+            )
+            assert store.store_analysis(
+                image_id,
+                image_hash,
+                analysis(
+                    (
+                        (0.2, 0.15, 0.3, 0.4),
+                        vector,
+                        (210, 170 - index * 10, 140),
+                    )
+                ),
+            )
+
+        monkeypatch.setattr(
+            FaceStore,
+            "_person_proposals",
+            lambda _self, face_ids, *_args: (
+                [None] * len(face_ids),
+                [0.0] * len(face_ids),
+            ),
+        )
+        unnamed = store.groups_for_view("unnamed")
+        assert len(unnamed) == 1
+        assert unnamed[0].count == 2
+
+        summary = store.reevaluate_unnamed_faces()
+
+        assert summary.proposals_found == 2
+        assert summary.people_matched == 2
+        proposals = store.groups_for_view("suggestions")
+        assert len(proposals) == 2
+        assert {group.proposed_person_name for group in proposals} == {"Alice", "Bob"}
+        assert all(group.count == 1 for group in proposals)
+        assert store.groups_for_view("unnamed") == []
+
+
+def test_rename_person_preserves_faces_and_virtual_directory_rules(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "catalog"
+    with Catalog(root, CatalogSettings(faces_enabled=True)) as catalog:
+        store = FaceStore(catalog)
+        image_id, image_hash = add_image(catalog, "portrait.jpg", (30, 60, 90))
+        assert store.store_analysis(
+            image_id,
+            image_hash,
+            analysis(((0.1, 0.1, 0.25, 0.35), embedding(0), (220, 180, 150))),
+        )
+        face_id = store.groups_for_view("loose")[0].face_ids[0]
+        person_id = store.name_faces((face_id,), "Alice")
+        candidate_image_id, candidate_image_hash = add_image(
+            catalog,
+            "candidate.jpg",
+            (90, 60, 30),
+        )
+        assert store.store_analysis(
+            candidate_image_id,
+            candidate_image_hash,
+            analysis(
+                (
+                    (0.2, 0.15, 0.3, 0.4),
+                    embedding(0, variation=0.01),
+                    (210, 170, 140),
+                )
+            ),
+        )
+        catalog._conn.execute(
+            "INSERT INTO people(name, normalized, created_at_ns) VALUES (?, ?, ?)",
+            ("Bob", "bob", 1),
+        )
+        simple = catalog.create_custom_virtual_directory(
+            "Alice photos",
+            "",
+            [""],
+            [],
+            ["Alice"],
+        )
+        advanced = catalog.create_advanced_custom_virtual_directory(
+            "Advanced Alice photos",
+            VirtualDirectoryRule(
+                "all",
+                children=(
+                    VirtualDirectoryRule("directory", value=""),
+                    VirtualDirectoryRule(
+                        "person",
+                        value="alice",
+                        display_value="Alice",
+                    ),
+                ),
+            ),
+        )
+
+        new_name = "Mary Jane + O'Neil 佐藤"
+        assert catalog.rename_person(person_id, f"  {new_name}  ") == new_name
+
+        person = next(person for person in store.people() if person.id == person_id)
+        assert person.name == new_name
+        named_group = next(
+            group
+            for group in store.groups_for_view("people")
+            if group.proposed_person_id == person_id
+        )
+        assert named_group.title == new_name
+        assert named_group.face_ids == (face_id,)
+        suggestion = store.groups_for_view("suggestions")[0]
+        assert suggestion.title == f"Likely {new_name}"
+        assert suggestion.proposed_person_name == new_name
+        assert suggestion.proposed_person_id == person_id
+
+        updated_simple = catalog.get_custom_virtual_directory(simple.id)
+        assert updated_simple is not None
+        assert updated_simple.people == (new_name,)
+        assert catalog.custom_virtual_directory_image_count(simple.id) == 1
+
+        updated_advanced = catalog.get_custom_virtual_directory(advanced.id)
+        assert updated_advanced is not None
+        assert updated_advanced.expression == VirtualDirectoryRule(
+            "all",
+            children=(
+                VirtualDirectoryRule("directory", value=""),
+                VirtualDirectoryRule(
+                    "person",
+                    value="mary jane + o'neil 佐藤",
+                    display_value=new_name,
+                ),
+            ),
+        )
+        assert catalog.custom_virtual_directory_image_count(advanced.id) == 1
+
+        with pytest.raises(ValueError, match='person named "Bob" already exists'):
+            catalog.rename_person(person_id, "Bob")
+        with pytest.raises(ValueError, match="selected person no longer exists"):
+            catalog.rename_person(999_999, "Nobody")
+
+        renamed_person = next(
+            person for person in store.people() if person.id == person_id
+        )
+        assert renamed_person.name == new_name
 
 
 def test_loose_faces_can_be_manually_grouped_and_groups_can_be_forced_loose(

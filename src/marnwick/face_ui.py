@@ -32,6 +32,7 @@ from .faces import (
     FACE_STATUS_ACTIVE,
     FACE_STATUS_IGNORED,
     FACE_STATUS_NOT_FACE,
+    FaceReevaluationSummary,
     FaceReviewGroup,
     FaceStore,
     FaceTile,
@@ -90,6 +91,7 @@ class FaceManagerDialog(QDialog):
         self._closed = False
         self._busy = False
         self._showing_all_faces = False
+        self._reevaluation_summary: FaceReevaluationSummary | None = None
         self._loader = RolloverThreadPoolExecutor(
             max_workers=1,
             thread_name_prefix="marnwick-face-review",
@@ -130,9 +132,17 @@ class FaceManagerDialog(QDialog):
         self.undo_button.setToolTip("Undo the most recent face-management decision")
         self.undo_button.clicked.connect(lambda: self._mutate("undo", (), None))
         controls.addWidget(self.undo_button)
-        refresh = QPushButton("Refresh")
-        refresh.clicked.connect(self.refresh_groups)
-        controls.addWidget(refresh)
+        self.refresh_button = QPushButton("Refresh")
+        self.refresh_button.clicked.connect(self.refresh_groups)
+        controls.addWidget(self.refresh_button)
+        self.reevaluate_button = QPushButton("Re-evaluate unnamed faces")
+        self.reevaluate_button.setToolTip(
+            "Exhaustively compare every unnamed face with confirmed identities"
+        )
+        self.reevaluate_button.clicked.connect(
+            lambda: self._mutate("reevaluate", (), None)
+        )
+        controls.addWidget(self.reevaluate_button)
         layout.addLayout(controls)
 
         splitter = QSplitter()
@@ -548,7 +558,9 @@ class FaceManagerDialog(QDialog):
         )
 
     def _mutate(self, kind: str, face_ids: tuple[int, ...], value: object | None) -> None:
-        if self._mutation_future is not None or (kind != "undo" and not face_ids):
+        if self._mutation_future is not None or (
+            kind not in {"undo", "reevaluate"} and not face_ids
+        ):
             return
         try:
             self._mutation_future = self._submit_mutation(kind, face_ids, value)
@@ -557,7 +569,11 @@ class FaceManagerDialog(QDialog):
             return
         self._pending_mutation = (kind, face_ids, value)
         self._set_busy(True)
-        self.group_detail.setText("Applying the reversible catalog decision…")
+        self.group_detail.setText(
+            "Comparing the full unnamed corpus with confirmed identities…"
+            if kind == "reevaluate"
+            else "Applying the reversible catalog decision…"
+        )
 
     def _settle_work(self) -> None:
         group_future = self._group_future
@@ -578,10 +594,18 @@ class FaceManagerDialog(QDialog):
                     self._person_name_model.setStringList(
                         [person.name for person in self._people]
                     )
-                    self.stats_label.setText(
+                    stats_text = (
                         f"{result.stats['named']:,}/{result.stats['faces']:,} named · "
                         f"{result.stats['people']:,} people · {result.stats['pending_images']:,} images pending"
                     )
+                    if self._reevaluation_summary is not None:
+                        summary = self._reevaluation_summary
+                        stats_text += (
+                            f" · Re-evaluated {summary.faces_examined:,}: "
+                            f"{summary.proposals_found:,} proposals across "
+                            f"{summary.people_matched:,} people"
+                        )
+                    self.stats_label.setText(stats_text)
                     self.group_list.clear()
                     for group in self._groups:
                         self.group_list.addItem(self._group_list_label(group))
@@ -631,6 +655,18 @@ class FaceManagerDialog(QDialog):
                     self.refresh_groups()
                     return
                 kind, requested_ids, value = pending
+                if kind == "reevaluate":
+                    if isinstance(result, FaceReevaluationSummary):
+                        self._reevaluation_summary = result
+                    review_index = self.view_combo.findData("review")
+                    if (
+                        review_index >= 0
+                        and self.view_combo.currentIndex() != review_index
+                    ):
+                        self.view_combo.setCurrentIndex(review_index)
+                    else:
+                        self.refresh_groups()
+                    return
                 local_exclusion = kind in {
                     "remove",
                     "defer",
@@ -744,6 +780,8 @@ class FaceManagerDialog(QDialog):
             self.undo_button,
             self.review_all_button,
             self.group_selected_button,
+            self.refresh_button,
+            self.reevaluate_button,
         ):
             widget.setEnabled(not busy)
         self._remove_shortcut.setEnabled(not busy and not self.name_entry.hasFocus())

@@ -8539,6 +8539,104 @@ class Catalog:
                 for row in rows
             ]
 
+    @classmethod
+    def _renamed_person_virtual_directory_rule(
+        cls,
+        rule: VirtualDirectoryRule,
+        old_normalized: str,
+        new_name: str,
+        new_normalized: str,
+    ) -> VirtualDirectoryRule:
+        children = tuple(
+            cls._renamed_person_virtual_directory_rule(
+                child,
+                old_normalized,
+                new_name,
+                new_normalized,
+            )
+            for child in rule.children
+        )
+        if rule.kind == "person" and rule.value == old_normalized:
+            return VirtualDirectoryRule(
+                kind=rule.kind,
+                value=new_normalized,
+                display_value=new_name,
+                children=children,
+            )
+        if children == rule.children:
+            return rule
+        return VirtualDirectoryRule(
+            kind=rule.kind,
+            value=rule.value,
+            display_value=rule.display_value,
+            children=children,
+        )
+
+    def rename_person(self, person_id: int, name: str) -> str:
+        """Rename one identity without changing its verified face membership."""
+
+        self._assert_writable()
+        saved_id = int(person_id)
+        clean_name = " ".join(str(name).strip().split())
+        normalized_name = normalize_person_name(clean_name)
+        if not clean_name or len(clean_name) > 200:
+            raise ValueError("Enter a person name from 1 through 200 characters")
+        with self._database_savepoint("rename_person"):
+            row = self._conn.execute(
+                "SELECT name, normalized FROM people WHERE id = ?",
+                (saved_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("The selected person no longer exists")
+            duplicate = self._conn.execute(
+                "SELECT id FROM people WHERE normalized = ? AND id <> ?",
+                (normalized_name, saved_id),
+            ).fetchone()
+            if duplicate is not None:
+                raise ValueError(f'a person named "{clean_name}" already exists')
+            old_normalized = str(row["normalized"])
+            self._conn.execute(
+                "UPDATE people SET name = ?, normalized = ? WHERE id = ?",
+                (clean_name, normalized_name, saved_id),
+            )
+            self._conn.execute(
+                """
+                UPDATE virtual_directory_people
+                SET person_name = ?, person_normalized = ?
+                WHERE person_normalized = ?
+                """,
+                (clean_name, normalized_name, old_normalized),
+            )
+            expression_rows = self._conn.execute(
+                """
+                SELECT id, expression_json
+                FROM virtual_directories
+                WHERE expression_json IS NOT NULL
+                """
+            ).fetchall()
+            for expression_row in expression_rows:
+                rule = self._virtual_directory_rule_from_json(
+                    expression_row["expression_json"]
+                )
+                if rule is None:
+                    continue
+                renamed_rule = self._renamed_person_virtual_directory_rule(
+                    rule,
+                    old_normalized,
+                    clean_name,
+                    normalized_name,
+                )
+                if renamed_rule == rule:
+                    continue
+                self._conn.execute(
+                    "UPDATE virtual_directories SET expression_json = ? WHERE id = ?",
+                    (
+                        self._virtual_directory_rule_json(renamed_rule),
+                        int(expression_row["id"]),
+                    ),
+                )
+        return clean_name
+
     @staticmethod
     def _verified_person_image_filter(person_id: int) -> tuple[str, list[object]]:
         return (
