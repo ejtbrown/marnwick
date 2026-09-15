@@ -6177,6 +6177,71 @@ def test_same_catalog_image_move_queues_exact_reconciliation(
         qt_app.processEvents()
 
 
+def test_drag_move_removes_only_moved_thumbnail_without_reloading_pane(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    (root / "target").mkdir(parents=True)
+    Image.new("RGB", (8, 8), (10, 20, 30)).save(root / "move.png")
+    Image.new("RGB", (8, 8), (40, 50, 60)).save(root / "stay.png")
+    window = MainWindow()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        catalog.refresh()
+        window.current_catalog = catalog
+        window.current_dir_rel = ""
+        window.load_current_directory()
+        settle_virtual_view_tasks(window, qt_app)
+        window.model._cancel_thumbnail_loads()
+
+        moved_pixmap = QPixmap(4, 4)
+        moved_pixmap.fill(QColor("red"))
+        retained_pixmap = QPixmap(4, 4)
+        retained_pixmap.fill(QColor("blue"))
+        window.model._cache_pixmap("move.png", moved_pixmap)
+        window.model._cache_pixmap("stay.png", retained_pixmap)
+        retained_cache_key = retained_pixmap.cacheKey()
+        pane_generation = window._physical_pane_generation
+        reloads: list[bool] = []
+        monkeypatch.setattr(
+            window,
+            "load_current_directory",
+            lambda *, preserve_selection=False: reloads.append(preserve_selection),
+        )
+
+        window.move_payload_to_directory(
+            [
+                {
+                    "catalog_root": str(root),
+                    "rel_path": "move.png",
+                    "kind": "image",
+                }
+            ],
+            root,
+            "target",
+        )
+        settle_move_payload_task(window, qt_app)
+        settle_post_move_reconcile_tasks(window, qt_app)
+
+        assert reloads == []
+        assert window._physical_pane_generation == pane_generation
+        assert [record.rel_path for record in window.model.images] == [
+            "target",
+            "stay.png",
+        ]
+        assert "move.png" not in window.model._pixmap_cache
+        assert window.model._pixmap_cache["stay.png"].cacheKey() == retained_cache_key
+        assert (root / "target" / "move.png").is_file()
+    finally:
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
 def test_post_move_reconcile_prunes_nested_and_covered_targets(
     tmp_path: Path,
     monkeypatch,
