@@ -861,6 +861,7 @@ class MovePayloadTask:
     navigation_owner: FullscreenViewer | None = None
     deleted_tag_name: str | None = None
     hide_sources: bool = True
+    refresh_current_view_on_success: bool = True
 
 
 @dataclass(slots=True)
@@ -1636,21 +1637,30 @@ class ThumbnailModel(QAbstractListModel):
             if complete_image_order is not None
             else self._indexed_slideshow_image_count
         )
-        if preserve_pixmap_cache and complete_row_by_key is not None:
+        if preserve_pixmap_cache:
+            current_rows = complete_row_by_key
+            if current_rows is None:
+                current_rows = {
+                    (
+                        "directory" if isinstance(record, DirectoryRecord) else "image",
+                        record.rel_path,
+                    ): row
+                    for row, record in enumerate(images)
+                }
             for rel_path in list(self._pixmap_cache):
                 previous_row = (
                     previous_complete_rows.get(("image", rel_path))
                     if previous_complete_rows is not None
                     else previous_rows.get(("image", rel_path))
                 )
-                new_row = complete_row_by_key.get(("image", rel_path))
+                new_row = current_rows.get(("image", rel_path))
                 if previous_row is None or new_row is None:
                     previous_row = (
                         previous_complete_rows.get(("directory", rel_path))
                         if previous_complete_rows is not None
                         else previous_rows.get(("directory", rel_path))
                     )
-                    new_row = complete_row_by_key.get(("directory", rel_path))
+                    new_row = current_rows.get(("directory", rel_path))
                 if previous_row is None or new_row is None:
                     self._drop_cached_pixmap(rel_path)
                     continue
@@ -1727,10 +1737,15 @@ class ThumbnailModel(QAbstractListModel):
         next_offset: int,
         has_more: bool,
         request_page: Callable[[int], None],
+        preserve_pixmap_cache: bool = False,
     ) -> None:
         """Publish one bounded pane page and defer every later page to a worker."""
 
-        self.set_images(catalog, images)
+        self.set_images(
+            catalog,
+            images,
+            preserve_pixmap_cache=preserve_pixmap_cache,
+        )
         self._page_request_callback = request_page
         self._page_fetch_pending = False
         self._next_page_offset = max(0, int(next_offset))
@@ -2052,7 +2067,11 @@ class ThumbnailModel(QAbstractListModel):
         """Replace loaded rows after a local mutation without discarding paging."""
 
         if not self.is_paged:
-            self.set_images(self.catalog, images)
+            self.set_images(
+                self.catalog,
+                images,
+                preserve_pixmap_cache=True,
+            )
             return
         assert self.catalog is not None
         request_page = self._page_request_callback
@@ -2088,6 +2107,7 @@ class ThumbnailModel(QAbstractListModel):
             # reload before any later page may be requested.
             has_more=False,
             request_page=request_page,
+            preserve_pixmap_cache=True,
         )
 
     @property
@@ -13280,7 +13300,7 @@ class MainWindow(QMainWindow):
                             complete_order_token=stable_order_token,
                             complete_image_count=total_images,
                             complete_image_order=stable_image_order,
-                            preserve_pixmap_cache=bool(cached_overlay),
+                            preserve_pixmap_cache=True,
                         )
                         self.model.update_records_in_place(cached_overlay)
                     elif same_complete_order:
@@ -13967,6 +13987,7 @@ class MainWindow(QMainWindow):
         warning_owner: QWidget = self
         canceled = False
         immediate_refresh_roots: set[Path] = set()
+        incremental_refresh_roots: set[Path] = set()
         failed_refresh_roots: set[Path] = set()
         thumbnail_reindex_roots: set[Path] = set()
         created_directories: list[tuple[Path, str]] = []
@@ -14050,8 +14071,11 @@ class MainWindow(QMainWindow):
                     saved_images.append((move_task, root, rel_path, committed_proof))
                     self._failed_image_edits.pop((root, rel_path), None)
             else:
-                immediate_refresh_roots.update(move_task.affected_roots)
-                immediate_refresh_roots.update(result.affected_roots)
+                result_roots = move_task.affected_roots | result.affected_roots
+                if move_task.refresh_current_view_on_success:
+                    immediate_refresh_roots.update(result_roots)
+                else:
+                    incremental_refresh_roots.update(result_roots)
                 reconcile_subtrees.update(result.reconcile_subtrees)
                 reconcile_images.update(result.reconcile_images)
             if result.created_dir_rel is not None:
@@ -14060,6 +14084,12 @@ class MainWindow(QMainWindow):
         refresh_roots = immediate_refresh_roots | failed_refresh_roots
         if refresh_roots:
             self._refresh_after_move_payload(refresh_roots)
+        incremental_refresh_roots.difference_update(refresh_roots)
+        if incremental_refresh_roots:
+            self._refresh_after_move_payload(
+                incremental_refresh_roots,
+                reload_current_view=False,
+            )
         self._queue_post_move_reconciliations(
             reconcile_subtrees,
             reconcile_images,
@@ -14527,7 +14557,12 @@ class MainWindow(QMainWindow):
                 return context
         return None
 
-    def _refresh_after_move_payload(self, affected_roots: set[Path]) -> None:
+    def _refresh_after_move_payload(
+        self,
+        affected_roots: set[Path],
+        *,
+        reload_current_view: bool = True,
+    ) -> None:
         for root in affected_roots:
             self._swept_catalog_roots.discard(root)
             self._pruned_catalog_roots.discard(root)
@@ -14535,7 +14570,11 @@ class MainWindow(QMainWindow):
         tree_scroll_generation = self._begin_tree_scroll_preservation(
             self._tree_scroll_position()
         )
-        if self.current_catalog is not None and self.current_catalog.root in affected_roots:
+        if (
+            reload_current_view
+            and self.current_catalog is not None
+            and self.current_catalog.root in affected_roots
+        ):
             # Image moves do not require clearing the entire folder tree. Keep
             # its existing Qt items as the incremental database reconciliation
             # updates any directory rows in place.
@@ -15563,6 +15602,7 @@ class MainWindow(QMainWindow):
             completion_verb="Copied" if copy_requested else "Moved",
             error_title="Copy" if copy_requested else "Move",
             hide_sources=not copy_requested,
+            refresh_current_view_on_success=False,
         )
         self._move_payload_tasks.append(move_task)
         self._refresh_active_move_payload_task()
