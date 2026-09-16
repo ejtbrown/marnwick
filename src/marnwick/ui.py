@@ -15,7 +15,12 @@ import weakref
 from collections import OrderedDict, defaultdict, deque
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
-from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from concurrent.futures import (
+    CancelledError,
+    Future,
+    ThreadPoolExecutor,
+    TimeoutError as FutureTimeoutError,
+)
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from functools import partial
@@ -125,6 +130,14 @@ from .async_utils import (
     shared_viewer_preview_executor,
 )
 from .app_icon import DESKTOP_FILE_ID, app_icon_bytes, virtual_folder_icon_bytes
+from .archive import (
+    ARCHIVE_KIND_PHYSICAL,
+    ArchiveRequest,
+    ArchiveResult,
+    create_zip_archive,
+    normalized_zip_output_path,
+    zip_safe_component,
+)
 from .catalog import (
     DUPLICATE_DELETE_EXACT,
     DUPLICATE_DELETE_VERY_SIMILAR,
@@ -865,6 +878,14 @@ class MovePayloadTask:
 
 
 @dataclass(slots=True)
+class ZipArchiveTask:
+    root: Path
+    task: IndexTask
+    future: Future[ArchiveResult]
+    output_path: Path
+
+
+@dataclass(slots=True)
 class MutationIdentityResult:
     image_identities: dict[Path, dict[str, object]]
     directory_identities: dict[Path, dict[str, object]]
@@ -1001,11 +1022,18 @@ QFrame#propertiesFrame QLabel {
 QComboBox,
 QLineEdit,
 QSpinBox,
+QKeySequenceEdit {
+    background: palette(base);
+    color: palette(text);
+    border: 1px solid palette(mid);
+    min-height: 1.5em;
+    padding: 2px 5px;
+}
 QPlainTextEdit {
     background: palette(base);
     color: palette(text);
     border: 1px solid palette(mid);
-    padding: 3px;
+    padding: 5px;
 }
 QComboBox QAbstractItemView {
     background: palette(base);
@@ -1042,6 +1070,11 @@ QTreeWidget::item:selected {
     color: palette(highlighted-text);
 }
 """
+
+PALETTE_AWARE_FILE_DIALOG_OPTIONS = QFileDialog.Option.DontUseNativeDialog
+PALETTE_AWARE_DIRECTORY_DIALOG_OPTIONS = (
+    QFileDialog.Option.ShowDirsOnly | PALETTE_AWARE_FILE_DIALOG_OPTIONS
+)
 
 MESSAGE_BUTTON_STYLESHEET = """
 QPushButton {
@@ -4029,20 +4062,26 @@ class DirectoryTree(QTreeWidget):
         item: QTreeWidgetItem,
     ) -> dict[str, QAction]:
         kind = item.data(0, VIRTUAL_KIND_ROLE)
+        actions: dict[str, QAction] = {}
         if kind == VIRTUAL_KIND_ROOT:
-            return {"new": menu.addAction("New")}
-        if kind == VIRTUAL_KIND_CUSTOM:
-            return {
-                "edit": menu.addAction("Edit"),
-                "delete": menu.addAction("Delete"),
-            }
-        if kind == VIRTUAL_KIND_PERSON:
-            return {"rename": menu.addAction("Rename")}
-        return {}
+            actions["new"] = menu.addAction("New")
+        elif kind == VIRTUAL_KIND_CUSTOM:
+            actions["edit"] = menu.addAction("Edit")
+            actions["delete"] = menu.addAction("Delete")
+        elif kind == VIRTUAL_KIND_PERSON:
+            actions["rename"] = menu.addAction("Rename")
+        if actions:
+            menu.addSeparator()
+        actions["add_to_zip"] = menu.addAction("Add to Zip")
+        return actions
 
     def _open_context_menu(self, pos) -> None:  # type: ignore[no-untyped-def]
         item = self.itemAt(pos)
-        if item is None:
+        if (
+            item is None
+            or item.data(0, TREE_LOAD_MORE_ROLE) is not None
+            or item.data(0, TREE_LOAD_MORE_TAGS_ROLE) is not None
+        ):
             return
         if self.window.is_virtual_tree_item(item):
             menu = QMenu(self)
@@ -4075,6 +4114,14 @@ class DirectoryTree(QTreeWidget):
                         int(item.data(0, VIRTUAL_VALUE_ROLE)),
                         item.text(0),
                     )
+            elif selected == actions.get("add_to_zip"):
+                self.window.add_tree_node_to_zip(
+                    root,
+                    "",
+                    virtual_kind=str(item.data(0, VIRTUAL_KIND_ROLE) or ""),
+                    virtual_value=str(item.data(0, VIRTUAL_VALUE_ROLE) or ""),
+                    label=item.text(0),
+                )
             return
         root = Path(item.data(0, CATALOG_ROOT_ROLE))
         dir_rel = item.data(0, DIR_REL_ROLE)
@@ -4084,6 +4131,7 @@ class DirectoryTree(QTreeWidget):
             restore_action = menu.addAction("Restore")
             menu.addSeparator()
         properties_action = menu.addAction("Properties")
+        archive_action = menu.addAction("Add to Zip")
         create_action = menu.addAction("Create Directory")
         delete_action = menu.addAction("Delete Directory") if dir_rel else None
         preferences_action = tags_action = close_action = None
@@ -4097,6 +4145,12 @@ class DirectoryTree(QTreeWidget):
             self.window.restore_trash_directory(root, dir_rel)
         elif selected == properties_action:
             self.window.open_directory_properties(root, dir_rel)
+        elif selected == archive_action:
+            self.window.add_tree_node_to_zip(
+                root,
+                str(dir_rel or ""),
+                label=item.text(0),
+            )
         elif selected == create_action:
             self.window.create_directory(root, dir_rel)
         elif delete_action is not None and selected == delete_action:
@@ -4263,6 +4317,15 @@ class MainWindow(QMainWindow):
             thread_name_prefix="marnwick-save",
             max_pending=MAX_PENDING_IMAGE_SAVES,
         )
+        # ZIP publication is an atomic user-requested output. Its dedicated
+        # bounded lane keeps a large archive from delaying protected catalog
+        # mutations, and cancellation can abandon a blocked destination
+        # without ever replacing the selected output with a partial archive.
+        self.archive_executor = AtomicSaveThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="marnwick-archive",
+            max_pending=1,
+        )
         self.identity_executor = RolloverThreadPoolExecutor(
             max_workers=1,
             thread_name_prefix="marnwick-confirm-identity",
@@ -4299,6 +4362,7 @@ class MainWindow(QMainWindow):
         self._delete_payload_task: DeletePayloadTask | None = None
         self._move_payload_tasks: list[MovePayloadTask] = []
         self._move_payload_task: MovePayloadTask | None = None
+        self._zip_archive_task: ZipArchiveTask | None = None
         self._mutation_identity_generation = 0
         self._move_identity_preflights: dict[
             Future[MutationIdentityResult], MoveIdentityPreflightTask
@@ -4584,6 +4648,10 @@ class MainWindow(QMainWindow):
         self._virtual_view_tasks.clear()
         self.duplicate_delete_executor.shutdown(wait=True, cancel_futures=True)
         self.file_move_executor.shutdown(wait=True, cancel_futures=True)
+        if self._zip_archive_task is not None:
+            self._zip_archive_task.task.cancel()
+            self._zip_archive_task = None
+        self.archive_executor.shutdown(wait=False, cancel_futures=True)
         for future in self._delete_confirmation_tasks:
             future.cancel()
         self._delete_confirmation_tasks.clear()
@@ -4654,6 +4722,7 @@ class MainWindow(QMainWindow):
         self._settle_duplicate_delete_task()
         self._settle_delete_payload_task()
         self._settle_move_payload_task()
+        self._settle_zip_archive_task()
         self._settle_image_reconcile_tasks()
         self._submit_pending_image_reconcile_retries()
         self._flush_deferred_delete_requests()
@@ -5482,7 +5551,12 @@ class MainWindow(QMainWindow):
 
     def open_catalog_dialog(self) -> None:
         dialog_started_at = monotonic()
-        directory = QFileDialog.getExistingDirectory(self, "Open catalog")
+        directory = QFileDialog.getExistingDirectory(
+            self,
+            "Open catalog",
+            "",
+            PALETTE_AWARE_DIRECTORY_DIALOG_OPTIONS,
+        )
         if directory:
             selected_at = monotonic()
             self.defer_open_catalog(
@@ -6684,6 +6758,141 @@ class MainWindow(QMainWindow):
             },
             completion_verb="Renamed",
             error_title="Rename Image",
+        )
+
+    def add_tree_node_to_zip(
+        self,
+        root: Path,
+        dir_rel: str,
+        *,
+        virtual_kind: str = "",
+        virtual_value: str = "",
+        label: str = "",
+    ) -> None:
+        """Prompt for and asynchronously archive one physical or virtual node."""
+
+        self._settle_zip_archive_task()
+        if self._zip_archive_task is not None:
+            self.progress_label.setText("Wait for the current ZIP archive to finish")
+            return
+        catalog = self.workspace.catalog_for_exact_root(root.expanduser().absolute())
+        if catalog is None:
+            return
+        default_label = label or Path(dir_rel).name or catalog.root.name or "archive"
+        default_name = f"{zip_safe_component(default_label)}.zip"
+        selected_path, _selected_filter = QFileDialog.getSaveFileName(
+            self,
+            "Add to Zip",
+            default_name,
+            "Zip archives (*.zip)",
+            options=PALETTE_AWARE_FILE_DIALOG_OPTIONS,
+        )
+        if not selected_path:
+            return
+        selected_output_path = Path(selected_path).expanduser().absolute()
+        output_path = normalized_zip_output_path(selected_output_path)
+        if output_path != selected_output_path and output_path.exists():
+            answer = QMessageBox.question(
+                self,
+                "Replace ZIP Archive?",
+                f"{output_path.name} already exists. Replace it?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        request = ArchiveRequest(
+            catalog_root=catalog.root,
+            expected_root_identity=catalog.root_identity,
+            expected_storage_identity=catalog.storage_identity,
+            node_kind=virtual_kind or ARCHIVE_KIND_PHYSICAL,
+            node_value=virtual_value,
+            directory_rel=dir_rel,
+            output_path=output_path,
+            sort_order=self.current_sort,
+        )
+        archive_task = IndexTask(
+            "Creating ZIP archive",
+            catalog.root,
+            dir_rel or None,
+            interactive=True,
+            idle_sleep_seconds=0.0,
+            preemptible=True,
+            expected_root_identity=catalog.root_identity,
+            expected_storage_identity=catalog.storage_identity,
+        )
+        archive_task.update(0, None, default_label)
+        try:
+            future = self.archive_executor.submit(
+                self._create_zip_archive_worker,
+                request,
+                archive_task,
+            )
+        except (ExecutorSaturatedError, RuntimeError) as error:
+            show_error(self, "Add to Zip", str(error))
+            return
+        archive_task.bind_future(future)  # type: ignore[arg-type]
+        self._zip_archive_task = ZipArchiveTask(
+            root=catalog.root,
+            task=archive_task,
+            future=future,
+            output_path=output_path,
+        )
+        self.progress_bar.setRange(0, 0)
+        self.progress_label.setText(f"Creating {output_path.name}")
+        QTimer.singleShot(0, self._poll_indexer)
+
+    @staticmethod
+    def _create_zip_archive_worker(
+        request: ArchiveRequest,
+        task: IndexTask,
+    ) -> ArchiveResult:
+        try:
+            result = create_zip_archive(request, task)
+        except IndexTaskCancelled:
+            task.mark_canceled()
+            raise
+        except BaseException as error:
+            task.mark_failed(error)
+            raise
+        task.mark_done()
+        return result
+
+    def _settle_zip_archive_task(self) -> None:
+        archive_task = self._zip_archive_task
+        if archive_task is None or not archive_task.future.done():
+            return
+        self._zip_archive_task = None
+        try:
+            result = archive_task.future.result()
+        except (CancelledError, IndexTaskCancelled):
+            self.progress_bar.setRange(0, 1)
+            self.progress_bar.setValue(0)
+            self.progress_label.setText("ZIP archive canceled")
+            return
+        except Exception as error:
+            self.progress_bar.setRange(0, 1)
+            self.progress_bar.setValue(0)
+            self.progress_label.setText("ZIP archive failed")
+            if not self._closing:
+                show_error(self, "Add to Zip", str(error))
+            return
+        self.progress_bar.setRange(0, max(1, result.file_count))
+        self.progress_bar.setValue(result.file_count)
+        self.progress_label.setText(
+            f"Created {result.output_path.name} with {result.file_count} file(s)"
+        )
+
+    def _show_zip_archive_status(self, archive_task: ZipArchiveTask) -> None:
+        snapshot = archive_task.task.snapshot()
+        if snapshot.total is None:
+            self.progress_bar.setRange(0, 0)
+        else:
+            self.progress_bar.setRange(0, max(1, snapshot.total))
+            self.progress_bar.setValue(min(snapshot.processed, max(1, snapshot.total)))
+        detail = f": {Path(snapshot.current).name}" if snapshot.current else ""
+        self.progress_label.setText(
+            f"Creating {archive_task.output_path.name} ({snapshot.processed} file(s)){detail}"
         )
 
     @staticmethod
@@ -16353,6 +16562,7 @@ class MainWindow(QMainWindow):
         self._settle_duplicate_delete_task()
         self._settle_delete_payload_task()
         self._settle_move_payload_task()
+        self._settle_zip_archive_task()
         self._settle_image_reconcile_tasks()
         self._settle_post_move_reconcile_tasks()
         self._flush_deferred_delete_requests()
@@ -16396,6 +16606,10 @@ class MainWindow(QMainWindow):
             or self._task_is_running(active_move_task.task, snapshots)
         ):
             self._show_move_payload_status(active_move_task.task.snapshot())
+            return
+        active_archive_task = self._zip_archive_task
+        if active_archive_task is not None:
+            self._show_zip_archive_status(active_archive_task)
             return
         active_virtual_task = self._active_virtual_view_task()
         visible_snapshots = [
@@ -17688,7 +17902,12 @@ class AppPreferencesDialog(QDialog):
         layout.addWidget(buttons)
 
     def add_catalog(self) -> None:
-        directory = QFileDialog.getExistingDirectory(self, "Add catalog")
+        directory = QFileDialog.getExistingDirectory(
+            self,
+            "Add catalog",
+            "",
+            PALETTE_AWARE_DIRECTORY_DIALOG_OPTIONS,
+        )
         if directory:
             self.catalog_list.addItem(str(Path(directory).expanduser()))
 

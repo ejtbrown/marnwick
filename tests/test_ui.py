@@ -27,9 +27,12 @@ from PySide6.QtWidgets import (  # noqa: E402
     QAbstractItemView,
     QApplication,
     QDialog,
+    QFileDialog,
     QMenu,
     QMessageBox,
     QStyle,
+    QStyleOptionComboBox,
+    QStyleOptionSpinBox,
     QStyleOptionViewItem,
     QTreeWidgetItem,
 )
@@ -242,6 +245,21 @@ def settle_move_payload_task(window: MainWindow, qt_app: QApplication, *, timeou
     assert not window._move_identity_preflights
     assert not window._restore_identity_preflights
     assert window._move_payload_task is None
+
+
+def settle_zip_archive_task(
+    window: MainWindow,
+    qt_app: QApplication,
+    *,
+    timeout: float = 5.0,
+) -> None:
+    deadline = monotonic() + timeout
+    while window._zip_archive_task is not None and monotonic() < deadline:
+        qt_app.processEvents()
+        window._settle_zip_archive_task()
+        sleep(0.01)
+    window._settle_zip_archive_task()
+    assert window._zip_archive_task is None
 
 
 def settle_post_move_reconcile_tasks(
@@ -3103,12 +3121,14 @@ def test_fullscreen_save_without_preserve_date_updates_modified_time(tmp_path: P
             qt_app.processEvents()
 
 
-def test_dialog_stylesheet_explicitly_styles_message_box_buttons() -> None:
+def test_dialog_stylesheet_styles_buttons_and_fields() -> None:
     assert "QMessageBox" in DIALOG_STYLESHEET
     assert "QPushButton" in DIALOG_STYLESHEET
     assert "QScrollArea" in DIALOG_STYLESHEET
     assert "QWidget#tagContainer" in DIALOG_STYLESHEET
     assert "QFrame#propertiesFrame" in DIALOG_STYLESHEET
+    assert "QKeySequenceEdit" in DIALOG_STYLESHEET
+    assert "min-height: 1.5em" in DIALOG_STYLESHEET
     assert "palette(window)" in DIALOG_STYLESHEET
     assert "#f6f7f9" not in DIALOG_STYLESHEET
     assert "#202124" not in DIALOG_STYLESHEET
@@ -5895,7 +5915,10 @@ def test_async_config_save_churn_keeps_only_the_latest_snapshot(
         qt_app.processEvents()
 
 
-def test_app_preferences_dialog_exposes_config_settings(tmp_path: Path) -> None:
+def test_app_preferences_dialog_exposes_config_settings(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
     qt_app = app()
     dialog = AppPreferencesDialog(
         AppConfig(
@@ -5909,6 +5932,40 @@ def test_app_preferences_dialog_exposes_config_settings(tmp_path: Path) -> None:
         )
     )
     try:
+        dialog.show()
+        qt_app.processEvents()
+        for combo in (
+            dialog.sort_order,
+            dialog.delete_behavior,
+            dialog.lama_runtime,
+            dialog.face_runtime,
+        ):
+            option = QStyleOptionComboBox()
+            combo.initStyleOption(option)
+            edit_rect = combo.style().subControlRect(
+                QStyle.ComplexControl.CC_ComboBox,
+                option,
+                QStyle.SubControl.SC_ComboBoxEditField,
+                combo,
+            )
+            assert edit_rect.height() >= combo.fontMetrics().height() + 6
+        for spin_box in (
+            dialog.window_x,
+            dialog.window_y,
+            dialog.window_width,
+            dialog.window_height,
+            dialog.thumbnail_size,
+        ):
+            option = QStyleOptionSpinBox()
+            spin_box.initStyleOption(option)
+            edit_rect = spin_box.style().subControlRect(
+                QStyle.ComplexControl.CC_SpinBox,
+                option,
+                QStyle.SubControl.SC_SpinBoxEditField,
+                spin_box,
+            )
+            assert edit_rect.height() >= spin_box.fontMetrics().height() + 6
+
         assert [
             dialog.lama_runtime.itemText(index)
             for index in range(dialog.lama_runtime.count())
@@ -5928,7 +5985,22 @@ def test_app_preferences_dialog_exposes_config_settings(tmp_path: Path) -> None:
         dialog.face_runtime.setCurrentIndex(
             dialog.face_runtime.findData(FACE_RUNTIME_REMOTE)
         )
-        dialog.catalog_list.addItem(str(tmp_path / "two"))
+        picker_options: list[QFileDialog.Option] = []
+
+        def select_catalog(
+            _parent,
+            _caption: str,
+            _directory: str,
+            options: QFileDialog.Option,
+        ) -> str:
+            picker_options.append(options)
+            return str(tmp_path / "two")
+
+        monkeypatch.setattr(
+            "marnwick.ui.QFileDialog.getExistingDirectory",
+            select_catalog,
+        )
+        dialog.add_catalog()
 
         selected = dialog.selected_config()
 
@@ -5938,6 +6010,7 @@ def test_app_preferences_dialog_exposes_config_settings(tmp_path: Path) -> None:
         assert selected.lama_runtime == LAMA_RUNTIME_REMOTE
         assert selected.face_runtime == FACE_RUNTIME_REMOTE
         assert selected.catalogs == [str(tmp_path / "one"), str(tmp_path / "two")]
+        assert picker_options == [ui_module.PALETTE_AWARE_DIRECTORY_DIALOG_OPTIONS]
     finally:
         dialog.close()
         dialog.deleteLater()
@@ -8448,12 +8521,25 @@ def test_open_catalog_dialog_defers_open_until_next_event_loop_tick(tmp_path: Pa
     root = tmp_path / "catalog"
     root.mkdir()
     calls: list[tuple[Path, bool, float | None]] = []
+    picker_options: list[QFileDialog.Option] = []
 
     window = MainWindow()
     try:
         window.progress_timer.stop()
         window.idle_timer.stop()
-        monkeypatch.setattr("marnwick.ui.QFileDialog.getExistingDirectory", lambda *_: str(root))
+        def select_catalog(
+            _parent,
+            _caption: str,
+            _directory: str,
+            options: QFileDialog.Option,
+        ) -> str:
+            picker_options.append(options)
+            return str(root)
+
+        monkeypatch.setattr(
+            "marnwick.ui.QFileDialog.getExistingDirectory",
+            select_catalog,
+        )
 
         def fake_open_catalog_async(
             selected_root: Path,
@@ -8469,6 +8555,7 @@ def test_open_catalog_dialog_defers_open_until_next_event_loop_tick(tmp_path: Pa
 
         assert calls == []
         assert not (root / ".marnwick").exists()
+        assert picker_options == [ui_module.PALETTE_AWARE_DIRECTORY_DIALOG_OPTIONS]
 
         qt_app.processEvents()
 
@@ -10336,6 +10423,17 @@ def test_virtual_directory_tree_loads_tag_and_duplicate_aggregates(tmp_path: Pat
         assert tag_item.data(0, VIRTUAL_KIND_ROLE) == VIRTUAL_KIND_TAG
         assert tag_item.data(0, VIRTUAL_VALUE_ROLE) == "Keep"
         assert tag_item.icon(0).cacheKey() == tags_root.icon(0).cacheKey()
+        tag_menu = QMenu()
+        try:
+            tag_actions = window.tree._virtual_context_menu_actions(
+                tag_menu,
+                tag_item,
+            )
+            assert list(tag_actions) == ["add_to_zip"]
+            assert tag_actions["add_to_zip"].text() == "Add to Zip"
+        finally:
+            tag_menu.close()
+            tag_menu.deleteLater()
         assert len(
             {
                 virtual_root.icon(0).cacheKey(),
@@ -10479,8 +10577,11 @@ def test_people_tree_is_opt_in_and_opens_the_selected_review_queue(
                 person_menu,
                 person_item,
             )
-            assert list(actions) == ["rename"]
-            assert [action.text() for action in actions.values()] == ["Rename"]
+            assert list(actions) == ["rename", "add_to_zip"]
+            assert [action.text() for action in actions.values()] == [
+                "Rename",
+                "Add to Zip",
+            ]
         finally:
             person_menu.close()
             person_menu.deleteLater()
@@ -11136,14 +11237,14 @@ def test_custom_virtual_directory_tree_create_browse_and_confirmed_delete(
                     root_menu,
                     virtual_root,
                 ).values()
-            ] == ["New"]
+            ] == ["New", "Add to Zip"]
             assert [
                 action.text()
                 for action in window.tree._virtual_context_menu_actions(
                     custom_menu,
                     custom_item,
                 ).values()
-            ] == ["Edit", "Delete"]
+            ] == ["Edit", "Delete", "Add to Zip"]
         finally:
             root_menu.close()
             root_menu.deleteLater()
@@ -13699,12 +13800,14 @@ def test_dismissing_child_tree_context_menu_does_not_open_catalog_tags(tmp_path:
     (root / "child").mkdir(parents=True)
     window = MainWindow()
     calls: list[Path] = []
+    labels: list[str] = []
 
     class DismissedMenu:
         def __init__(self, _parent) -> None:  # type: ignore[no-untyped-def]
             pass
 
-        def addAction(self, _label: str) -> object:  # noqa: N802 - Qt-compatible fake
+        def addAction(self, label: str) -> object:  # noqa: N802 - Qt-compatible fake
+            labels.append(label)
             return object()
 
         def addSeparator(self) -> None:  # noqa: N802 - Qt-compatible fake
@@ -13729,6 +13832,52 @@ def test_dismissing_child_tree_context_menu_does_not_open_catalog_tags(tmp_path:
         window.tree._open_context_menu(window.tree.visualItemRect(child).center())
 
         assert calls == []
+        assert "Add to Zip" in labels
+    finally:
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_add_tree_node_to_zip_uses_save_dialog_and_appends_extension(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    (root / "notes.txt").write_text("catalog notes", encoding="utf-8")
+    selected_path = tmp_path / "catalog-backup"
+    picker_options: list[QFileDialog.Option] = []
+    window = MainWindow()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+
+        def select_output(*_args, **kwargs):
+            picker_options.append(kwargs["options"])
+            return str(selected_path), "Zip archives (*.zip)"
+
+        monkeypatch.setattr(
+            "marnwick.ui.QFileDialog.getSaveFileName",
+            select_output,
+        )
+
+        window.add_tree_node_to_zip(
+            catalog.root,
+            "",
+            label="Catalog Backup",
+        )
+        settle_zip_archive_task(window, qt_app)
+
+        output = tmp_path / "catalog-backup.zip"
+        assert output.is_file()
+        assert (
+            window.progress_label.text()
+            == "Created catalog-backup.zip with 1 file(s)"
+        )
+        assert picker_options == [ui_module.PALETTE_AWARE_FILE_DIALOG_OPTIONS]
     finally:
         window.close()
         window.deleteLater()
