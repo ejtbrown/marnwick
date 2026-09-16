@@ -88,6 +88,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QKeySequenceEdit,
     QLabel,
+    QLayout,
     QLineEdit,
     QListView,
     QListWidget,
@@ -999,6 +1000,13 @@ QMessageBox {
     background: palette(window);
     color: palette(window-text);
 }
+QDialog#appPreferencesDialog,
+QScrollArea#preferencesScroll,
+QWidget#preferencesScrollViewport,
+QWidget#preferencesContent {
+    background: palette(button);
+    color: palette(button-text);
+}
 QLabel,
 QCheckBox {
     background: transparent;
@@ -1034,6 +1042,19 @@ QPlainTextEdit {
     color: palette(text);
     border: 1px solid palette(mid);
     padding: 5px;
+}
+QGroupBox {
+    border: 1px solid palette(mid);
+    border-radius: 5px;
+    margin-top: 0.8em;
+    padding-top: 0.5em;
+}
+QGroupBox::title {
+    subcontrol-origin: margin;
+    left: 8px;
+    padding: 0 5px;
+    color: palette(window-text);
+    font-weight: 600;
 }
 QComboBox QAbstractItemView {
     background: palette(base);
@@ -17782,12 +17803,35 @@ class AppPreferencesDialog(QDialog):
         self._loaded_catalogs = config._loaded_catalogs
         self._hotkeys = dict(config.hotkeys)
         self._remote_lama = replace(config.remote_lama)
+        self.setObjectName("appPreferencesDialog")
         self.setWindowTitle("Preferences")
         self.setWindowIcon(load_app_icon())
         self.setStyleSheet(DIALOG_STYLESHEET)
 
         layout = QVBoxLayout(self)
-        form = QFormLayout()
+        self.preferences_scroll = QScrollArea()
+        self.preferences_scroll.setObjectName("preferencesScroll")
+        self.preferences_scroll.viewport().setObjectName(
+            "preferencesScrollViewport"
+        )
+        self.preferences_scroll.setWidgetResizable(True)
+        self.preferences_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.preferences_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        preferences_content = QWidget()
+        preferences_content.setObjectName("preferencesContent")
+        content_layout = QVBoxLayout(preferences_content)
+        content_layout.setContentsMargins(4, 4, 4, 4)
+        content_layout.setSpacing(12)
+        content_layout.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
+        self.preferences_scroll.setWidget(preferences_content)
+        layout.addWidget(self.preferences_scroll, 1)
+
+        window_group = QGroupBox("Window")
+        window_form = QFormLayout(window_group)
+        window_form.setHorizontalSpacing(18)
+        window_form.setVerticalSpacing(8)
 
         self.window_x = QSpinBox()
         self.window_x.setRange(-100000, 100000)
@@ -17845,18 +17889,26 @@ class AppPreferencesDialog(QDialog):
         if face_runtime_index >= 0:
             self.face_runtime.setCurrentIndex(face_runtime_index)
 
-        form.addRow("Window x", self.window_x)
-        form.addRow("Window y", self.window_y)
-        form.addRow("Window width", self.window_width)
-        form.addRow("Window height", self.window_height)
-        form.addRow("Window maximized", self.window_maximized)
-        form.addRow("Thumbnails per row", self.thumbnail_size)
-        form.addRow("Sort order", self.sort_order)
-        form.addRow("Delete behavior", self.delete_behavior)
-        layout.addLayout(form)
+        window_form.addRow("Window x", self.window_x)
+        window_form.addRow("Window y", self.window_y)
+        window_form.addRow("Window width", self.window_width)
+        window_form.addRow("Window height", self.window_height)
+        window_form.addRow("Window maximized", self.window_maximized)
+        content_layout.addWidget(window_group)
+
+        browsing_group = QGroupBox("Browsing and files")
+        browsing_form = QFormLayout(browsing_group)
+        browsing_form.setHorizontalSpacing(18)
+        browsing_form.setVerticalSpacing(8)
+        browsing_form.addRow("Thumbnails per row", self.thumbnail_size)
+        browsing_form.addRow("Sort order", self.sort_order)
+        browsing_form.addRow("Delete behavior", self.delete_behavior)
+        content_layout.addWidget(browsing_group)
 
         lama_group = QGroupBox("LaMa")
         lama_layout = QFormLayout(lama_group)
+        lama_layout.setHorizontalSpacing(18)
+        lama_layout.setVerticalSpacing(8)
         lama_layout.addRow("Processing runtime", self.lama_runtime)
         lama_note = QLabel(
             "Auto prefers available GPU runtimes and falls back to CPU. "
@@ -17866,10 +17918,12 @@ class AppPreferencesDialog(QDialog):
         )
         lama_note.setWordWrap(True)
         lama_layout.addRow(lama_note)
-        layout.addWidget(lama_group)
+        content_layout.addWidget(lama_group)
 
         face_group = QGroupBox("Face processing")
         face_layout = QFormLayout(face_group)
+        face_layout.setHorizontalSpacing(18)
+        face_layout.setVerticalSpacing(8)
         face_layout.addRow("Processing runtime", self.face_runtime)
         face_note = QLabel(
             "Face processing is enabled separately for each catalog. Auto uses an available "
@@ -17878,13 +17932,15 @@ class AppPreferencesDialog(QDialog):
         )
         face_note.setWordWrap(True)
         face_layout.addRow(face_note)
-        layout.addWidget(face_group)
+        content_layout.addWidget(face_group)
 
-        layout.addWidget(QLabel("Catalogs"))
+        catalog_group = QGroupBox("Catalogs")
+        catalog_layout = QVBoxLayout(catalog_group)
         self.catalog_list = QListWidget()
+        self.catalog_list.setMinimumHeight(110)
         for catalog_path in config.catalogs:
             self.catalog_list.addItem(catalog_path)
-        layout.addWidget(self.catalog_list)
+        catalog_layout.addWidget(self.catalog_list)
 
         catalog_buttons = QHBoxLayout()
         add_catalog = QPushButton("Add")
@@ -17894,12 +17950,14 @@ class AppPreferencesDialog(QDialog):
         catalog_buttons.addWidget(add_catalog)
         catalog_buttons.addWidget(remove_catalog)
         catalog_buttons.addStretch(1)
-        layout.addLayout(catalog_buttons)
+        catalog_layout.addLayout(catalog_buttons)
+        content_layout.addWidget(catalog_group)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+        self.resize(620, 680)
 
     def add_catalog(self) -> None:
         directory = QFileDialog.getExistingDirectory(

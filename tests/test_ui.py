@@ -27,7 +27,9 @@ from PySide6.QtWidgets import (  # noqa: E402
     QAbstractItemView,
     QApplication,
     QDialog,
+    QDialogButtonBox,
     QFileDialog,
+    QGroupBox,
     QMenu,
     QMessageBox,
     QStyle,
@@ -6014,6 +6016,87 @@ def test_app_preferences_dialog_exposes_config_settings(
     finally:
         dialog.close()
         dialog.deleteLater()
+        qt_app.processEvents()
+
+
+def test_app_preferences_scrolls_instead_of_compressing_fields() -> None:
+    qt_app = app()
+    dialog = AppPreferencesDialog(AppConfig())
+    try:
+        dialog.resize(620, 420)
+        dialog.show()
+        qt_app.processEvents()
+
+        assert [
+            group.title()
+            for group in dialog.findChildren(QGroupBox)
+        ] == [
+            "Window",
+            "Browsing and files",
+            "LaMa",
+            "Face processing",
+            "Catalogs",
+        ]
+        assert dialog.preferences_scroll.verticalScrollBar().maximum() > 0
+
+        for fields in (
+            (
+                dialog.window_x,
+                dialog.window_y,
+                dialog.window_width,
+                dialog.window_height,
+                dialog.window_maximized,
+            ),
+            (
+                dialog.thumbnail_size,
+                dialog.sort_order,
+                dialog.delete_behavior,
+            ),
+        ):
+            assert all(
+                first.parentWidget() is second.parentWidget()
+                for first, second in zip(fields, fields[1:])
+            )
+            assert all(
+                first.geometry().bottom() < second.geometry().top()
+                for first, second in zip(fields, fields[1:])
+            )
+
+        buttons = dialog.findChild(QDialogButtonBox)
+        assert buttons is not None
+        assert buttons.isVisible()
+        assert not dialog.preferences_scroll.isAncestorOf(buttons)
+    finally:
+        dialog.close()
+        dialog.deleteLater()
+        qt_app.processEvents()
+
+
+def test_app_preferences_uses_a_distinct_dark_surface() -> None:
+    qt_app = app()
+    original = QPalette(qt_app.palette())
+    dark = darker_system_palette(original, Qt.ColorScheme.Dark)
+    qt_app.setPalette(dark)
+    dialog = AppPreferencesDialog(AppConfig())
+    try:
+        dialog.show()
+        qt_app.processEvents()
+
+        dialog_surface = dialog.grab().toImage().pixelColor(1, 1)
+        scroll_surface = (
+            dialog.preferences_scroll.viewport()
+            .grab()
+            .toImage()
+            .pixelColor(1, 1)
+        )
+        assert dialog_surface == dark.color(QPalette.ColorRole.Button)
+        assert scroll_surface == dark.color(QPalette.ColorRole.Button)
+        assert dialog_surface != dark.color(QPalette.ColorRole.Window)
+        assert dialog_surface != dark.color(QPalette.ColorRole.Base)
+    finally:
+        dialog.close()
+        dialog.deleteLater()
+        qt_app.setPalette(original)
         qt_app.processEvents()
 
 
