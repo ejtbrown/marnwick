@@ -1022,11 +1022,18 @@ QFrame#propertiesFrame QLabel {
 QComboBox,
 QLineEdit,
 QSpinBox,
+QKeySequenceEdit {
+    background: palette(base);
+    color: palette(text);
+    border: 1px solid palette(mid);
+    min-height: 1.5em;
+    padding: 2px 5px;
+}
 QPlainTextEdit {
     background: palette(base);
     color: palette(text);
     border: 1px solid palette(mid);
-    padding: 3px;
+    padding: 5px;
 }
 QComboBox QAbstractItemView {
     background: palette(base);
@@ -1063,6 +1070,11 @@ QTreeWidget::item:selected {
     color: palette(highlighted-text);
 }
 """
+
+PALETTE_AWARE_FILE_DIALOG_OPTIONS = QFileDialog.Option.DontUseNativeDialog
+PALETTE_AWARE_DIRECTORY_DIALOG_OPTIONS = (
+    QFileDialog.Option.ShowDirsOnly | PALETTE_AWARE_FILE_DIALOG_OPTIONS
+)
 
 MESSAGE_BUTTON_STYLESHEET = """
 QPushButton {
@@ -5539,7 +5551,12 @@ class MainWindow(QMainWindow):
 
     def open_catalog_dialog(self) -> None:
         dialog_started_at = monotonic()
-        directory = QFileDialog.getExistingDirectory(self, "Open catalog")
+        directory = QFileDialog.getExistingDirectory(
+            self,
+            "Open catalog",
+            "",
+            PALETTE_AWARE_DIRECTORY_DIALOG_OPTIONS,
+        )
         if directory:
             selected_at = monotonic()
             self.defer_open_catalog(
@@ -6768,6 +6785,7 @@ class MainWindow(QMainWindow):
             "Add to Zip",
             default_name,
             "Zip archives (*.zip)",
+            options=PALETTE_AWARE_FILE_DIALOG_OPTIONS,
         )
         if not selected_path:
             return
@@ -17884,7 +17902,12 @@ class AppPreferencesDialog(QDialog):
         layout.addWidget(buttons)
 
     def add_catalog(self) -> None:
-        directory = QFileDialog.getExistingDirectory(self, "Add catalog")
+        directory = QFileDialog.getExistingDirectory(
+            self,
+            "Add catalog",
+            "",
+            PALETTE_AWARE_DIRECTORY_DIALOG_OPTIONS,
+        )
         if directory:
             self.catalog_list.addItem(str(Path(directory).expanduser()))
 
