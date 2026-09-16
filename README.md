@@ -137,7 +137,7 @@ Physical-folder navigation is progressive. Marnwick checks and lists only the se
 
 Deep discovery walks descendants separately from the selected-pane load and commits its directory inventory in batches. The folder tree reads that inventory from SQLite in bounded pages and performs only a short batch of Qt item work per event-loop turn. If tree work for an older catalog is still pending, the current catalog takes priority; selecting an already visible directory does not wait for the full descendant tree to finish.
 
-Right-click a file tile for rename or deletion; image tiles also offer duplicate matches and metadata. Right-click a folder tile for open, properties, deletion, or trash restore. The folder-tree context menu also provides directory creation and, at a catalog root, catalog preferences, tag definitions, and close.
+Right-click a file tile for rename or deletion; image tiles also offer duplicate matches and metadata. Right-click a folder tile for open, properties, deletion, or trash restore. The folder-tree context menu also provides directory creation and, at a catalog root, catalog preferences, tag definitions, and close. Every real folder-tree node offers **Add to Zip**: physical nodes export their filesystem subtree, while virtual containers reproduce their visible hierarchy and place each terminal view's matching files beneath it.
 
 Right-click **Virtual Directories** and choose **New** to save a named view. In
 **Simple** mode, a saved virtual directory combines selected catalog folder

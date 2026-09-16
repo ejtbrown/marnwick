@@ -244,6 +244,21 @@ def settle_move_payload_task(window: MainWindow, qt_app: QApplication, *, timeou
     assert window._move_payload_task is None
 
 
+def settle_zip_archive_task(
+    window: MainWindow,
+    qt_app: QApplication,
+    *,
+    timeout: float = 5.0,
+) -> None:
+    deadline = monotonic() + timeout
+    while window._zip_archive_task is not None and monotonic() < deadline:
+        qt_app.processEvents()
+        window._settle_zip_archive_task()
+        sleep(0.01)
+    window._settle_zip_archive_task()
+    assert window._zip_archive_task is None
+
+
 def settle_post_move_reconcile_tasks(
     window: MainWindow,
     qt_app: QApplication,
@@ -10336,6 +10351,17 @@ def test_virtual_directory_tree_loads_tag_and_duplicate_aggregates(tmp_path: Pat
         assert tag_item.data(0, VIRTUAL_KIND_ROLE) == VIRTUAL_KIND_TAG
         assert tag_item.data(0, VIRTUAL_VALUE_ROLE) == "Keep"
         assert tag_item.icon(0).cacheKey() == tags_root.icon(0).cacheKey()
+        tag_menu = QMenu()
+        try:
+            tag_actions = window.tree._virtual_context_menu_actions(
+                tag_menu,
+                tag_item,
+            )
+            assert list(tag_actions) == ["add_to_zip"]
+            assert tag_actions["add_to_zip"].text() == "Add to Zip"
+        finally:
+            tag_menu.close()
+            tag_menu.deleteLater()
         assert len(
             {
                 virtual_root.icon(0).cacheKey(),
@@ -10479,8 +10505,11 @@ def test_people_tree_is_opt_in_and_opens_the_selected_review_queue(
                 person_menu,
                 person_item,
             )
-            assert list(actions) == ["rename"]
-            assert [action.text() for action in actions.values()] == ["Rename"]
+            assert list(actions) == ["rename", "add_to_zip"]
+            assert [action.text() for action in actions.values()] == [
+                "Rename",
+                "Add to Zip",
+            ]
         finally:
             person_menu.close()
             person_menu.deleteLater()
@@ -11136,14 +11165,14 @@ def test_custom_virtual_directory_tree_create_browse_and_confirmed_delete(
                     root_menu,
                     virtual_root,
                 ).values()
-            ] == ["New"]
+            ] == ["New", "Add to Zip"]
             assert [
                 action.text()
                 for action in window.tree._virtual_context_menu_actions(
                     custom_menu,
                     custom_item,
                 ).values()
-            ] == ["Edit", "Delete"]
+            ] == ["Edit", "Delete", "Add to Zip"]
         finally:
             root_menu.close()
             root_menu.deleteLater()
@@ -13699,12 +13728,14 @@ def test_dismissing_child_tree_context_menu_does_not_open_catalog_tags(tmp_path:
     (root / "child").mkdir(parents=True)
     window = MainWindow()
     calls: list[Path] = []
+    labels: list[str] = []
 
     class DismissedMenu:
         def __init__(self, _parent) -> None:  # type: ignore[no-untyped-def]
             pass
 
-        def addAction(self, _label: str) -> object:  # noqa: N802 - Qt-compatible fake
+        def addAction(self, label: str) -> object:  # noqa: N802 - Qt-compatible fake
+            labels.append(label)
             return object()
 
         def addSeparator(self) -> None:  # noqa: N802 - Qt-compatible fake
@@ -13729,6 +13760,45 @@ def test_dismissing_child_tree_context_menu_does_not_open_catalog_tags(tmp_path:
         window.tree._open_context_menu(window.tree.visualItemRect(child).center())
 
         assert calls == []
+        assert "Add to Zip" in labels
+    finally:
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_add_tree_node_to_zip_uses_save_dialog_and_appends_extension(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    (root / "notes.txt").write_text("catalog notes", encoding="utf-8")
+    selected_path = tmp_path / "catalog-backup"
+    window = MainWindow()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        monkeypatch.setattr(
+            "marnwick.ui.QFileDialog.getSaveFileName",
+            lambda *_args: (str(selected_path), "Zip archives (*.zip)"),
+        )
+
+        window.add_tree_node_to_zip(
+            catalog.root,
+            "",
+            label="Catalog Backup",
+        )
+        settle_zip_archive_task(window, qt_app)
+
+        output = tmp_path / "catalog-backup.zip"
+        assert output.is_file()
+        assert (
+            window.progress_label.text()
+            == "Created catalog-backup.zip with 1 file(s)"
+        )
     finally:
         window.close()
         window.deleteLater()
