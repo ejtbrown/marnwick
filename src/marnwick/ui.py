@@ -257,6 +257,7 @@ MAX_TIMING_FILE_BYTES = 8 * 1024 * 1024
 TREE_BUILD_BATCH_SIZE = 400
 TREE_BUILD_BUDGET_SECONDS = 0.008
 TREE_PAGE_POLL_INTERVAL_MS = 15
+TREE_PAGE_ADMISSION_RETRY_MS = 250
 INITIAL_TREE_ENTRY_LIMIT = 512
 INITIAL_TREE_SCAN_BUDGET_SECONDS = 0.006
 TREE_CHILD_PAGE_SIZE = 400
@@ -9367,6 +9368,28 @@ class MainWindow(QMainWindow):
             return
         self._start_incremental_tree_rebuild(catalog, reason=reason)
 
+    def _request_post_delete_tree_rebuild(self, catalog: Catalog) -> None:
+        """Queue at most one tree refresh behind the currently running one.
+
+        A delete only needs a later snapshot of the tree; it must not preempt
+        an active read merely because the affected catalog is currently
+        selected.  The per-catalog pending entry also coalesces a burst of
+        deletes while guaranteeing that one refresh runs after the mutation.
+        """
+
+        if catalog.root in self._pending_tree_rebuilds:
+            return
+        if self._tree_build_task is not None:
+            self._pending_tree_rebuilds[catalog.root] = (catalog, "file_delete")
+            self._append_timing_event(
+                catalog.root,
+                "queue_incremental_tree_rebuild",
+                None,
+                {"reason": "file_delete"},
+            )
+            return
+        self._request_incremental_tree_rebuild(catalog, reason="file_delete")
+
     def _start_incremental_tree_rebuild(self, catalog: Catalog, *, reason: str) -> None:
         if self._closing or self.workspace.catalog_for_root(catalog.root) is not catalog:
             return
@@ -9554,6 +9577,20 @@ class MainWindow(QMainWindow):
                 task.page_offset,
                 cancel_event,
             )
+        except ExecutorSaturatedError:
+            # A canceled native read can temporarily occupy every bounded
+            # rollover epoch. Keep this logical refresh active and retry once
+            # a read slot becomes available instead of presenting admission
+            # backpressure as a folder-tree (or deletion) failure.
+            self.progress_bar.setRange(0, 0)
+            self.progress_label.setText(
+                f"Waiting to refresh folder tree: {task.processed} folders ready"
+            )
+            QTimer.singleShot(
+                TREE_PAGE_ADMISSION_RETRY_MS,
+                partial(self._retry_tree_page_submission, task.generation),
+            )
+            return
         except RuntimeError as error:
             self._finish_tree_build_error(task, error)
             return
@@ -9570,6 +9607,18 @@ class MainWindow(QMainWindow):
             ),
         )
 
+    def _retry_tree_page_submission(self, generation: int) -> None:
+        if self._closing:
+            return
+        task = self._tree_build_task
+        if (
+            task is None
+            or task.generation != generation
+            or task.page_future is not None
+        ):
+            return
+        self._submit_tree_page(task)
+
     def _finish_tree_build_error(
         self,
         task: TreeBuildTask,
@@ -9581,7 +9630,11 @@ class MainWindow(QMainWindow):
         self.progress_bar.setRange(0, 1)
         self.progress_bar.setValue(0)
         self.progress_label.setText("Ready")
-        if self.current_catalog is task.catalog and not isinstance(error, IndexTaskCancelled):
+        if (
+            task.reason != "file_delete"
+            and self.current_catalog is task.catalog
+            and not isinstance(error, IndexTaskCancelled)
+        ):
             show_error(self, "Folder Tree", str(error))
         self._start_next_pending_tree_rebuild()
 
@@ -14051,13 +14104,25 @@ class MainWindow(QMainWindow):
                 )
                 continue
             except Exception as error:
-                last_error = error
+                remaining_rel_paths = delete_task.outcome.remaining_rel_paths
                 self._settle_viewer_delete(
                     delete_task,
                     path_removed=self._viewer_delete_path_removed_from_outcome(
                         delete_task
                     ),
                 )
+                if remaining_rel_paths == ():
+                    # Teardown/durability bookkeeping can fail after unlink.
+                    # The filesystem postcondition is authoritative for what
+                    # the user should expect to have happened.
+                    last_result = DeletePayloadResult(
+                        requested=len(delete_task.rel_paths),
+                        deleted=len(delete_task.rel_paths),
+                        affected_roots={delete_task.root},
+                        remaining_rel_paths=(),
+                    )
+                else:
+                    last_error = error
                 continue
             affected_roots.update(result.affected_roots)
             self._settle_viewer_delete(
@@ -14071,6 +14136,9 @@ class MainWindow(QMainWindow):
                     )
                 ),
             )
+            if result.remaining_rel_paths == ():
+                last_result = result
+                continue
             if result.canceled:
                 canceled = True
                 continue
@@ -14132,13 +14200,20 @@ class MainWindow(QMainWindow):
             self._swept_catalog_roots.discard(root)
             self._pruned_catalog_roots.discard(root)
             self._drop_very_similar_cache(root)
+        tree_scroll_generation = self._begin_tree_scroll_preservation(
+            self._tree_scroll_position()
+        )
         if self.current_catalog is not None and self.current_catalog.root in affected_roots:
-            self.reload_tree_and_directory(preserve_tree_scroll=True)
-        else:
-            for root in affected_roots:
-                catalog = self.workspace.catalog_for_root(root)
-                if catalog is not None:
-                    self._request_incremental_tree_rebuild(catalog, reason="file_delete")
+            # The delete path already removes selected records optimistically,
+            # but viewer-initiated and background deletes still need the pane
+            # reconciled. Preserve the existing Qt tree while its database
+            # snapshot is updated incrementally.
+            self.load_current_directory(preserve_selection=True)
+        for root in affected_roots:
+            catalog = self.workspace.catalog_for_root(root)
+            if catalog is not None:
+                self._request_post_delete_tree_rebuild(catalog)
+        self._continue_tree_scroll_preservation(tree_scroll_generation)
 
     def _active_delete_payload_task(self) -> DeletePayloadTask | None:
         self._refresh_active_delete_payload_task()
