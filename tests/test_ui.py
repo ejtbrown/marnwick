@@ -2971,7 +2971,11 @@ def test_delete_error_after_unlink_settles_viewer_from_worker_postcondition(
     root.mkdir()
     for name in ("a.png", "b.png"):
         Image.new("RGB", (4, 4), (10, 20, 30)).save(root / name)
-    monkeypatch.setattr("marnwick.ui.show_error", lambda *_args: None)
+    errors: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        "marnwick.ui.show_error",
+        lambda _parent, title, message: errors.append((title, message)),
+    )
     window = MainWindow()
     viewer: FullscreenViewer | None = None
     try:
@@ -3010,10 +3014,50 @@ def test_delete_error_after_unlink_settles_viewer_from_worker_postcondition(
         assert navigator.order == ["b.png"]
         assert navigator.next_offset == 1
         assert navigator.total_count == 1
+        assert errors == []
+        assert window.progress_label.text() == "Deleted 1 image(s)"
     finally:
         if viewer is not None:
             viewer.close()
             viewer.deleteLater()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_delete_error_before_unlink_reports_failure(tmp_path: Path, monkeypatch) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    Image.new("RGB", (4, 4), (10, 20, 30)).save(root / "a.png")
+    errors: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        "marnwick.ui.show_error",
+        lambda _parent, title, message: errors.append((title, message)),
+    )
+    window = MainWindow()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        catalog.refresh()
+
+        def fail_before_unlink(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+            raise OSError("simulated delete failure")
+
+        monkeypatch.setattr(Catalog, "delete_images", fail_before_unlink)
+        assert window.queue_delete_images(
+            catalog,
+            ["a.png"],
+            expected_identities=catalog.file_identities(["a.png"]),
+            wipe=False,
+            remove_from_current_view=False,
+        )
+        settle_delete_payload_task(window, qt_app)
+
+        assert (root / "a.png").is_file()
+        assert errors == [("Delete", "simulated delete failure")]
+    finally:
         window.close()
         window.deleteLater()
         qt_app.processEvents()
@@ -11590,6 +11634,109 @@ def test_current_catalog_tree_preempts_blocked_older_catalog_page(
         qt_app.processEvents()
 
 
+def test_post_delete_tree_refresh_queues_once_behind_active_refresh(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    started = Event()
+    release = Event()
+    calls = 0
+    queued_events: list[str] = []
+    window = MainWindow()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        window.current_catalog = catalog
+        window.current_dir_rel = ""
+        original_worker = window._read_tree_page_worker
+
+        def blocked_first_worker(*args, **kwargs):  # type: ignore[no-untyped-def]
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                started.set()
+                assert release.wait(timeout=5)
+            return original_worker(*args, **kwargs)
+
+        monkeypatch.setattr(window, "_read_tree_page_worker", blocked_first_worker)
+        monkeypatch.setattr(
+            window,
+            "_append_timing_event",
+            lambda _root, event, *_args: queued_events.append(event),
+        )
+        window._start_incremental_tree_rebuild(catalog, reason="file_delete")
+        assert started.wait(timeout=1)
+        active_task = window._tree_build_task
+        assert active_task is not None
+
+        window._request_post_delete_tree_rebuild(catalog)
+        window._request_post_delete_tree_rebuild(catalog)
+
+        assert window._tree_build_task is active_task
+        assert window._pending_tree_rebuilds == {
+            catalog.root: (catalog, "file_delete")
+        }
+        assert queued_events.count("queue_incremental_tree_rebuild") == 1
+
+        release.set()
+        settle_tree_build_tasks(window, qt_app, timeout=5)
+        assert calls == 2
+    finally:
+        release.set()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_saturated_post_delete_tree_refresh_retries_without_alert(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    errors: list[tuple[str, str]] = []
+    window = MainWindow()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        window.current_catalog = catalog
+        original_submit = window.tree_read_executor.submit
+        submissions = 0
+
+        def saturated_once(*args, **kwargs):  # type: ignore[no-untyped-def]
+            nonlocal submissions
+            submissions += 1
+            if submissions == 1:
+                raise ui_module.ExecutorSaturatedError("busy")
+            return original_submit(*args, **kwargs)
+
+        monkeypatch.setattr(window.tree_read_executor, "submit", saturated_once)
+        monkeypatch.setattr(
+            "marnwick.ui.show_error",
+            lambda _parent, title, message: errors.append((title, message)),
+        )
+
+        window._start_incremental_tree_rebuild(catalog, reason="file_delete")
+        assert window._tree_build_task is not None
+        assert window._tree_build_task.page_future is None
+        assert window.progress_label.text().startswith("Waiting to refresh folder tree")
+
+        settle_tree_build_tasks(window, qt_app, timeout=5)
+
+        assert submissions >= 2
+        assert errors == []
+    finally:
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
 def test_current_tree_page_bypasses_three_blocked_generations(
     tmp_path: Path,
     monkeypatch,
@@ -11913,6 +12060,48 @@ def test_background_catalog_mutation_does_not_reset_current_catalog_pane(
         assert window.model.images is model_images
         assert window._physical_pane_generation == pane_generation
         assert incremental_roots == [first.root, first.root]
+    finally:
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
+def test_current_catalog_delete_refresh_preserves_tree_and_reloads_pane(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    window = MainWindow()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        window.current_catalog = catalog
+        window.current_dir_rel = ""
+        pane_reloads: list[bool] = []
+        tree_refreshes: list[Path] = []
+        monkeypatch.setattr(
+            window,
+            "reload_tree_and_directory",
+            lambda **_kwargs: pytest.fail("delete performed a full tree reload"),
+        )
+        monkeypatch.setattr(
+            window,
+            "load_current_directory",
+            lambda *, preserve_selection=False: pane_reloads.append(preserve_selection),
+        )
+        monkeypatch.setattr(
+            window,
+            "_request_post_delete_tree_rebuild",
+            lambda requested: tree_refreshes.append(requested.root),
+        )
+
+        window._refresh_after_file_delete({catalog.root})
+
+        assert pane_reloads == [True]
+        assert tree_refreshes == [catalog.root]
     finally:
         window.close()
         window.deleteLater()
