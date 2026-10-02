@@ -1243,6 +1243,31 @@ class FaceStore:
                 },
             )
 
+    def reject_person_in_image(
+        self,
+        rel_path: str,
+        person_id: int,
+    ) -> tuple[int, ...]:
+        """Remove every active association between one person and one image."""
+
+        ids = tuple(
+            int(row["id"])
+            for row in self.connection.execute(
+                """
+                SELECT face.id
+                FROM faces AS face
+                JOIN images AS image ON image.id = face.image_id
+                WHERE image.rel_path = ?
+                  AND face.person_id = ?
+                  AND face.status = 'active'
+                ORDER BY face.id
+                """,
+                (rel_path, int(person_id)),
+            )
+        )
+        self.reject_person(ids, int(person_id))
+        return ids
+
     def separate_faces(
         self,
         first_face_ids: Sequence[int],

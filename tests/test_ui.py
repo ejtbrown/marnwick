@@ -10743,6 +10743,116 @@ def test_people_tree_is_opt_in_and_opens_the_selected_review_queue(
         qt_app.processEvents()
 
 
+def test_person_thumbnail_action_removes_picture_association(tmp_path: Path) -> None:
+    qt_app = app()
+    root = tmp_path / "catalog"
+    root.mkdir()
+    Image.new("RGB", (8, 8), (10, 20, 30)).save(root / "portrait.jpg")
+    person_name = "Mary & Jo / O'Neil 佐藤"
+    window = MainWindow()
+    try:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        catalog = window.workspace.open_catalog(root)
+        catalog.set_settings(CatalogSettings(faces_enabled=True))
+        catalog.refresh()
+        person_cursor = catalog._conn.execute(
+            "INSERT INTO people(name, normalized, created_at_ns) VALUES (?, ?, ?)",
+            (person_name, "mary & jo / o'neil 佐藤", 1),
+        )
+        person_id = int(person_cursor.lastrowid)
+        image_id = int(
+            catalog._conn.execute(
+                "SELECT id FROM images WHERE rel_path = 'portrait.jpg'"
+            ).fetchone()["id"]
+        )
+        face_cursor = catalog._conn.execute(
+            """
+            INSERT INTO faces(
+                image_id, ordinal, x, y, width, height, landmarks,
+                detection_score, quality, embedding, embedding_version,
+                thumbnail_rel_path, person_id, confirmed, status,
+                deferred_until_ns, created_at_ns, updated_at_ns
+            ) VALUES (?, 0, 0.1, 0.1, 0.3, 0.4, ?, 0.99, 0.9, ?, ?, ?, ?, 1,
+                      'active', 0, 1, 1)
+            """,
+            (
+                image_id,
+                bytes(40),
+                bytes(128 * 4),
+                "test-embedding",
+                "00/" + "0" * 64 + ".jpg",
+                person_id,
+            ),
+        )
+        face_id = int(face_cursor.lastrowid)
+        window.current_catalog = catalog
+        window.rebuild_tree()
+        settle_tree_build_tasks(window, qt_app)
+
+        virtual_root = find_virtual_tree_root(window)
+        people_root = next(
+            virtual_root.child(index)
+            for index in range(virtual_root.childCount())
+            if virtual_root.child(index).data(0, VIRTUAL_KIND_ROLE)
+            == VIRTUAL_KIND_PEOPLE_ROOT
+        )
+        people_catalog_root = next(
+            people_root.child(index)
+            for index in range(people_root.childCount())
+            if people_root.child(index).data(0, VIRTUAL_KIND_ROLE)
+            == VIRTUAL_KIND_PEOPLE_CATALOG_ROOT
+        )
+        person_item = people_catalog_root.child(0)
+        window.tree.setCurrentItem(person_item)
+        window._directory_clicked(person_item)
+        settle_virtual_view_tasks(window, qt_app)
+        record = window.model.images[0]
+        assert isinstance(record, ImageRecord)
+
+        menu = QMenu()
+        try:
+            actions = window._thumbnail_context_menu_actions(menu, record)
+            action = actions["person_not_in_picture"]
+            assert action.text().replace("&&", "&") == (
+                f"{person_name} is not in this picture"
+            )
+        finally:
+            menu.close()
+            menu.deleteLater()
+
+        mutation = window.remove_current_person_from_picture(catalog, record)
+        assert mutation is not None
+        assert mutation.task.priority == ActionPriority.TAG_UPDATE
+        settle_move_payload_task(window, qt_app)
+        settle_tree_build_tasks(window, qt_app)
+        settle_virtual_view_tasks(window, qt_app)
+
+        face = catalog._conn.execute(
+            "SELECT person_id, confirmed FROM faces WHERE id = ?",
+            (face_id,),
+        ).fetchone()
+        assert face["person_id"] is None
+        assert int(face["confirmed"]) == 0
+        rejection = catalog._conn.execute(
+            "SELECT 1 FROM face_person_rejections "
+            "WHERE face_id = ? AND person_id = ?",
+            (face_id, person_id),
+        ).fetchone()
+        assert rejection is not None
+        assert window.current_virtual_kind == VIRTUAL_KIND_PERSON
+        assert window.current_virtual_value == str(person_id)
+        assert window.model.images == []
+    finally:
+        window.progress_timer.stop()
+        window.idle_timer.stop()
+        window.indexer.shutdown()
+        window.workspace.close()
+        window.close()
+        window.deleteLater()
+        qt_app.processEvents()
+
+
 def test_people_catalog_rename_updates_tree_through_priority_worker(
     tmp_path: Path,
     monkeypatch,

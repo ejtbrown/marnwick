@@ -274,6 +274,76 @@ def test_face_review_naming_negatives_and_undo(tmp_path: Path) -> None:
         assert store.stats()["ignored"] == 1
 
 
+def test_reject_person_in_image_only_removes_that_person_from_that_image(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "catalog"
+    with Catalog(root, CatalogSettings(faces_enabled=True)) as catalog:
+        store = FaceStore(catalog)
+        shared_id, shared_hash = add_image(catalog, "shared.jpg", (30, 60, 90))
+        other_id, other_hash = add_image(catalog, "other.jpg", (90, 60, 30))
+        assert store.store_analysis(
+            shared_id,
+            shared_hash,
+            analysis(
+                ((0.05, 0.1, 0.2, 0.3), embedding(0), (220, 180, 150)),
+                ((0.35, 0.1, 0.2, 0.3), embedding(0, variation=0.01), (210, 170, 140)),
+                ((0.65, 0.1, 0.2, 0.3), embedding(1), (150, 180, 220)),
+            ),
+        )
+        assert store.store_analysis(
+            other_id,
+            other_hash,
+            analysis(
+                ((0.2, 0.1, 0.2, 0.3), embedding(0, variation=0.02), (200, 160, 130)),
+            ),
+        )
+        shared_faces = tuple(
+            int(row["id"])
+            for row in catalog._conn.execute(
+                "SELECT id FROM faces WHERE image_id = ? ORDER BY ordinal",
+                (shared_id,),
+            )
+        )
+        other_face = int(
+            catalog._conn.execute(
+                "SELECT id FROM faces WHERE image_id = ?",
+                (other_id,),
+            ).fetchone()["id"]
+        )
+        alice_id = store.name_faces(shared_faces[:2], "Alice")
+        bob_id = store.name_faces((shared_faces[2],), "Bob")
+        store.name_faces((other_face,), "Alice", person_id=alice_id)
+
+        rejected = store.reject_person_in_image("shared.jpg", alice_id)
+
+        assert rejected == shared_faces[:2]
+        shared_rows = list(
+            catalog._conn.execute(
+                "SELECT id, person_id, confirmed FROM faces "
+                "WHERE image_id = ? ORDER BY ordinal",
+                (shared_id,),
+            )
+        )
+        assert [row["person_id"] for row in shared_rows] == [None, None, bob_id]
+        assert [int(row["confirmed"]) for row in shared_rows] == [0, 0, 1]
+        other_row = catalog._conn.execute(
+            "SELECT person_id, confirmed FROM faces WHERE id = ?",
+            (other_face,),
+        ).fetchone()
+        assert int(other_row["person_id"]) == alice_id
+        assert int(other_row["confirmed"]) == 1
+        rejected_rows = {
+            int(row["face_id"])
+            for row in catalog._conn.execute(
+                "SELECT face_id FROM face_person_rejections WHERE person_id = ?",
+                (alice_id,),
+            )
+        }
+        assert rejected_rows == set(shared_faces[:2])
+        assert catalog.person_image_and_slideshow_count(alice_id) == (1, 1)
+
+
 def test_naming_faces_with_an_existing_name_reuses_that_person(tmp_path: Path) -> None:
     root = tmp_path / "catalog"
     with Catalog(root, CatalogSettings(faces_enabled=True)) as catalog:

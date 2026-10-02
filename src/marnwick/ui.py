@@ -6654,6 +6654,36 @@ class MainWindow(QMainWindow):
         mutation.edit_owner = self
         return mutation
 
+    def queue_person_picture_rejection(
+        self,
+        catalog: Catalog,
+        person_id: int,
+        rel_path: str,
+    ) -> MovePayloadTask | None:
+        if (
+            self.workspace.catalog_for_root(catalog.root) is not catalog
+            or int(person_id) <= 0
+            or not rel_path
+        ):
+            return None
+        mutation = self._queue_catalog_mutation(
+            catalog,
+            label="Removing person from picture",
+            dest_dir_rel=rel_path.rpartition("/")[0],
+            priority=ActionPriority.TAG_UPDATE,
+            worker=lambda task: self._reject_person_picture_worker(
+                catalog.root,
+                catalog.root_identity,
+                int(person_id),
+                rel_path,
+                task,
+            ),
+            completion_verb="Updated",
+            error_title="Update Person",
+        )
+        mutation.edit_owner = self
+        return mutation
+
     def queue_image_tags(
         self,
         catalog: Catalog,
@@ -7745,6 +7775,40 @@ class MainWindow(QMainWindow):
         task.update(1, 1, name)
         task.mark_done()
         return MovePayloadResult(1, renamed, {root})
+
+    @staticmethod
+    def _reject_person_picture_worker(
+        root: Path,
+        expected_root_identity: tuple[int, int],
+        person_id: int,
+        rel_path: str,
+        task: IndexTask,
+    ) -> MovePayloadResult:
+        task.update(0, 1, rel_path)
+        task.check_canceled()
+
+        def write() -> int:
+            with Catalog.open_writer(
+                root,
+                expected_root_identity=expected_root_identity,
+                expected_storage_identity=task.expected_storage_identity,
+            ) as catalog:
+                rejected = FaceStore(catalog).reject_person_in_image(
+                    rel_path,
+                    person_id,
+                )
+                return int(bool(rejected))
+
+        updated = MainWindow._wait_for_tag_database(
+            task,
+            processed=0,
+            total=1,
+            current=rel_path,
+            write=write,
+        )
+        task.update(1, 1, rel_path)
+        task.mark_done()
+        return MovePayloadResult(1, updated, {root})
 
     @staticmethod
     def _create_custom_virtual_directory_worker(
@@ -15363,6 +15427,30 @@ class MainWindow(QMainWindow):
             task.mark_failed(error)
             raise
 
+    def _current_person_virtual_directory(self) -> tuple[int, str] | None:
+        catalog = self.current_catalog
+        if catalog is None or self.current_virtual_kind != VIRTUAL_KIND_PERSON:
+            return None
+        try:
+            person_id = int(self.current_virtual_value)
+        except (TypeError, ValueError):
+            return None
+        if person_id <= 0:
+            return None
+        current_item = self.tree.currentItem()
+        if (
+            current_item is not None
+            and current_item.data(0, VIRTUAL_KIND_ROLE) == VIRTUAL_KIND_PERSON
+            and str(current_item.data(0, VIRTUAL_VALUE_ROLE)) == str(person_id)
+            and str(current_item.data(0, CATALOG_ROOT_ROLE)) == str(catalog.root)
+            and current_item.text(0)
+        ):
+            return person_id, current_item.text(0)
+        for person in self._tree_people_cache.get(catalog.root, ()):
+            if person.id == person_id:
+                return person_id, person.name
+        return None
+
     def _open_thumbnail_context_menu(self, pos) -> None:  # type: ignore[no-untyped-def]
         if self.current_catalog is None:
             return
@@ -15394,6 +15482,11 @@ class MainWindow(QMainWindow):
             self.delete_directory(catalog.root, record.dir_rel)
         elif selected == actions.get("list_duplicates") and isinstance(record, ImageRecord):
             self.open_duplicate_list_dialog(record, catalog=catalog)
+        elif (
+            selected == actions.get("person_not_in_picture")
+            and isinstance(record, ImageRecord)
+        ):
+            self.remove_current_person_from_picture(catalog, record)
         elif selected == actions.get("rename") and isinstance(record, ImageRecord):
             self.rename_image(catalog, record)
         elif selected == actions.get("delete"):
@@ -15425,10 +15518,34 @@ class MainWindow(QMainWindow):
         actions["rename"] = menu.addAction("Rename")
         if record.media_kind == "image":
             actions["list_duplicates"] = menu.addAction("List Duplicates")
+            person = self._current_person_virtual_directory()
+            if person is not None:
+                person_name = person[1].replace("&", "&&")
+                actions["person_not_in_picture"] = menu.addAction(
+                    f"{person_name} is not in this picture"
+                )
         actions["delete"] = menu.addAction("Delete")
         if record.media_kind == "image":
             actions["metadata"] = menu.addAction("Metadata")
         return actions
+
+    def remove_current_person_from_picture(
+        self,
+        catalog: Catalog,
+        record: ImageRecord,
+    ) -> MovePayloadTask | None:
+        person = self._current_person_virtual_directory()
+        if (
+            person is None
+            or self.current_catalog is not catalog
+            or record.catalog_root != catalog.root
+        ):
+            return None
+        return self.queue_person_picture_rejection(
+            catalog,
+            person[0],
+            record.rel_path,
+        )
 
     def open_duplicate_list_dialog(self, record: ImageRecord, *, catalog: Catalog | None = None) -> None:
         catalog = catalog or self.current_catalog
