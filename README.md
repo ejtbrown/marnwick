@@ -15,7 +15,7 @@ Each catalog keeps its metadata beside the photos in a `.marnwick` directory. Mo
 - Sort thumbnail views by name, file size, modification date, or aspect ratio.
 - View images and documents fullscreen in display order or a randomized order.
 - Read text, DOCX, ODT, and PDF files fit to the viewer width, with keyboard and mouse-wheel scrolling.
-- Open videos in the system's default player and preview them with midpoint film-strip thumbnails.
+- Open individual videos in the system's default player and preview them with midpoint film-strip thumbnails. Select multiple videos and press `Enter` to play them sequentially in thumbnail-pane order.
 - Zoom, pan, show file information, copy files to the desktop clipboard, and inspect image metadata.
 - Rotate, flip, crop, reduce red eye, and clone/heal from the fullscreen viewer.
 - Remove masked objects with local GPU-accelerated LaMa and automatic CPU fallback, or an explicitly trusted Remote GPU service.
@@ -32,7 +32,7 @@ Each catalog keeps its metadata beside the photos in a `.marnwick` directory. Mo
 - Rebuild stale thumbnails and prune unreferenced cache files.
 - Generate deterministic large test catalogs and drive performance runs through an authenticated localhost debug interface.
 
-Marnwick recognizes AVIF, BMP, GIF, HEIC, HEIF, JPEG, PNG, TIFF, and WebP images; AVI, M4V, MKV, MOV, MP4, MPEG, MPG, WebM, and WMV videos; plain-text and common structured-text files; and DOCX, ODT, and PDF documents. Actual image decoding depends on the codecs available to Pillow and Qt; HEIC, HEIF, and AVIF commonly require additional platform or Pillow plugins. GIF animation is played in the fullscreen viewer. Videos are opened by the system's default player.
+Marnwick recognizes AVIF, BMP, GIF, HEIC, HEIF, JPEG, PNG, TIFF, and WebP images; AVI, M4V, MKV, MOV, MP4, MPEG, MPG, WebM, and WMV videos; plain-text and common structured-text files; and DOCX, ODT, and PDF documents. Actual image decoding depends on the codecs available to Pillow and Qt; HEIC, HEIF, and AVIF commonly require additional platform or Pillow plugins. GIF animation is played in the fullscreen viewer. Individual videos open in the system's default player; multi-video queues use Qt's available playback codecs.
 
 ## Requirements
 
@@ -123,6 +123,8 @@ assigned to another action.
 | `Delete` or `Backspace` | Permanently delete selected files after confirmation |
 | Drag | Move selected files or folders to a physical folder tile or folder-tree item |
 | `Ctrl` while dragging | Copy selected files or folders; the drag cursor shows a `+` badge |
+
+When at least two selected items are videos, `Enter` plays those videos in pane order in a queue window. Other selected file types are excluded. Pause/Play controls playback; Close or Escape stops the queue. Unreadable videos are skipped and listed when playback finishes. Double-click and single-video activation continue to use the system player.
 
 Use the slider to choose the number of thumbnail columns and the sort menu to change ordering. Scroll positions and selections are remembered separately for each physical or virtual directory during the session.
 
