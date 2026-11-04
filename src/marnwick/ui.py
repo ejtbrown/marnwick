@@ -4452,6 +4452,7 @@ class MainWindow(QMainWindow):
         self._tree_scroll_preservation_generation = 0
         self._tree_scroll_preservation: tuple[int, tuple[int, int]] | None = None
         self._physical_pane_generation = 0
+        self._fullscreen_restore_sequence = 0
         self._last_physical_progress_reload_at = 0.0
         self._pending_physical_progress_reload: tuple[Path, str, SortOrder] | None = None
         self._physical_progress_reload_timer_pending = False
@@ -5451,7 +5452,7 @@ class MainWindow(QMainWindow):
                 "thumbnail.open",
                 "thumbnail.open_alternate",
             ):
-                self.open_viewer(self.thumbnail_keyboard_activation_index(), random_mode=False)
+                self.open_thumbnail_selection()
                 return True
             if self.hotkey_matches(event, "thumbnail.random"):
                 self.open_viewer(self.thumbnail_keyboard_activation_index(), random_mode=True)
@@ -15485,6 +15486,23 @@ class MainWindow(QMainWindow):
                 expected_identity=expected_identity,
             )
 
+    def open_thumbnail_selection(self) -> None:
+        videos = [
+            record.absolute_path for record in self.selected_records()
+            if isinstance(record, ImageRecord) and record.media_kind == "video"
+        ]
+        if len(videos) > 1 and self.current_catalog is not None:
+            from .video_player import VideoQueueDialog
+
+            dialog = VideoQueueDialog(videos, self)
+            try:
+                dialog.exec()
+            finally:
+                dialog.stop()
+                dialog.deleteLater()
+            return
+        self.open_viewer(self.thumbnail_keyboard_activation_index(), random_mode=False)
+
     def open_viewer(self, index: QModelIndex, *, random_mode: bool) -> None:
         if self.current_catalog is None:
             return
@@ -15590,6 +15608,10 @@ class MainWindow(QMainWindow):
                 index=start_index,
             )
         tree_scroll_position = self._tree_scroll_position()
+        pane_key = self._current_thumbnail_scroll_key()
+        pane_sort = self.current_sort
+        self._fullscreen_restore_sequence += 1
+        restore_sequence = self._fullscreen_restore_sequence
         viewer = FullscreenViewer(
             catalog,
             navigator,
@@ -15598,25 +15620,34 @@ class MainWindow(QMainWindow):
             display_order=viewer_display_order,
             random_mode=random_mode,
         )
-        last_viewed: str | None = None
         try:
             viewer.exec_fullscreen()
-            last_viewed = viewer.last_viewed_rel_path
         finally:
+            last_viewed = viewer.last_viewed_rel_path
             viewer.deleteLater()
-            if last_viewed is not None and self.current_catalog is catalog:
-                self._restore_thumbnail_after_fullscreen(catalog, last_viewed)
+            pane_generation = self._physical_pane_generation
+
+            def restore_thumbnail() -> None:
+                if (
+                    self._closing
+                    or restore_sequence != self._fullscreen_restore_sequence
+                    or pane_key != self._current_thumbnail_scroll_key()
+                    or pane_sort != self.current_sort
+                    or pane_generation != self._physical_pane_generation
+                ):
+                    return
+                if last_viewed is not None:
+                    self._restore_thumbnail_after_fullscreen(catalog, last_viewed)
+
+            if last_viewed is not None:
+                restore_thumbnail()
                 # A queued layout or scroll restoration can run as the modal
                 # viewer relinquishes control. Reapply the final selection
                 # once the main window has resumed processing events so the
                 # selected thumbnail remains in its viewport.
                 QTimer.singleShot(
                     0,
-                    partial(
-                        self._restore_thumbnail_after_fullscreen,
-                        catalog,
-                        last_viewed,
-                    ),
+                    restore_thumbnail,
                 )
             # Modal activation and any discovery publication that completed
             # behind the viewer must not repurpose the user's tree viewport.
@@ -16458,8 +16489,7 @@ class MainWindow(QMainWindow):
         selected = self._select_thumbnail_record_key(("image", rel_path))
         catalog = self.current_catalog
         pane_load_pending = any(
-            task.kind == VIRTUAL_KIND_PHYSICAL
-            and self._is_current_virtual_task(task)
+            self._is_current_virtual_task(task)
             and task.fingerprint == self._physical_pane_generation
             and not task.cancel_event.is_set()
             and not task.future.cancelled()
@@ -16493,7 +16523,11 @@ class MainWindow(QMainWindow):
         if self.current_catalog is None or self.current_catalog.root != root:
             self._pending_rel_path_selection = None
             return
-        if self._select_thumbnail_record_key(("image", rel_path)) and clear_on_success:
+        if (
+            self._select_thumbnail_record_key(("image", rel_path))
+            and clear_on_success
+            and self._active_virtual_view_task() is None
+        ):
             self._pending_rel_path_selection = None
 
     def sync_thumbnail_to_rel_path(self, catalog: Catalog, rel_path: str) -> None:
