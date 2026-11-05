@@ -12299,7 +12299,7 @@ class MainWindow(QMainWindow):
             # QListView's batched layout can shift rows on later event-loop
             # turns, after the saved scrollbar position has been restored.
             QTimer.singleShot(
-                0,
+                16,
                 partial(
                     self._ensure_pending_move_thumbnail_visible,
                     scroll_key,
@@ -12859,6 +12859,7 @@ class MainWindow(QMainWindow):
                 root,
                 expected_root_identity,
                 expected_storage_identity,
+                *(() if kind == VIRTUAL_KIND_PHYSICAL else (kind,)),
                 value,
                 sort_order.value,
                 fingerprint,
@@ -16425,6 +16426,13 @@ class MainWindow(QMainWindow):
         self.thumbnail_view.scrollTo(index, QListView.ScrollHint.PositionAtCenter)
         self.update_selection_status()
         self._remember_thumbnail_scroll_position()
+        # A newly fetched virtual page has not necessarily completed QListView's
+        # batched layout. Reuse the guarded visibility anchor so scrollTo is
+        # retried after layout, without fighting later selection/user scrolling.
+        scroll_key = self._current_thumbnail_scroll_key()
+        if scroll_key is not None:
+            self._pending_move_thumbnail_visibility = (scroll_key, key)
+            self._ensure_pending_move_thumbnail_visible(scroll_key)
         return True
 
     def open_go_to_file_dialog(self) -> None:

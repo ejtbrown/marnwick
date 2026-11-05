@@ -15,11 +15,11 @@ from test_media_documents_video import make_video
 
 
 @pytest.fixture
-def pane(tmp_path):
+def pane(tmp_path, request):
     qt = app()
     root = tmp_path / 'catalog'
     root.mkdir()
-    for i in range(80):
+    for i in range(getattr(request, "param", 80)):
         Image.new('RGB', (8, 8), (i, 20, 30)).save(root / f'{i:02}.jpg')
     window = ui.MainWindow()
     window.progress_timer.stop()
@@ -246,4 +246,51 @@ def test_fullscreen_selection_fetches_unloaded_virtual_pages(pane):
         window._settle_virtual_view_tasks()
     assert requested == [20, 40, 60]
     assert window.selected_rel_paths() == ['70.jpg']
+    assert window._pending_rel_path_selection is None
+
+
+@pytest.mark.parametrize("pane", [80, 650], indirect=True)
+def test_fullscreen_exit_fetches_real_tag_pages(pane, monkeypatch):
+    """Use the actual request/worker boundary, not a fabricated page callback."""
+    from PySide6.QtCore import QTimer
+    from time import sleep
+    qt, window, catalog = pane
+    monkeypatch.setattr(ui, 'PANE_QUERY_PAGE_SIZE', 200 if len(catalog.list_images()) > 200 else 20)
+    target_ordinal = 600 if len(catalog.list_images()) > 200 else 71
+    target = catalog.list_images()[target_ordinal - 1].rel_path
+    for record in catalog.list_images():
+        catalog.set_image_tags(record.rel_path, ['test'], replace=True)
+    window.load_current_directory()
+    def settle_until(predicate):
+        deadline = monotonic() + 5
+        while not predicate() and monotonic() < deadline:
+            qt.processEvents()
+            window._settle_virtual_view_tasks()
+            sleep(.01)
+        assert predicate()
+    settle_until(lambda: window.model.is_paged and not window._virtual_view_tasks)
+    visited = []
+    timer = QTimer(window)
+    def close_when_loaded():
+        viewer = next((w for w in qt.topLevelWidgets()
+                       if isinstance(w, ui.FullscreenViewer) and w.isVisible()), None)
+        if viewer is not None and viewer.last_viewed_rel_path == target:
+            visited.append(viewer.last_viewed_rel_path)
+            timer.stop()
+            viewer.reject()
+    def navigate():
+        viewer = next(w for w in qt.topLevelWidgets() if isinstance(w, ui.FullscreenViewer))
+        viewer.go_to_file_number(target_ordinal)
+        # Bound a failed navigation so the regression cannot hang the suite.
+        QTimer.singleShot(5000, viewer, viewer.reject)
+    timer.timeout.connect(close_when_loaded)
+    timer.start(20)
+    QTimer.singleShot(100, navigate)
+    window.open_viewer(window.model.index(0, 0), random_mode=False)
+    timer.stop()
+    assert visited == [target]
+    settle_until(lambda: window.selected_rel_paths() == [target])
+    row = window.model.row_for_key(('image', target))
+    settle_until(lambda: window.thumbnail_view.visualRect(window.model.index(row, 0)).intersects(
+        window.thumbnail_view.viewport().rect()))
     assert window._pending_rel_path_selection is None
