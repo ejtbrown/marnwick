@@ -17554,7 +17554,7 @@ def test_paged_random_viewer_prefetches_one_complete_randomized_order(
         )
 
     navigator = ui_module.PagedImageNavigator(
-        order=["a.png"],
+        order=["b.png"],
         index=0,
         next_offset=0,
         has_more=True,
@@ -17563,7 +17563,7 @@ def test_paged_random_viewer_prefetches_one_complete_randomized_order(
         random_mode=True,
         prefetch_all=True,
     )
-    viewer = FullscreenViewer(catalog, navigator, display_order=["a.png"])
+    viewer = FullscreenViewer(catalog, navigator, display_order=order[:2])
     try:
         deadline = monotonic() + 2
         while (
@@ -17575,7 +17575,20 @@ def test_paged_random_viewer_prefetches_one_complete_randomized_order(
             sleep(0.001)
 
         assert calls == [(0, ui_module.PANE_QUERY_PAGE_SIZE)]
-        assert navigator.order == ["a.png", "c.png", "b.png"]
+        assert navigator.order == ["b.png", "c.png", "a.png"]
+        assert viewer.image_position() == (2, 3)
+        assert viewer.label.ordinal_text() == "2 / 3"
+        viewer.navigate(1)
+        settle_viewer_load(viewer, qt_app)
+        assert navigator.current == "c.png"
+        assert viewer.image_position() == (3, 3)
+        viewer.navigate(1)
+        settle_viewer_load(viewer, qt_app)
+        assert navigator.current == "a.png"
+        assert viewer.image_position() == (1, 3)
+        viewer.navigate(-1)
+        settle_viewer_load(viewer, qt_app)
+        assert viewer.image_position() == (3, 3)
         assert viewer._display_order == order
         assert navigator.total_count == 3
         assert not navigator.has_more
@@ -17604,8 +17617,8 @@ def test_paged_random_open_uses_every_matching_path_not_loaded_prefix(
             assert isinstance(navigator, ui_module.PagedImageNavigator)
             assert navigator.random_mode
             assert navigator.prefetch_all
-            assert navigator.order == [filenames[0]]
-            assert kwargs["display_order"] == [filenames[0]]
+            assert navigator.order == [filenames[1]]
+            assert kwargs["display_order"] == filenames[:2]
             page = navigator.page_loader(0, ui_module.PANE_QUERY_PAGE_SIZE, Event())
             assert page.randomized
             assert page.complete_order
@@ -17652,7 +17665,7 @@ def test_paged_random_open_uses_every_matching_path_not_loaded_prefix(
         )
         monkeypatch.setattr(ui_module, "FullscreenViewer", FakeViewer)
 
-        window.open_viewer(window.model.index(0, 0), random_mode=True)
+        window.open_viewer(window.model.index(1, 0), random_mode=True)
 
         assert len(captured_orders) == 1
         assert len(captured_orders[0]) == len(filenames)

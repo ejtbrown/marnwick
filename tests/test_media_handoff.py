@@ -100,6 +100,52 @@ def test_fullscreen_exit_restores_and_ignores_stale_handoff(pane, monkeypatch, i
     assert window.selected_rel_paths() == ['00.jpg']
 
 
+@pytest.mark.parametrize("random_mode", [False, True])
+def test_fullscreen_sort_position_and_thumbnail_return(pane, monkeypatch, random_mode):
+    qt, window, catalog = pane
+    from marnwick.navigation import ImageNavigator
+
+    window.current_sort = ui.SortOrder.NAME_DESC
+    records = catalog.list_images(sort_order=window.current_sort)
+    order = [record.rel_path for record in records]
+    window.model.set_images(catalog, records)
+    target = order[25]
+    if random_mode:
+        monkeypatch.setattr(
+            ImageNavigator,
+            "random",
+            classmethod(
+                lambda cls, items, start: cls(
+                    [start, target, *(item for item in items if item not in {start, target})]
+                )
+            ),
+        )
+    original_viewer = ui.FullscreenViewer
+    asserted = []
+
+    def exit_after_navigation(viewer):
+        from test_ui import settle_viewer_load
+
+        for _ in range(1 if random_mode else 25):
+            viewer.navigate(1)
+        settle_viewer_load(viewer, qt)
+        assert viewer.navigator.current == target
+        asserted.append((viewer.image_position(), viewer.label.ordinal_text()))
+        viewer._shutdown_async_load()
+
+    monkeypatch.setattr(original_viewer, "exec_fullscreen", exit_after_navigation)
+    window.open_viewer(window.model.index(0, 0), random_mode=random_mode)
+    qt.processEvents()
+
+    assert window.selected_rel_paths() == [target]
+    row = window.model.row_for_key(("image", target))
+    assert row == 25
+    assert window.thumbnail_view.visualRect(window.model.index(row, 0)).intersects(
+        window.thumbnail_view.viewport().rect()
+    )
+    assert asserted == [((26, len(order)), f"26 / {len(order)}")]
+
+
 @pytest.mark.parametrize('key', [Qt.Key.Key_Return, Qt.Key.Key_Enter])
 def test_enter_queues_selected_videos_in_pane_order(pane, monkeypatch, key):
     qt, window, catalog = pane
@@ -249,15 +295,41 @@ def test_fullscreen_selection_fetches_unloaded_virtual_pages(pane):
     assert window._pending_rel_path_selection is None
 
 
-@pytest.mark.parametrize("pane", [80, 650], indirect=True)
-def test_fullscreen_exit_fetches_real_tag_pages(pane, monkeypatch):
+@pytest.mark.parametrize(
+    "pane,random_mode,delay_layout",
+    [(80, False, False), (650, False, False), (80, True, False),
+     (650, True, False), (650, True, True)],
+    indirect=["pane"],
+)
+def test_fullscreen_exit_fetches_real_tag_pages(pane, monkeypatch, random_mode, delay_layout):
     """Use the actual request/worker boundary, not a fabricated page callback."""
     from PySide6.QtCore import QTimer
     from time import sleep
     qt, window, catalog = pane
     monkeypatch.setattr(ui, 'PANE_QUERY_PAGE_SIZE', 200 if len(catalog.list_images()) > 200 else 20)
+    if random_mode:
+        monkeypatch.setattr(ui, "shuffled_items", lambda items: list(reversed(items)))
     target_ordinal = 600 if len(catalog.list_images()) > 200 else 71
     target = catalog.list_images()[target_ordinal - 1].rel_path
+    layout_scheduled = False
+    layout_resumed = False
+    if delay_layout:
+        view = window.thumbnail_view
+        view.setBatchSize(1)
+
+        def resume_layout():
+            nonlocal layout_resumed
+            layout_resumed = True
+            view.setBatchSize(256)
+            view.doItemsLayout()
+
+        def defer_until_selected(*_):
+            nonlocal layout_scheduled
+            if not layout_scheduled and window.selected_rel_paths() == [target]:
+                layout_scheduled = True
+                QTimer.singleShot(200, view, resume_layout)
+
+        view.selectionModel().selectionChanged.connect(defer_until_selected)
     for record in catalog.list_images():
         catalog.set_image_tags(record.rel_path, ['test'], replace=True)
     window.load_current_directory()
@@ -275,7 +347,7 @@ def test_fullscreen_exit_fetches_real_tag_pages(pane, monkeypatch):
         viewer = next((w for w in qt.topLevelWidgets()
                        if isinstance(w, ui.FullscreenViewer) and w.isVisible()), None)
         if viewer is not None and viewer.last_viewed_rel_path == target:
-            visited.append(viewer.last_viewed_rel_path)
+            visited.append((viewer.last_viewed_rel_path, viewer.image_position()))
             timer.stop()
             viewer.reject()
     def navigate():
@@ -286,11 +358,88 @@ def test_fullscreen_exit_fetches_real_tag_pages(pane, monkeypatch):
     timer.timeout.connect(close_when_loaded)
     timer.start(20)
     QTimer.singleShot(100, navigate)
-    window.open_viewer(window.model.index(0, 0), random_mode=False)
+    window.open_viewer(window.model.index(0, 0), random_mode=random_mode)
     timer.stop()
-    assert visited == [target]
+    assert [path for path, _position in visited] == [target]
     settle_until(lambda: window.selected_rel_paths() == [target])
     row = window.model.row_for_key(('image', target))
     settle_until(lambda: window.thumbnail_view.visualRect(window.model.index(row, 0)).intersects(
         window.thumbnail_view.viewport().rect()))
     assert window._pending_rel_path_selection is None
+    assert visited == [(target, (target_ordinal, len(catalog.list_images())))]
+    if delay_layout:
+        assert layout_resumed
+
+
+def test_pending_reveal_respects_user_scroll(pane, monkeypatch):
+    qt, window, _catalog = pane
+    window.select_rel_path("70.jpg")
+    pending = window._pending_move_thumbnail_visibility
+    assert pending is not None
+    window._thumbnail_scroll_range_changed(0, 100)
+    window._thumbnail_scroll_user_action()
+    calls = []
+    monkeypatch.setattr(
+        window, "_ensure_pending_move_thumbnail_visible",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+
+    qt.processEvents()
+
+    assert window._pending_move_thumbnail_visibility is None
+    assert not calls
+
+
+def test_early_range_change_keeps_pending_scroll_correction(pane):
+    from PySide6.QtTest import QTest
+
+    qt, window, _catalog = pane
+    key = ("image", "70.jpg")
+    assert window._select_thumbnail_record_key(key)
+    view = window.thumbnail_view
+    bar = view.verticalScrollBar()
+    row = window.model.row_for_key(key)
+    index = window.model.index(row, 0)
+
+    def visible():
+        return view.visualRect(index).intersects(view.viewport().rect())
+
+    assert visible()
+    assert window._pending_move_thumbnail_visibility is not None
+    bar.setMaximum(bar.maximum() + 1)
+    qt.processEvents()
+    # A subsequent programmatic scroll reset is not a user cancellation.
+    bar.setValue(bar.minimum())
+    assert not visible()
+    QTest.qWait(100)
+    assert visible()
+
+
+def test_reveal_callbacks_stay_with_their_own_anchor(pane, monkeypatch):
+    qt, window, _catalog = pane
+    view = window.thumbnail_view
+    bar = view.verticalScrollBar()
+    calls = []
+    original = window._ensure_pending_move_thumbnail_visible
+
+    def record(key, *, retries=5):
+        calls.append((window._pending_move_thumbnail_visibility, retries))
+        original(key, retries=retries)
+
+    monkeypatch.setattr(window, "_ensure_pending_move_thumbnail_visible", record)
+    assert window._select_thumbnail_record_key(("image", "70.jpg"))
+    old = window._pending_move_thumbnail_visibility
+    bar.setMaximum(bar.maximum() + 1)
+    assert window._select_thumbnail_record_key(("image", "60.jpg"))
+    new = window._pending_move_thumbnail_visibility
+    assert new is not old
+    # A queued attempt for 70 must not operate on the new 60 selection.
+    window._continue_thumbnail_reveal(old, 0)
+    window._retry_thumbnail_reveal_after_layout(old)
+    assert window._thumbnail_reveal_timer_anchor is new
+    calls.clear()
+    bar.setMaximum(bar.maximum() + 1)
+    bar.setMaximum(bar.maximum() + 1)
+    qt.processEvents()
+    assert sum(anchor is new and retries == 0 for anchor, retries in calls) == 1
+    assert window.selected_rel_paths() == ["60.jpg"]

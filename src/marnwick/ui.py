@@ -4437,6 +4437,12 @@ class MainWindow(QMainWindow):
         self._pending_move_thumbnail_visibility: (
             tuple[TreeStateKey, tuple[str, str]] | None
         ) = None
+        self._thumbnail_reveal_timer_anchor: (
+            tuple[TreeStateKey, tuple[str, str]] | None
+        ) = None
+        self._thumbnail_reveal_range_anchor: (
+            tuple[TreeStateKey, tuple[str, str]] | None
+        ) = None
         self._indexing_was_active = False
         self._catalog_intent_root: Path | None = None
         self._catalog_intent_sequence = 0
@@ -12257,14 +12263,14 @@ class MainWindow(QMainWindow):
         *,
         retries: int = 5,
     ) -> None:
-        """Keep the move anchor visible through scroll and batched-layout restores."""
+        """Keep the selected anchor visible through scroll and batched-layout restores."""
 
+        if self._closing:
+            return
         pending = self._pending_move_thumbnail_visibility
         if pending is None:
             return
-        if scroll_key != pending[0]:
-            if not self._has_pending_move_payload_tasks():
-                self._pending_move_thumbnail_visibility = None
+        if scroll_key != pending[0] or scroll_key != self._current_thumbnail_scroll_key():
             return
         record_key = pending[1]
         if self._current_thumbnail_selection_key() != record_key:
@@ -12295,20 +12301,48 @@ class MainWindow(QMainWindow):
                 QListView.ScrollHint.PositionAtCenter,
             )
         self._remember_thumbnail_scroll_position()
+        if self._pending_move_thumbnail_visibility is not pending:
+            return
+        if self._thumbnail_reveal_timer_anchor is pending:
+            # A range notification may reveal the row transiently. Keep the
+            # active correction chain responsible for retiring this anchor.
+            return
         if retries > 0:
-            # QListView's batched layout can shift rows on later event-loop
-            # turns, after the saved scrollbar position has been restored.
+            self._thumbnail_reveal_timer_anchor = pending
             QTimer.singleShot(
                 16,
-                partial(
-                    self._ensure_pending_move_thumbnail_visible,
-                    scroll_key,
-                    retries=retries - 1,
-                ),
+                self,
+                partial(self._continue_thumbnail_reveal, pending, retries - 1),
             )
             return
-        if not self._has_pending_move_payload_tasks():
+        if (
+            not self._has_pending_move_payload_tasks()
+            and self.thumbnail_view.visualRect(index).intersects(
+                self.thumbnail_view.viewport().rect()
+            )
+        ):
             self._pending_move_thumbnail_visibility = None
+
+    def _continue_thumbnail_reveal(
+        self,
+        pending: tuple[TreeStateKey, tuple[str, str]],
+        retries: int,
+    ) -> None:
+        if self._thumbnail_reveal_timer_anchor is not pending:
+            return
+        self._thumbnail_reveal_timer_anchor = None
+        if self._pending_move_thumbnail_visibility is pending:
+            self._ensure_pending_move_thumbnail_visible(pending[0], retries=retries)
+
+    def _retry_thumbnail_reveal_after_layout(
+        self,
+        pending: tuple[TreeStateKey, tuple[str, str]],
+    ) -> None:
+        if self._thumbnail_reveal_range_anchor is not pending:
+            return
+        self._thumbnail_reveal_range_anchor = None
+        if self._pending_move_thumbnail_visibility is pending:
+            self._ensure_pending_move_thumbnail_visible(pending[0], retries=0)
 
     def _cancel_thumbnail_scroll_restore(self) -> None:
         self._thumbnail_scroll_restore_generation += 1
@@ -12348,6 +12382,20 @@ class MainWindow(QMainWindow):
         _minimum: int,
         _maximum: int,
     ) -> None:
+        pending = self._pending_move_thumbnail_visibility
+        if (
+            pending is not None
+            and self._thumbnail_reveal_range_anchor is not pending
+            and not self._closing
+        ):
+            self._thumbnail_reveal_range_anchor = pending
+            # A paged target can be selected before its batched layout exists.
+            # Retry after a range change without starting another timer chain.
+            QTimer.singleShot(
+                0,
+                self,
+                partial(self._retry_thumbnail_reveal_after_layout, pending),
+            )
         if self._thumbnail_follow_paged_end:
             QTimer.singleShot(0, self._continue_thumbnail_end_paging)
         else:
@@ -15548,7 +15596,6 @@ class MainWindow(QMainWindow):
         )
         start_index = order.index(start)
         catalog = self.current_catalog
-        viewer_display_order = order
         if self.model.is_paged and self.current_virtual_kind in {
             None,
             VIRTUAL_KIND_TAG,
@@ -15578,7 +15625,6 @@ class MainWindow(QMainWindow):
                     value,
                     self.current_sort,
                 )
-                viewer_display_order = initial
             else:
                 initial = list(order)
                 next_offset = self.model.next_page_offset
@@ -15618,7 +15664,7 @@ class MainWindow(QMainWindow):
             navigator,
             self,
             wipe_on_delete=self.wipe_on_delete_enabled(),
-            display_order=viewer_display_order,
+            display_order=order,
             random_mode=random_mode,
         )
         try:
@@ -21452,7 +21498,7 @@ class FullscreenViewer(QDialog):
         self._display_order = list(
             navigator.order if display_order is None else display_order
         )
-        self._display_seen = set(self._display_order)
+        self._index_display_order()
         self.last_viewed_rel_path = navigator.current
         self.operations: list[EditOperation] = []
         self._edit_undo_starts: list[int] = []
@@ -22411,6 +22457,12 @@ class FullscreenViewer(QDialog):
         self.catalog._validate_catalog_entry_parts(relative.parts)  # noqa: SLF001
         return self.catalog.root.joinpath(*relative.parts)
 
+    def _index_display_order(self) -> None:
+        self._display_ordinals = {
+            rel_path: ordinal
+            for ordinal, rel_path in enumerate(self._display_order, start=1)
+        }
+
     def _go_to_file_total(self) -> int:
         if isinstance(self.navigator, PagedImageNavigator):
             return max(len(self._display_order), self.navigator.total_count)
@@ -22418,8 +22470,9 @@ class FullscreenViewer(QDialog):
 
     def _current_display_ordinal(self) -> int:
         if self.navigator.order:
-            with suppress(ValueError):
-                return self._display_order.index(self.navigator.current) + 1
+            ordinal = self._display_ordinals.get(self.navigator.current)
+            if ordinal is not None:
+                return ordinal
             return min(self.navigator.index + 1, max(1, self._go_to_file_total()))
         return 1
 
@@ -22728,7 +22781,7 @@ class FullscreenViewer(QDialog):
             navigator.has_more = page.has_more
             navigator.total_count = max(len(rebuilt_order), total_count)
             self._display_order = list(self._navigation_rebuild_display_order)
-            self._display_seen = set(self._display_order)
+            self._index_display_order()
             self._reset_navigation_rebuild()
             if navigator.order:
                 navigator.index = (
@@ -22744,13 +22797,13 @@ class FullscreenViewer(QDialog):
             return
         if page.complete_order and page.display_rel_paths is not None:
             self._display_order = list(dict.fromkeys(page.display_rel_paths))
-            self._display_seen = set(self._display_order)
+            self._index_display_order()
         else:
             for rel_path in page.display_rel_paths or page.rel_paths:
-                if rel_path in self._display_seen:
+                if rel_path in self._display_ordinals:
                     continue
-                self._display_seen.add(rel_path)
                 self._display_order.append(rel_path)
+                self._display_ordinals[rel_path] = len(self._display_order)
         added = navigator.append_page(page)
         self.update_ordinal_overlay()
         self._navigation_page_select_first = False
@@ -22905,13 +22958,11 @@ class FullscreenViewer(QDialog):
         except ValueError:
             return
         self._cancel_navigation_page_for_delete(preserve_rebuild=True)
-        try:
-            display_index = self._display_order.index(rel_path)
-        except ValueError:
-            display_index = None
-        else:
+        display_ordinal = self._display_ordinals.get(rel_path)
+        display_index = None if display_ordinal is None else display_ordinal - 1
+        if display_index is not None:
             self._display_order.pop(display_index)
-            self._display_seen.discard(rel_path)
+            self._index_display_order()
         self._pending_image_delete = ViewerDeletePending(
             rel_path,
             removed_index,
@@ -22945,7 +22996,7 @@ class FullscreenViewer(QDialog):
                     min(pending.display_index, len(self._display_order)),
                     rel_path,
                 )
-                self._display_seen.add(rel_path)
+                self._index_display_order()
             if isinstance(navigator, PagedImageNavigator):
                 navigator._seen.add(rel_path)
             if current_rel_path is None:
@@ -23674,6 +23725,14 @@ class FullscreenViewer(QDialog):
             )
 
     def image_position(self) -> tuple[int, int]:
+        if self.random_mode:
+            # Shuffle controls traversal, not the image's position in the pane.
+            ordinal = (
+                self._display_ordinals.get(self.navigator.current, 0)
+                if self.navigator.order
+                else 0
+            )
+            return ordinal, self._go_to_file_total()
         total = (
             self.navigator.total_count
             if isinstance(self.navigator, PagedImageNavigator)
