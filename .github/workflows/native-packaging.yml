@@ -1,0 +1,156 @@
+name: Native packaging
+
+on:
+  pull_request:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2022
+            target: windows-x64
+            arch: x64
+            python: '3.14.4'
+          - runner: macos-15
+            target: macos-arm64
+            arch: arm64
+            python: '3.12.10'
+    name: Package ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: ${{ matrix.python }}
+          architecture: ${{ matrix.arch }}
+      - name: Install locked dependencies
+        run: >-
+          python -m pip install --only-binary=:all: --require-hashes -r requirements-runtime.lock -r requirements-lama-cpu.lock -r packaging/requirements-build.lock
+      - name: Packaging unit tests
+        run: python -m unittest discover -s tests -p "test_packaging*.py" -v
+      - name: Build and archive
+        id: archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          # Quoted positional parameters can be empty with nounset on Bash 3.2.
+          set --
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            set -- --tag "$GITHUB_REF_NAME"
+          fi
+          python packaging/build_native.py "$@"
+          python packaging/archive_bundle.py "$@"
+      - name: Smoke test the deliverable
+        run: python packaging/smoke_artifact.py
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ steps.archive.outputs.name }}
+          path: dist/artifacts/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+  attach-draft-assets:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    concurrency:
+      group: native-draft-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: marnwick-v*-${{ github.sha }}
+          path: assets
+      - name: Attach validated assets to the existing draft
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          sha="$GITHUB_SHA"
+          [[ "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
+          repo="repos/$GITHUB_REPOSITORY"
+
+          # Resolve lightweight and annotated tags without relying on target_commitish.
+          verify_tag() {
+            local object type object_sha
+            object=$(gh api "$repo/git/ref/tags/$tag" --jq '.object')
+            for ((depth=0; depth<10; depth++)); do
+              type=$(jq -er '.type' <<<"$object")
+              object_sha=$(jq -er '.sha' <<<"$object")
+              if [[ "$type" == commit ]]; then
+                [[ "$object_sha" == "$sha" ]]
+                return
+              fi
+              [[ "$type" == tag ]] || return 1
+              object=$(gh api "$repo/git/tags/$object_sha" --jq '.object')
+            done
+            return 1
+          }
+          verify_tag
+          release_id=$(gh api --paginate --slurp "$repo/releases?per_page=100" |
+            jq -er --arg tag "$tag" '
+              [ .[][] | select(.tag_name == $tag) ] |
+              if length == 1 and .[0].draft then .[0].id
+              else error("Expected exactly one matching draft release") end
+            ')
+
+          files=()
+          for target in windows-x64 macos-arm64; do
+            name="marnwick-$tag-$target-$sha"
+            dir="assets/$name"
+            ext=zip
+            [[ "$target" != windows-x64 ]] || ext=exe
+            artifact="$name.$ext"
+            digest=$(sha256sum "$dir/$artifact")
+            digest="${digest%% *}"
+            jq -e --arg tag "$tag" --arg sha "$sha" --arg target "$target" \
+              --arg artifact "$artifact" --arg digest "$digest" '
+                .version_tag == $tag and ("v" + .package_version) == $tag and
+                .source_sha == $sha and .target == $target and
+                .artifact == $artifact and .sha256 == $digest
+              ' "$dir/$name.json" > /dev/null
+            test "$(cat "$dir/$name.sha256")" = "$digest  $artifact"
+            files+=("$dir/$artifact" "$dir/$name.json" "$dir/$name.sha256")
+          done
+
+          for asset in "${files[@]}"; do
+            verify_tag
+            release=$(gh api "$repo/releases/$release_id")
+            jq -e --arg tag "$tag" '.draft and .tag_name == $tag' <<<"$release" > /dev/null
+            filename="${asset##*/}"
+            # Permit a retry after a partial upload only when the bytes match.
+            existing=$(gh api --paginate --slurp "$repo/releases/$release_id/assets?per_page=100" |
+              jq -cer --arg name "$filename" '[ .[][] | select(.name == $name) ]')
+            if [[ "$existing" != '[]' ]]; then
+              digest=$(sha256sum "$asset")
+              digest="${digest%% *}"
+              jq -e --arg digest "sha256:$digest" \
+                'length == 1 and .[0].state == "uploaded" and .[0].digest == $digest' \
+                <<<"$existing" > /dev/null
+              continue
+            fi
+            curl --fail-with-body --silent --show-error \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Content-Type: application/octet-stream" \
+              --data-binary "@$asset" \
+              "https://uploads.github.com/$repo/releases/$release_id/assets?name=$filename" > /dev/null
+          done

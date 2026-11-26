@@ -46,6 +46,8 @@ The runtime dependencies are NumPy, Pillow, PyAV, PySide6, the timeout-capable R
 
 ## Quick start
 
+For Windows x64 and Apple Silicon release downloads, see the [native packaging and smoke-test guide](packaging/README.md).
+
 ### Linux and macOS
 
 From a fresh clone:

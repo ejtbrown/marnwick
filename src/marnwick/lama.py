@@ -8,7 +8,6 @@ import os
 from pathlib import Path
 import stat
 import subprocess  # nosec B404
-import sys
 import tempfile
 from threading import Event, Lock, Thread
 from time import monotonic, sleep
@@ -38,6 +37,7 @@ from .remote_lama import (
     RemoteLamaClient,
     RemoteLamaNotConfiguredError,
 )
+from .worker_launch import LAMA_WORKER, worker_command
 
 
 LAMA_MODEL_REVISION = "0153b00d76c01058d825296ee162b46ff75ce05d"
@@ -297,10 +297,8 @@ class LamaWorkerService:
         )
         ready_path = Path(worker_temp_dir.name) / "ready.json"
         stderr_file = tempfile.TemporaryFile()
-        command = [
-            sys.executable,
-            "-m",
-            "marnwick.lama_worker",
+        command = worker_command(
+            LAMA_WORKER,
             "--serve",
             "--model",
             str(model_path),
@@ -308,7 +306,7 @@ class LamaWorkerService:
             str(ready_path),
             "--runtime",
             runtime,
-        ]
+        )
         environment = dict(os.environ)
         environment["PYTHONNOUSERSITE"] = "1"
         creation_flags = (
@@ -781,10 +779,8 @@ def _run_lama_worker(
     provider_callback: LamaProviderCallback | None,
 ) -> str:
     timeout_seconds = _lama_timeout_seconds(timeout)
-    command = [
-        sys.executable,
-        "-m",
-        "marnwick.lama_worker",
+    command = worker_command(
+        LAMA_WORKER,
         "--model",
         str(model_path),
         "--input",
@@ -797,7 +793,7 @@ def _run_lama_worker(
         str(status_path),
         "--runtime",
         runtime,
-    ]
+    )
     environment = dict(os.environ)
     environment["PYTHONNOUSERSITE"] = "1"
     started = monotonic()
