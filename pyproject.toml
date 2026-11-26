@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "marnwick"
-version = "0.1.0"
+version = "1.0.0"
 description = "A fast, portable photo viewer and organizer for catalog-based workflows."
 readme = "README.md"
 requires-python = ">=3.12,<3.15"

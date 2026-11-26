@@ -35,6 +35,7 @@ from .remote_lama import (
     remote_lama_endpoint,
     remote_lama_is_configured,
 )
+from .worker_launch import GPU_WORKER, worker_command
 
 
 GPU_TEST_TIMEOUT_SECONDS = 5 * 60.0
@@ -422,15 +423,13 @@ def _run_gpu_test_worker(
     cancel_event: Event | None,
     timeout_seconds: float,
 ) -> GpuTestResult:
-    command = [
-        sys.executable,
-        "-m",
-        "marnwick.gpu_test",
+    command = worker_command(
+        GPU_WORKER,
         "--worker",
         method.provider,
         "--model",
         str(model_path),
-    ]
+    )
     environment = dict(os.environ)
     environment["PYTHONNOUSERSITE"] = "1"
     started = monotonic()
