@@ -138,7 +138,7 @@ def main() -> int:
         "signing": "ad-hoc" if target == "macos-arm64" else "unsigned",
     }, indent=2) + "\n", encoding="utf-8")
     artifact.with_suffix(".sha256").write_text(
-        f"{checksum}  {artifact.name}\n", encoding="utf-8",
+        f"{checksum}  {artifact.name}\n", encoding="utf-8", newline="\n",
     )
     if "GITHUB_OUTPUT" in os.environ:
         with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as outputs:

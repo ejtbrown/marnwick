@@ -1,6 +1,7 @@
 """Packaging contracts that can be checked without third-party dependencies."""
 from __future__ import annotations
 
+import hashlib
 import importlib
 import json
 from pathlib import Path
@@ -54,6 +55,31 @@ class WorkerRoutingTests(unittest.TestCase):
 
 
 class ProvenanceTests(unittest.TestCase):
+    def test_windows_archive_checksum_sidecar_matches_release_comparison(self):
+        source = "a" * 40
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            bundle = root / "Marnwick.exe"
+            payload = b"synthetic executable"
+            bundle.write_bytes(payload)
+            with (
+                patch.object(archive_bundle, "__file__", str(root / "packaging/archive_bundle.py")),
+                patch.object(archive_bundle, "native_target", return_value="windows-x64"),
+                patch.object(archive_bundle, "source_identity", return_value=source),
+                patch.object(archive_bundle, "source_version", return_value="1.0.0"),
+                patch.object(archive_bundle, "verified_bundle", return_value=bundle),
+                patch.dict(archive_bundle.os.environ, {"GITHUB_OUTPUT": str(root / "outputs")}),
+                patch.object(sys, "argv", ["archive_bundle.py", "--tag", "v1.0.0"]),
+            ):
+                self.assertEqual(archive_bundle.main(), 0)
+            artifact = f"marnwick-v1.0.0-windows-x64-{source}.exe"
+            sidecar = (root / "dist/artifacts" / artifact).with_suffix(".sha256")
+            expected = f"{hashlib.sha256(payload).hexdigest()}  {artifact}".encode("ascii")
+            written = sidecar.read_bytes()
+            self.assertEqual(written, expected + b"\n")
+            # Bash command substitution strips trailing LF but preserves CR.
+            self.assertEqual(written.rstrip(b"\n"), expected)
+
     def test_tag_must_match_stable_source_version(self):
         version = archive_bundle.source_version(ROOT)
         self.assertEqual(archive_bundle.version_tag(version), f"v{version}")

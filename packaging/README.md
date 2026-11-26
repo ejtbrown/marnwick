@@ -86,7 +86,7 @@ zip="$PWD/marnwick-<tag>-macos-arm64-<sha>.zip"
 shasum -a 256 "$zip"
 smoke_dir="$(mktemp -d)"
 ditto -x -k "$zip" "$smoke_dir"
-"$smoke_dir/Marnwick.app/Contents/MacOS/Marnwick" --packaging-self-test
+"$smoke_dir/Marnwick.app/Contents/MacOS/Marnwick" --packaging-self-test &&
 open "$smoke_dir/Marnwick.app"
 ```
 
