@@ -45,12 +45,13 @@ jobs:
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-          args=()
+          # Quoted positional parameters can be empty with nounset on Bash 3.2.
+          set --
           if [[ "$GITHUB_REF" == refs/tags/* ]]; then
-            args=(--tag "$GITHUB_REF_NAME")
+            set -- --tag "$GITHUB_REF_NAME"
           fi
-          python packaging/build_native.py "${args[@]}"
-          python packaging/archive_bundle.py "${args[@]}"
+          python packaging/build_native.py "$@"
+          python packaging/archive_bundle.py "$@"
       - name: Smoke test the deliverable
         run: python packaging/smoke_artifact.py
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

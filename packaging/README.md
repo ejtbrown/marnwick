@@ -65,6 +65,14 @@ after the native smoke tests pass. The tag-only release job verifies source,
 tag, and asset checksums and attaches the named assets to an existing draft
 for that tag. The draft remains unpublished.
 
+The workflow uses positional parameters to support macOS system Bash 3.2
+and Windows Git Bash with `set -u`. Local stub checks on Bash 5.3, including
+with `BASH_COMPAT=3.2`, showed that a PR invokes both scripts without `--tag`
+and a `v1.0.0` tag invokes each script with exactly `--tag v1.0.0`.
+Both scripts validate any supplied tag against the source version. A checkout
+SHA mismatch stopped the step before either script ran, and a build failure
+stopped it before archiving.
+
 ## Smoke test a downloaded deliverable
 
 Extract the outer GitHub Actions download if needed. From a clean desktop
