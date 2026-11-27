@@ -32,7 +32,7 @@ Each catalog keeps its metadata beside the photos in a `.marnwick` directory. Mo
 - Rebuild stale thumbnails and prune unreferenced cache files.
 - Generate deterministic large test catalogs and drive performance runs through an authenticated localhost debug interface.
 
-Marnwick recognizes AVIF, BMP, GIF, HEIC, HEIF, JPEG, PNG, TIFF, and WebP images; AVI, M4V, MKV, MOV, MP4, MPEG, MPG, WebM, and WMV videos; plain-text and common structured-text files; and DOCX, ODT, and PDF documents. Actual image decoding depends on the codecs available to Pillow and Qt; HEIC, HEIF, and AVIF commonly require additional platform or Pillow plugins. GIF animation is played in the fullscreen viewer. Individual videos open in the system's default player; multi-video queues use Qt's available playback codecs.
+Marnwick recognizes AVIF, BMP, GIF, HEIC, HEIF, JPEG, PNG, TIFF, and WebP images; AVI, M4V, MKV, MOV, MP4, MPEG, MPG, WebM, and WMV videos; plain-text and common structured-text files; and DOCX, ODT, and PDF documents. Actual image decoding depends on the codecs available to Pillow and Qt; HEIC, HEIF, and AVIF commonly require additional platform or Pillow plugins. GIF animation is played in the fullscreen viewer. Individual videos open in the system's default player; multi-video queues use the configured default player on Linux and Qt’s available playback codecs on macOS and Windows.
 
 ## Requirements
 
@@ -126,7 +126,13 @@ assigned to another action.
 | Drag | Move selected files or folders to a physical folder tile or folder-tree item |
 | `Ctrl` while dragging | Copy selected files or folders; the drag cursor shows a `+` badge |
 
-When at least two selected items are videos, `Enter` plays those videos in pane order in a queue window. Other selected file types are excluded. Pause/Play controls playback; Close or Escape stops the queue. Unreadable videos are skipped and listed when playback finishes. Double-click and single-video activation continue to use the system player.
+When at least two selected items are videos, `Enter` queues them in pane order and excludes other selected file types. Double-click and single-video activation use the system player.
+
+On Linux, Marnwick looks up the configured default for each video without changing associations. If all videos use the same recognized VLC installation, Marnwick sends an ordered playlist to a separate VLC instance. VLC controls that playlist after handoff. For a supported D-Bus-activated player, Marnwick uses `gdbus` for activation and `libdbus-1` to verify the player and send one Open request to its unique D-Bus name. The connection that verifies the player also sends Open and receives its acknowledgment. If that connection is lost, the queue stops without reconnecting to send the file. The session bus and kernel must supply a connection-bound Linux pidfd through the D-Bus `ProcessFD` credential. Marnwick requires both process exit and release of the player’s D-Bus name before opening the next file. An Open acknowledgment confirms the request only. Reaching the end of a video or closing a window while the player process stays alive leaves the queue waiting. Marnwick checks ownership history and the pinned process again after the final owner lookup, before sending the next Open request. A brief replacement during that lookup stops the queue before it sends the file. A failed request or unavailable ownership or process tracking also stops the queue. For a default without D-Bus activation or a native playlist adapter, Marnwick requests one file through `gio` and stops there.
+
+Close or Escape cancels later Linux launches and leaves the current player open. A request already in progress can finish. Repeated Enter keeps the existing queue open.
+
+On macOS and Windows, the queue plays in Marnwick’s Qt video window. Pause/Play controls playback, and Close or Escape stops the queue. The window skips unreadable videos and lists them when playback finishes.
 
 Use the slider to choose the number of thumbnail columns and the sort menu to change ordering. Scroll positions and selections are remembered separately for each physical or virtual directory during the session.
 

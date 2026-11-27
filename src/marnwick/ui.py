@@ -15536,17 +15536,27 @@ class MainWindow(QMainWindow):
             )
 
     def open_thumbnail_selection(self) -> None:
+        active_queue = getattr(self, "_active_linux_video_queue", None)
+        if active_queue is not None:
+            active_queue.raise_()
+            active_queue.activateWindow()
+            return
         videos = [
             record.absolute_path for record in self.selected_records()
             if isinstance(record, ImageRecord) and record.media_kind == "video"
         ]
         if len(videos) > 1 and self.current_catalog is not None:
-            from .video_player import VideoQueueDialog
+            from .video_player import LinuxVideoQueueDialog, VideoQueueDialog
 
-            dialog = VideoQueueDialog(videos, self)
+            linux = sys.platform.startswith("linux")
+            dialog = (LinuxVideoQueueDialog if linux else VideoQueueDialog)(videos, self)
+            if linux:
+                self._active_linux_video_queue = dialog
             try:
                 dialog.exec()
             finally:
+                if linux:
+                    self._active_linux_video_queue = None
                 dialog.stop()
                 dialog.deleteLater()
             return

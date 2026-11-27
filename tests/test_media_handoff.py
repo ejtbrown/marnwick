@@ -147,32 +147,79 @@ def test_fullscreen_sort_position_and_thumbnail_return(pane, monkeypatch, random
 
 
 @pytest.mark.parametrize('key', [Qt.Key.Key_Return, Qt.Key.Key_Enter])
-def test_enter_queues_selected_videos_in_pane_order(pane, monkeypatch, key):
+@pytest.mark.parametrize('platform', ['linux', 'darwin', 'win32'])
+def test_enter_queues_selected_videos_in_pane_order(pane, monkeypatch, key, platform):
+    from types import SimpleNamespace
+
     qt, window, catalog = pane
     from marnwick import video_player
-    monkeypatch.setattr(ui.QDesktopServices, 'openUrl', lambda _url: True)
+    monkeypatch.setattr(ui, 'sys', SimpleNamespace(platform=platform))
     for name in ['a.mp4', 'b.mp4', 'c.mp4']:
         make_video(catalog.root / name)
     catalog.refresh()
-    records = list(reversed([r for r in catalog.list_images() if r.media_kind == 'video']))
+    entries = catalog.list_images()
+    records = list(reversed([r for r in entries if r.media_kind == 'video']))
+    records.insert(1, next(r for r in entries if r.media_kind != 'video'))
     window.model.set_images(catalog, records)
     selection = window.thumbnail_view.selectionModel()
-    for row in [2, 0, 1]:
+    for row in [2, 0, 3, 1]:
         selection.select(window.model.index(row, 0), QItemSelectionModel.SelectionFlag.Select)
     captured = []
+    duplicate_actions = []
+
     class Queue:
         def __init__(self, paths, parent):
-            captured.extend(paths)
+            captured.append(paths)
         def exec(self):
-            pass
+            if platform == 'linux':
+                assert window.eventFilter(window.thumbnail_view, event)
+        def raise_(self):
+            duplicate_actions.append('raise')
+        def activateWindow(self):
+            duplicate_actions.append('activate')
         def stop(self):
             pass
         def deleteLater(self):
             pass
-    monkeypatch.setattr(video_player, 'VideoQueueDialog', Queue)
+
+    def unexpected_queue(*args):
+        pytest.fail('wrong platform queue')
+
+    monkeypatch.setattr(video_player, 'LinuxVideoQueueDialog', Queue if platform == 'linux' else unexpected_queue)
+    monkeypatch.setattr(video_player, 'VideoQueueDialog', unexpected_queue if platform == 'linux' else Queue)
     event = QKeyEvent(QEvent.Type.KeyPress, key, Qt.KeyboardModifier.NoModifier)
     assert window.eventFilter(window.thumbnail_view, event)
-    assert captured == [r.absolute_path for r in records]
+    assert captured == [[r.absolute_path for r in records if r.media_kind == 'video']]
+    assert duplicate_actions == (['raise', 'activate'] if platform == 'linux' else [])
+    assert getattr(window, '_active_linux_video_queue', None) is None
+
+
+def test_linux_enter_with_one_video_uses_system_player(pane, monkeypatch):
+    from types import SimpleNamespace
+    from marnwick import video_player
+
+    _, window, catalog = pane
+    path = catalog.root / 'single.mp4'
+    make_video(path)
+    catalog.refresh()
+    records = catalog.list_images()
+    window.model.set_images(catalog, records)
+    row = next(row for row, record in enumerate(records) if record.media_kind == 'video')
+    window.thumbnail_view.selectionModel().setCurrentIndex(
+        window.model.index(row, 0), QItemSelectionModel.SelectionFlag.ClearAndSelect)
+    opened = []
+    monkeypatch.setattr(ui, 'sys', SimpleNamespace(platform='linux'))
+    monkeypatch.setattr(ui, 'QDesktopServices',
+                        SimpleNamespace(openUrl=lambda url: opened.append(url.toLocalFile()) or True))
+
+    def unexpected_queue(*args):
+        pytest.fail('single-video Enter opened a queue')
+
+    monkeypatch.setattr(video_player, 'LinuxVideoQueueDialog', unexpected_queue)
+    monkeypatch.setattr(video_player, 'VideoQueueDialog', unexpected_queue)
+    event = QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Return, Qt.KeyboardModifier.NoModifier)
+    assert window.eventFilter(window.thumbnail_view, event)
+    assert opened == [str(path)]
 
 
 def test_queue_real_playback_and_invalid_file(tmp_path):
