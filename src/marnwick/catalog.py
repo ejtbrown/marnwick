@@ -3939,10 +3939,13 @@ class Catalog:
                 """,
                 (pattern, limit, offset),
             )
-            return [
-                str(row["dir_rel"])
-                for row in self._iter_cursor_rows(rows, cancel_check)
-            ]
+            try:
+                return [
+                    str(row["dir_rel"])
+                    for row in self._iter_cursor_rows(rows, cancel_check)
+                ]
+            finally:
+                rows.close()
 
     @staticmethod
     def _validate_query_page(limit: int, offset: int) -> tuple[int, int]:
